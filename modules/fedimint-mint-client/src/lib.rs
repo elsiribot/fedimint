@@ -25,6 +25,8 @@ mod input;
 mod oob;
 /// State machines for mint outputs
 pub mod output;
+/// State machines for spending notes with exact denominations
+pub mod spend_exact;
 
 pub mod events;
 
@@ -120,6 +122,7 @@ use crate::oob::{MintOOBStateMachine, MintOOBStates, MintOOBStatesCreatedMulti};
 use crate::output::{
     MintOutputCommon, MintOutputStateMachine, MintOutputStates, NoteIssuanceRequest,
 };
+use crate::spend_exact::SpendExactStateMachine;
 
 const MINT_E_CASH_TYPE_CHILD_ID: ChildId = ChildId(0);
 
@@ -556,6 +559,18 @@ pub enum SpendOOBState {
     Refunded,
 }
 
+/// The high-level state of a spend exact operation started with
+/// [`MintClientModule::spend_notes_with_exact_denominations`].
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SpendExactState {
+    /// We need to reissue notes to get the exact denominations
+    Reissuing,
+    /// We have exact notes available and the operation completed immediately
+    Success(TieredMulti<SpendableNote>),
+    /// Some error happened and the operation failed
+    Failed(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MintOperationMeta {
     pub variant: MintOperationMetaVariant,
@@ -585,6 +600,10 @@ pub enum MintOperationMetaVariant {
         oob_notes: OOBNotes,
         #[serde(default)]
         no_timeout: bool,
+    },
+    SpendExact {
+        requested_denominations: TieredCounts,
+        change_outpoints: Option<OutPointRange>,
     },
 }
 
@@ -1307,7 +1326,7 @@ impl MintClientModule {
             dbtx,
             &SelectNotesWithAtleastAmount,
             min_amount,
-            self.cfg.fee_consensus.clone(),
+            self.cfg.fee_consensus,
         )
         .await?;
 
@@ -2091,7 +2110,8 @@ impl MintClientModule {
 
                 (txid, out_points)
             }
-            MintOperationMetaVariant::SpendOOB { .. } => bail!("Operation is not a reissuance"),
+            MintOperationMetaVariant::SpendOOB { .. }
+            | MintOperationMetaVariant::SpendExact { .. } => bail!("Operation is not a reissuance"),
         };
 
         let client_ctx = self.client_ctx.clone();
@@ -2939,6 +2959,7 @@ pub enum MintClientStateMachines {
     Output(MintOutputStateMachine),
     Input(MintInputStateMachine),
     OOB(MintOOBStateMachine),
+    SpendExact(SpendExactStateMachine),
     // Removed in https://github.com/fedimint/fedimint/pull/4035 , now ignored
     Restore(MintRestoreStateMachine),
 }
@@ -2978,6 +2999,12 @@ impl State for MintClientStateMachines {
                     MintClientStateMachines::OOB
                 )
             }
+            MintClientStateMachines::SpendExact(spend_exact_state) => {
+                sm_enum_variant_translation!(
+                    spend_exact_state.transitions(context, global_context),
+                    MintClientStateMachines::SpendExact
+                )
+            }
             MintClientStateMachines::Restore(_) => {
                 sm_enum_variant_translation!(vec![], MintClientStateMachines::Restore)
             }
@@ -2989,6 +3016,9 @@ impl State for MintClientStateMachines {
             MintClientStateMachines::Output(issuance_state) => issuance_state.operation_id(),
             MintClientStateMachines::Input(redemption_state) => redemption_state.operation_id(),
             MintClientStateMachines::OOB(oob_state) => oob_state.operation_id(),
+            MintClientStateMachines::SpendExact(spend_exact_state) => {
+                spend_exact_state.operation_id()
+            }
             MintClientStateMachines::Restore(r) => r.operation_id,
         }
     }
@@ -2998,7 +3028,9 @@ impl State for MintClientStateMachines {
             MintClientStateMachines::Output(s) => s.fmt_visualization(f, indent),
             MintClientStateMachines::Input(s) => s.fmt_visualization(f, indent),
             MintClientStateMachines::OOB(s) => s.fmt_visualization(f, indent),
-            MintClientStateMachines::Restore(_) => write!(f, "{indent}{self:?}"),
+            MintClientStateMachines::SpendExact(_) | MintClientStateMachines::Restore(_) => {
+                write!(f, "{indent}{self:?}")
+            }
         }
     }
 }
