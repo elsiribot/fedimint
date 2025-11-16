@@ -30,9 +30,14 @@ enum Opts {
         /// Include federation invite code in the OOB notes
         #[clap(long, default_value = "false")]
         include_invite: bool,
+        /// Split each note into a separate [`OOBNotes`] struct instead of
+        /// combining them
+        #[clap(long, default_value = "false")]
+        split: bool,
     },
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_cli_command(
     mint: &MintClientModule,
     args: &[ffi::OsString],
@@ -77,6 +82,7 @@ pub(crate) async fn handle_cli_command(
         Opts::SpendExact {
             denominations,
             include_invite,
+            split,
         } => {
             // Parse denominations from string
             let denomination_counts =
@@ -130,16 +136,47 @@ pub(crate) async fn handle_cli_command(
 
             // Convert to OOB notes
             let federation_id_prefix = mint.federation_id.to_prefix();
-            let oob_notes = if include_invite {
-                OOBNotes::new_with_invite(notes.clone(), &mint.client_ctx.get_invite_code().await)
-            } else {
-                OOBNotes::new(federation_id_prefix, notes.clone())
-            };
 
-            Ok(json!({
-                "notes": oob_notes.to_string(),
-                "amount_msat": notes.total_amount(),
-            }))
+            if split {
+                // Split each note into a separate OOBNotes struct
+                let mut note_strings = Vec::new();
+
+                for (amount, note) in notes.iter_items() {
+                    let mut single_note_tiered = fedimint_core::TieredMulti::default();
+                    single_note_tiered.push(amount, *note);
+
+                    let oob_note = if include_invite {
+                        OOBNotes::new_with_invite(
+                            single_note_tiered,
+                            &mint.client_ctx.get_invite_code().await,
+                        )
+                    } else {
+                        OOBNotes::new(federation_id_prefix, single_note_tiered)
+                    };
+
+                    note_strings.push(oob_note.to_string());
+                }
+
+                Ok(json!({
+                    "notes": note_strings,
+                    "amount_msat": notes.total_amount(),
+                }))
+            } else {
+                // Combine all notes into a single OOBNotes struct
+                let oob_notes = if include_invite {
+                    OOBNotes::new_with_invite(
+                        notes.clone(),
+                        &mint.client_ctx.get_invite_code().await,
+                    )
+                } else {
+                    OOBNotes::new(federation_id_prefix, notes.clone())
+                };
+
+                Ok(json!({
+                    "notes": oob_notes.to_string(),
+                    "amount_msat": notes.total_amount(),
+                }))
+            }
         }
     }
 }
