@@ -140,6 +140,16 @@ impl ClientModule for WalletClientModule {
             .map(|a| Amounts::new_bitcoin(self.cfg.fee_consensus.fee(*a)))
     }
 
+    async fn input_amount(
+        &self,
+        _input: &<Self::Common as ModuleCommon>::Input,
+    ) -> Option<Amounts> {
+        // walletv2 inputs only carry a UTXO index, not the deposit amount.
+        // Recovering the value would require a federation API lookup or a
+        // local cache populated by the receive state machine.
+        None
+    }
+
     fn output_fee(
         &self,
         amount: &Amounts,
@@ -148,6 +158,14 @@ impl ClientModule for WalletClientModule {
         amount
             .get(&AmountUnit::BITCOIN)
             .map(|a| Amounts::new_bitcoin(self.cfg.fee_consensus.fee(*a)))
+    }
+
+    async fn output_amount(
+        &self,
+        output: &<Self::Common as ModuleCommon>::Output,
+    ) -> Option<Amounts> {
+        let value = output.maybe_v0_ref()?.value;
+        Some(Amounts::new_bitcoin(Amount::from_sats(value.to_sat())))
     }
 
     #[cfg(feature = "cli")]
