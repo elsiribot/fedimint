@@ -25,6 +25,7 @@ pub mod connection_limits;
 pub mod db;
 
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -89,7 +90,7 @@ pub type SetupUiRouter = Box<dyn Fn(DynSetupApi) -> axum::Router + Send>;
 pub async fn run(
     data_dir: PathBuf,
     force_api_secrets: ApiSecrets,
-    settings: ConfigGenSettings,
+    mut settings: ConfigGenSettings,
     db: Database,
     code_version_str: String,
     module_init_registry: ServerModuleInitRegistry,
@@ -100,6 +101,20 @@ pub async fn run(
     db_checkpoint_retention: u64,
     iroh_api_limits: ConnectionLimits,
 ) -> anyhow::Result<()> {
+    if settings.api_tor_mode {
+        let tor_virtual_port = settings.tor_api_port.unwrap_or(settings.api_bind.port());
+        let tor_forward_addr = api_forward_address(settings.api_bind);
+        let tor_api_url = net::api::tor::start_tor_api_service(
+            &task_group,
+            &settings.tor_api_service_name,
+            tor_virtual_port,
+            tor_forward_addr,
+        )
+        .await?;
+
+        settings.api_url = Some(tor_api_url);
+    }
+
     let (cfg, connections, p2p_status_receivers) = match get_config(&data_dir)? {
         Some(cfg) => {
             let connector = if cfg.consensus.iroh_endpoints.is_empty() {
@@ -182,6 +197,7 @@ pub async fn run(
         settings.api_bind,
         settings.iroh_dns,
         settings.iroh_relays,
+        settings.api_tor_mode,
         cfg,
         db,
         module_init_registry.clone(),
@@ -202,6 +218,19 @@ pub async fn run(
     task_group.shutdown();
 
     Ok(())
+}
+
+fn api_forward_address(api_bind: SocketAddr) -> SocketAddr {
+    if api_bind.ip().is_unspecified() {
+        let ip = match api_bind.ip() {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        };
+
+        SocketAddr::new(ip, api_bind.port())
+    } else {
+        api_bind
+    }
 }
 
 async fn update_server_info_version_dbtx(

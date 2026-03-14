@@ -21,6 +21,11 @@ path = "src/lib.rs"
 [dependencies]
 aleph-bft = { workspace = true }
 anyhow = { workspace = true }
+arti-client = { workspace = true, features = [
+    "onion-service-service",
+    "rustls",
+    "tokio",
+] }
 async-channel = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
@@ -57,6 +62,7 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 rayon = { workspace = true }
 rcgen = { workspace = true }
+safelog = "0.4.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha3 = { workspace = true }
@@ -67,6 +73,8 @@ tar = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true, features = ["codec"] }
+tor-cell = "0.33.0"
+tor-hsservice = "0.33.0"
 tower = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }

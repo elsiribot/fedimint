@@ -212,6 +212,12 @@ pub struct ConfigGenSettings {
     pub api_url: Option<SafeUrl>,
     /// Enable iroh for networking
     pub enable_iroh: bool,
+    /// Serve user API via an in-process Tor onion service
+    pub api_tor_mode: bool,
+    /// Onion service nickname used by Arti key management
+    pub tor_api_service_name: String,
+    /// Virtual onion service port to advertise in API URL
+    pub tor_api_port: Option<u16>,
     /// Optional URL of the Iroh DNS server
     pub iroh_dns: Option<SafeUrl>,
     /// Optional URLs of the Iroh relays to register on

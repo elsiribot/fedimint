@@ -47,8 +47,9 @@ use fedimintd_envs::{
     FM_BIND_TOKIO_CONSOLE_ENV, FM_BIND_UI_ENV, FM_BITCOIN_NETWORK_ENV, FM_BITCOIND_PASSWORD_ENV,
     FM_BITCOIND_URL_ENV, FM_BITCOIND_URL_PASSWORD_FILE_ENV, FM_BITCOIND_USERNAME_ENV,
     FM_DATA_DIR_ENV, FM_DB_CHECKPOINT_RETENTION_ENV, FM_DISABLE_META_MODULE_ENV,
-    FM_ENABLE_IROH_ENV, FM_ESPLORA_URL_ENV, FM_FORCE_API_SECRETS_ENV,
+    FM_ENABLE_API_TOR_ENV, FM_ENABLE_IROH_ENV, FM_ESPLORA_URL_ENV, FM_FORCE_API_SECRETS_ENV,
     FM_IROH_API_MAX_CONNECTIONS_ENV, FM_IROH_API_MAX_REQUESTS_PER_CONNECTION_ENV, FM_P2P_URL_ENV,
+    FM_TOR_API_PORT_ENV, FM_TOR_API_SERVICE_NAME_ENV,
 };
 use futures::FutureExt as _;
 use tracing::{debug, error, info};
@@ -156,6 +157,18 @@ struct ServerOpts {
 
     #[arg(long, env = FM_ENABLE_IROH_ENV)]
     enable_iroh: bool,
+
+    /// Serve the user API via an in-process Tor onion service.
+    #[arg(long, env = FM_ENABLE_API_TOR_ENV, conflicts_with = "enable_iroh")]
+    enable_api_tor: bool,
+
+    /// Onion service nickname used by Arti key management.
+    #[arg(long, env = FM_TOR_API_SERVICE_NAME_ENV, requires = "enable_api_tor", default_value = "fedimint-api")]
+    tor_api_service_name: String,
+
+    /// Virtual port advertised in the onion service API URL.
+    #[arg(long, env = FM_TOR_API_PORT_ENV, requires = "enable_api_tor")]
+    tor_api_port: Option<u16>,
 
     /// Optional URL of the Iroh DNS server
     #[arg(long, env = FM_IROH_DNS_ENV, requires = "enable_iroh")]
@@ -303,6 +316,9 @@ pub async fn run(
         p2p_url: server_opts.p2p_url.clone(),
         api_url: server_opts.api_url.clone(),
         enable_iroh: server_opts.enable_iroh,
+        api_tor_mode: server_opts.enable_api_tor,
+        tor_api_service_name: server_opts.tor_api_service_name.clone(),
+        tor_api_port: server_opts.tor_api_port,
         iroh_dns: server_opts.iroh_dns.clone(),
         iroh_relays: server_opts.iroh_relays.clone(),
         network: server_opts.bitcoin_network,

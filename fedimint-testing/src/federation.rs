@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -263,9 +264,9 @@ impl FederationTestBuilder {
         for (peer_id, cfg) in configs.clone() {
             let peer_port = self.base_port + u16::from(peer_id) * 3;
 
-            let p2p_bind = format!("127.0.0.1:{peer_port}").parse().unwrap();
-            let api_bind = format!("127.0.0.1:{}", peer_port + 1).parse().unwrap();
-            let ui_bind = format!("127.0.0.1:{}", peer_port + 2).parse().unwrap();
+            let p2p_bind: SocketAddr = format!("127.0.0.1:{peer_port}").parse().unwrap();
+            let api_bind: SocketAddr = format!("127.0.0.1:{}", peer_port + 1).parse().unwrap();
+            let ui_bind: SocketAddr = format!("127.0.0.1:{}", peer_port + 2).parse().unwrap();
 
             if u16::from(peer_id) >= self.num_peers - self.num_offline {
                 continue;
@@ -312,6 +313,7 @@ impl FederationTestBuilder {
                     api_bind,
                     None,
                     vec![],
+                    false,
                     cfg.clone(),
                     db.clone(),
                     module_init_registry,

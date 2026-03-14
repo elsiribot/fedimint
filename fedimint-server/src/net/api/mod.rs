@@ -2,6 +2,7 @@ pub mod announcement;
 pub mod guardian_metadata;
 mod http_auth;
 pub mod pkarr_publish;
+pub mod tor;
 
 use std::fmt::{self, Formatter};
 use std::net::SocketAddr;

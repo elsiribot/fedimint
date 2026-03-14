@@ -64,6 +64,7 @@ pub async fn run(
     api_bind: SocketAddr,
     iroh_dns: Option<SafeUrl>,
     iroh_relays: Vec<SafeUrl>,
+    api_tor_mode: bool,
     cfg: ServerConfig,
     db: Database,
     module_init_registry: ServerModuleInitRegistry,
@@ -215,7 +216,8 @@ pub async fn run(
     )
     .await;
 
-    if let Some(iroh_api_sk) = cfg.private.iroh_api_sk.clone()
+    if !api_tor_mode
+        && let Some(iroh_api_sk) = cfg.private.iroh_api_sk.clone()
         && let Err(e) = Box::pin(start_iroh_api(
             iroh_api_sk,
             api_bind,
