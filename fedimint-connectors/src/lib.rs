@@ -84,6 +84,23 @@ impl ConnectorRegistryBuilder {
         connectors_lazy.insert("ws".into(), (ws_connector_init.clone(), OnceCell::new()));
         connectors_lazy.insert("wss".into(), (ws_connector_init.clone(), OnceCell::new()));
 
+        #[cfg(all(feature = "tor", not(target_family = "wasm")))]
+        {
+            let tor_connector_init = Arc::new(move || {
+                Box::pin(async move {
+                    use crate::tor::TorConnector;
+
+                    Ok(Arc::new(TorConnector::bootstrap().await?) as DynConnector)
+                })
+                    as Pin<Box<dyn Future<Output = anyhow::Result<DynConnector>> + Send>>
+            });
+
+            connectors_lazy.insert(
+                "tor+ws".into(),
+                (tor_connector_init.clone(), OnceCell::new()),
+            );
+        }
+
         // Iroh connector init function
         let builder_iroh = self.clone();
         connectors_lazy.insert(

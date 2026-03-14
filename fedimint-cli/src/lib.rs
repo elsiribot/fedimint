@@ -1203,10 +1203,10 @@ impl FedimintCli {
             }) => {
                 let client = self.client_open(&cli).await?;
 
-                if !["ws", "wss"].contains(&api_url.scheme()) {
+                if !["ws", "wss", "tor+ws"].contains(&api_url.scheme()) {
                     return Err(CliError {
                         error: format!(
-                            "Unsupported URL scheme {}, use ws:// or wss://",
+                            "Unsupported URL scheme {}, use ws://, wss://, or tor+ws://",
                             api_url.scheme()
                         ),
                     });

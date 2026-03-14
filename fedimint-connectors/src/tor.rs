@@ -52,6 +52,8 @@ impl Connector for TorConnector {
         url: &SafeUrl,
         api_secret: Option<&str>,
     ) -> super::ServerResult<DynGuaridianConnection> {
+        let (is_tls, websocket_url) = websocket_url_for_tor(url)?;
+
         let addr = (
             url.host_str()
                 .ok_or_else(|| ServerError::InvalidEndpoint(anyhow!("Expected host str")))?,
@@ -101,16 +103,6 @@ impl Connector for TorConnector {
             anonymized_stream
         };
 
-        let is_tls = match url.scheme() {
-            "wss" => true,
-            "ws" => false,
-            unexpected_scheme => {
-                return Err(ServerError::InvalidEndpoint(anyhow!(
-                    "Unsupported scheme: {unexpected_scheme}"
-                )));
-            }
-        };
-
         let tls_connector = if is_tls {
             let webpki_roots = webpki_roots::TLS_SERVER_ROOTS.iter().cloned();
             let mut root_certs = RootCertStore::empty();
@@ -148,7 +140,7 @@ impl Connector for TorConnector {
         match tls_connector {
             None => {
                 let client = ws_client_builder
-                    .build_with_stream(url.as_str(), anonymized_stream)
+                    .build_with_stream(websocket_url.as_str(), anonymized_stream)
                     .await
                     .map_err(|e| ServerError::Connection(e.into()))?;
 
@@ -171,7 +163,7 @@ impl Connector for TorConnector {
                     .map_err(|e| ServerError::Connection(e.into()))?;
 
                 let client = ws_client_builder
-                    .build_with_stream(url.as_str(), anonymized_tls_stream)
+                    .build_with_stream(websocket_url.as_str(), anonymized_tls_stream)
                     .await
                     .map_err(|e| ServerError::Connection(e.into()))?;
 
@@ -182,5 +174,23 @@ impl Connector for TorConnector {
 
     async fn connect_gateway(&self, _url: &SafeUrl) -> anyhow::Result<DynGatewayConnection> {
         Err(anyhow!("Unsupported transport method"))
+    }
+}
+
+fn websocket_url_for_tor(url: &SafeUrl) -> super::ServerResult<(bool, SafeUrl)> {
+    match url.scheme() {
+        "wss" => Ok((true, url.clone())),
+        "ws" => Ok((false, url.clone())),
+        "tor+ws" => {
+            let mut websocket_url = url.clone().to_unsafe();
+            websocket_url
+                .set_scheme("ws")
+                .expect("Known-valid url scheme replacement should not fail");
+
+            Ok((false, websocket_url.into()))
+        }
+        unexpected_scheme => Err(ServerError::InvalidEndpoint(anyhow!(
+            "Unsupported scheme: {unexpected_scheme}"
+        ))),
     }
 }
