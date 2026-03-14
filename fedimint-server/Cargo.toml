@@ -36,7 +36,7 @@ bls12_381 = { workspace = true }
 bytes = { workspace = true }
 fedimint-aead = { workspace = true }
 fedimint-api-client = { workspace = true }
-fedimint-connectors = { workspace = true }
+fedimint-connectors = { workspace = true, features = ["tor"] }
 fedimint-core = { workspace = true }
 fedimint-derive-secret = { workspace = true }
 fedimint-logging = { workspace = true }

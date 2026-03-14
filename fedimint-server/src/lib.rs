@@ -176,6 +176,12 @@ pub async fn run(
             .map(|(id, config)| (*id, &config.kind)),
     )?;
 
+    if settings.api_tor_mode && !cfg.consensus.iroh_endpoints.is_empty() {
+        anyhow::bail!(
+            "Tor API mode cannot be enabled for a federation configured with Iroh API endpoints"
+        );
+    }
+
     let db = db.with_decoders(decoders);
 
     initialize_gauge_metrics(&task_group, &db).await;
