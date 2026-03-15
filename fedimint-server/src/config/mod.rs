@@ -182,12 +182,29 @@ pub fn legacy_consensus_config_hash(cfg: &ServerConfigConsensus) -> sha256::Hash
 
 // FIXME: (@leonardo) Should this have another field for the expected transport
 // ? (e.g. clearnet/tor/...)
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianApiMode {
+    #[default]
+    Clearnet,
+    Tor,
+}
+
+impl GuardianApiMode {
+    pub const fn is_tor(self) -> bool {
+        matches!(self, Self::Tor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfigLocal {
     /// Network addresses and names for all p2p connections
     pub p2p_endpoints: BTreeMap<PeerId, PeerUrl>,
     /// Our peer id (generally should not change)
     pub identity: PeerId,
+    /// Preferred guardian API mode for this server.
+    #[serde(default)]
+    pub guardian_api_mode: Option<GuardianApiMode>,
     /// How many API connections we will accept
     pub max_connections: u32,
     /// Influences the atomic broadcast ordering latency, should be higher than
@@ -230,6 +247,16 @@ pub struct ConfigGenSettings {
     pub default_modules: BTreeSet<ModuleKind>,
 }
 
+impl ConfigGenSettings {
+    pub const fn guardian_api_mode(&self) -> GuardianApiMode {
+        if self.api_tor_mode {
+            GuardianApiMode::Tor
+        } else {
+            GuardianApiMode::Clearnet
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 /// All the parameters necessary for generating the `ServerConfig` during setup
 ///
@@ -238,6 +265,8 @@ pub struct ConfigGenSettings {
 pub struct ConfigGenParams {
     /// Our own peer id
     pub identity: PeerId,
+    /// Preferred guardian API mode for this server
+    pub guardian_api_mode: GuardianApiMode,
     /// Our TLS certificate private key
     pub tls_key: Option<Arc<rustls::pki_types::PrivateKeyDer<'static>>>,
     /// Optional secret key for our iroh api endpoint
@@ -351,6 +380,7 @@ impl ServerConfig {
         let local = ServerConfigLocal {
             p2p_endpoints: params.p2p_urls(),
             identity,
+            guardian_api_mode: Some(params.guardian_api_mode),
             max_connections: DEFAULT_MAX_CLIENT_CONNECTIONS,
             broadcast_round_delay_ms: if is_running_in_test_env() {
                 DEFAULT_TEST_BROADCAST_ROUND_DELAY_MS

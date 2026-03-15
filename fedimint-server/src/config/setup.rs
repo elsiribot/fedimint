@@ -423,6 +423,7 @@ impl ISetupApi for SetupApi {
 
         let params = ConfigGenParams {
             identity: PeerId::from(our_id as u16),
+            guardian_api_mode: self.settings.guardian_api_mode(),
             tls_key: local_params.tls_key,
             iroh_api_sk: local_params.iroh_api_sk,
             iroh_p2p_sk: local_params.iroh_p2p_sk,

@@ -5,7 +5,7 @@ use fedimint_core::PeerId;
 use fedimint_core::core::ModuleKind;
 use fedimint_core::module::ApiAuth;
 use fedimint_core::setup_code::{PeerEndpoints, PeerSetupCode};
-use fedimint_server::config::ConfigGenParams;
+use fedimint_server::config::{ConfigGenParams, GuardianApiMode};
 use fedimint_server::core::ServerModuleInitRegistry;
 use fedimint_server::net::p2p_connector::gen_cert_and_key;
 use tokio_rustls::rustls;
@@ -71,6 +71,7 @@ pub fn local_config_gen_params(
         .map(|peer| {
             let params = ConfigGenParams {
                 identity: *peer,
+                guardian_api_mode: GuardianApiMode::Clearnet,
                 api_auth: API_AUTH.clone(),
                 tls_key: Some(tls_keys[peer].1.clone()),
                 iroh_api_sk: None,

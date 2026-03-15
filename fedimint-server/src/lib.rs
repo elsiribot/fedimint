@@ -101,7 +101,23 @@ pub async fn run(
     db_checkpoint_retention: u64,
     iroh_api_limits: ConnectionLimits,
 ) -> anyhow::Result<()> {
-    if settings.api_tor_mode {
+    let default_guardian_api_mode = settings.guardian_api_mode();
+    let loaded_cfg = get_config(&data_dir)?;
+    let guardian_api_mode = loaded_cfg
+        .as_ref()
+        .and_then(|cfg| cfg.local.guardian_api_mode)
+        .unwrap_or(default_guardian_api_mode);
+
+    if guardian_api_mode.is_tor()
+        && let Some(cfg) = loaded_cfg.as_ref()
+        && !cfg.consensus.iroh_endpoints.is_empty()
+    {
+        anyhow::bail!(
+            "Tor API mode cannot be enabled for a federation configured with Iroh API endpoints"
+        );
+    }
+
+    if guardian_api_mode.is_tor() {
         let tor_virtual_port = settings.tor_api_port.unwrap_or(settings.api_bind.port());
         let tor_forward_addr = api_forward_address(settings.api_bind);
         let tor_api_url = net::api::tor::start_tor_api_service(
@@ -115,7 +131,7 @@ pub async fn run(
         settings.api_url = Some(tor_api_url);
     }
 
-    let (cfg, connections, p2p_status_receivers) = match get_config(&data_dir)? {
+    let (cfg, connections, p2p_status_receivers) = match loaded_cfg {
         Some(cfg) => {
             let connector = if cfg.consensus.iroh_endpoints.is_empty() {
                 TlsTcpConnector::new(
@@ -176,7 +192,7 @@ pub async fn run(
             .map(|(id, config)| (*id, &config.kind)),
     )?;
 
-    if settings.api_tor_mode && !cfg.consensus.iroh_endpoints.is_empty() {
+    if guardian_api_mode.is_tor() && !cfg.consensus.iroh_endpoints.is_empty() {
         anyhow::bail!(
             "Tor API mode cannot be enabled for a federation configured with Iroh API endpoints"
         );
@@ -203,7 +219,7 @@ pub async fn run(
         settings.api_bind,
         settings.iroh_dns,
         settings.iroh_relays,
-        settings.api_tor_mode,
+        guardian_api_mode.is_tor(),
         cfg,
         db,
         module_init_registry.clone(),
