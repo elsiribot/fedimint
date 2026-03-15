@@ -15,6 +15,7 @@ pub const EXPLORER_IDX_ROUTE: &str = "/explorer";
 pub const EXPLORER_ROUTE: &str = "/explorer/{session_idx}";
 pub const DOWNLOAD_BACKUP_ROUTE: &str = "/download-backup";
 pub const CHANGE_PASSWORD_ROUTE: &str = "/change-password";
+pub const SWITCH_GUARDIAN_API_MODE_ROUTE: &str = "/switch-guardian-api-mode";
 pub const METRICS_ROUTE: &str = "/metrics";
 
 #[derive(Debug, Deserialize)]

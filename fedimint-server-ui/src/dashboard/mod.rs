@@ -15,7 +15,7 @@ use axum::routing::{get, post};
 use axum_extra::extract::cookie::CookieJar;
 use consensus_explorer::consensus_explorer_view;
 use fedimint_metrics::{Encoder, REGISTRY, TextEncoder};
-use fedimint_server_core::dashboard_ui::{DashboardApiModuleExt, DynDashboardApi};
+use fedimint_server_core::dashboard_ui::{DashboardApiModuleExt, DynDashboardApi, GuardianApiMode};
 use fedimint_ui_common::assets::WithStaticRoutesExt;
 use fedimint_ui_common::auth::UserAuth;
 use fedimint_ui_common::{
@@ -30,8 +30,22 @@ use {
 use crate::dashboard::modules::{lnv2, meta, wallet, walletv2};
 use crate::{
     CHANGE_PASSWORD_ROUTE, DOWNLOAD_BACKUP_ROUTE, EXPLORER_IDX_ROUTE, EXPLORER_ROUTE, LoginInput,
-    METRICS_ROUTE, login_submit_response,
+    METRICS_ROUTE, SWITCH_GUARDIAN_API_MODE_ROUTE, login_submit_response,
 };
+
+fn guardian_api_mode_name(mode: GuardianApiMode) -> &'static str {
+    match mode {
+        GuardianApiMode::Clearnet => "Clearnet",
+        GuardianApiMode::Tor => "Tor",
+    }
+}
+
+fn guardian_api_mode_switch_label(mode: GuardianApiMode) -> &'static str {
+    match mode {
+        GuardianApiMode::Clearnet => "Switch to Tor",
+        GuardianApiMode::Tor => "Switch to Clearnet",
+    }
+}
 
 // Dashboard login form handler
 async fn login_form(State(_state): State<UiState<DynDashboardApi>>) -> impl IntoResponse {
@@ -179,6 +193,47 @@ async fn change_password(
     }
 }
 
+async fn switch_guardian_api_mode(
+    State(state): State<UiState<DynDashboardApi>>,
+    user_auth: UserAuth,
+) -> impl IntoResponse {
+    match state
+        .api
+        .switch_guardian_api_mode(&user_auth.guardian_auth_token)
+        .await
+    {
+        Ok(()) => {
+            let content = html! {
+                div class="alert alert-success" {
+                    "Guardian API mode changed successfully."
+                }
+                div class="alert alert-info" {
+                    "Fedimint instance will shut down and might require a manual restart (depending how it's run)."
+                }
+                div class="button-container" {
+                    a href="/login" class="btn btn-primary" { "Go to Login" }
+                }
+            };
+
+            Html(dashboard_layout(content, "Guardian API Mode Changed", None).into_string())
+                .into_response()
+        }
+        Err(err) => {
+            let content = html! {
+                div class="alert alert-danger" {
+                    "Failed to switch guardian API mode: " (err)
+                }
+                div class="button-container" {
+                    a href="/" class="btn btn-primary" { "Return to Dashboard" }
+                }
+            };
+
+            Html(dashboard_layout(content, "Guardian API Mode Change Failed", None).into_string())
+                .into_response()
+        }
+    }
+}
+
 // Main dashboard view
 async fn dashboard_view(
     State(state): State<UiState<DynDashboardApi>>,
@@ -194,6 +249,7 @@ async fn dashboard_view(
     let audit_summary = state.api.federation_audit().await;
     let bitcoin_rpc_url = state.api.bitcoin_rpc_url().await;
     let bitcoin_rpc_status = state.api.bitcoin_rpc_status().await;
+    let guardian_api_mode = state.api.guardian_api_mode().await;
 
     let content = html! {
         div class="row gy-4" {
@@ -219,6 +275,38 @@ async fn dashboard_view(
         div class="row gy-4 mt-2" {
             div class="col-12" {
                 (bitcoin::render(bitcoin_rpc_url, &bitcoin_rpc_status))
+            }
+        }
+
+        div class="row gy-4 mt-4" {
+            div class="col-12" {
+                div class="card" {
+                    div class="card-header bg-secondary text-white" {
+                        h5 class="mb-0" { "Guardian API Mode" }
+                    }
+                    div class="card-body" {
+                        div class="row" {
+                            div class="col-lg-6 mb-3 mb-lg-0" {
+                                p class="mb-2" {
+                                    "Current mode: "
+                                    strong { (guardian_api_mode_name(guardian_api_mode)) }
+                                }
+                                form method="post" action=(SWITCH_GUARDIAN_API_MODE_ROUTE) {
+                                    button type="submit" class="btn btn-outline-secondary" {
+                                        (guardian_api_mode_switch_label(guardian_api_mode))
+                                    }
+                                }
+                            }
+                            div class="col-lg-6" {
+                                div class="alert alert-secondary mb-0" {
+                                    strong { "Restart Required" }
+                                    br;
+                                    "Switching modes shuts down fedimintd. Restart it after the change completes."
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -346,6 +434,10 @@ pub fn router(api: DynDashboardApi) -> Router {
         .route(EXPLORER_IDX_ROUTE, get(consensus_explorer_view))
         .route(DOWNLOAD_BACKUP_ROUTE, get(download_backup))
         .route(CHANGE_PASSWORD_ROUTE, post(change_password))
+        .route(
+            SWITCH_GUARDIAN_API_MODE_ROUTE,
+            post(switch_guardian_api_mode),
+        )
         .route(METRICS_ROUTE, get(metrics_handler))
         .route(
             CONNECTIVITY_CHECK_ROUTE,
