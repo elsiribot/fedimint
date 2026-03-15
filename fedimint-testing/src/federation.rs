@@ -311,6 +311,8 @@ impl FederationTestBuilder {
                     connections,
                     p2p_status_receivers,
                     api_bind,
+                    "fedimint-api".to_owned(),
+                    None,
                     None,
                     vec![],
                     false,

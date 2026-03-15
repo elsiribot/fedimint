@@ -7,7 +7,7 @@ use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::envs::is_running_in_test_env;
 use fedimint_core::net::guardian_metadata::{GuardianMetadata, SignedGuardianMetadata};
 use fedimint_core::task::{TaskGroup, sleep};
-use fedimint_core::util::FmtCompact;
+use fedimint_core::util::{FmtCompact, SafeUrl};
 use fedimint_core::{PeerId, impl_db_lookup, impl_db_record, secp256k1};
 use fedimint_logging::LOG_NET_API;
 use futures::future::join_all;
@@ -39,17 +39,19 @@ pub async fn start_guardian_metadata_service(
     db: &Database,
     tg: &TaskGroup,
     cfg: &ServerConfig,
+    active_api_url: SafeUrl,
     api_secret: Option<String>,
 ) -> anyhow::Result<()> {
     const INITIAL_DELAY_SECONDS: u64 = 5;
     const FAILURE_RETRY_SECONDS: u64 = 60;
     const SUCCESS_RETRY_SECONDS: u64 = 600;
 
-    let initial_delay = if insert_signed_guardian_metadata_if_not_present(db, cfg).await {
-        Duration::ZERO
-    } else {
-        Duration::from_secs(INITIAL_DELAY_SECONDS)
-    };
+    let initial_delay =
+        if insert_signed_guardian_metadata_if_not_present(db, cfg, active_api_url).await {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(INITIAL_DELAY_SECONDS)
+        };
 
     let db = db.clone();
     let api_client = DynGlobalApi::new(
@@ -139,7 +141,11 @@ pub async fn start_guardian_metadata_service(
 /// in the database and creates one if not.
 ///
 /// Return `true` fresh metadata was inserted because it was not present
-async fn insert_signed_guardian_metadata_if_not_present(db: &Database, cfg: &ServerConfig) -> bool {
+async fn insert_signed_guardian_metadata_if_not_present(
+    db: &Database,
+    cfg: &ServerConfig,
+    active_api_url: SafeUrl,
+) -> bool {
     let mut dbtx = db.begin_transaction().await;
     if dbtx
         .get_value(&GuardianMetadataKey(cfg.local.identity))
@@ -155,11 +161,7 @@ async fn insert_signed_guardian_metadata_if_not_present(db: &Database, cfg: &Ser
         .as_secs();
 
     let guardian_metadata = GuardianMetadata::new(
-        cfg.consensus
-            .api_endpoints()
-            .get(&cfg.local.identity)
-            .map(|endpoint| vec![endpoint.url.clone()])
-            .unwrap_or_default(),
+        vec![active_api_url],
         super::pkarr_publish::pkarr_id_z32(&cfg.private.broadcast_secret_key),
         timestamp_secs,
     );

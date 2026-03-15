@@ -109,6 +109,9 @@ pub trait IDashboardApi {
     /// Get the current guardian API mode
     async fn guardian_api_mode(&self) -> GuardianApiMode;
 
+    /// Whether the guardian API mode can be switched on this federation
+    async fn can_switch_guardian_api_mode(&self) -> bool;
+
     /// Switch to the other guardian API mode and restart
     async fn switch_guardian_api_mode(
         &self,

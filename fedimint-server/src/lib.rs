@@ -199,11 +199,35 @@ pub async fn run(
     }
 
     let db = db.with_decoders(decoders);
+    let active_api_url = if guardian_api_mode.is_tor() {
+        settings
+            .api_url
+            .clone()
+            .expect("Tor API mode should set an API URL before starting services")
+    } else {
+        cfg.consensus.api_endpoints()[&cfg.local.identity]
+            .url
+            .clone()
+    };
 
     initialize_gauge_metrics(&task_group, &db).await;
 
-    start_api_announcement_service(&db, &task_group, &cfg, force_api_secrets.get_active()).await?;
-    start_guardian_metadata_service(&db, &task_group, &cfg, force_api_secrets.get_active()).await?;
+    start_api_announcement_service(
+        &db,
+        &task_group,
+        &cfg,
+        active_api_url.clone(),
+        force_api_secrets.get_active(),
+    )
+    .await?;
+    start_guardian_metadata_service(
+        &db,
+        &task_group,
+        &cfg,
+        active_api_url,
+        force_api_secrets.get_active(),
+    )
+    .await?;
     start_pkarr_publish_service(&db, &task_group, &cfg).await?;
 
     info!(target: LOG_CONSENSUS, "Starting consensus...");
@@ -217,6 +241,8 @@ pub async fn run(
         connections,
         p2p_status_receivers,
         settings.api_bind,
+        settings.tor_api_service_name,
+        settings.tor_api_port,
         settings.iroh_dns,
         settings.iroh_relays,
         guardian_api_mode.is_tor(),
@@ -242,7 +268,7 @@ pub async fn run(
     Ok(())
 }
 
-fn api_forward_address(api_bind: SocketAddr) -> SocketAddr {
+pub(crate) fn api_forward_address(api_bind: SocketAddr) -> SocketAddr {
     if api_bind.ip().is_unspecified() {
         let ip = match api_bind.ip() {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),

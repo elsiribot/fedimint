@@ -42,17 +42,19 @@ pub async fn start_api_announcement_service(
     db: &Database,
     tg: &TaskGroup,
     cfg: &ServerConfig,
+    active_api_url: SafeUrl,
     api_secret: Option<String>,
 ) -> anyhow::Result<()> {
     const INITIAL_DEALY_SECONDS: u64 = 5;
     const FAILURE_RETRY_SECONDS: u64 = 60;
     const SUCCESS_RETRY_SECONDS: u64 = 600;
 
-    let initial_delay = if insert_signed_api_announcement_if_not_present(db, cfg).await {
-        Duration::ZERO
-    } else {
-        Duration::from_secs(INITIAL_DEALY_SECONDS)
-    };
+    let initial_delay =
+        if insert_signed_api_announcement_if_not_present(db, cfg, active_api_url).await {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(INITIAL_DEALY_SECONDS)
+        };
 
     let db = db.clone();
     // FIXME: (@leonardo) how should we handle the connector here ?
@@ -134,7 +136,11 @@ pub async fn start_api_announcement_service(
 /// identity in the database and creates one if not.
 ///
 /// Return `true` fresh announcements were inserted because it was not present
-async fn insert_signed_api_announcement_if_not_present(db: &Database, cfg: &ServerConfig) -> bool {
+async fn insert_signed_api_announcement_if_not_present(
+    db: &Database,
+    cfg: &ServerConfig,
+    active_api_url: SafeUrl,
+) -> bool {
     let mut dbtx = db.begin_transaction().await;
     if dbtx
         .get_value(&ApiAnnouncementKey(cfg.local.identity))
@@ -144,12 +150,7 @@ async fn insert_signed_api_announcement_if_not_present(db: &Database, cfg: &Serv
         return false;
     }
 
-    let api_announcement = ApiAnnouncement::new(
-        cfg.consensus.api_endpoints()[&cfg.local.identity]
-            .url
-            .clone(),
-        0,
-    );
+    let api_announcement = ApiAnnouncement::new(active_api_url, 0);
     let ctx = secp256k1::Secp256k1::new();
     let signed_announcement =
         api_announcement.sign(&ctx, &cfg.private.broadcast_secret_key.keypair(&ctx));

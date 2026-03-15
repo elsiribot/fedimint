@@ -1,6 +1,7 @@
 //! Implements the client API through which users interact with the federation
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -69,6 +70,7 @@ use futures::StreamExt;
 use tokio::sync::watch::{self, Receiver, Sender};
 use tracing::{debug, info, warn};
 
+use crate::api_forward_address;
 use crate::config::io::{
     CONSENSUS_CONFIG, ENCRYPTED_EXT, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG, SALT_FILE,
     reencrypt_private_config,
@@ -84,6 +86,7 @@ use crate::net::api::HasApiContext;
 use crate::net::api::announcement::{ApiAnnouncementKey, ApiAnnouncementPrefix, get_api_urls};
 use crate::net::api::guardian_metadata::GuardianMetadataKey;
 use crate::net::api::pkarr_publish::pkarr_id_z32;
+use crate::net::api::tor::start_tor_api_service;
 use crate::net::p2p::P2PStatusReceivers;
 
 #[derive(Clone)]
@@ -92,6 +95,12 @@ pub struct ConsensusApi {
     pub cfg: ServerConfig,
     /// Directory where config files are stored
     pub cfg_dir: PathBuf,
+    /// Bind address of the API server
+    pub api_bind: SocketAddr,
+    /// Onion service nickname used when preparing a Tor API URL
+    pub tor_api_service_name: String,
+    /// Optional virtual onion service port
+    pub tor_api_port: Option<u16>,
     /// Database for serving the API
     pub db: Database,
     /// Modules registered with the federation
@@ -189,23 +198,30 @@ impl ConsensusApi {
             return Ok(configured_url);
         }
 
-        self.known_api_urls()
+        if let Some(url) = self
+            .known_api_urls()
             .await
             .into_iter()
             .find(|url| api_url_matches_mode(url, mode))
-            .ok_or_else(|| {
-                ApiError::bad_request(
-                    match mode {
-                        ConfigGuardianApiMode::Clearnet => {
-                            "No known clearnet API URL is available for this guardian yet"
-                        }
-                        ConfigGuardianApiMode::Tor => {
-                            "No known Tor API URL is available for this guardian yet"
-                        }
-                    }
-                    .to_owned(),
-                )
-            })
+        {
+            return Ok(url);
+        }
+
+        match mode {
+            ConfigGuardianApiMode::Clearnet => Err(ApiError::bad_request(
+                "No known clearnet API URL is available for this guardian yet".to_owned(),
+            )),
+            ConfigGuardianApiMode::Tor => start_tor_api_service(
+                &self.task_group,
+                &self.tor_api_service_name,
+                self.tor_api_port.unwrap_or(self.api_bind.port()),
+                api_forward_address(self.api_bind),
+            )
+            .await
+            .map_err(|error| {
+                ApiError::server_error(format!("Failed to prepare Tor API URL: {error}"))
+            }),
+        }
     }
 
     async fn metadata_api_urls_for_mode(
@@ -984,6 +1000,10 @@ impl IDashboardApi for ConsensusApi {
         }
     }
 
+    async fn can_switch_guardian_api_mode(&self) -> bool {
+        self.cfg.consensus.iroh_endpoints.is_empty()
+    }
+
     async fn switch_guardian_api_mode(
         &self,
         _guardian_auth: &GuardianAuthToken,
@@ -995,7 +1015,7 @@ impl IDashboardApi for ConsensusApi {
         let task_group = self.task_group.clone();
         fedimint_core::runtime::spawn("shutdown after guardian api mode switch", async move {
             info!(target: LOG_NET_API, "Will shutdown after guardian API mode switch");
-            fedimint_core::runtime::sleep(Duration::from_secs(1)).await;
+            fedimint_core::runtime::sleep(Duration::from_secs(5)).await;
             task_group.shutdown();
         });
 

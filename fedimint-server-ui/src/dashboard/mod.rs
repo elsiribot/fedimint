@@ -250,6 +250,7 @@ async fn dashboard_view(
     let bitcoin_rpc_url = state.api.bitcoin_rpc_url().await;
     let bitcoin_rpc_status = state.api.bitcoin_rpc_status().await;
     let guardian_api_mode = state.api.guardian_api_mode().await;
+    let can_switch_guardian_api_mode = state.api.can_switch_guardian_api_mode().await;
 
     let content = html! {
         div class="row gy-4" {
@@ -291,9 +292,15 @@ async fn dashboard_view(
                                     "Current mode: "
                                     strong { (guardian_api_mode_name(guardian_api_mode)) }
                                 }
-                                form method="post" action=(SWITCH_GUARDIAN_API_MODE_ROUTE) {
-                                    button type="submit" class="btn btn-outline-secondary" {
-                                        (guardian_api_mode_switch_label(guardian_api_mode))
+                                @if can_switch_guardian_api_mode {
+                                    form method="post" action=(SWITCH_GUARDIAN_API_MODE_ROUTE) {
+                                        button type="submit" class="btn btn-outline-secondary" {
+                                            (guardian_api_mode_switch_label(guardian_api_mode))
+                                        }
+                                    }
+                                } @else {
+                                    div class="alert alert-secondary mb-0" {
+                                        "Guardian API mode switching is unavailable for federations using Iroh API endpoints."
                                     }
                                 }
                             }

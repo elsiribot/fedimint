@@ -62,6 +62,8 @@ pub async fn run(
     connections: DynP2PConnections<P2PMessage>,
     p2p_status_receivers: P2PStatusReceivers,
     api_bind: SocketAddr,
+    tor_api_service_name: String,
+    tor_api_port: Option<u16>,
     iroh_dns: Option<SafeUrl>,
     iroh_relays: Vec<SafeUrl>,
     api_tor_mode: bool,
@@ -187,6 +189,9 @@ pub async fn run(
     let consensus_api = ConsensusApi {
         cfg: cfg.clone(),
         cfg_dir: data_dir.clone(),
+        api_bind,
+        tor_api_service_name,
+        tor_api_port,
         db: db.clone(),
         modules: module_registry.clone(),
         client_cfg: client_cfg.clone(),
