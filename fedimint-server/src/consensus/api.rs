@@ -2,7 +2,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -47,6 +47,7 @@ use fedimint_core::net::api_announcement::{
     ApiAnnouncement, SignedApiAnnouncement, SignedApiAnnouncementSubmission,
 };
 use fedimint_core::net::auth::{GuardianAuthToken, check_auth};
+use fedimint_core::net::guardian_metadata::GuardianMetadata;
 use fedimint_core::secp256k1::{PublicKey, SECP256K1};
 use fedimint_core::session_outcome::{
     SessionOutcome, SessionStatus, SessionStatusV2, SignedSessionOutcome,
@@ -55,12 +56,13 @@ use fedimint_core::task::TaskGroup;
 use fedimint_core::transaction::{
     SerdeTransaction, Transaction, TransactionError, TransactionSubmissionOutcome,
 };
-use fedimint_core::util::{FmtCompact, SafeUrl};
+use fedimint_core::util::{FmtCompact, SafeUrl, write_overwrite};
 use fedimint_core::{ChainId, OutPoint, OutPointRange, PeerId, TransactionId, secp256k1};
 use fedimint_logging::LOG_NET_API;
 use fedimint_server_core::bitcoin_rpc::ServerBitcoinRpcMonitor;
 use fedimint_server_core::dashboard_ui::{
-    IDashboardApi, P2PConnectionStatus, ServerBitcoinRpcStatus,
+    GuardianApiMode as DashboardGuardianApiMode, IDashboardApi, P2PConnectionStatus,
+    ServerBitcoinRpcStatus,
 };
 use fedimint_server_core::{DynServerModule, ServerModuleRegistry, ServerModuleRegistryExt};
 use futures::StreamExt;
@@ -71,13 +73,17 @@ use crate::config::io::{
     CONSENSUS_CONFIG, ENCRYPTED_EXT, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG, SALT_FILE,
     reencrypt_private_config,
 };
-use crate::config::{ServerConfig, legacy_consensus_config_hash};
+use crate::config::{
+    GuardianApiMode as ConfigGuardianApiMode, ServerConfig, legacy_consensus_config_hash,
+};
 use crate::consensus::db::{AcceptedItemPrefix, AcceptedTransactionKey, SignedSessionOutcomeKey};
 use crate::consensus::engine::get_finished_session_count_static;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
 use crate::metrics::{BACKUP_WRITE_SIZE_BYTES, STORED_BACKUPS_COUNT};
 use crate::net::api::HasApiContext;
 use crate::net::api::announcement::{ApiAnnouncementKey, ApiAnnouncementPrefix, get_api_urls};
+use crate::net::api::guardian_metadata::GuardianMetadataKey;
+use crate::net::api::pkarr_publish::pkarr_id_z32;
 use crate::net::p2p::P2PStatusReceivers;
 
 #[derive(Clone)]
@@ -115,6 +121,150 @@ impl ConsensusApi {
         // TODO: In the future, we might want to fetch it from the DB, so it's possible
         // to customize from the UX
         self.force_api_secret.clone()
+    }
+
+    fn current_guardian_api_mode(&self) -> ConfigGuardianApiMode {
+        self.cfg.local.guardian_api_mode.unwrap_or_default()
+    }
+
+    async fn switch_guardian_api_mode_inner(&self) -> Result<(), ApiError> {
+        let target_mode = match self.current_guardian_api_mode() {
+            ConfigGuardianApiMode::Clearnet => ConfigGuardianApiMode::Tor,
+            ConfigGuardianApiMode::Tor => ConfigGuardianApiMode::Clearnet,
+        };
+
+        if target_mode.is_tor() && !self.cfg.consensus.iroh_endpoints.is_empty() {
+            return Err(ApiError::bad_request(
+                "Tor API mode cannot be enabled for a federation configured with Iroh API endpoints"
+                    .to_owned(),
+            ));
+        }
+
+        let active_url = self.active_api_url_for_mode(target_mode).await?;
+        let metadata_urls = self
+            .metadata_api_urls_for_mode(target_mode, &active_url)
+            .await;
+
+        self.persist_guardian_api_mode(target_mode)?;
+        self.sign_api_announcement(active_url).await;
+        self.sign_guardian_metadata(GuardianMetadata::new(
+            metadata_urls,
+            self.current_pkarr_id().await,
+            fedimint_core::time::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("System time should be after UNIX_EPOCH")
+                .as_secs(),
+        ))
+        .await;
+
+        info!(target: LOG_NET_API, mode = ?target_mode, "Successfully switched guardian API mode");
+
+        Ok(())
+    }
+
+    fn persist_guardian_api_mode(&self, mode: ConfigGuardianApiMode) -> Result<(), ApiError> {
+        let mut local = self.cfg.local.clone();
+        local.guardian_api_mode = Some(mode);
+        let local_config_path = self.cfg_dir.join(LOCAL_CONFIG).with_extension(JSON_EXT);
+        let local_config = serde_json::to_vec_pretty(&local)
+            .map_err(|e| ApiError::server_error(format!("Failed to encode local config: {e}")))?;
+
+        write_overwrite(&local_config_path, local_config).map_err(|e| {
+            ApiError::server_error(format!(
+                "Failed to persist guardian API mode to {}: {e}",
+                local_config_path.display()
+            ))
+        })
+    }
+
+    async fn active_api_url_for_mode(
+        &self,
+        mode: ConfigGuardianApiMode,
+    ) -> Result<SafeUrl, ApiError> {
+        let configured_url = self.cfg.consensus.api_endpoints()[&self.cfg.local.identity]
+            .url
+            .clone();
+
+        if api_url_matches_mode(&configured_url, mode) {
+            return Ok(configured_url);
+        }
+
+        self.known_api_urls()
+            .await
+            .into_iter()
+            .find(|url| api_url_matches_mode(url, mode))
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    match mode {
+                        ConfigGuardianApiMode::Clearnet => {
+                            "No known clearnet API URL is available for this guardian yet"
+                        }
+                        ConfigGuardianApiMode::Tor => {
+                            "No known Tor API URL is available for this guardian yet"
+                        }
+                    }
+                    .to_owned(),
+                )
+            })
+    }
+
+    async fn metadata_api_urls_for_mode(
+        &self,
+        mode: ConfigGuardianApiMode,
+        active_url: &SafeUrl,
+    ) -> Vec<SafeUrl> {
+        let mut urls = vec![active_url.clone()];
+        urls.extend(
+            self.known_api_urls()
+                .await
+                .into_iter()
+                .filter(|url| url != active_url),
+        );
+
+        if mode == ConfigGuardianApiMode::Tor {
+            urls.sort_by_key(|url| !api_url_matches_mode(url, mode));
+        }
+
+        urls
+    }
+
+    async fn known_api_urls(&self) -> Vec<SafeUrl> {
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let mut urls = vec![
+            self.cfg.consensus.api_endpoints()[&self.cfg.local.identity]
+                .url
+                .clone(),
+        ];
+
+        if let Some(announcement) = dbtx
+            .get_value(&ApiAnnouncementKey(self.cfg.local.identity))
+            .await
+        {
+            push_unique_url(&mut urls, announcement.api_announcement.api_url);
+        }
+
+        if let Some(metadata) = dbtx
+            .get_value(&GuardianMetadataKey(self.cfg.local.identity))
+            .await
+        {
+            for url in metadata.guardian_metadata().api_urls.iter().cloned() {
+                push_unique_url(&mut urls, url);
+            }
+        }
+
+        urls
+    }
+
+    async fn current_pkarr_id(&self) -> String {
+        self.db
+            .begin_transaction_nc()
+            .await
+            .get_value(&GuardianMetadataKey(self.cfg.local.identity))
+            .await
+            .map_or_else(
+                || pkarr_id_z32(&self.cfg.private.broadcast_secret_key),
+                |metadata| metadata.guardian_metadata().pkarr_id_z32.clone(),
+            )
     }
 
     // we want to return an error if and only if the submitted transaction is
@@ -667,6 +817,21 @@ impl ConsensusApi {
     }
 }
 
+fn api_url_matches_mode(url: &SafeUrl, mode: ConfigGuardianApiMode) -> bool {
+    match mode {
+        ConfigGuardianApiMode::Clearnet => {
+            !url.is_onion_address() && !url.scheme().starts_with("tor+")
+        }
+        ConfigGuardianApiMode::Tor => url.is_onion_address() || url.scheme().starts_with("tor+"),
+    }
+}
+
+fn push_unique_url(urls: &mut Vec<SafeUrl>, url: SafeUrl) {
+    if !urls.contains(&url) {
+        urls.push(url);
+    }
+}
+
 #[async_trait]
 impl HasApiContext<ConsensusApi> for ConsensusApi {
     async fn context(
@@ -810,6 +975,31 @@ impl IDashboardApi for ConsensusApi {
         }
         self.change_guardian_password(new_password, guardian_auth)
             .map_err(|e| e.to_string())
+    }
+
+    async fn guardian_api_mode(&self) -> DashboardGuardianApiMode {
+        match self.current_guardian_api_mode() {
+            ConfigGuardianApiMode::Clearnet => DashboardGuardianApiMode::Clearnet,
+            ConfigGuardianApiMode::Tor => DashboardGuardianApiMode::Tor,
+        }
+    }
+
+    async fn switch_guardian_api_mode(
+        &self,
+        _guardian_auth: &GuardianAuthToken,
+    ) -> Result<(), String> {
+        self.switch_guardian_api_mode_inner()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let task_group = self.task_group.clone();
+        fedimint_core::runtime::spawn("shutdown after guardian api mode switch", async move {
+            info!(target: LOG_NET_API, "Will shutdown after guardian API mode switch");
+            fedimint_core::runtime::sleep(Duration::from_secs(1)).await;
+            task_group.shutdown();
+        });
+
+        Ok(())
     }
 }
 

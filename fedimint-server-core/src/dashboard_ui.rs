@@ -39,6 +39,13 @@ pub struct P2PConnectionStatus {
     pub rtt: Option<Duration>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardianApiMode {
+    Clearnet,
+    Tor,
+}
+
 /// Interface for guardian dashboard API in a running federation
 #[async_trait]
 pub trait IDashboardApi {
@@ -96,6 +103,15 @@ pub trait IDashboardApi {
         &self,
         new_password: &str,
         current_password: &str,
+        guardian_auth: &GuardianAuthToken,
+    ) -> Result<(), String>;
+
+    /// Get the current guardian API mode
+    async fn guardian_api_mode(&self) -> GuardianApiMode;
+
+    /// Switch to the other guardian API mode and restart
+    async fn switch_guardian_api_mode(
+        &self,
         guardian_auth: &GuardianAuthToken,
     ) -> Result<(), String>;
 
