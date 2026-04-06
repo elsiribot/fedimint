@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use fedimint_core::core::ModuleKind;
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::module::serde_json;
-use fedimint_core::{Amount, PeerId, plugin_types_trait_impl_config};
+use fedimint_core::module::{serde_json, AmountUnit};
+use fedimint_core::{plugin_types_trait_impl_config, Amount, PeerId};
 use serde::{Deserialize, Serialize};
 use tbs::{AggregatePublicKey, PublicKeyShare};
 
@@ -33,6 +33,8 @@ pub struct MintConfigConsensus {
     pub tbs_agg_pks: BTreeMap<Denomination, AggregatePublicKey>,
     pub tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, PublicKeyShare>>,
     pub fee_consensus: FeeConsensus,
+    #[serde(default = "AmountUnit::bitcoin")]
+    pub amount_unit: AmountUnit,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +47,8 @@ pub struct MintClientConfig {
     pub tbs_agg_pks: BTreeMap<Denomination, AggregatePublicKey>,
     pub tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, PublicKeyShare>>,
     pub fee_consensus: FeeConsensus,
+    #[serde(default = "AmountUnit::bitcoin")]
+    pub amount_unit: AmountUnit,
 }
 
 impl std::fmt::Display for MintClientConfig {

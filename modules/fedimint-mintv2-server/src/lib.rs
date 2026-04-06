@@ -19,31 +19,31 @@ use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::encoding::Encodable;
-use fedimint_core::envs::{FM_ENABLE_MODULE_MINTV2_ENV, is_env_var_set_opt};
+use fedimint_core::envs::{is_env_var_set_opt, FM_ENABLE_MODULE_MINTV2_ENV};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion,
+    api_endpoint, AmountUnit, Amounts, ApiEndpoint, ApiError, ApiVersion, CoreConsensusVersion,
     InputMeta, ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions,
-    TransactionItemAmounts, api_endpoint,
+    TransactionItemAmounts, CORE_CONSENSUS_VERSION,
 };
 use fedimint_core::{
-    Amount, BitcoinHash, InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, apply,
-    async_trait_maybe_send, push_db_key_items, push_db_pair_items,
+    apply, async_trait_maybe_send, push_db_key_items, push_db_pair_items, Amount, BitcoinHash,
+    InPoint, NumPeers, NumPeersExt, OutPoint, PeerId,
 };
 use fedimint_mintv2_common::config::{
-    FeeConsensus, MintClientConfig, MintConfig, MintConfigConsensus, MintConfigPrivate,
-    consensus_denominations,
+    consensus_denominations, FeeConsensus, MintClientConfig, MintConfig, MintConfigConsensus,
+    MintConfigPrivate,
 };
 use fedimint_mintv2_common::endpoint_constants::{
     RECOVERY_COUNT_ENDPOINT, RECOVERY_SLICE_ENDPOINT, RECOVERY_SLICE_HASH_ENDPOINT,
     SIGNATURE_SHARES_ENDPOINT, SIGNATURE_SHARES_RECOVERY_ENDPOINT,
 };
 use fedimint_mintv2_common::{
-    Denomination, MODULE_CONSENSUS_VERSION, MintCommonInit, MintConsensusItem, MintInput,
-    MintInputError, MintModuleTypes, MintOutput, MintOutputError, MintOutputOutcome, RecoveryItem,
-    verify_note,
+    verify_note, Denomination, MintCommonInit, MintConsensusItem, MintInput, MintInputError,
+    MintModuleTypes, MintOutput, MintOutputError, MintOutputOutcome, RecoveryItem,
+    MODULE_CONSENSUS_VERSION,
 };
-use fedimint_server_core::config::{PeerHandleOps, eval_poly_g2};
+use fedimint_server_core::config::{eval_poly_g2, PeerHandleOps};
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
 use fedimint_server_core::{
     ConfigGenModuleArgs, ServerModule, ServerModuleInit, ServerModuleInitArgs,
@@ -53,7 +53,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaChaRng;
 use strum::IntoEnumIterator;
 use tbs::{
-    AggregatePublicKey, BlindedSignatureShare, PublicKeyShare, SecretKeyShare, derive_pk_share,
+    derive_pk_share, AggregatePublicKey, BlindedSignatureShare, PublicKeyShare, SecretKeyShare,
 };
 use threshold_crypto::ff::Field;
 use threshold_crypto::group::Curve;
@@ -201,6 +201,7 @@ impl ServerModuleInit for MintInit {
                         tbs_agg_pks: tbs_agg_pks.clone(),
                         tbs_pks: tbs_pks.clone(),
                         fee_consensus: fee_consensus.clone(),
+                        amount_unit: AmountUnit::BITCOIN,
                     },
                     private: MintConfigPrivate {
                         tbs_sks: consensus_denominations()
@@ -256,6 +257,7 @@ impl ServerModuleInit for MintInit {
                 tbs_agg_pks,
                 tbs_pks,
                 fee_consensus,
+                amount_unit: AmountUnit::BITCOIN,
             },
         };
 
@@ -287,6 +289,7 @@ impl ServerModuleInit for MintInit {
             tbs_agg_pks: config.tbs_agg_pks,
             tbs_pks: config.tbs_pks.clone(),
             fee_consensus: config.fee_consensus.clone(),
+            amount_unit: config.amount_unit,
         })
     }
 
@@ -417,11 +420,12 @@ impl ServerModule for Mint {
         .await;
 
         let amount = input.note.amount();
+        let unit = self.cfg.consensus.amount_unit;
 
         Ok(InputMeta {
             amount: TransactionItemAmounts {
-                amounts: Amounts::new_bitcoin(amount),
-                fees: Amounts::new_bitcoin(self.cfg.consensus.fee_consensus.fee(amount)),
+                amounts: Amounts::new_custom(unit, amount),
+                fees: Amounts::new_custom(unit, self.cfg.consensus.fee_consensus.fee(amount)),
             },
             pub_key: input.note.nonce,
         })
@@ -474,10 +478,11 @@ impl ServerModule for Mint {
         .await;
 
         let amount = output.amount();
+        let unit = self.cfg.consensus.amount_unit;
 
         Ok(TransactionItemAmounts {
-            amounts: Amounts::new_bitcoin(amount),
-            fees: Amounts::new_bitcoin(self.cfg.consensus.fee_consensus.fee(amount)),
+            amounts: Amounts::new_custom(unit, amount),
+            fees: Amounts::new_custom(unit, self.cfg.consensus.fee_consensus.fee(amount)),
         })
     }
 
@@ -592,7 +597,7 @@ async fn get_recovery_count(dbtx: &mut DatabaseTransaction<'_>) -> u64 {
         .await
         .next()
         .await
-        .map_or(0, |entry| entry.0.0 + 1)
+        .map_or(0, |entry| entry.0 .0 + 1)
 }
 
 async fn get_recovery_slice(
