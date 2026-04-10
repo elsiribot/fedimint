@@ -1,29 +1,16 @@
 name: "Build Start9 fedimintd Package"
 
-# Runs after CI (nix) completes, which publishes the fedimint/fedimintd
-# Docker Hub image that the s9pk Dockerfile depends on
 on:
-  workflow_run:
-    workflows: ["CI (nix)"]
-    types: [completed]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 jobs:
   build-fedimintd-s9pk:
     name: "Build fedimintd.s9pk"
-    if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
-      IS_PRERELEASE: ${{
-          contains(github.event.workflow_run.head_branch, 'beta') ||
-          contains(github.event.workflow_run.head_branch, 'rc')
-        }}
+      TAG_NAME: v0.11.0-beta.1
+      IS_PRERELEASE: "true"
     steps:
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -42,11 +29,10 @@ jobs:
         run: |
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
-      # start-os v0.3.5.1 doesn't compile on newer Rust versions
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85.1"
+          toolchain: "1.86.0"
       - name: Install cargo tools
         run: |
           # web-static-pack-packer 0.5.2 requires rustc 1.88+
@@ -103,6 +89,6 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.workflow_run.head_branch }}
+          tag_name: ${{ env.TAG_NAME }}
           files: fedimint-startos/fedimintd-v*.s9pk
           prerelease: ${{ env.IS_PRERELEASE }}
