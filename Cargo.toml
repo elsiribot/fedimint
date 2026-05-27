@@ -9,6 +9,7 @@ members = [
     "devimint",
     "docs",
     "fedimint-api-client",
+    "fedimint-bench",
     "fedimint-bip39",
     "fedimint-bitcoind",
     "fedimint-build",
