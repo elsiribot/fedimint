@@ -108,8 +108,8 @@ use crate::pay::{
     LightningPayStateMachine,
 };
 use crate::receive::{
-    LightningReceiveError, LightningReceiveStateMachine, LightningReceiveStates,
-    LightningReceiveSubmittedOffer, get_incoming_contract,
+    LightningReceiveConfirmedInvoice, LightningReceiveError, LightningReceiveStateMachine,
+    LightningReceiveStates, LightningReceiveSubmittedOffer, get_incoming_contract,
 };
 use crate::recurring::RecurringPaymentCodeEntry;
 
@@ -277,7 +277,8 @@ pub use deprecated_variant_hack::LightningOperationMetaVariant;
 #[allow(deprecated)]
 mod deprecated_variant_hack {
     use super::{
-        Bolt11Invoice, Deserialize, LightningOperationMetaPay, OutPoint, Serialize, secp256k1,
+        Bolt11Invoice, Deserialize, LightningOperationMetaPay, OperationId, OutPoint, Serialize,
+        secp256k1,
     };
     use crate::recurring::ReurringPaymentReceiveMeta;
 
@@ -287,6 +288,11 @@ mod deprecated_variant_hack {
         Pay(LightningOperationMetaPay),
         Receive {
             out_point: OutPoint,
+            invoice: Bolt11Invoice,
+            gateway_id: Option<secp256k1::PublicKey>,
+        },
+        ReceiveReclaim {
+            original_operation_id: OperationId,
             invoice: Bolt11Invoice,
             gateway_id: Option<secp256k1::PublicKey>,
         },
@@ -559,6 +565,13 @@ impl ClientModule for LightningClientModule {
                         yield serde_json::to_value(state)?;
                     }
                 }
+                "reclaim_ln_receive" => {
+                    let req: ReclaimLnReceiveRequest = serde_json::from_value(payload)?;
+                    let operation_id = self.reclaim_ln_receive(req.original_operation_id).await?;
+                    yield serde_json::json!({
+                        "operation_id": operation_id,
+                    });
+                }
                 "create_bolt11_invoice_for_user_tweaked" => {
                     let req: CreateBolt11InvoiceForUserTweakedRequest = serde_json::from_value(payload)?;
                     let (op, invoice, _) = self
@@ -652,6 +665,11 @@ struct SubscribeInternalPayRequest {
 #[derive(Deserialize)]
 struct SubscribeLnReceiveRequest {
     operation_id: OperationId,
+}
+
+#[derive(Deserialize)]
+struct ReclaimLnReceiveRequest {
+    original_operation_id: OperationId,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1895,6 +1913,96 @@ impl LightningClientModule {
         Ok((operation_id, invoice, preimage))
     }
 
+    pub async fn reclaim_ln_receive(
+        &self,
+        original_operation_id: OperationId,
+    ) -> anyhow::Result<OperationId> {
+        let operation = self.client_ctx.get_operation(original_operation_id).await?;
+        let LightningOperationMeta {
+            variant,
+            extra_meta,
+        } = operation.meta::<LightningOperationMeta>();
+
+        let LightningOperationMetaVariant::Receive {
+            invoice,
+            gateway_id,
+            ..
+        } = variant
+        else {
+            bail!("Operation is not a lightning receive")
+        };
+
+        let receiving_key = self
+            .find_ln_receive_key(original_operation_id)
+            .await
+            .ok_or_else(|| {
+                anyhow!("Cannot reclaim LN receive because the original receive key is unavailable")
+            })?;
+        let reclaim_operation_id = OperationId::new_random();
+        let operation_meta = LightningOperationMeta {
+            variant: LightningOperationMetaVariant::ReceiveReclaim {
+                original_operation_id,
+                invoice: invoice.clone(),
+                gateway_id,
+            },
+            extra_meta,
+        };
+        let state = LightningClientStateMachines::Receive(LightningReceiveStateMachine {
+            operation_id: reclaim_operation_id,
+            state: LightningReceiveStates::ConfirmedInvoice(LightningReceiveConfirmedInvoice {
+                invoice,
+                receiving_key,
+            }),
+        });
+
+        self.client_ctx
+            .manual_operation_start(
+                reclaim_operation_id,
+                LightningCommonInit::KIND.as_str(),
+                operation_meta,
+                vec![self.client_ctx.make_dyn_state(state)],
+            )
+            .await?;
+
+        Ok(reclaim_operation_id)
+    }
+
+    async fn find_ln_receive_key(&self, operation_id: OperationId) -> Option<ReceivingKey> {
+        if let Some(receiving_key) = self
+            .client_ctx
+            .get_own_operation_active_states(operation_id)
+            .await
+            .into_iter()
+            .find_map(|(state, _)| Self::ln_receive_key_from_state(&state))
+        {
+            return Some(receiving_key);
+        }
+
+        self.client_ctx
+            .get_own_operation_inactive_states(operation_id)
+            .await
+            .into_iter()
+            .find_map(|(state, _)| Self::ln_receive_key_from_state(&state))
+    }
+
+    fn ln_receive_key_from_state(state: &LightningClientStateMachines) -> Option<ReceivingKey> {
+        match state {
+            LightningClientStateMachines::Receive(receive) => match &receive.state {
+                LightningReceiveStates::SubmittedOffer(submitted_offer) => {
+                    Some(submitted_offer.receiving_key)
+                }
+                LightningReceiveStates::ConfirmedInvoice(confirmed_invoice) => {
+                    Some(confirmed_invoice.receiving_key)
+                }
+                LightningReceiveStates::Canceled(_)
+                | LightningReceiveStates::Funded(_)
+                | LightningReceiveStates::Success(_) => None,
+            },
+            LightningClientStateMachines::InternalPay(_)
+            | LightningClientStateMachines::LightningPay(_) => None,
+        }
+    }
+
     #[deprecated(since = "0.7.0", note = "Use recurring payment functionality instead")]
     #[allow(deprecated)]
     pub async fn subscribe_ln_claim(
@@ -1928,18 +2036,21 @@ impl LightningClientModule {
         operation_id: OperationId,
     ) -> anyhow::Result<UpdateStreamOrOutcome<LnReceiveState>> {
         let operation = self.client_ctx.get_operation(operation_id).await?;
-        let LightningOperationMetaVariant::Receive {
-            out_point, invoice, ..
-        } = operation.meta::<LightningOperationMeta>().variant
-        else {
-            bail!("Operation is not a lightning payment")
+        let (invoice, tx_accepted_future) = match operation.meta::<LightningOperationMeta>().variant
+        {
+            LightningOperationMetaVariant::Receive {
+                out_point, invoice, ..
+            } => {
+                let tx_accepted_future = self
+                    .client_ctx
+                    .transaction_updates(operation_id)
+                    .await
+                    .await_tx_accepted(out_point.txid);
+                (invoice, Some(tx_accepted_future))
+            }
+            LightningOperationMetaVariant::ReceiveReclaim { invoice, .. } => (invoice, None),
+            _ => bail!("Operation is not a lightning payment"),
         };
-
-        let tx_accepted_future = self
-            .client_ctx
-            .transaction_updates(operation_id)
-            .await
-            .await_tx_accepted(out_point.txid);
 
         let client_ctx = self.client_ctx.clone();
 
@@ -1950,9 +2061,11 @@ impl LightningClientModule {
 
                 yield LnReceiveState::Created;
 
-                if tx_accepted_future.await.is_err() {
-                    yield LnReceiveState::Canceled { reason: LightningReceiveError::Rejected };
-                    return;
+                if let Some(tx_accepted_future) = tx_accepted_future {
+                    if tx_accepted_future.await.is_err() {
+                        yield LnReceiveState::Canceled { reason: LightningReceiveError::Rejected };
+                        return;
+                    }
                 }
                 yield LnReceiveState::WaitingForPayment { invoice: invoice.to_string(), timeout: invoice.expiry_time() };
 
@@ -1961,16 +2074,21 @@ impl LightningClientModule {
 
                         yield LnReceiveState::Funded;
 
-                        if let Ok(out_points) = self_ref.await_claim_acceptance(operation_id).await {
-                            yield LnReceiveState::AwaitingFunds;
+                        match self_ref.await_claim_acceptance(operation_id).await {
+                            Ok(out_points) => {
+                                yield LnReceiveState::AwaitingFunds;
 
-                            if client_ctx.await_primary_module_outputs(operation_id, out_points).await.is_ok() {
-                                yield LnReceiveState::Claimed;
-                                return;
+                                if client_ctx.await_primary_module_outputs(operation_id, out_points).await.is_ok() {
+                                    yield LnReceiveState::Claimed;
+                                    return;
+                                }
+
+                                yield LnReceiveState::Canceled { reason: LightningReceiveError::ClaimRejected };
+                            }
+                            Err(e) => {
+                                yield LnReceiveState::Canceled { reason: e };
                             }
                         }
-
-                        yield LnReceiveState::Canceled { reason: LightningReceiveError::Rejected };
                     }
                     Err(e) => {
                         yield LnReceiveState::Canceled { reason: e };
