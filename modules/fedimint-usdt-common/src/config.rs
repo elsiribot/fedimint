@@ -24,6 +24,6 @@ pub struct UsdtClientConfig {
 
 impl std::fmt::Display for UsdtClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UsdtClientConfig {self:?}")
+        write!(f, "{self:?}")
     }
 }

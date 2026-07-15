@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, ensure};
 use cggmp21::ExecutionId;
 use fedimint_core::PeerId;
 use fedimint_server_core::ConfigGenModuleArgs;
@@ -102,6 +102,19 @@ async fn resolve_party_assignment(
 
     let enc_pk_map: BTreeMap<PeerId, PublicKey> = peers.exchange_encodable(our_enc_pk).await?;
 
+    // Guard against a misbehaving (or buggy) peer submitting another peer's
+    // MPC-transport encryption public key: since our own party index below is
+    // resolved by matching `our_enc_pk` against the values in this map, a
+    // duplicate value could make us (or another honest peer) resolve to the
+    // wrong party index. Every peer's encryption key must be unique.
+    let distinct_enc_pks: std::collections::BTreeSet<[u8; 33]> =
+        enc_pk_map.values().map(PublicKey::serialize).collect();
+    ensure!(
+        distinct_enc_pks.len() == enc_pk_map.len(),
+        "duplicate MPC encryption key found among peers during USDT DKG party assignment; \
+         each peer must submit a distinct encryption key"
+    );
+
     let our_peer = *enc_pk_map
         .iter()
         .find(|(_, pk)| **pk == our_enc_pk)
@@ -152,6 +165,14 @@ async fn run_keygen(
         ..
     } = assignment;
     let (my_index, n, threshold) = (*my_index, *n, *threshold);
+
+    tracing::info!(
+        target: "fedimint_usdt",
+        n,
+        my_index,
+        threshold,
+        "starting USDT DKG keygen phase"
+    );
 
     let codec = EncryptedRoundCodec::new(
         my_index,
@@ -204,6 +225,13 @@ async fn run_aux_gen(
         ..
     } = assignment;
     let (my_index, n) = (*my_index, *n);
+
+    tracing::info!(
+        target: "fedimint_usdt",
+        n,
+        my_index,
+        "starting USDT DKG aux-gen phase"
+    );
 
     let codec = EncryptedRoundCodec::new(
         my_index,

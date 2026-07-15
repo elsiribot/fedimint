@@ -12,6 +12,7 @@ use fedimint_core::config::{
 };
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{DatabaseTransaction, DatabaseVersion};
+use fedimint_core::envs::{FM_ENABLE_MODULE_USDT_ENV, is_env_var_set_opt};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
     ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
@@ -22,7 +23,7 @@ use fedimint_core::{InPoint, NumPeersExt, OutPoint, PeerId};
 use fedimint_server_core::config::PeerHandleOps;
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
 use fedimint_server_core::{
-    ConfigGenModuleArgs, ServerModule, ServerModuleInit, ServerModuleInitArgs,
+    ConfigGenModuleArgs, EnvVarDoc, ServerModule, ServerModuleInit, ServerModuleInitArgs,
 };
 use fedimint_threshold_ecdsa::group_public_key;
 pub use fedimint_usdt_common as common;
@@ -91,6 +92,17 @@ impl ServerModuleInit for UsdtInit {
             ),
             &[(0, 0)],
         )
+    }
+
+    fn is_enabled_by_default(&self) -> bool {
+        is_env_var_set_opt(FM_ENABLE_MODULE_USDT_ENV).unwrap_or(false)
+    }
+
+    fn get_documented_env_vars(&self) -> Vec<EnvVarDoc> {
+        vec![EnvVarDoc {
+            name: FM_ENABLE_MODULE_USDT_ENV,
+            description: "Set to 1/true to enable the USDT-on-EVM module (experimental). Disabled by default.",
+        }]
     }
 
     /// Initialize the module

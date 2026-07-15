@@ -8,7 +8,7 @@ publish = false
 version = { workspace = true }
 
 [[test]]
-name = "usdt_tests"
+name = "fedimint_usdt_tests"
 path = "tests/tests.rs"
 
 [dependencies]

@@ -1,6 +1,5 @@
 use strum_macros::EnumIter;
 
-// #[repr(u8)]
 #[derive(Clone, Debug, EnumIter)]
 pub enum DbKeyPrefix {}
 

@@ -30,6 +30,7 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 bls12_381 = { workspace = true }

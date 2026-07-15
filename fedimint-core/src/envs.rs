@@ -27,6 +27,7 @@ pub const FM_ENABLE_MODULE_MINT_ENV: &str = "FM_ENABLE_MODULE_MINT";
 pub const FM_ENABLE_MODULE_MINTV2_ENV: &str = "FM_ENABLE_MODULE_MINTV2";
 pub const FM_ENABLE_MODULE_WALLET_ENV: &str = "FM_ENABLE_MODULE_WALLET";
 pub const FM_ENABLE_MODULE_WALLETV2_ENV: &str = "FM_ENABLE_MODULE_WALLETV2";
+pub const FM_ENABLE_MODULE_USDT_ENV: &str = "FM_ENABLE_MODULE_USDT";
 
 /// Disable mint base fees for testing and development environments
 pub const FM_DISABLE_BASE_FEES_ENV: &str = "FM_DISABLE_BASE_FEES";
