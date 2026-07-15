@@ -245,6 +245,8 @@ P9 hardening + full acceptance suite + audit prep ★ (needs all)
 
 **Goal:** The single abstraction (interface A, Phase-2 section) that lets any cggmp21 protocol run over synchronous all-to-all byte-exchange rounds — the only transport shape Fedimint offers at both setup (`PeerHandleOps::exchange_bytes`) and runtime (consensus items).
 
+**Deviation from initial master plan (recorded 2026-07-15):** Phase 2 keeps `fedimint-threshold-ecdsa` free of any `fedimint-core` dependency (Phase 1 established this and the whole-branch review praised it). The `RoundExchange` trait and an in-memory implementation live in the crate and ARE the test harness; the `PeerHandleOps`-backed setup adapter and the consensus-item runtime adapter move to Phase 3/Phase 6 (the module crate, which already depends on fedimint-server-core). Net effect: same transport abstraction, cleaner dependency boundary, and the setup-DKG wiring is validated in Phase 3's acceptance rather than here.
+
 **Tasks (summary; JIT plan expands):**
 1. `EncryptedRoundCodec`: static x25519 or secp256k1-ECIES keypair per guardian (generated at config time, pubkeys in consensus config); pack/unpack `{broadcast, p2p: BTreeMap<u16, ciphertext>}` round packets. Property tests for codec round-trip + tamper rejection.
 2. `drive_over_exchange`: pump a cggmp21 `state-machine`-feature sync state machine (`ProceedResult`) against a `RoundExchange`; map round_based `Outgoing`/`Incoming` (sender indexes, broadcast vs p2p) onto packets. This uses the **sync driver, not async Sink/Stream** — deterministic, no runtime coupling.
