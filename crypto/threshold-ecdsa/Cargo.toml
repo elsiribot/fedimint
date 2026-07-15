@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 cggmp21 = { workspace = true }
 hd-wallet = { workspace = true }
 rand = { workspace = true }
@@ -22,6 +23,7 @@ round-based = { workspace = true }
 secp256k1 = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 cggmp21 = { workspace = true, features = ["spof"] }

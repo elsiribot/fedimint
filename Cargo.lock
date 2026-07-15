@@ -4915,6 +4915,7 @@ name = "fedimint-threshold-ecdsa"
 version = "0.12.0-alpha"
 dependencies = [
  "anyhow",
+ "async-trait",
  "cggmp21",
  "hd-wallet",
  "hex",

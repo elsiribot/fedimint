@@ -39,6 +39,8 @@ use sha3::{Digest as _, Keccak256};
 /// The only curve this crate supports.
 pub type Curve = cggmp21::supported_curves::Secp256k1;
 
+pub mod transport;
+
 /// Run the CGGMP21 distributed key generation as party `i` of `n`,
 /// with signing threshold `t`. HD derivation is always enabled so the
 /// resulting share can sign for SLIP-10-derived child keys (per-deposit
