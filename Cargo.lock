@@ -5054,6 +5054,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "fedimint-usdt-tests"
+version = "0.12.0-alpha"
+dependencies = [
+ "anyhow",
+ "fedimint-api-client",
+ "fedimint-client",
+ "fedimint-client-module",
+ "fedimint-core",
+ "fedimint-logging",
+ "fedimint-mint-client",
+ "fedimint-mint-common",
+ "fedimint-mint-server",
+ "fedimint-server",
+ "fedimint-testing",
+ "fedimint-usdt-client",
+ "fedimint-usdt-common",
+ "fedimint-usdt-server",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fedimint-util-error"
 version = "0.12.0-alpha"
 dependencies = [
@@ -5306,6 +5328,7 @@ dependencies = [
  "fedimint-server-ui",
  "fedimint-unknown-common",
  "fedimint-unknown-server",
+ "fedimint-usdt-server",
  "fedimint-wallet-server",
  "fedimint-walletv2-common",
  "fedimint-walletv2-server",

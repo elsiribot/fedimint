@@ -1,0 +1,33 @@
+[package]
+authors = { workspace = true }
+description = "fedimint-usdt-tests contains boot integration tests for the usdt module"
+edition = { workspace = true }
+license = { workspace = true }
+name = "fedimint-usdt-tests"
+publish = false
+version = { workspace = true }
+
+[[test]]
+name = "usdt_tests"
+path = "tests/tests.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-logging = { workspace = true }
+fedimint-mint-client = { workspace = true }
+fedimint-mint-common = { workspace = true }
+fedimint-mint-server = { workspace = true }
+fedimint-server = { workspace = true }
+fedimint-testing = { workspace = true }
+fedimint-usdt-client = { workspace = true }
+fedimint-usdt-common = { workspace = true }
+fedimint-usdt-server = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

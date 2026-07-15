@@ -14,8 +14,9 @@ use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{DatabaseTransaction, DatabaseVersion};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    ApiEndpoint, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta, ModuleConsensusVersion,
-    ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
+    ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
+    ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
+    api_endpoint,
 };
 use fedimint_core::{InPoint, NumPeersExt, OutPoint, PeerId};
 use fedimint_server_core::config::PeerHandleOps;
@@ -26,6 +27,7 @@ use fedimint_server_core::{
 use fedimint_threshold_ecdsa::group_public_key;
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
+use fedimint_usdt_common::endpoint_constants::GROUP_PUBLIC_KEY_ENDPOINT;
 use fedimint_usdt_common::{
     MODULE_CONSENSUS_VERSION, UsdtCommonInit, UsdtConsensusItem, UsdtInput, UsdtInputError,
     UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
@@ -270,7 +272,13 @@ impl ServerModule for Usdt {
     }
 
     fn api_endpoints(&self) -> Vec<ApiEndpoint<Self>> {
-        Vec::new()
+        vec![api_endpoint! {
+            GROUP_PUBLIC_KEY_ENDPOINT,
+            ApiVersion::new(0, 0),
+            async |module: &Usdt, _context, _params: ()| -> secp256k1::PublicKey {
+                Ok(module.cfg.consensus.group_public_key)
+            }
+        }]
     }
 }
 

@@ -88,6 +88,7 @@ members = [
     "modules/fedimint-usdt-client",
     "modules/fedimint-usdt-common",
     "modules/fedimint-usdt-server",
+    "modules/fedimint-usdt-tests",
     "modules/fedimint-wallet-client",
     "modules/fedimint-wallet-common",
     "modules/fedimint-wallet-server",
