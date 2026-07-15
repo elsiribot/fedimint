@@ -4919,6 +4919,7 @@ dependencies = [
  "rand 0.8.5",
  "round-based",
  "secp256k1",
+ "sha2 0.10.9",
  "sha3",
  "tokio",
 ]
