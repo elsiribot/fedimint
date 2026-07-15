@@ -66,6 +66,8 @@ where
 {
     cggmp21::keygen::<Curve>(eid, i, n)
         .set_threshold(t)
+        // HD is already cggmp21's default; set it explicitly so this keeps
+        // working if that default ever flips.
         .hd_wallet(true)
         .start(rng, party)
         .await
@@ -80,6 +82,13 @@ pub type KeyShare = cggmp21::KeyShare<Curve>;
 /// Run auxiliary-info generation (Paillier setup). `pregenerated` primes
 /// are expensive to produce — generate them ahead of time (they are
 /// consumed by this call).
+///
+/// `eid` must be unique per protocol execution — never reuse an eid across
+/// executions — and must be distinct from the eids used for keygen and for
+/// any other aux-gen or signing execution, while being identical across all
+/// participants of this execution. The transport behind `party` must be
+/// authenticated, and point-to-point messages encrypted (cggmp21
+/// requirement).
 pub async fn run_aux_gen<M>(
     eid: cggmp21::ExecutionId<'_>,
     i: u16,
@@ -142,6 +151,13 @@ fn convert_signature(
 ///   signature is valid for the derived child public key instead of the group
 ///   key
 /// * `digest` — the prehashed message (e.g. keccak256 of an EVM tx)
+///
+/// `eid` must be unique per protocol execution — never reuse an eid across
+/// executions — and must be distinct from the eids used for keygen/aux-gen
+/// and any other signing execution, while being identical across all
+/// participants of this execution. The transport behind `party` must be
+/// authenticated, and point-to-point messages encrypted (cggmp21
+/// requirement).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_signing<M>(
     eid: cggmp21::ExecutionId<'_>,
@@ -193,7 +209,7 @@ pub fn evm_address(pk: &secp256k1::PublicKey) -> [u8; 20] {
 pub fn derived_public_key(share: &KeyShare, path: &[u32]) -> anyhow::Result<secp256k1::PublicKey> {
     let child = share
         .derive_child_public_key::<hd_wallet::Slip10, _>(path.iter().copied())
-        .map_err(|err| anyhow::anyhow!("child key derivation failed: {err}"))?;
+        .context("child key derivation failed")?;
     let compressed = child.public_key.to_bytes(true);
     secp256k1::PublicKey::from_slice(&compressed)
         .context("derived key is not a valid secp256k1 point")

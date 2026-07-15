@@ -40,7 +40,7 @@ async fn dkg_produces_consistent_group_key() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn aux_gen_and_assembly_yield_full_key_share() {
+async fn aux_gen_assembly_and_signing_yield_working_key_share() {
     let eid_keygen = ExecutionId::new(b"test-aux-keygen");
     let eid_aux = ExecutionId::new(b"test-aux-auxgen");
 
@@ -63,12 +63,52 @@ async fn aux_gen_and_assembly_yield_full_key_share() {
         .collect::<anyhow::Result<Vec<_>>>()
         .expect("aux gen failed");
 
+    let mut shares = Vec::with_capacity(usize::from(N));
     for (core, aux) in cores.into_iter().zip(aux_infos) {
         let share = crate::assemble_key_share(core, aux).expect("assembly failed");
         // serde round-trip: shares must be storable in the guardian DB.
         let json = serde_json::to_string(&share).expect("serialize");
         let restored: crate::KeyShare = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.shared_public_key(), share.shared_public_key());
+        shares.push(share);
+    }
+
+    // Compose the full pipeline: sign with a t-subset of the DKG-produced,
+    // aux-assembled shares (not trusted-dealer shares) and verify the
+    // resulting signature against the group key.
+    let eid_signing = ExecutionId::new(b"test-aux-signing");
+    let signers: [u16; T as usize] = [0, 1, 3];
+    let digest: [u8; 32] = Keccak256::digest(b"fedimint usdt aux pipeline test").into();
+
+    let signatures = round_based::sim::run_with_setup(
+        signers
+            .iter()
+            .map(|&keygen_i| (shares[usize::from(keygen_i)].clone(), OsRng)),
+        |i, party, (share, mut rng)| async move {
+            crate::run_signing(
+                eid_signing,
+                i,
+                &signers,
+                &share,
+                None,
+                digest,
+                &mut rng,
+                party,
+            )
+            .await
+        },
+    )
+    .expect("sim failed")
+    .into_iter()
+    .collect::<anyhow::Result<Vec<_>>>()
+    .expect("signing failed");
+
+    let group_pk = crate::group_public_key(&shares[0]).expect("group key");
+    let msg = secp256k1::Message::from_digest(digest);
+    let secp = secp256k1::Secp256k1::verification_only();
+    for sig in &signatures {
+        secp.verify_ecdsa(&msg, sig, &group_pk)
+            .expect("signature must verify");
     }
 }
 
