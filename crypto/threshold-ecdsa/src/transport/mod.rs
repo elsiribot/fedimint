@@ -75,10 +75,12 @@
 mod codec;
 mod driver;
 mod mesh;
+mod off_thread;
 
 pub use codec::{EncryptedRoundCodec, OpenedRound};
 pub use driver::drive_over_exchange;
 pub use mesh::{InMemoryMesh, in_memory_mesh};
+pub use off_thread::{ChannelExchange, ProtocolHandle, spawn_protocol};
 
 /// The index of a party among `n` participants, in `0..n`.
 pub type PartyIndex = u16;

@@ -29,7 +29,7 @@ serde = { workspace = true, features = ["derive"] }
 serde-big-array = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
 cggmp21 = { workspace = true, features = ["spof"] }
