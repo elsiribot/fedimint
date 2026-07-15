@@ -284,4 +284,6 @@ Basis: one strong senior Rust engineer using AI coding tools heavily, **integrat
 
 **Milestones:** testnet MVP ≈ **4.5–6 months**; audited mainnet-ready ≈ **7.5–10 months** (external audit adds ~4–8 weeks calendar). For comparison, a Liquid (L-USDt) variant is estimated at roughly **40–50% of this effort** (no MPC, no ERC-4337, no consolidation subsystem).
 
-**Top risks after the library assumption:** (1) interactive-MPC ↔ consensus integration (presigning, guardian churn, identifiable aborts); (2) library fit — additive/HD derivation and identifiable-abort support must be verified up front (hence the phase-0 spike); (3) ERC-4337/paymaster friction with USDT specifically.
+**Top risks after the library assumption:** (1) interactive-MPC ↔ consensus integration (presigning, guardian churn, abort handling); (2) library fit; (3) ERC-4337/paymaster friction with USDT specifically.
+
+**Library selection (resolved 2026-07-15):** `cggmp21` (LFDT-Lockness, ex-Dfns) — MIT/Apache-2.0, Kudelski-audited, maintained, arbitrary t-of-n, SLIP-10 HD derivation (signs for derived child keys from the same shares, replacing the additive-tweak requirement), presigning, transport abstracted via `round_based::Delivery`. Known gap: **no identifiable aborts** — a stalled/malicious signer cannot be cryptographically blamed; mitigate with per-peer round timeouts and rotating the signing subset (t < n). Alternatives rejected: synedrion (AGPL, unaudited), sl-dkls23 (non-commercial license), 0xCarbon DKLs23 (unaudited), ZenGo multi-party-ecdsa (unmaintained, vulnerable lineage).
