@@ -5037,6 +5037,7 @@ version = "0.12.0-alpha"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bls12_381",
  "cggmp21",
  "erased-serde",
  "fedimint-core",
@@ -5046,8 +5047,10 @@ dependencies = [
  "rand 0.8.5",
  "secp256k1",
  "serde",
+ "sha2 0.10.9",
  "strum 0.27.1",
  "strum_macros 0.27.1",
+ "tokio",
 ]
 
 [[package]]

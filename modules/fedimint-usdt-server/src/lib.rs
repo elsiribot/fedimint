@@ -36,6 +36,8 @@ use strum::IntoEnumIterator;
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigPrivate};
 use crate::db::DbKeyPrefix;
 
+mod dkg;
+
 pub mod config;
 pub mod db;
 
@@ -156,10 +158,11 @@ impl ServerModuleInit for UsdtInit {
     /// Generates configs for all peers in an untrusted manner
     async fn distributed_gen(
         &self,
-        _peers: &(dyn PeerHandleOps + Send + Sync),
-        _args: &ConfigGenModuleArgs,
+        peers: &(dyn PeerHandleOps + Send + Sync),
+        args: &ConfigGenModuleArgs,
     ) -> anyhow::Result<ServerModuleConfig> {
-        bail!("usdt distributed_gen implemented in the next task")
+        let config = dkg::distributed_gen(peers, args).await?;
+        Ok(config.to_erased())
     }
 
     /// Converts the consensus config into the client config
@@ -325,6 +328,308 @@ mod tests {
             UsdtInit
                 .validate_config(peer, server_cfgs[peer].clone())
                 .expect("dealer-generated config must validate for every peer");
+        }
+    }
+}
+
+/// Acceptance test for real distributed key generation (`distributed_gen`):
+/// runs the actual N-party cggmp21 keygen + aux-info-gen over a hermetic
+/// fake config-gen peer channel, then proves the resulting key shares are
+/// genuinely usable by running one 3-of-4 threshold signature and verifying
+/// it against the group key with the independent `secp256k1` crate.
+#[cfg(test)]
+mod distributed_gen_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use cggmp21::ExecutionId;
+    use fedimint_core::bitcoin::Network;
+    use fedimint_core::{NumPeers, NumPeersExt as _, PeerId};
+    use fedimint_threshold_ecdsa::Curve;
+    use fedimint_threshold_ecdsa::transport::{
+        EncryptedRoundCodec, drive_over_exchange, in_memory_mesh,
+    };
+    use rand::rngs::OsRng;
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    const N: u16 = 4;
+    const T: u16 = 3;
+
+    /// Shared state for [`FakeDkgNetwork`]: one entry per logical round
+    /// (keyed by a per-peer, monotonically increasing round counter), each
+    /// holding the payload every peer has submitted so far for that round.
+    /// A round is complete once all `total` peers have submitted.
+    struct DkgCoordinator {
+        rounds: std::sync::Mutex<HashMap<u64, BTreeMap<PeerId, Vec<u8>>>>,
+        notify: Notify,
+        total: usize,
+    }
+
+    /// A hermetic, in-memory [`PeerHandleOps`] impl for N peers sharing one
+    /// [`DkgCoordinator`]: `exchange_bytes` is an all-to-all round barrier —
+    /// it submits this peer's payload for "its next round" and blocks until
+    /// every peer has submitted for that same round, then returns all of
+    /// them. Each `FakeDkgNetwork` tracks its own round counter, so
+    /// `distributed_gen`'s sequential keygen-then-aux-gen round series (each
+    /// itself many rounds) is serviced correctly without any explicit round
+    /// numbering in the `exchange_bytes` API itself.
+    struct FakeDkgNetwork {
+        coordinator: Arc<DkgCoordinator>,
+        my_peer: PeerId,
+        num_peers: NumPeers,
+        next_round: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerHandleOps for FakeDkgNetwork {
+        fn num_peers(&self) -> NumPeers {
+            self.num_peers
+        }
+
+        async fn run_dkg_g1(
+            &self,
+        ) -> anyhow::Result<(Vec<bls12_381::G1Projective>, bls12_381::Scalar)> {
+            unimplemented!("usdt DKG does not use run_dkg_g1")
+        }
+
+        async fn run_dkg_g2(
+            &self,
+        ) -> anyhow::Result<(Vec<bls12_381::G2Projective>, bls12_381::Scalar)> {
+            unimplemented!("usdt DKG does not use run_dkg_g2")
+        }
+
+        async fn exchange_bytes(&self, data: Vec<u8>) -> anyhow::Result<BTreeMap<PeerId, Vec<u8>>> {
+            let round = self.next_round.fetch_add(1, Ordering::SeqCst);
+
+            {
+                let mut rounds = self
+                    .coordinator
+                    .rounds
+                    .lock()
+                    .expect("coordinator mutex poisoned");
+                let entry = rounds.entry(round).or_default();
+                entry.insert(self.my_peer, data);
+                if entry.len() == self.coordinator.total {
+                    // Every peer has submitted for this round: wake everyone
+                    // (including peers that haven't called `notified()` yet;
+                    // see the loop below for why that is still race-free).
+                    self.coordinator.notify.notify_waiters();
+                }
+            }
+
+            loop {
+                // Register as a waiter *before* checking the round's
+                // completion, using `enable()` so a `notify_waiters()` that
+                // races with our check (fired by another peer between our
+                // check and our `.await` below) is not missed. Without this,
+                // a peer could check the map (not yet complete), then miss
+                // the one-shot `notify_waiters()` fired immediately after by
+                // the peer that completes the round, and hang forever.
+                let notified = self.coordinator.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                {
+                    let rounds = self
+                        .coordinator
+                        .rounds
+                        .lock()
+                        .expect("coordinator mutex poisoned");
+                    if let Some(entry) = rounds.get(&round)
+                        && entry.len() == self.coordinator.total
+                    {
+                        return Ok(entry.clone());
+                    }
+                }
+
+                notified.await;
+            }
+        }
+    }
+
+    /// Runs `UsdtInit::distributed_gen` concurrently for all of `peer_ids`
+    /// over a shared, hermetic [`FakeDkgNetwork`] coordinator, returning
+    /// every guardian's typed config.
+    async fn run_distributed_gen_for_all_peers(peer_ids: &[PeerId]) -> Vec<UsdtConfig> {
+        let coordinator = Arc::new(DkgCoordinator {
+            rounds: std::sync::Mutex::new(HashMap::new()),
+            notify: Notify::new(),
+            total: peer_ids.len(),
+        });
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+
+        let mut tasks = Vec::with_capacity(peer_ids.len());
+        for &peer in peer_ids {
+            let net = FakeDkgNetwork {
+                coordinator: coordinator.clone(),
+                my_peer: peer,
+                num_peers: peer_ids.to_num_peers(),
+                next_round: AtomicU64::new(0),
+            };
+            // This module has no other way to obtain N concurrent, `Send`
+            // `distributed_gen` futures than spawning them onto the
+            // multi-thread runtime: each one blocks (via `PeerHandleOps`)
+            // on the others' progress, so they cannot be `.await`ed
+            // sequentially on one task.
+            // nosemgrep: ban-tokio-spawn
+            tasks.push(tokio::spawn(async move {
+                UsdtInit.distributed_gen(&net, &args).await
+            }));
+        }
+
+        let mut configs = Vec::with_capacity(peer_ids.len());
+        for t in tasks {
+            configs.push(
+                t.await
+                    .expect("distributed_gen task must not panic")
+                    .expect("distributed_gen must succeed")
+                    .to_typed::<UsdtConfig>()
+                    .expect("config was just generated by the same distributed_gen"),
+            );
+        }
+        configs
+    }
+
+    /// Asserts every guardian's config agrees on the group key/threshold,
+    /// each guardian's own key share aggregates to that group key, and each
+    /// config passes `validate_config` under its own `PeerId`.
+    fn assert_configs_consistent_and_valid(peer_ids: &[PeerId], configs: &[UsdtConfig]) {
+        let group_public_key = configs[0].consensus.group_public_key;
+        for cfg in configs {
+            assert_eq!(
+                cfg.consensus.group_public_key, group_public_key,
+                "all guardians must agree on the DKG group public key"
+            );
+            assert_eq!(cfg.consensus.threshold, T);
+            assert_eq!(
+                fedimint_threshold_ecdsa::group_public_key(&cfg.private.key_share)
+                    .expect("valid key share"),
+                group_public_key,
+                "each guardian's own key share must aggregate to the group key"
+            );
+        }
+
+        for peer in peer_ids {
+            UsdtInit
+                .validate_config(peer, configs[peer.to_usize()].clone().to_erased())
+                .expect("distributed_gen output must validate for every guardian");
+        }
+    }
+
+    /// Runs a real `T`-of-`N` threshold signature over `shares` (a fresh
+    /// mesh + fresh MPC-transport encryption keys for the signing
+    /// sub-protocol, independent of the DKG's), returning the raw cggmp21
+    /// signatures.
+    ///
+    /// cggmp21's synchronous signing state machine is `!Send` (like
+    /// keygen/aux-gen; see `threshold-ecdsa`'s
+    /// `keygen_and_signing_over_exchange_transport` test), so the signer
+    /// tasks are scheduled cooperatively on one thread via `LocalSet`
+    /// instead of `tokio::spawn`.
+    async fn run_threshold_signing(
+        shares: &[fedimint_threshold_ecdsa::KeyShare],
+        signers: [u16; T as usize],
+        digest: [u8; 32],
+    ) -> Vec<cggmp21::Signature<Curve>> {
+        let secp = secp256k1::Secp256k1::new();
+        let signer_secret_keys: Vec<secp256k1::SecretKey> = (0..signers.len())
+            .map(|i| {
+                let mut bytes = [7u8; 32];
+                bytes[31] = u8::try_from(i + 1).expect("fewer than 256 signers in this test");
+                secp256k1::SecretKey::from_slice(&bytes).expect("valid scalar")
+            })
+            .collect();
+        let signer_public_keys: Vec<secp256k1::PublicKey> = signer_secret_keys
+            .iter()
+            .map(|sk| sk.public_key(&secp))
+            .collect();
+
+        let data = cggmp21::DataToSign::from_scalar(
+            cggmp21::generic_ec::Scalar::from_be_bytes_mod_order(digest),
+        );
+        let eid_signing = ExecutionId::new(b"usdt-server-distributed-gen-test-signing");
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let meshes = in_memory_mesh(T);
+                let mut handles = Vec::with_capacity(usize::from(T));
+                for (pos, mut mesh) in meshes.into_iter().enumerate() {
+                    let pos = u16::try_from(pos).expect("T fits in u16");
+                    let keygen_index = signers[usize::from(pos)];
+                    let codec = EncryptedRoundCodec::new(
+                        pos,
+                        signer_secret_keys[usize::from(pos)],
+                        signer_public_keys.clone(),
+                        eid_signing.as_bytes().to_vec(),
+                    );
+                    let share = shares[usize::from(keygen_index)].clone();
+                    handles.push(tokio::task::spawn_local(async move {
+                        let mut rng = OsRng;
+                        let sm = cggmp21::signing(eid_signing, pos, &signers, &share)
+                            .sign_sync(&mut rng, data);
+                        drive_over_exchange(sm, &codec, &mut mesh).await
+                    }));
+                }
+                let mut signatures = Vec::with_capacity(usize::from(T));
+                for h in handles {
+                    signatures.push(
+                        h.await
+                            .expect("signer task must not panic")
+                            .expect("driving signing over the mesh")
+                            .expect("cggmp21 signing"),
+                    );
+                }
+                signatures
+            })
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distributed_gen_produces_working_threshold_signing_key() {
+        let peer_ids: Vec<PeerId> = (0..N).map(PeerId::from).collect();
+
+        let configs = run_distributed_gen_for_all_peers(&peer_ids).await;
+        assert_configs_consistent_and_valid(&peer_ids, &configs);
+        let group_public_key = configs[0].consensus.group_public_key;
+
+        // Strongest possible acceptance: prove the DKG output is genuine
+        // signing material by running a real 3-of-4 threshold signature over
+        // the shares and verifying it against the group key.
+        let shares: Vec<fedimint_threshold_ecdsa::KeyShare> = configs
+            .iter()
+            .map(|cfg| cfg.private.key_share.clone())
+            .collect();
+        let digest: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(b"usdt distributed_gen acceptance test").into()
+        };
+        let signatures = run_threshold_signing(&shares, [0, 1, 3], digest).await;
+
+        // Independent verification: convert the raw (r, s) scalars to the
+        // workspace's canonical secp256k1 signature type (same compact +
+        // normalize_s conversion `fedimint_threshold_ecdsa::run_signing`
+        // uses internally) and check against the group key.
+        let msg = secp256k1::Message::from_digest(digest);
+        let verifier = secp256k1::Secp256k1::verification_only();
+        for sig in &signatures {
+            let mut compact = [0u8; 64];
+            compact[..32].copy_from_slice(&sig.r.to_be_bytes());
+            compact[32..].copy_from_slice(&sig.s.to_be_bytes());
+            let mut ecdsa_sig = secp256k1::ecdsa::Signature::from_compact(&compact)
+                .expect("cggmp21 produced a valid compact signature");
+            ecdsa_sig.normalize_s();
+            verifier
+                .verify_ecdsa(&msg, &ecdsa_sig, &group_public_key)
+                .expect(
+                    "signature produced from the DKG-generated shares must verify against the DKG group key",
+                );
         }
     }
 }
