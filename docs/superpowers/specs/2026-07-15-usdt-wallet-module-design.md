@@ -228,7 +228,8 @@ If ERC-4337 integration proves impractical on a target chain, fall back to **Mod
 
 (Full step-by-step plan to be produced separately.)
 
-1. **Threshold ECDSA subsystem** — DKG, signing, additive tweaks; audited protocol; tests.
+0. **MPC library spike (1–2 weeks)** — select the threshold-ECDSA library (CGGMP21/DKLs-class, audited; verify t-of-n, additive/HD derivation, identifiable aborts, transport abstraction) and prototype one threshold signature end-to-end through a Fedimint-compatible transport. Resolves the largest source of estimate variance before deeper investment.
+1. **Threshold ECDSA subsystem** — DKG, signing, additive tweaks; integrate the audited library selected in the spike; tests.
 2. **EVM chain adapter** — `IServerEvmRpc` + one concrete implementation (an L2 first, for cheap gas during development); consensus over head/gas price.
 3. **Common crate** — config, consensus items, input/output and claim types, encoding.
 4. **Deposit path** — counterfactual address derivation, detection consensus, gasless claim → mint.
@@ -261,3 +262,26 @@ If ERC-4337 integration proves impractical on a target chain, fall back to **Mod
 | External dependency | Bitcoin full nodes | Bitcoin-equivalent EVM nodes **+ paymaster/bundler** (liveness/pricing, non-custodial) |
 
 The design preserves Fedimint's core custody trust (guardian threshold authorizes every move) while accepting a **non-custodial** gas-relaying dependency and a **consensus-based** deposit-detection model as the price of operating on an account-model chain.
+
+---
+
+## 10. Effort estimate
+
+Basis: one strong senior Rust engineer using AI coding tools heavily, **integrating an existing audited threshold-ECDSA library** (CGGMP21/DKLs-class) rather than building the primitive. Engineer-weeks; wide error bars.
+
+| Workstream | Weeks | Notes |
+| --- | ---: | --- |
+| Threshold ECDSA (integrate library, DKG, signing, tweaks) | 5–8 | Work is the multi-round-MPC ↔ Fedimint-consensus integration, presigning, abort handling — not the crypto itself |
+| ERC-4337 integration (smart account, paymaster, bundler, UserOps) | 4–8 | Integration-debug-heavy; USDT ERC-20 quirks |
+| Common crate + module plumbing | 3–5 | |
+| Deposit path (addresses, detection consensus, claim→mint) | 3–5 | |
+| EVM chain adapter | 2–4 | |
+| Withdrawal (fee quoting, signing, outcome tracking) | 2–4 | |
+| Consolidation (batched sweeps) | 2–4 | |
+| Integration tests / devimint | 3–6 | |
+| Fallback gas model (self-run paymaster + ETH float) | 2–4 | Deferrable past MVP |
+| Hardening + audit prep/remediation | 3–5 | Primitive pre-audited → smaller audit scope |
+
+**Milestones:** testnet MVP ≈ **4.5–6 months**; audited mainnet-ready ≈ **7.5–10 months** (external audit adds ~4–8 weeks calendar). For comparison, a Liquid (L-USDt) variant is estimated at roughly **40–50% of this effort** (no MPC, no ERC-4337, no consolidation subsystem).
+
+**Top risks after the library assumption:** (1) interactive-MPC ↔ consensus integration (presigning, guardian churn, identifiable aborts); (2) library fit — additive/HD derivation and identifiable-abort support must be verified up front (hence the phase-0 spike); (3) ERC-4337/paymaster friction with USDT specifically.
