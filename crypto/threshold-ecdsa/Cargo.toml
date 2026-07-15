@@ -23,7 +23,7 @@ hd-wallet = { workspace = true }
 hkdf = { workspace = true }
 rand = { workspace = true }
 ring = { workspace = true }
-round-based = { workspace = true }
+round-based = { workspace = true, features = ["state-machine"] }
 secp256k1 = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive"] }
 serde-big-array = { workspace = true }
