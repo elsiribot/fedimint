@@ -5015,6 +5015,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "fedimint-usdt-server"
+version = "0.12.0-alpha"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cggmp21",
+ "erased-serde",
+ "fedimint-core",
+ "fedimint-server-core",
+ "fedimint-threshold-ecdsa",
+ "fedimint-usdt-common",
+ "rand 0.8.5",
+ "secp256k1",
+ "serde",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
+]
+
+[[package]]
 name = "fedimint-util-error"
 version = "0.12.0-alpha"
 dependencies = [
