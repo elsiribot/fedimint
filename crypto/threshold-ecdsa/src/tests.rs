@@ -125,3 +125,70 @@ async fn signing_with_fewer_than_threshold_fails() {
         assert!(outputs.into_iter().all(|r| r.is_err()));
     }
 }
+
+#[test]
+fn evm_address_matches_known_vector() {
+    // Private key 0x...01 -> the well-known address
+    // 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+    let secp = secp256k1::Secp256k1::new();
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes[31] = 1;
+    let sk = secp256k1::SecretKey::from_slice(&sk_bytes).expect("valid key");
+    let pk = sk.public_key(&secp);
+    assert_eq!(
+        crate::evm_address(&pk),
+        <[u8; 20]>::try_from(
+            hex::decode("7e5f4552091a69125d5dfcb7b8c2659029395bdf")
+                .expect("valid hex")
+                .as_slice()
+        )
+        .expect("20 bytes"),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn derived_key_signing_verifies_against_derived_pubkey() {
+    let shares = dealer_shares();
+    let eid = ExecutionId::new(b"test-derived-signing");
+    let signers: [u16; T as usize] = [0, 1, 2];
+    let path: &[u32] = &[7, 42]; // e.g. (account, deposit-index)
+    let digest: [u8; 32] = Keccak256::digest(b"deposit sweep").into();
+
+    let signatures = round_based::sim::run_with_setup(
+        signers
+            .iter()
+            .map(|&keygen_i| (shares[usize::from(keygen_i)].clone(), OsRng)),
+        |i, party, (share, mut rng)| async move {
+            crate::run_signing(
+                eid,
+                i,
+                &signers,
+                &share,
+                Some(path),
+                digest,
+                &mut rng,
+                party,
+            )
+            .await
+        },
+    )
+    .expect("sim failed")
+    .into_iter()
+    .collect::<anyhow::Result<Vec<_>>>()
+    .expect("signing failed");
+
+    let child_pk = crate::derived_public_key(&shares[0], path).expect("derive");
+    let group_pk = crate::group_public_key(&shares[0]).expect("group key");
+    assert_ne!(child_pk, group_pk, "derived key must differ from group key");
+
+    let msg = secp256k1::Message::from_digest(digest);
+    let secp = secp256k1::Secp256k1::verification_only();
+    for sig in &signatures {
+        secp.verify_ecdsa(&msg, sig, &child_pk)
+            .expect("must verify against the DERIVED key");
+        assert!(
+            secp.verify_ecdsa(&msg, sig, &group_pk).is_err(),
+            "must NOT verify against the group key"
+        );
+    }
+}

@@ -7,6 +7,7 @@
 //! server module that consumes this crate.
 
 use anyhow::Context as _;
+use sha3::{Digest as _, Keccak256};
 
 /// The only curve this crate supports.
 pub type Curve = cggmp21::supported_curves::Secp256k1;
@@ -142,6 +143,33 @@ where
         .await
         .context("cggmp21 signing failed")?;
     convert_signature(sig)
+}
+
+/// The standard Ethereum address of a secp256k1 public key: the last 20
+/// bytes of keccak256 over the 64-byte uncompressed point (i.e. the
+/// uncompressed SEC1 encoding with its leading `0x04` prefix stripped).
+pub fn evm_address(pk: &secp256k1::PublicKey) -> [u8; 20] {
+    let uncompressed = pk.serialize_uncompressed();
+    let hash = Keccak256::digest(&uncompressed[1..]);
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&hash[12..]);
+    address
+}
+
+/// Derive the child public key for a non-hardened SLIP-10 `path`.
+///
+/// A signature produced by [`run_signing`] with `derivation_path: Some(path)`
+/// verifies against this key (and not against the group key returned by
+/// [`group_public_key`]). This lets the USDT module derive a per-deposit EVM
+/// address from `(group key, path)` up front, and later sign for that exact
+/// address using the same guardian shares.
+pub fn derived_public_key(share: &KeyShare, path: &[u32]) -> anyhow::Result<secp256k1::PublicKey> {
+    let child = share
+        .derive_child_public_key::<hd_wallet::Slip10, _>(path.iter().copied())
+        .map_err(|err| anyhow::anyhow!("child key derivation failed: {err}"))?;
+    let compressed = child.public_key.to_bytes(true);
+    secp256k1::PublicKey::from_slice(&compressed)
+        .context("derived key is not a valid secp256k1 point")
 }
 
 #[cfg(test)]

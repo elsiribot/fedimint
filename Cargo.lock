@@ -4916,6 +4916,8 @@ version = "0.12.0-alpha"
 dependencies = [
  "anyhow",
  "cggmp21",
+ "hd-wallet",
+ "hex",
  "rand 0.8.5",
  "round-based",
  "secp256k1",

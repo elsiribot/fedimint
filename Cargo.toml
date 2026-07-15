@@ -253,6 +253,10 @@ getrandom = "0.3.3"
 gloo-net = "0.6.0"
 gloo-timers = "0.3.0"
 group = "0.13.0"
+hd-wallet = { version = "0.6.1", default-features = false, features = [
+    "slip10",
+    "curve-secp256k1",
+] }
 hex = "0.4.3"
 hex-conservative = "1.0.0"
 hkdf = { package = "fedimint-hkdf", path = "./crypto/hkdf", version = "=0.12.0-alpha" }
