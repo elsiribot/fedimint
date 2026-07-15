@@ -265,6 +265,19 @@ The design preserves Fedimint's core custody trust (guardian threshold authorize
 
 ---
 
+## 9.1 Decision record addendum (2026-07-15, after planning research)
+
+Settled with elsirion during master planning (full rationale in `docs/superpowers/plans/2026-07-15-usdt-evm-module-master-plan.md`):
+
+- **Runtime MPC transport:** CGGMP21 signing rounds ride **consensus items** (like peg-out signatures today), full-interactive, P2P round parts encrypted per-recipient. ~15–60 s per signing session; withdrawals batch into one UserOp per session. No core-framework changes; no presignature pool (avoids the presig-reuse key-leak hazard). Fedimint exposes no runtime guardian-to-guardian channel to modules, so the alternatives were a public-API side channel or a core extension — both rejected for v1.
+- **Setup-time DKG:** CGGMP21 keygen + aux-gen run over `PeerHandleOps::exchange_bytes` broadcast rounds during config gen (per-recipient-encrypted payloads packed into each round). Note: `fedimint-testing` only exercises trusted-dealer config gen, so real DKG needs its own harness over the fake p2p mesh.
+- **AA stack:** SimpleAccount + EntryPoint v0.7, vendored bytecode. Per-deposit addresses come from **CREATE2 salts committing to the claim key** — HD derivation is off the critical path (retained only for the bare-EOA fallback Model C).
+- **Deposit watching:** **claim-triggered verification** — no standing watch set; the client requests a check after depositing (`check_deposit`), guardians verify the account balance at a confirmation-depth-anchored block and vote identical observations to threshold.
+- **Denomination (deployment constraint):** Fedimint transactions balance in a single unit federation-wide, so this module implies a **USDT-denominated federation** (mint issues USDT e-cash; 1 `Amount` unit ≡ 10⁻⁶ USDT). Mixed BTC+USDT federations are out of scope — multi-asset support would be a deep core change.
+- **Fee/FX pricing:** guardians vote `{max_fee_per_gas, usdt_per_eth}` from per-guardian-configured sources; median-of-votes, mirroring today's bitcoin feerate votes.
+
+---
+
 ## 10. Effort estimate
 
 Basis: one strong senior Rust engineer using AI coding tools heavily, **integrating an existing audited threshold-ECDSA library** (CGGMP21/DKLs-class) rather than building the primitive. Engineer-weeks; wide error bars.
