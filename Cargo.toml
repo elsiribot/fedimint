@@ -85,6 +85,7 @@ members = [
     "modules/fedimint-mintv2-tests",
     "modules/fedimint-unknown-common",
     "modules/fedimint-unknown-server",
+    "modules/fedimint-usdt-common",
     "modules/fedimint-wallet-client",
     "modules/fedimint-wallet-common",
     "modules/fedimint-wallet-server",
@@ -240,6 +241,7 @@ fedimint-threshold-ecdsa = { path = "./crypto/threshold-ecdsa", version = "=0.12
 fedimint-ui-common = { path = "./fedimint-ui-common", version = "=0.12.0-alpha" }
 fedimint-unknown-common = { path = "./modules/fedimint-unknown-common", version = "=0.12.0-alpha" }
 fedimint-unknown-server = { path = "./modules/fedimint-unknown-server", version = "=0.12.0-alpha" }
+fedimint-usdt-common = { path = "./modules/fedimint-usdt-common", version = "=0.12.0-alpha" }
 fedimint-util-error = { path = "./fedimint-util-error", version = "=0.12.0-alpha" }
 fedimint-wallet-client = { path = "./modules/fedimint-wallet-client", version = "=0.12.0-alpha" }
 fedimint-wallet-common = { path = "./modules/fedimint-wallet-common", version = "=0.12.0-alpha" }
