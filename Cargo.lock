@@ -4920,6 +4920,7 @@ dependencies = [
  "cggmp21",
  "fedimint-aead",
  "fedimint-hkdf",
+ "futures",
  "hd-wallet",
  "hex",
  "rand 0.8.5",
