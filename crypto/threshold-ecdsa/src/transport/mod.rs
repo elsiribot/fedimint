@@ -1,13 +1,15 @@
 //! Transport for driving cggmp21 protocols over synchronous all-to-all
 //! byte-exchange rounds.
 //!
-//! This module currently provides only the [`RoundExchange`] trait and an
-//! in-memory mesh test transport ([`mesh`]). Later tasks add a codec
-//! (`codec.rs`) for encrypting/authenticating point-to-point messages and a
-//! driver (`driver.rs`) that adapts a [`RoundExchange`] into a
-//! `round_based::Delivery`.
+//! This module currently provides the [`RoundExchange`] trait, an
+//! in-memory mesh test transport ([`mesh`]), and [`EncryptedRoundCodec`]
+//! for encrypting/authenticating point-to-point round messages
+//! (`codec.rs`). A later task adds a driver (`driver.rs`) that adapts a
+//! [`RoundExchange`] into a `round_based::Delivery`.
+mod codec;
 mod mesh;
 
+pub use codec::{EncryptedRoundCodec, OpenedRound};
 pub use mesh::{InMemoryMesh, in_memory_mesh};
 
 /// The index of a party among `n` participants, in `0..n`.
