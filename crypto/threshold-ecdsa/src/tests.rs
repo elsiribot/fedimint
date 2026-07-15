@@ -329,12 +329,12 @@ async fn keygen_and_signing_over_exchange_transport() {
                 let msg = secp256k1::Message::from_digest(digest);
                 let verifier = secp256k1::Secp256k1::verification_only();
                 for sig in &signatures {
-                    let mut compact = [0u8; 64];
-                    compact[..32].copy_from_slice(&sig.r.to_be_bytes());
-                    compact[32..].copy_from_slice(&sig.s.to_be_bytes());
-                    let mut ecdsa_sig = secp256k1::ecdsa::Signature::from_compact(&compact)
-                        .expect("valid compact sig");
-                    ecdsa_sig.normalize_s();
+                    // Same r/s -> compact -> normalize_s conversion the production
+                    // `run_signing` path uses; exercised here directly since this
+                    // acceptance test drives cggmp21 as a state machine instead of
+                    // through `run_signing`.
+                    let ecdsa_sig =
+                        crate::convert_signature(*sig).expect("valid signature conversion");
                     verifier
                         .verify_ecdsa(&msg, &ecdsa_sig, &group_pk)
                         .expect("signature must verify against the group key");
@@ -427,56 +427,67 @@ impl round_based::state_machine::StateMachine for P2PRoundOnce {
 async fn corrupted_round_payload_aborts_driver_cleanly() {
     use crate::transport::{EncryptedRoundCodec, in_memory_mesh};
 
-    let secp = secp256k1::Secp256k1::new();
-    let sks: Vec<secp256k1::SecretKey> = (0..N)
-        .map(|i| {
-            let mut b = [3u8; 32];
-            b[31] = (i + 1) as u8;
-            secp256k1::SecretKey::from_slice(&b).expect("valid scalar")
-        })
-        .collect();
-    let pks: Vec<secp256k1::PublicKey> = sks.iter().map(|sk| sk.public_key(&secp)).collect();
+    // Guards against a regression that turns the expected `Err` abort back
+    // into a hang (e.g. the driver blocking forever on a message that will
+    // never arrive), matching the acceptance test's timeout pattern.
+    tokio::time::timeout(std::time::Duration::from_secs(600), async {
+        let secp = secp256k1::Secp256k1::new();
+        let sks: Vec<secp256k1::SecretKey> = (0..N)
+            .map(|i| {
+                let mut b = [3u8; 32];
+                b[31] = (i + 1) as u8;
+                secp256k1::SecretKey::from_slice(&b).expect("valid scalar")
+            })
+            .collect();
+        let pks: Vec<secp256k1::PublicKey> = sks.iter().map(|sk| sk.public_key(&secp)).collect();
 
-    // Corrupt party 1's payload on the first (and only) round, as observed
-    // by every other party.
-    let corrupt_sender: crate::transport::PartyIndex = 1;
-    let meshes = in_memory_mesh(N);
-    let mut handles = Vec::with_capacity(usize::from(N));
-    for (i, mesh) in meshes.into_iter().enumerate() {
-        let i = i as u16;
-        let mut exchange = CorruptingExchange {
-            inner: mesh,
-            corrupt_sender,
-            triggered: false,
-        };
-        let codec = EncryptedRoundCodec::new(i, sks[i as usize], pks.clone());
-        handles.push(tokio::spawn(async move {
-            let sm = P2PRoundOnce {
-                me: i,
-                n: N,
-                next_recipient: 0,
-                received: 0,
+        // Corrupt party 1's payload on the first (and only) round, as observed
+        // by every other party.
+        let corrupt_sender: crate::transport::PartyIndex = 1;
+        let meshes = in_memory_mesh(N);
+        let mut handles = Vec::with_capacity(usize::from(N));
+        for (i, mesh) in meshes.into_iter().enumerate() {
+            let i = i as u16;
+            let mut exchange = CorruptingExchange {
+                inner: mesh,
+                corrupt_sender,
+                triggered: false,
             };
-            crate::transport::drive_over_exchange(sm, &codec, &mut exchange).await
-        }));
-    }
-
-    let mut saw_err = false;
-    for (i, h) in handles.into_iter().enumerate() {
-        let result = h.await.expect("task must not panic");
-        if i as u16 == corrupt_sender {
-            // Nothing is corrupted from party `corrupt_sender`'s own point
-            // of view (the driver never opens its own payload), so it
-            // completes normally.
-            result.expect("uncorrupted party completes");
-        } else if result.is_err() {
-            saw_err = true;
+            let codec = EncryptedRoundCodec::new(i, sks[i as usize], pks.clone());
+            // This crate has no fedimint-core dependency (by design), so
+            // fedimint_core::runtime::spawn is unavailable here; raw
+            // tokio::spawn is fine in this test-only code.
+            // nosemgrep: ban-tokio-spawn
+            handles.push(tokio::spawn(async move {
+                let sm = P2PRoundOnce {
+                    me: i,
+                    n: N,
+                    next_recipient: 0,
+                    received: 0,
+                };
+                crate::transport::drive_over_exchange(sm, &codec, &mut exchange).await
+            }));
         }
-    }
-    assert!(
-        saw_err,
-        "at least one party must see the corrupted payload and abort with Err"
-    );
+
+        let mut saw_err = false;
+        for (i, h) in handles.into_iter().enumerate() {
+            let result = h.await.expect("task must not panic");
+            if i as u16 == corrupt_sender {
+                // Nothing is corrupted from party `corrupt_sender`'s own point
+                // of view (the driver never opens its own payload), so it
+                // completes normally.
+                result.expect("uncorrupted party completes");
+            } else if result.is_err() {
+                saw_err = true;
+            }
+        }
+        assert!(
+            saw_err,
+            "at least one party must see the corrupted payload and abort with Err"
+        );
+    })
+    .await
+    .expect("test timed out");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -33,7 +33,6 @@ tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 cggmp21 = { workspace = true, features = ["spof"] }
-futures = { workspace = true }
 hex = { workspace = true }
 round-based = { workspace = true, features = ["sim"] }
 serde_json = { workspace = true }

@@ -15,6 +15,13 @@ pub struct InMemoryMesh {
 }
 
 /// Build `n` connected in-memory endpoints, one per party, wired all-to-all.
+///
+/// This is a test utility, not a production transport (see the `transport`
+/// module docs for where production [`RoundExchange`] impls live). It is
+/// deliberately kept `pub` (not `#[cfg(test)]`-gated) rather than hidden
+/// behind a `test-util` feature: later phases' own integration tests will
+/// want to drive their consensus/config-gen adapters against this same
+/// in-memory mesh, and gating it would force them to duplicate it instead.
 pub fn in_memory_mesh(n: u16) -> Vec<InMemoryMesh> {
     let mut senders = Vec::with_capacity(n as usize);
     let mut inboxes = Vec::with_capacity(n as usize);
@@ -79,6 +86,10 @@ mod tests {
         let handles: Vec<_> = ends
             .drain(..)
             .map(|mut e| {
+                // This crate has no fedimint-core dependency (by design), so
+                // fedimint_core::runtime::spawn is unavailable here; raw
+                // tokio::spawn is fine in this test-only code.
+                // nosemgrep: ban-tokio-spawn
                 tokio::spawn(async move {
                     let got = e
                         .exchange(vec![e.party_index() as u8])

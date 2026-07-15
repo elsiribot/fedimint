@@ -164,6 +164,10 @@ mod tests {
             .map(|(i, mut exchange)| {
                 let codec = EncryptedRoundCodec::new(i as u16, sks[i], pks.clone());
                 let sm = TrivialSm::new(i as u8, 2);
+                // This crate has no fedimint-core dependency (by design), so
+                // fedimint_core::runtime::spawn is unavailable here; raw
+                // tokio::spawn is fine in this test-only code.
+                // nosemgrep: ban-tokio-spawn
                 tokio::spawn(async move { drive_over_exchange(sm, &codec, &mut exchange).await })
             })
             .collect();
