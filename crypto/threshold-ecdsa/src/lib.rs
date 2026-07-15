@@ -1,10 +1,37 @@
 //! Threshold ECDSA for Fedimint federations, wrapping the audited
-//! [`cggmp21`] implementation (CGGMP21 protocol, Kudelski-audited).
+//! [`cggmp21`] implementation (CGGMP21 protocol, audited by Kudelski).
 //!
-//! This crate is transport-agnostic: protocol runners take a
-//! [`round_based::MpcParty`], and the caller supplies message delivery.
-//! It must not depend on fedimint-core; consensus/p2p wiring lives in the
-//! server module that consumes this crate.
+//! # Model
+//!
+//! The federation runs DKG once ([`run_keygen`] + [`run_aux_gen`] +
+//! [`assemble_key_share`]), yielding one [`KeyShare`] per guardian and a
+//! single group secp256k1 key. Any `t` of `n` guardians co-produce a
+//! standard ECDSA signature via [`run_signing`] — on-chain it is
+//! indistinguishable from a single-key EOA signature.
+//!
+//! Per-deposit addresses use SLIP-10 non-hardened derivation: derive the
+//! child key with [`derived_public_key`] (address via [`evm_address`]),
+//! and sign for it later from the *same shares* by passing the
+//! derivation path to [`run_signing`]. No per-deposit key material is
+//! stored.
+//!
+//! # Transport
+//!
+//! Protocol runners are generic over [`round_based::Mpc`]; the caller
+//! supplies message delivery (any authenticated `Stream`/`Sink` pair via
+//! [`round_based::Delivery`]). All messages must be authenticated and
+//! point-to-point messages encrypted. Tests use `round_based`'s
+//! in-memory simulation; the Fedimint p2p wiring lives in the consuming
+//! server module, not here.
+//!
+//! # Limitations
+//!
+//! * cggmp21 does not implement identifiable aborts: a stalled or malicious
+//!   signer cannot be cryptographically blamed. Callers should apply per-peer
+//!   round timeouts and retry with a different t-subset.
+//! * `cggmp21::trusted_dealer` (behind the `spof` feature) reconstructs the
+//!   full secret in one place and is used in this crate's tests only.
+//!   Production shares must come from DKG.
 
 use anyhow::Context as _;
 use sha3::{Digest as _, Keccak256};
