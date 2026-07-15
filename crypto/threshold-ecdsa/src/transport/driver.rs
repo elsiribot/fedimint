@@ -8,7 +8,7 @@ use anyhow::{Context as _, anyhow};
 use round_based::state_machine::{ProceedResult, StateMachine};
 use round_based::{Incoming, MessageDestination, MessageType, Outgoing};
 
-use super::{EncryptedRoundCodec, RoundExchange};
+use super::{EncryptedRoundCodec, PartyIndex, RoundExchange};
 
 /// Drive a cggmp21 sync state machine to completion over a `RoundExchange`,
 /// encrypting point-to-point messages per recipient via the codec.
@@ -24,9 +24,10 @@ where
     let me = exchange.party_index();
     let n = exchange.n();
     let mut broadcast_out: Option<SM::Msg> = None;
-    let mut p2p_out: BTreeMap<u16, SM::Msg> = BTreeMap::new();
+    let mut p2p_out: BTreeMap<PartyIndex, SM::Msg> = BTreeMap::new();
     let mut incoming: VecDeque<Incoming<SM::Msg>> = VecDeque::new();
     let mut next_id: u64 = 0;
+    let mut round: u64 = 0;
 
     loop {
         match sm.proceed() {
@@ -41,25 +42,35 @@ where
             },
             ProceedResult::NeedsOneMoreMessage => {
                 if let Some(msg) = incoming.pop_front() {
-                    sm.received_msg(msg)
-                        .map_err(|_| anyhow!("state machine rejected message"))?;
+                    sm.received_msg(msg).map_err(|rejected| {
+                        anyhow!(
+                            "state machine rejected message from party {} (round {round})",
+                            rejected.sender
+                        )
+                    })?;
                     continue;
                 }
                 // Round boundary: exchange our buffered outgoing, refill incoming.
+                let we_sent_something = broadcast_out.is_some() || !p2p_out.is_empty();
                 let payload = codec
-                    .seal_round(broadcast_out.as_ref(), &p2p_out)
+                    .seal_round(round, broadcast_out.as_ref(), &p2p_out)
                     .context("sealing round payload")?;
                 broadcast_out = None;
                 p2p_out.clear();
                 let all = exchange.exchange(payload).await.context("round exchange")?;
+                let mut received_something = false;
                 for sender in 0..n {
                     if sender == me {
                         continue;
                     }
+                    let sender_payload = all
+                        .get(usize::from(sender))
+                        .context("RoundExchange returned too few payloads")?;
                     let opened = codec
-                        .open_round::<SM::Msg>(sender, &all[sender as usize])
+                        .open_round::<SM::Msg>(round, sender, sender_payload)
                         .with_context(|| format!("opening round payload from party {sender}"))?;
                     if let Some(b) = opened.broadcast {
+                        received_something = true;
                         incoming.push_back(Incoming {
                             id: next_id,
                             sender,
@@ -69,6 +80,7 @@ where
                         next_id += 1;
                     }
                     if let Some(p) = opened.p2p_to_me {
+                        received_something = true;
                         incoming.push_back(Incoming {
                             id: next_id,
                             sender,
@@ -78,6 +90,12 @@ where
                         next_id += 1;
                     }
                 }
+                if !we_sent_something && !received_something {
+                    return Err(anyhow!(
+                        "no progress in exchange round {round}: a peer withheld or omitted an expected message"
+                    ));
+                }
+                round += 1;
                 // Loop; proceed() will request the messages we just queued.
             }
         }
@@ -162,7 +180,12 @@ mod tests {
             .drain(..)
             .enumerate()
             .map(|(i, mut exchange)| {
-                let codec = EncryptedRoundCodec::new(i as u16, sks[i], pks.clone());
+                let codec = EncryptedRoundCodec::new(
+                    i as u16,
+                    sks[i],
+                    pks.clone(),
+                    b"test-domain".to_vec(),
+                );
                 let sm = TrivialSm::new(i as u8, 2);
                 // This crate has no fedimint-core dependency (by design), so
                 // fedimint_core::runtime::spawn is unavailable here; raw

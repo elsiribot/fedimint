@@ -26,8 +26,19 @@
 //! it to be confidential. Each point-to-point message is individually
 //! ECIES-boxed to its recipient (ephemeral-static ECDH, stretched via
 //! HKDF-SHA256 into a ChaCha20-Poly1305 key; see `codec.rs`), so only the
-//! addressed recipient can decrypt it and every party's inbound messages
-//! are still authenticated.
+//! addressed recipient can decrypt it, and the ciphertext is tamper-evident
+//! (AEAD tag failure on modification). The HKDF also binds the caller's
+//! `domain`, the round counter, and the sender/recipient party indexes into
+//! the key, so a given box decrypts only for the exact `(domain, round,
+//! sender, recipient)` it was sealed for: it cannot be replayed into a
+//! different round or protocol run, and a party cannot copy another
+//! party's box out of the all-to-all exchange and re-submit it as its own,
+//! since the AEAD key derived under its own index won't match. What the
+//! codec does **not** provide is delivery authenticity or liveness for the
+//! outer packet — verifying that a payload attributed to party `k` by the
+//! [`RoundExchange`] transport actually originated from `k`, and ensuring
+//! every expected payload eventually arrives, are the transport's
+//! responsibility, not the codec's.
 //!
 //! # Identity: `PartyIndex`, not `PeerId`
 //!

@@ -236,7 +236,12 @@ async fn keygen_and_signing_over_exchange_transport() {
                 let mut handles = Vec::with_capacity(usize::from(N));
                 for (i, mut mesh) in meshes.into_iter().enumerate() {
                     let i = i as u16;
-                    let codec = EncryptedRoundCodec::new(i, enc_sks[i as usize], enc_pks.clone());
+                    let codec = EncryptedRoundCodec::new(
+                        i,
+                        enc_sks[i as usize],
+                        enc_pks.clone(),
+                        eid_keygen.as_bytes().to_vec(),
+                    );
                     handles.push(tokio::task::spawn_local(async move {
                         let mut rng = OsRng;
                         let sm = cggmp21::keygen::<Curve>(eid_keygen, i, N)
@@ -266,7 +271,12 @@ async fn keygen_and_signing_over_exchange_transport() {
                 let mut handles = Vec::with_capacity(usize::from(N));
                 for (i, mut mesh) in meshes.into_iter().enumerate() {
                     let i = i as u16;
-                    let codec = EncryptedRoundCodec::new(i, enc_sks[i as usize], enc_pks.clone());
+                    let codec = EncryptedRoundCodec::new(
+                        i,
+                        enc_sks[i as usize],
+                        enc_pks.clone(),
+                        eid_aux.as_bytes().to_vec(),
+                    );
                     handles.push(tokio::task::spawn_local(async move {
                         let mut rng = OsRng;
                         let primes = cggmp21::PregeneratedPrimes::generate(&mut rng);
@@ -309,6 +319,7 @@ async fn keygen_and_signing_over_exchange_transport() {
                         pos,
                         enc_sks[usize::from(keygen_index)],
                         signer_pks.clone(),
+                        eid_signing.as_bytes().to_vec(),
                     );
                     let share = shares[usize::from(keygen_index)].clone();
                     handles.push(tokio::task::spawn_local(async move {
@@ -453,7 +464,8 @@ async fn corrupted_round_payload_aborts_driver_cleanly() {
                 corrupt_sender,
                 triggered: false,
             };
-            let codec = EncryptedRoundCodec::new(i, sks[i as usize], pks.clone());
+            let codec =
+                EncryptedRoundCodec::new(i, sks[i as usize], pks.clone(), b"test-domain".to_vec());
             // This crate has no fedimint-core dependency (by design), so
             // fedimint_core::runtime::spawn is unavailable here; raw
             // tokio::spawn is fine in this test-only code.
