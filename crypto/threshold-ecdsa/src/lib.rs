@@ -82,5 +82,67 @@ pub fn assemble_key_share(
     cggmp21::KeyShare::from_parts((core, aux)).context("key share validation failed")
 }
 
+/// Convert the group public key (a curve point) to the workspace's
+/// canonical `secp256k1::PublicKey`.
+pub fn group_public_key(share: &KeyShare) -> anyhow::Result<secp256k1::PublicKey> {
+    use cggmp21::key_share::AnyKeyShare as _;
+
+    let compressed = share.shared_public_key().to_bytes(true);
+    secp256k1::PublicKey::from_slice(&compressed)
+        .context("group public key is not a valid secp256k1 point")
+}
+
+fn convert_signature(
+    sig: cggmp21::Signature<Curve>,
+) -> anyhow::Result<secp256k1::ecdsa::Signature> {
+    let mut compact = [0u8; 64];
+    compact[..32].copy_from_slice(&sig.r.to_be_bytes());
+    compact[32..].copy_from_slice(&sig.s.to_be_bytes());
+    let mut sig = secp256k1::ecdsa::Signature::from_compact(&compact)
+        .context("cggmp21 produced an invalid compact signature")?;
+    // EVM (and the secp256k1 crate's verify) require low-s form.
+    sig.normalize_s();
+    Ok(sig)
+}
+
+/// Sign a 32-byte digest with a t-subset of guardians.
+///
+/// * `i` — this party's index within `signers` (0..t)
+/// * `signers` — keygen indexes of the t participating parties (all parties
+///   must pass the identical slice)
+/// * `derivation_path` — optional SLIP-10 non-hardened path; when set, the
+///   signature is valid for the derived child public key instead of the group
+///   key
+/// * `digest` — the prehashed message (e.g. keccak256 of an EVM tx)
+#[allow(clippy::too_many_arguments)]
+pub async fn run_signing<M>(
+    eid: cggmp21::ExecutionId<'_>,
+    i: u16,
+    signers: &[u16],
+    share: &KeyShare,
+    derivation_path: Option<&[u32]>,
+    digest: [u8; 32],
+    rng: &mut (impl rand::RngCore + rand::CryptoRng),
+    party: M,
+) -> anyhow::Result<secp256k1::ecdsa::Signature>
+where
+    M: round_based::Mpc<ProtocolMessage = cggmp21::signing::msg::Msg<Curve, sha2::Sha256>>,
+{
+    let data = cggmp21::DataToSign::from_scalar(
+        cggmp21::generic_ec::Scalar::from_be_bytes_mod_order(digest),
+    );
+    let mut builder = cggmp21::signing(eid, i, signers, share);
+    if let Some(path) = derivation_path {
+        builder = builder
+            .set_derivation_path(path.iter().copied())
+            .context("invalid derivation path")?;
+    }
+    let sig = builder
+        .sign(rng, party, data)
+        .await
+        .context("cggmp21 signing failed")?;
+    convert_signature(sig)
+}
+
 #[cfg(test)]
 mod tests;
