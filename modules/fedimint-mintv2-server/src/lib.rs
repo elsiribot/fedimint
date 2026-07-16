@@ -22,9 +22,9 @@ use fedimint_core::encoding::Encodable;
 use fedimint_core::envs::{FM_ENABLE_MODULE_MINTV2_ENV, is_env_var_set_opt};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    AmountUnit, Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION,
-    CoreConsensusVersion, InputMeta, ModuleConsensusVersion, ModuleInit,
-    SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
+    Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion,
+    InputMeta, ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions,
+    TransactionItemAmounts, api_endpoint,
 };
 use fedimint_core::{
     Amount, BitcoinHash, InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, apply,
@@ -32,7 +32,7 @@ use fedimint_core::{
 };
 use fedimint_mintv2_common::config::{
     FeeConsensus, MintClientConfig, MintConfig, MintConfigConsensus, MintConfigPrivate,
-    consensus_denominations,
+    MintGenParams, consensus_denominations,
 };
 use fedimint_mintv2_common::endpoint_constants::{
     RECOVERY_COUNT_ENDPOINT, RECOVERY_SLICE_ENDPOINT, RECOVERY_SLICE_HASH_ENDPOINT,
@@ -135,7 +135,7 @@ impl ModuleInit for MintInit {
 #[apply(async_trait_maybe_send!)]
 impl ServerModuleInit for MintInit {
     type Module = Mint;
-    type Params = ();
+    type Params = MintGenParams;
 
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
         &[MODULE_CONSENSUS_VERSION]
@@ -174,7 +174,7 @@ impl ServerModuleInit for MintInit {
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
-        _params: &Self::Params,
+        params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         let fee_consensus = if args.disable_base_fees {
             FeeConsensus::zero()
@@ -210,7 +210,7 @@ impl ServerModuleInit for MintInit {
                         tbs_agg_pks: tbs_agg_pks.clone(),
                         tbs_pks: tbs_pks.clone(),
                         fee_consensus: fee_consensus.clone(),
-                        amount_unit: AmountUnit::BITCOIN,
+                        amount_unit: params.amount_unit,
                     },
                     private: MintConfigPrivate {
                         tbs_sks: consensus_denominations()
@@ -233,7 +233,7 @@ impl ServerModuleInit for MintInit {
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
-        _params: &Self::Params,
+        params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
         let fee_consensus = if args.disable_base_fees {
             FeeConsensus::zero()
@@ -267,7 +267,7 @@ impl ServerModuleInit for MintInit {
                 tbs_agg_pks,
                 tbs_pks,
                 fee_consensus,
-                amount_unit: AmountUnit::BITCOIN,
+                amount_unit: params.amount_unit,
             },
         };
 
@@ -619,4 +619,60 @@ async fn get_recovery_slice(
         .map(|entry| entry.1)
         .collect()
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::PeerId;
+    use fedimint_core::module::AmountUnit;
+    use fedimint_mintv2_common::config::{MintConfig, MintGenParams};
+    use fedimint_server_core::{ConfigGenModuleArgs, ServerModuleInit};
+
+    use crate::MintInit;
+
+    fn args() -> ConfigGenModuleArgs {
+        ConfigGenModuleArgs {
+            network: bitcoin::Network::Regtest,
+            disable_base_fees: false,
+        }
+    }
+
+    #[test]
+    fn trusted_dealer_gen_uses_params_amount_unit() {
+        let peers: Vec<PeerId> = (0..4).map(PeerId::from).collect();
+
+        let params = MintGenParams {
+            amount_unit: AmountUnit::new_custom(1),
+        };
+
+        let configs = MintInit.trusted_dealer_gen(&peers, &args(), &params);
+
+        for peer in &peers {
+            let cfg = configs[peer]
+                .clone()
+                .to_typed::<MintConfig>()
+                .expect("valid mint config");
+
+            assert_eq!(cfg.consensus.amount_unit, AmountUnit::new_custom(1));
+        }
+    }
+
+    #[test]
+    fn trusted_dealer_gen_default_params_is_bitcoin() {
+        let peers: Vec<PeerId> = (0..4).map(PeerId::from).collect();
+
+        let params = MintGenParams::default();
+        assert_eq!(params.amount_unit, AmountUnit::BITCOIN);
+
+        let configs = MintInit.trusted_dealer_gen(&peers, &args(), &params);
+
+        for peer in &peers {
+            let cfg = configs[peer]
+                .clone()
+                .to_typed::<MintConfig>()
+                .expect("valid mint config");
+
+            assert_eq!(cfg.consensus.amount_unit, AmountUnit::BITCOIN);
+        }
+    }
 }

@@ -9,9 +9,22 @@ use tbs::{AggregatePublicKey, PublicKeyShare};
 
 use crate::{Denomination, MintCommonInit};
 
+/// Per-instance config gen params for the mintv2 module.
+///
+/// `amount_unit` selects which [`AmountUnit`] this mint instance is
+/// denominated in, allowing a federation to run e.g. a USDT-denominated
+/// mintv2 instance alongside the default Bitcoin-denominated one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MintGenParams {
-    pub fee_consensus: FeeConsensus,
+    pub amount_unit: AmountUnit,
+}
+
+impl Default for MintGenParams {
+    fn default() -> Self {
+        Self {
+            amount_unit: AmountUnit::BITCOIN,
+        }
+    }
 }
 
 pub fn consensus_denominations() -> impl DoubleEndedIterator<Item = Denomination> {
