@@ -5637,6 +5637,7 @@ dependencies = [
  "fedimint-tbs",
  "fedimint-testing",
  "fedimint-threshold-crypto",
+ "fedimint-usdt-common",
  "ff",
  "futures",
  "rand 0.8.5",

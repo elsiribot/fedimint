@@ -9,7 +9,7 @@ use fedimint_client_module::AdminCreds;
 use fedimint_client_module::secret::{PlainRootSecretStrategy, RootSecretStrategy};
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::PeerId;
-use fedimint_core::config::{ClientConfig, FederationId};
+use fedimint_core::config::{ClientConfig, ConfigGenModuleParams, FederationId};
 use fedimint_core::core::ModuleKind;
 use fedimint_core::db::Database;
 use fedimint_core::db::mem_impl::MemDatabase;
@@ -257,6 +257,7 @@ pub struct FederationTestBuilder {
     client_init: ClientModuleInitRegistry,
     bitcoin_rpc_connection: DynServerBitcoinRpc,
     enable_mint_fees: bool,
+    extra_module_instances: Vec<(ModuleKind, ConfigGenModuleParams)>,
 }
 
 impl FederationTestBuilder {
@@ -279,6 +280,7 @@ impl FederationTestBuilder {
             client_init,
             bitcoin_rpc_connection,
             enable_mint_fees: true,
+            extra_module_instances: Vec::new(),
         }
     }
 
@@ -312,6 +314,19 @@ impl FederationTestBuilder {
         self
     }
 
+    /// Attach an extra instance of an already-registered module kind, with
+    /// its own config-gen params (already serialized to JSON). Appended after
+    /// the default one-instance-per-kind set built from `server_init`, so its
+    /// instance id is assigned last.
+    pub fn with_extra_module_instance(
+        mut self,
+        kind: ModuleKind,
+        params: ConfigGenModuleParams,
+    ) -> FederationTestBuilder {
+        self.extra_module_instances.push((kind, params));
+        self
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> FederationTest {
         install_crypto_provider().await;
@@ -326,6 +341,7 @@ impl FederationTestBuilder {
             self.base_port,
             self.enable_mint_fees,
             &self.server_init,
+            &self.extra_module_instances,
         )
         .expect("Generates local config");
 

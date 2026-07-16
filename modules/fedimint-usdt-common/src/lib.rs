@@ -6,7 +6,7 @@ use std::fmt;
 use config::UsdtClientConfig;
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind};
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::module::{CommonModuleInit, ModuleCommon, ModuleConsensusVersion};
+use fedimint_core::module::{AmountUnit, CommonModuleInit, ModuleCommon, ModuleConsensusVersion};
 use fedimint_core::plugin_types_trait_impl_common;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,6 +22,20 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 
 /// Modules are non-compatible with older versions
 pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 0);
+
+/// The [`AmountUnit`] that USDT-denominated ecash is issued in.
+///
+/// This is a coordination constant: it must be used both as the
+/// `mintv2` config-gen param (`fedimint_mintv2_common::config::MintGenParams
+/// { amount_unit: USDT_UNIT, .. }`) for the mint instance that issues
+/// USDT-denominated notes, *and* by the usdt module's own consensus logic
+/// (`process_input`/`process_output`, added in a later phase) when crediting
+/// or debiting a guardian-observed USDT deposit/withdrawal. The client's
+/// per-unit primary-module routing (`Client::primary_module_for_unit`) keys
+/// off this exact value, so any mismatch between the mint instance's
+/// configured unit and the value the usdt module credits would silently
+/// route balance to the wrong (or no) mint instance.
+pub const USDT_UNIT: AmountUnit = AmountUnit::new_custom(1);
 
 /// A 20-byte EVM (Ethereum-style) address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
 use fedimint_core::PeerId;
+use fedimint_core::config::ConfigGenModuleParams;
 use fedimint_core::core::ModuleKind;
 use fedimint_core::module::ApiAuth;
 use fedimint_core::setup_code::{PeerEndpoints, PeerSetupCode};
@@ -15,11 +16,19 @@ pub static API_AUTH: LazyLock<ApiAuth> = LazyLock::new(|| ApiAuth::new("pass".to
 /// Creates the config gen params for each peer
 ///
 /// Uses peers * 2 ports offset from `base_port`
+///
+/// `extra_module_instances` appends additional module instances (of an
+/// already-registered kind) beyond the one-instance-per-kind default, each
+/// carrying its own config-gen params — e.g. a second `mintv2` instance
+/// denominated in a non-Bitcoin `AmountUnit` alongside the default Bitcoin
+/// mintv2 instance. Instance ids are assigned by append order, after the
+/// default one-per-kind instances.
 pub fn local_config_gen_params(
     peers: &[PeerId],
     base_port: u16,
     enable_mint_fees: bool,
     registry: &ServerModuleInitRegistry,
+    extra_module_instances: &[(ModuleKind, ConfigGenModuleParams)],
 ) -> anyhow::Result<BTreeMap<PeerId, ConfigGenParams>> {
     // Enable every registered module. `build_module_params_registry`
     // materializes the module instance list (one instance per kind, carrying
@@ -27,7 +36,10 @@ pub fn local_config_gen_params(
     // which is the single source of truth for config generation.
     let enabled_modules: BTreeSet<ModuleKind> =
         registry.iter().map(|(kind, _)| kind.clone()).collect();
-    let module_params = build_module_params_registry(registry, &enabled_modules);
+    let mut module_params = build_module_params_registry(registry, &enabled_modules);
+    for (kind, params) in extra_module_instances {
+        module_params.attach_config_gen_params(kind.clone(), params.clone());
+    }
 
     // Generate TLS cert and private key
     let tls_keys: BTreeMap<
