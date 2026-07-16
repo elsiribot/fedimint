@@ -13,6 +13,7 @@ name = "devimint"
 path = "src/main.rs"
 
 [dependencies]
+alloy = { workspace = true }
 anyhow = { workspace = true, features = ["backtrace"] }
 axum = { workspace = true, features = ["tracing"] }
 bitcoin = { workspace = true }

@@ -90,6 +90,9 @@ pub const FM_LND_BASE_EXECUTABLE_ENV: &str = "FM_LND_BASE_EXECUTABLE";
 // Env variable to override esplora binary set:
 pub const FM_ESPLORA_BASE_EXECUTABLE_ENV: &str = "FM_ESPLORA_BASE_EXECUTABLE";
 
+// Env variable to override anvil binary set:
+pub const FM_ANVIL_BASE_EXECUTABLE_ENV: &str = "FM_ANVIL_BASE_EXECUTABLE";
+
 // Env variable to override esplora binary set:
 pub const FM_RECOVERYTOOL_BASE_EXECUTABLE_ENV: &str = "FM_RECOVERYTOOL_BASE_EXECUTABLE";
 

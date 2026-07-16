@@ -891,15 +891,80 @@ impl Esplora {
     }
 }
 
+/// The EVM devnet daemon used by USDT-on-EVM module tests, started via the
+/// `anvil` binary (part of the Foundry toolkit). Unlike [`Esplora`], it has
+/// no upstream dependency on [`Bitcoind`] and can be started standalone.
+#[derive(Clone)]
+pub struct Anvil {
+    _process: ProcessHandle,
+    rpc_port: u16,
+}
+
+impl Anvil {
+    pub async fn new(process_mgr: &ProcessManager) -> Result<Self> {
+        debug!("Starting anvil");
+        let anvil_port = process_mgr.globals.FM_PORT_ANVIL;
+        // spawn anvil
+        let cmd = cmd!(
+            crate::util::Anvil,
+            "--port={anvil_port}",
+            "--chain-id=31337",
+            "--silent",
+        );
+        let process = process_mgr.spawn_daemon("anvil", cmd).await?;
+
+        Self::wait_for_ready(anvil_port).await?;
+        debug!(target: LOG_DEVIMINT, "Anvil ready");
+        if let Some(pid) = process.id().await {
+            write_overwrite_async(
+                process_mgr.globals.FM_TEST_DIR.join("anvil.pid"),
+                pid.to_string(),
+            )
+            .await?;
+        }
+
+        Ok(Self {
+            _process: process,
+            rpc_port: anvil_port,
+        })
+    }
+
+    /// The HTTP JSON-RPC URL anvil is listening on.
+    pub fn rpc_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.rpc_port)
+    }
+
+    /// Wait until the server is able to respond to requests.
+    async fn wait_for_ready(anvil_port: u16) -> Result<()> {
+        let url = format!("http://127.0.0.1:{anvil_port}")
+            .parse()
+            .with_context(|| format!("invalid anvil url for port {anvil_port}"))?;
+        let provider = alloy::providers::ProviderBuilder::new().connect_http(url);
+
+        poll("anvil server ready", || async {
+            alloy::providers::Provider::get_chain_id(&provider)
+                .await
+                .map_err(|e| ControlFlow::Continue(anyhow::anyhow!(e)))?;
+
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+}
+
 #[allow(unused)]
 pub struct ExternalDaemons {
     pub bitcoind: Bitcoind,
     pub esplora: Esplora,
+    pub anvil: Anvil,
 }
 
 pub async fn external_daemons(process_mgr: &ProcessManager) -> Result<ExternalDaemons> {
     let bitcoind = Bitcoind::new(process_mgr, false).await?;
     let esplora = Esplora::new(process_mgr, bitcoind.clone()).await?;
+    let anvil = Anvil::new(process_mgr).await?;
     let start_time = fedimint_core::time::now();
     // make sure the bitcoind wallet is ready
     let _ = bitcoind.wallet_client().await?;
@@ -908,5 +973,9 @@ pub async fn external_daemons(process_mgr: &ProcessManager) -> Result<ExternalDa
         "starting base daemons took {:?}",
         start_time.elapsed()?
     );
-    Ok(ExternalDaemons { bitcoind, esplora })
+    Ok(ExternalDaemons {
+        bitcoind,
+        esplora,
+        anvil,
+    })
 }
