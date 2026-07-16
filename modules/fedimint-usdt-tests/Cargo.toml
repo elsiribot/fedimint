@@ -12,7 +12,9 @@ name = "fedimint_usdt_tests"
 path = "tests/tests.rs"
 
 [dependencies]
+alloy = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 fedimint-api-client = { workspace = true }
 fedimint-client = { workspace = true }
 fedimint-client-module = { workspace = true }
@@ -26,6 +28,8 @@ fedimint-testing = { workspace = true }
 fedimint-usdt-client = { workspace = true }
 fedimint-usdt-common = { workspace = true }
 fedimint-usdt-server = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

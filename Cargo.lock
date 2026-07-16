@@ -6149,7 +6149,9 @@ dependencies = [
 name = "fedimint-usdt-tests"
 version = "0.12.0-alpha"
 dependencies = [
+ "alloy",
  "anyhow",
+ "async-trait",
  "fedimint-api-client",
  "fedimint-client",
  "fedimint-client-module",
@@ -6163,6 +6165,8 @@ dependencies = [
  "fedimint-usdt-client",
  "fedimint-usdt-common",
  "fedimint-usdt-server",
+ "hex",
+ "serde_json",
  "tokio",
  "tracing",
 ]
