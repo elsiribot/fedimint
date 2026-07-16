@@ -49,6 +49,24 @@ impl fmt::Display for UsdtAmount {
     }
 }
 
+/// A federation member's vote on the current EVM fee market and USDT/ETH
+/// exchange rate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
+pub struct FeeVote {
+    pub max_fee_per_gas_wei: u64,
+    pub usdt_per_eth_e6: u64,
+}
+
+impl fmt::Display for FeeVote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "FeeVote(max_fee_per_gas_wei={}, usdt_per_eth_e6={})",
+            self.max_fee_per_gas_wei, self.usdt_per_eth_e6
+        )
+    }
+}
+
 /// Non-transaction items that will be submitted to consensus
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct UsdtConsensusItem;
@@ -164,6 +182,19 @@ mod tests {
             .expect("UsdtAmount should decode what it just encoded");
 
         assert_eq!(amount, decoded);
+    }
+
+    #[test]
+    fn test_fee_vote_round_trips_through_consensus_encoding() {
+        let vote = FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        let bytes = vote.consensus_encode_to_vec();
+        let decoded = FeeVote::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+            .expect("FeeVote should decode what it just encoded");
+
+        assert_eq!(vote, decoded);
     }
 
     #[test]
