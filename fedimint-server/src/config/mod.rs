@@ -496,9 +496,10 @@ impl ServerConfig {
             .module_params
             .iter_modules()
             .map(|(module_id, kind, params)| {
-                let module_init = registry
-                    .get(kind)
-                    .expect("Enabled module must be registered");
+                let module_init = registry.get(kind).expect(
+                    "Module kinds in module_params are validated against the \
+                     available-modules registry before config gen starts",
+                );
                 (
                     module_id,
                     module_init.trusted_dealer_gen(&peer0.peer_ids(), &args, params),

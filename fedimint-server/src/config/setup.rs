@@ -596,6 +596,17 @@ impl ISetupApi for SetupApi {
                     .select_kinds(&self.settings.default_modules)
             });
 
+        // A leader-supplied module instance list could reference a module kind
+        // this build doesn't know about. Reject it here, before it reaches
+        // config generation, where an unregistered kind would otherwise be
+        // reachable as an unrecoverable panic in the trusted-dealer path.
+        for (_, kind, _) in module_params.iter_modules() {
+            ensure!(
+                self.settings.available_modules.contains(kind),
+                "Module of kind {kind} is not available in this build"
+            );
+        }
+
         let our_id = state
             .setup_codes
             .iter()

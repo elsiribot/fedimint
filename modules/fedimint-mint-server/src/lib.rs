@@ -288,11 +288,13 @@ impl ServerModuleInit for MintInit {
                         (peer, pks)
                     })
                     .collect(),
-                fee_consensus: params.fee_consensus().unwrap_or(if args.disable_base_fees {
+                fee_consensus: if args.disable_base_fees {
                     FeeConsensus::zero()
                 } else {
-                    FeeConsensus::new(0).expect("Relative fee is within range")
-                }),
+                    params.fee_consensus().unwrap_or_else(|| {
+                        FeeConsensus::new(0).expect("Relative fee is within range")
+                    })
+                },
                 max_notes_per_denomination: DEFAULT_MAX_NOTES_PER_DENOMINATION,
             },
         };
