@@ -36,6 +36,7 @@ use fedimint_logging::LOG_MODULE_MINT;
 pub use fedimint_mint_common as common;
 use fedimint_mint_common::config::{
     FeeConsensus, MintClientConfig, MintConfig, MintConfigConsensus, MintConfigPrivate,
+    MintGenParams,
 };
 pub use fedimint_mint_common::{BackupRequest, SignedBackupRequest};
 use fedimint_mint_common::{
@@ -156,23 +157,10 @@ impl ModuleInit for MintInit {
     }
 }
 
-/// Default denomination base for ecash notes (powers of 2)
-const DEFAULT_DENOMINATION_BASE: u16 = 2;
-
-/// Maximum denomination size (1,000,000 coins)
-const MAX_DENOMINATION_SIZE: Amount = Amount::from_bitcoins(1_000_000);
-
-/// Generate the denomination tiers based on the base
-fn gen_denominations() -> Vec<Amount> {
-    Tiered::gen_denominations(DEFAULT_DENOMINATION_BASE, MAX_DENOMINATION_SIZE)
-        .tiers()
-        .copied()
-        .collect()
-}
-
 #[apply(async_trait_maybe_send!)]
 impl ServerModuleInit for MintInit {
     type Module = Mint;
+    type Params = MintGenParams;
 
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
         &[MODULE_CONSENSUS_VERSION]
@@ -208,8 +196,9 @@ impl ServerModuleInit for MintInit {
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
+        params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
-        let denominations = gen_denominations();
+        let denominations = params.gen_denominations();
 
         let tbs_keys = denominations
             .iter()
@@ -240,7 +229,9 @@ impl ServerModuleInit for MintInit {
                         fee_consensus: if args.disable_base_fees {
                             FeeConsensus::zero()
                         } else {
-                            FeeConsensus::new(0).expect("Relative fee is within range")
+                            params.fee_consensus().unwrap_or_else(|| {
+                                FeeConsensus::new(0).expect("Relative fee is within range")
+                            })
                         },
                         max_notes_per_denomination: DEFAULT_MAX_NOTES_PER_DENOMINATION,
                     },
@@ -265,8 +256,9 @@ impl ServerModuleInit for MintInit {
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
+        params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
-        let denominations = gen_denominations();
+        let denominations = params.gen_denominations();
 
         let mut amount_keys = BTreeMap::new();
 
@@ -296,11 +288,11 @@ impl ServerModuleInit for MintInit {
                         (peer, pks)
                     })
                     .collect(),
-                fee_consensus: if args.disable_base_fees {
+                fee_consensus: params.fee_consensus().unwrap_or(if args.disable_base_fees {
                     FeeConsensus::zero()
                 } else {
                     FeeConsensus::new(0).expect("Relative fee is within range")
-                },
+                }),
                 max_notes_per_denomination: DEFAULT_MAX_NOTES_PER_DENOMINATION,
             },
         };

@@ -514,6 +514,67 @@ impl<M> Default for ModuleInitRegistry<M> {
 
 pub type CommonModuleInitRegistry = ModuleInitRegistry<DynCommonModuleInit>;
 
+/// Type erased module config gen params
+pub type ConfigGenModuleParams = serde_json::Value;
+
+/// Registry that contains the config gen params for all modules
+pub type ServerModuleConfigGenParamsRegistry = ModuleRegistry<ConfigGenModuleParams>;
+
+impl Eq for ServerModuleConfigGenParamsRegistry {}
+
+impl PartialEq for ServerModuleConfigGenParamsRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter_modules().eq(other.iter_modules())
+    }
+}
+
+impl ModuleRegistry<ConfigGenModuleParams> {
+    /// Attach config gen params for a module using an explicit instance id.
+    ///
+    /// # Panics
+    /// Panics if `gen` cannot be serialized to JSON (a module bug).
+    pub fn attach_config_gen_params_by_id<T: Serialize>(
+        &mut self,
+        id: ModuleInstanceId,
+        kind: ModuleKind,
+        r#gen: T,
+    ) -> &mut Self {
+        let params = serde_json::to_value(r#gen)
+            .unwrap_or_else(|err| panic!("Invalid config gen params for {kind}: {err}"));
+        self.register_module(id, kind, params);
+        self
+    }
+
+    /// Attach config gen params for a module, auto-assigning the next instance
+    /// id.
+    ///
+    /// # Panics
+    /// Panics if `gen` cannot be serialized to JSON (a module bug).
+    pub fn attach_config_gen_params<T: Serialize>(
+        &mut self,
+        kind: ModuleKind,
+        r#gen: T,
+    ) -> &mut Self {
+        let params = serde_json::to_value(r#gen)
+            .unwrap_or_else(|err| panic!("Invalid config gen params for {kind}: {err}"));
+        self.append_module(kind, params);
+        self
+    }
+
+    /// Build a params registry from a list of `(kind, params)` instances,
+    /// auto-assigning instance ids by position (0, 1, 2, ...).
+    ///
+    /// # Panics
+    /// Panics if any `params` cannot be serialized to JSON (a module bug).
+    pub fn from_instances<T: Serialize>(instances: Vec<(ModuleKind, T)>) -> Self {
+        let mut registry = Self::default();
+        for (kind, params) in instances {
+            registry.attach_config_gen_params(kind, params);
+        }
+        registry
+    }
+}
+
 impl<M> From<Vec<M>> for ModuleInitRegistry<M>
 where
     M: AsRef<dyn IDynCommonModuleInit + Send + Sync + 'static>,

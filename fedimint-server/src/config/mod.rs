@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, format_err};
 use bitcoin::hashes::sha256;
+use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
 pub use fedimint_core::config::{
     ClientConfig, FederationId, GlobalClientConfig, JsonWithKind, ModuleInitRegistry, P2PMessage,
     PeerUrl, ServerModuleConfig, ServerModuleConsensusConfig, TypedServerModuleConfig,
@@ -483,22 +484,17 @@ impl ServerConfig {
             disable_base_fees: peer0.disable_base_fees,
         };
 
-        // Use legacy module ordering for backwards compatibility tests
-        let use_legacy_order = is_env_var_set("FM_BACKWARDS_COMPATIBILITY_TEST");
-        let module_iter: Vec<_> = if use_legacy_order {
-            registry.iter_legacy_order()
-        } else {
-            registry.iter().collect()
-        };
+        let module_params = build_module_params_registry(registry, &peer0.enabled_modules);
 
-        let module_configs: BTreeMap<_, _> = module_iter
-            .into_iter()
-            .filter(|(kind, _)| peer0.enabled_modules.contains(kind))
-            .enumerate()
-            .map(|(module_id, (_kind, module_init))| {
+        let module_configs: BTreeMap<_, _> = module_params
+            .iter_modules()
+            .map(|(module_id, kind, params)| {
+                let module_init = registry
+                    .get(kind)
+                    .expect("Enabled module must be registered");
                 (
-                    module_id as ModuleInstanceId,
-                    module_init.trusted_dealer_gen(&peer0.peer_ids(), &args),
+                    module_id,
+                    module_init.trusted_dealer_gen(&peer0.peer_ids(), &args, params),
                 )
             })
             .collect();
@@ -643,29 +639,25 @@ impl ServerConfig {
             disable_base_fees: params.disable_base_fees,
         };
 
-        // Use legacy module ordering for backwards compatibility tests
-        let use_legacy_order = is_env_var_set("FM_BACKWARDS_COMPATIBILITY_TEST");
-        let module_iter: Vec<_> = if use_legacy_order {
-            registry.iter_legacy_order()
-        } else {
-            registry.iter().collect()
-        };
+        let module_params = build_module_params_registry(&registry, &params.enabled_modules);
 
         let mut module_cfgs = BTreeMap::new();
 
-        for (module_id, (kind, module_init)) in module_iter
-            .into_iter()
-            .filter(|(kind, _)| params.enabled_modules.contains(kind))
-            .enumerate()
-        {
+        for (module_id, kind, module_config_gen_params) in module_params.iter_modules() {
             info!(
                 target: LOG_NET_PEER_DKG,
                 "Running config generation for module of kind {kind}..."
             );
 
-            let cfg = module_init.distributed_gen(&handle, &args).await?;
+            let module_init = registry
+                .get(kind)
+                .with_context(|| format!("Module of kind {kind} not found"))?;
 
-            module_cfgs.insert(module_id as ModuleInstanceId, cfg);
+            let cfg = module_init
+                .distributed_gen(&handle, &args, module_config_gen_params)
+                .await?;
+
+            module_cfgs.insert(module_id, cfg);
         }
 
         let cfg = ServerConfig::from(
@@ -720,6 +712,37 @@ impl ServerConfig {
 
         Ok(cfg)
     }
+}
+
+/// Build the per-instance config gen params registry derived from the set of
+/// enabled modules.
+///
+/// Modules are iterated in the same order used for instance-id assignment
+/// (legacy insertion order under `FM_BACKWARDS_COMPATIBILITY_TEST`, otherwise
+/// the registry's kind-sorted order), and each enabled module contributes its
+/// own default config gen params via
+/// [`fedimint_server_core::IServerModuleInit::default_config_gen_params`].
+/// Instance ids are assigned by position, preserving the historical
+/// `.enumerate()` id assignment.
+fn build_module_params_registry(
+    registry: &ServerModuleInitRegistry,
+    enabled_modules: &BTreeSet<ModuleKind>,
+) -> ServerModuleConfigGenParamsRegistry {
+    let use_legacy_order = is_env_var_set("FM_BACKWARDS_COMPATIBILITY_TEST");
+    let module_iter: Vec<_> = if use_legacy_order {
+        registry.iter_legacy_order()
+    } else {
+        registry.iter().collect()
+    };
+
+    let mut module_params = ServerModuleConfigGenParamsRegistry::default();
+    for (kind, module_init) in module_iter
+        .into_iter()
+        .filter(|(kind, _)| enabled_modules.contains(kind))
+    {
+        module_params.append_module(kind.clone(), module_init.default_config_gen_params());
+    }
+    module_params
 }
 
 async fn receive_from_peer_with_progress(

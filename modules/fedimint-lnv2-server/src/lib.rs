@@ -219,6 +219,7 @@ impl ModuleInit for LightningInit {
 #[apply(async_trait_maybe_send!)]
 impl ServerModuleInit for LightningInit {
     type Module = Lightning;
+    type Params = ();
 
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
         &[MODULE_CONSENSUS_VERSION]
@@ -258,6 +259,7 @@ impl ServerModuleInit for LightningInit {
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         let tpe_pks = peers
             .iter()
@@ -292,6 +294,7 @@ impl ServerModuleInit for LightningInit {
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
         let (polynomial, sks) = peers.run_dkg_g1().await?;
 

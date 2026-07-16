@@ -135,6 +135,7 @@ impl ModuleInit for MintInit {
 #[apply(async_trait_maybe_send!)]
 impl ServerModuleInit for MintInit {
     type Module = Mint;
+    type Params = ();
 
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
         &[MODULE_CONSENSUS_VERSION]
@@ -173,6 +174,7 @@ impl ServerModuleInit for MintInit {
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         let fee_consensus = if args.disable_base_fees {
             FeeConsensus::zero()
@@ -231,6 +233,7 @@ impl ServerModuleInit for MintInit {
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
         let fee_consensus = if args.disable_base_fees {
             FeeConsensus::zero()

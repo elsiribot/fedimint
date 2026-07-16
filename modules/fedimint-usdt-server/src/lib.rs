@@ -79,6 +79,7 @@ impl ModuleInit for UsdtInit {
 #[async_trait]
 impl ServerModuleInit for UsdtInit {
     type Module = Usdt;
+    type Params = ();
 
     /// Returns the version of this module
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
@@ -134,6 +135,7 @@ impl ServerModuleInit for UsdtInit {
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         let num_peers = peers.to_num_peers();
         let n = u16::try_from(num_peers.total())
@@ -191,6 +193,7 @@ impl ServerModuleInit for UsdtInit {
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
         let config = dkg::distributed_gen(peers, args).await?;
         Ok(config.to_erased())
@@ -339,7 +342,7 @@ mod tests {
             disable_base_fees: false,
         };
 
-        let server_cfgs = UsdtInit.trusted_dealer_gen(&peers, &args);
+        let server_cfgs = UsdtInit.trusted_dealer_gen(&peers, &args, &());
         assert_eq!(server_cfgs.len(), usize::from(NUM_PEERS));
 
         let typed_cfgs = server_cfgs
@@ -520,7 +523,7 @@ mod distributed_gen_tests {
             // sequentially on one task.
             // nosemgrep: ban-tokio-spawn
             tasks.push(tokio::spawn(async move {
-                UsdtInit.distributed_gen(&net, &args).await
+                UsdtInit.distributed_gen(&net, &args, &()).await
             }));
         }
 
