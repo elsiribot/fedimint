@@ -269,7 +269,25 @@ P9 hardening + full acceptance suite + audit prep ★ (needs all)
 
 **Tasks:** `alloy` workspace dep; `AlloyEvmRpc` (reads + `handleOps` self-bundling from a broadcaster EOA); `MockEvmRpc` in `fedimint-usdt-tests`; vendor contract artifacts (compile TetherToken 0.4.17 + fetch canonical EntryPoint/SimpleAccountFactory v0.7 artifacts, commit JSON); devimint `Anvil` daemon (`external.rs` Esplora-pattern: `FM_PORT_ANVIL` in vars.rs, `util.rs` binary alias `FM_ANVIL_BASE_EXECUTABLE_ENV`, nix packaging of foundry); deploy fixture: EntryPoint via `anvil_setCode` at its canonical address, factory + TetherToken + TestTokenPaymaster via funded-EOA deploys, paymaster staked/funded; `DevFed` integration + `devimint-env` exposure of addresses via env vars.
 
-**Acceptance ★:** integration test (gated on anvil presence, CI-wired): spin anvil, deploy fixture, mint TetherToken to a test EOA, transfer, read balance via `AlloyEvmRpc` at a depth-confirmed block; submit a trivial self-bundled UserOp through EntryPoint successfully. Est: 3–4 wks. **Risk:** USDT-quirk handling in alloy contract bindings (no-return-value `transfer`) — covered by using the real TetherToken bytecode in every test from day one.
+**Scope decision (2026-07-16, settled with elsirion): Phase 4 = read-side adapter + hermetic anvil harness only. ERC-4337 machinery (real TetherToken/EntryPoint/SimpleAccount/paymaster artifact vendoring, UserOp packing/hashing/submission, `submit_user_ops`/`get_user_op_receipt`/`SignedUserOp`/`UserOpReceipt`) moves to Phase 7**, which is where it is actually exercised and where USDT's non-standard quirks matter. Phase 4 delivers exactly what unblocks Phase 5 (deposits): the read methods + `send_raw_transaction`, `AlloyEvmRpc`, `MockEvmRpc`, the anvil harness, and a **simple vendored test ERC-20** (deterministic committed bytecode) for the read acceptance. The `IServerEvmRpc` trait ships its read half now; the UserOp methods are added in Phase 7 (trait extension, not a rewrite).
+
+Revised `IServerEvmRpc` for Phase 4 (read half + raw send):
+```rust
+#[async_trait]
+pub trait IServerEvmRpc: Debug + Send + Sync + 'static {
+    async fn get_chain_id(&self) -> anyhow::Result<u64>;
+    async fn get_block_number(&self) -> anyhow::Result<u64>;
+    async fn get_erc20_balance(&self, token: EvmAddress, holder: EvmAddress, at_block: u64) -> anyhow::Result<UsdtAmount>;
+    async fn get_fee_estimate(&self) -> anyhow::Result<FeeVote>;
+    async fn get_code_len(&self, addr: EvmAddress) -> anyhow::Result<usize>;
+    async fn send_raw_transaction(&self, signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]>; // returns tx hash
+    fn into_dyn(self) -> DynServerEvmRpc where Self: Sized;
+}
+// Phase 7 adds: submit_user_ops, get_user_op_receipt (+ SignedUserOp, UserOpReceipt).
+```
+`FeeVote { max_fee_per_gas_wei: u64, usdt_per_eth_e6: u64 }` is added to `-common` now (wasm-safe, two u64s; the consensus-item wiring that consumes it lands in Phase 8's fee logic).
+
+**Acceptance ★:** hermetic Rust integration test (skips if `anvil` absent, runs in CI where nix provides foundry): spawn anvil, deploy the vendored test ERC-20, seed a holder balance, `transfer`, and read chain-id/block-number/balance-at-confirmation-depth/code-len via `AlloyEvmRpc` against the live node; plus a devimint `Anvil` daemon + smoke test. Est: 2–3 wks (reduced from 3–4 by the deferral). **Risk (now in Phase 7):** USDT-quirk handling — Phase 7 must use the real TetherToken bytecode from its first test.
 
 ### Phase 5 — Deposit path: check → consensus → claim
 
