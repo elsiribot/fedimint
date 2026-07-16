@@ -23,7 +23,7 @@ use rand::rngs::OsRng;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest as _, Sha256};
 
-use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigPrivate};
+use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 
 /// Domain-separation prefix for the keygen sub-protocol's `ExecutionId`,
 /// folded into a hash of every party's exchanged MPC-transport encryption
@@ -294,6 +294,13 @@ pub(crate) async fn distributed_gen(
         private: UsdtConfigPrivate {
             key_share,
             mpc_encryption_sk,
+            // This guardian's own RPC endpoint is not exchanged with peers
+            // (each guardian's is its own); default to localhost for
+            // dev/test the same way trusted-dealer-gen does. Later
+            // phases/ops override via config.
+            local: UsdtConfigLocal {
+                evm_rpc_url: crate::config::default_evm_rpc_url(),
+            },
         },
         consensus: UsdtConfigConsensus {
             group_public_key,

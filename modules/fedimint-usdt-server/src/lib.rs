@@ -36,13 +36,15 @@ use fedimint_usdt_common::{
 use rand::rngs::OsRng;
 use strum::IntoEnumIterator;
 
-use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigPrivate};
+use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 use crate::db::DbKeyPrefix;
+use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 
 mod dkg;
 
 pub mod config;
 pub mod db;
+pub mod rpc;
 
 /// Generates the module
 #[derive(Debug, Clone)]
@@ -107,7 +109,9 @@ impl ServerModuleInit for UsdtInit {
 
     /// Initialize the module
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
-        Ok(Usdt::new(args.cfg().to_typed()?))
+        let cfg: UsdtConfig = args.cfg().to_typed()?;
+        let evm_rpc = AlloyEvmRpc::new(&cfg.private.local.evm_rpc_url)?.into_dyn();
+        Ok(Usdt::new(cfg, evm_rpc))
     }
 
     /// Generates configs for all peers in a trusted manner for testing.
@@ -155,6 +159,9 @@ impl ServerModuleInit for UsdtInit {
                     private: UsdtConfigPrivate {
                         key_share: shares[index].clone(),
                         mpc_encryption_sk: mpc_encryption_keys[&peer].0,
+                        local: UsdtConfigLocal {
+                            evm_rpc_url: crate::config::default_evm_rpc_url(),
+                        },
                     },
                     consensus: UsdtConfigConsensus {
                         group_public_key,
@@ -221,6 +228,10 @@ impl ServerModuleInit for UsdtInit {
 #[derive(Debug)]
 pub struct Usdt {
     pub cfg: UsdtConfig,
+    /// Read (and, later, broadcast) access to this guardian's configured EVM
+    /// node. Unused by any consensus method yet; wired in for Phase 5's
+    /// deposit detection and beyond.
+    pub evm_rpc: DynServerEvmRpc,
 }
 
 /// Implementation of consensus for the server module
@@ -296,8 +307,8 @@ impl ServerModule for Usdt {
 
 impl Usdt {
     /// Create new module instance
-    pub fn new(cfg: UsdtConfig) -> Usdt {
-        Usdt { cfg }
+    pub fn new(cfg: UsdtConfig, evm_rpc: DynServerEvmRpc) -> Usdt {
+        Usdt { cfg, evm_rpc }
     }
 }
 

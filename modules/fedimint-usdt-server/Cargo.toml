@@ -16,6 +16,7 @@ name = "fedimint_usdt_server"
 path = "src/lib.rs"
 
 [dependencies]
+alloy = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 cggmp21 = { workspace = true, features = ["spof"] }
