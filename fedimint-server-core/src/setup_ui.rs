@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
 use fedimint_core::core::ModuleKind;
 use fedimint_core::module::ApiAuth;
 
@@ -30,6 +31,12 @@ pub trait ISetupApi {
     /// Get the modules that should be enabled by default in the setup UI
     fn default_modules(&self) -> BTreeSet<ModuleKind>;
 
+    /// Get the default config-gen params for every available module kind,
+    /// keyed by instance id in the canonical instance order. The setup UI uses
+    /// this to materialize the module instance list from the set of module
+    /// kinds the operator selected.
+    fn available_module_params(&self) -> ServerModuleConfigGenParamsRegistry;
+
     /// Reset the set of other guardians
     async fn reset_setup_codes(&self);
 
@@ -39,7 +46,7 @@ pub trait ISetupApi {
         name: String,
         federation_name: Option<String>,
         disable_base_fees: Option<bool>,
-        enabled_modules: Option<BTreeSet<ModuleKind>>,
+        module_params: Option<ServerModuleConfigGenParamsRegistry>,
         federation_size: Option<u32>,
     ) -> Result<String>;
 
@@ -64,8 +71,8 @@ pub trait ISetupApi {
     /// Returns whether base fees are disabled, if set by any setup code
     async fn cfg_base_fees_disabled(&self) -> Option<bool>;
 
-    /// Returns the enabled modules, if set by any setup code
-    async fn cfg_enabled_modules(&self) -> Option<BTreeSet<ModuleKind>>;
+    /// Returns the module instance list, if set by any setup code
+    async fn cfg_module_params(&self) -> Option<ServerModuleConfigGenParamsRegistry>;
 
     /// Get the fedimintd version
     async fn fedimintd_version(&self) -> String;

@@ -221,6 +221,10 @@ pub struct ConfigGenSettings {
     pub available_modules: BTreeSet<ModuleKind>,
     /// Modules that should be enabled by default in the setup UI
     pub default_modules: BTreeSet<ModuleKind>,
+    /// Default config-gen params for every available module, keyed by instance
+    /// id in the canonical instance order. Used to materialize the module
+    /// instance list from a set of selected module kinds during setup.
+    pub available_module_params: ServerModuleConfigGenParamsRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -243,8 +247,9 @@ pub struct ConfigGenParams {
     pub meta: BTreeMap<String, String>,
     /// Whether to disable base fees for this federation
     pub disable_base_fees: bool,
-    /// Modules enabled by the leader during setup
-    pub enabled_modules: BTreeSet<ModuleKind>,
+    /// The module instance list to generate configs for. This is the single
+    /// source of truth for which module instances the federation runs.
+    pub module_params: ServerModuleConfigGenParamsRegistry,
     /// Bitcoin network for this federation
     pub network: bitcoin::Network,
 }
@@ -484,9 +489,8 @@ impl ServerConfig {
             disable_base_fees: peer0.disable_base_fees,
         };
 
-        let module_params = build_module_params_registry(registry, &peer0.enabled_modules);
-
-        let module_configs: BTreeMap<_, _> = module_params
+        let module_configs: BTreeMap<_, _> = peer0
+            .module_params
             .iter_modules()
             .map(|(module_id, kind, params)| {
                 let module_init = registry
@@ -639,11 +643,9 @@ impl ServerConfig {
             disable_base_fees: params.disable_base_fees,
         };
 
-        let module_params = build_module_params_registry(&registry, &params.enabled_modules);
-
         let mut module_cfgs = BTreeMap::new();
 
-        for (module_id, kind, module_config_gen_params) in module_params.iter_modules() {
+        for (module_id, kind, module_config_gen_params) in params.module_params.iter_modules() {
             info!(
                 target: LOG_NET_PEER_DKG,
                 "Running config generation for module of kind {kind}..."
@@ -714,17 +716,21 @@ impl ServerConfig {
     }
 }
 
-/// Build the per-instance config gen params registry derived from the set of
-/// enabled modules.
+/// Build a module instance list holding one instance of each module in
+/// `enabled_modules`, each carrying that module's default config gen params.
 ///
-/// Modules are iterated in the same order used for instance-id assignment
-/// (legacy insertion order under `FM_BACKWARDS_COMPATIBILITY_TEST`, otherwise
-/// the registry's kind-sorted order), and each enabled module contributes its
-/// own default config gen params via
+/// This materializes the instance list at the setup boundaries (the default
+/// `available_module_params` in [`ConfigGenSettings`] and the test config gen
+/// params), where a set of module kinds needs to be turned into the instance
+/// list that is the source of truth for config generation.
+///
+/// Modules are iterated in the canonical instance order (legacy insertion order
+/// under `FM_BACKWARDS_COMPATIBILITY_TEST`, otherwise the registry's
+/// kind-sorted order), and each module contributes its own default config gen
+/// params via
 /// [`fedimint_server_core::IServerModuleInit::default_config_gen_params`].
-/// Instance ids are assigned by position, preserving the historical
-/// `.enumerate()` id assignment.
-fn build_module_params_registry(
+/// Instance ids are assigned by position.
+pub fn build_module_params_registry(
     registry: &ServerModuleInitRegistry,
     enabled_modules: &BTreeSet<ModuleKind>,
 ) -> ServerModuleConfigGenParamsRegistry {

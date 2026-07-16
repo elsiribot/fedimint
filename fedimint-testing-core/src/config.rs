@@ -5,7 +5,7 @@ use fedimint_core::PeerId;
 use fedimint_core::core::ModuleKind;
 use fedimint_core::module::ApiAuth;
 use fedimint_core::setup_code::{PeerEndpoints, PeerSetupCode};
-use fedimint_server::config::ConfigGenParams;
+use fedimint_server::config::{ConfigGenParams, build_module_params_registry};
 use fedimint_server::core::ServerModuleInitRegistry;
 use fedimint_server::net::p2p_connector::gen_cert_and_key;
 use tokio_rustls::rustls;
@@ -21,8 +21,13 @@ pub fn local_config_gen_params(
     enable_mint_fees: bool,
     registry: &ServerModuleInitRegistry,
 ) -> anyhow::Result<BTreeMap<PeerId, ConfigGenParams>> {
+    // Enable every registered module. `build_module_params_registry`
+    // materializes the module instance list (one instance per kind, carrying
+    // each module's default config gen params) in the canonical instance order,
+    // which is the single source of truth for config generation.
     let enabled_modules: BTreeSet<ModuleKind> =
         registry.iter().map(|(kind, _)| kind.clone()).collect();
+    let module_params = build_module_params_registry(registry, &enabled_modules);
 
     // Generate TLS cert and private key
     let tls_keys: BTreeMap<
@@ -59,7 +64,7 @@ pub fn local_config_gen_params(
                 },
                 federation_name: None,
                 disable_base_fees: Some(!enable_mint_fees),
-                enabled_modules: None,
+                module_params: None,
                 federation_size: None,
                 network: bitcoin::Network::Regtest,
                 fedimint_version: fedimint_core::version::cargo_pkg_release().to_owned(),
@@ -79,7 +84,7 @@ pub fn local_config_gen_params(
                 peers: connections.clone(),
                 meta: BTreeMap::new(),
                 disable_base_fees: !enable_mint_fees,
-                enabled_modules: enabled_modules.clone(),
+                module_params: module_params.clone(),
                 network: bitcoin::Network::Regtest,
             };
             Ok((*peer, params))

@@ -528,6 +528,100 @@ impl PartialEq for ServerModuleConfigGenParamsRegistry {
     }
 }
 
+impl PartialOrd for ServerModuleConfigGenParamsRegistry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ServerModuleConfigGenParamsRegistry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // `serde_json::Value` is not `Ord`, so compare instances by their
+        // canonical JSON string. Without the `preserve_order` feature
+        // `serde_json` sorts object keys, making the string canonical and thus
+        // consistent with the structural `PartialEq` above.
+        fn key(
+            registry: &ServerModuleConfigGenParamsRegistry,
+        ) -> Vec<(ModuleInstanceId, ModuleKind, String)> {
+            registry
+                .iter_modules()
+                .map(|(id, kind, params)| (id, kind.clone(), params.to_string()))
+                .collect()
+        }
+
+        key(self).cmp(&key(other))
+    }
+}
+
+impl Serialize for ServerModuleConfigGenParamsRegistry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let instances: Vec<(ModuleInstanceId, &ModuleKind, &ConfigGenModuleParams)> =
+            self.iter_modules().collect();
+        instances.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerModuleConfigGenParamsRegistry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let instances: Vec<(ModuleInstanceId, ModuleKind, ConfigGenModuleParams)> =
+            Vec::deserialize(deserializer)?;
+        Ok(Self::from_iter(instances))
+    }
+}
+
+impl Encodable for ServerModuleConfigGenParamsRegistry {
+    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
+        // `ConfigGenModuleParams` (`serde_json::Value`) has no `Encodable` impl,
+        // so encode each instance's params as its canonical JSON string.
+        let instances: Vec<(ModuleInstanceId, ModuleKind, String)> = self
+            .iter_modules()
+            .map(|(id, kind, params)| (id, kind.clone(), params.to_string()))
+            .collect();
+        instances.consensus_encode(writer)
+    }
+}
+
+impl Decodable for ServerModuleConfigGenParamsRegistry {
+    fn consensus_decode_partial_from_finite_reader<R: std::io::Read>(
+        r: &mut R,
+        modules: &ModuleDecoderRegistry,
+    ) -> Result<Self, crate::encoding::DecodeError> {
+        let instances: Vec<(ModuleInstanceId, ModuleKind, String)> =
+            Decodable::consensus_decode_partial_from_finite_reader(r, modules)?;
+        instances
+            .into_iter()
+            .map(|(id, kind, params)| {
+                let params: ConfigGenModuleParams = serde_json::from_str(&params)
+                    .map_err(crate::encoding::DecodeError::from_err)?;
+                Ok((id, kind, params))
+            })
+            .collect::<Result<Vec<_>, crate::encoding::DecodeError>>()
+            .map(Self::from_iter)
+    }
+}
+
+impl ModuleRegistry<ConfigGenModuleParams> {
+    /// The set of module kinds present in this instance list.
+    pub fn kinds(&self) -> BTreeSet<ModuleKind> {
+        self.iter_modules()
+            .map(|(_, kind, _)| kind.clone())
+            .collect()
+    }
+
+    /// Build a new instance list containing only the instances whose kind is in
+    /// `selected`, preserving this registry's instance order and re-assigning
+    /// instance ids by position (0, 1, 2, ...).
+    pub fn select_kinds(&self, selected: &BTreeSet<ModuleKind>) -> Self {
+        let mut selection = Self::default();
+        for (_, kind, params) in self.iter_modules() {
+            if selected.contains(kind) {
+                selection.append_module(kind.clone(), params.clone());
+            }
+        }
+        selection
+    }
+}
+
 impl ModuleRegistry<ConfigGenModuleParams> {
     /// Attach config gen params for a module using an explicit instance id.
     ///
