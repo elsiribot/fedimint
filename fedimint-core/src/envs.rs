@@ -29,6 +29,14 @@ pub const FM_ENABLE_MODULE_WALLET_ENV: &str = "FM_ENABLE_MODULE_WALLET";
 pub const FM_ENABLE_MODULE_WALLETV2_ENV: &str = "FM_ENABLE_MODULE_WALLETV2";
 pub const FM_ENABLE_MODULE_USDT_ENV: &str = "FM_ENABLE_MODULE_USDT";
 
+/// Env var to override the USDT module's EVM RPC URL at runtime.
+///
+/// Takes priority over the per-guardian `evm_rpc_url` baked into the
+/// encrypted private config. Used e.g. by `devimint` to point at its
+/// dynamically allocated `anvil` port, which is never known at config-gen
+/// time.
+pub const FM_USDT_EVM_RPC_URL_ENV: &str = "FM_USDT_EVM_RPC_URL";
+
 /// Disable mint base fees for testing and development environments
 pub const FM_DISABLE_BASE_FEES_ENV: &str = "FM_DISABLE_BASE_FEES";
 

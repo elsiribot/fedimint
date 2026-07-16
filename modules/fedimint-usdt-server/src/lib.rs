@@ -12,7 +12,7 @@ use fedimint_core::config::{
 };
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{DatabaseTransaction, DatabaseVersion};
-use fedimint_core::envs::{FM_ENABLE_MODULE_USDT_ENV, is_env_var_set_opt};
+use fedimint_core::envs::{FM_ENABLE_MODULE_USDT_ENV, FM_USDT_EVM_RPC_URL_ENV, is_env_var_set_opt};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
     ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
@@ -101,16 +101,26 @@ impl ServerModuleInit for UsdtInit {
     }
 
     fn get_documented_env_vars(&self) -> Vec<EnvVarDoc> {
-        vec![EnvVarDoc {
-            name: FM_ENABLE_MODULE_USDT_ENV,
-            description: "Set to 1/true to enable the USDT-on-EVM module (experimental). Disabled by default.",
-        }]
+        vec![
+            EnvVarDoc {
+                name: FM_ENABLE_MODULE_USDT_ENV,
+                description: "Set to 1/true to enable the USDT-on-EVM module (experimental). Disabled by default.",
+            },
+            EnvVarDoc {
+                name: FM_USDT_EVM_RPC_URL_ENV,
+                description: "Overrides the EVM RPC URL for this guardian at runtime, taking priority over the configured `evm_rpc_url`.",
+            },
+        ]
     }
 
     /// Initialize the module
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
         let cfg: UsdtConfig = args.cfg().to_typed()?;
-        let evm_rpc = AlloyEvmRpc::new(&cfg.private.local.evm_rpc_url)?.into_dyn();
+        let evm_rpc_url = std::env::var(FM_USDT_EVM_RPC_URL_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| cfg.private.local.evm_rpc_url.clone());
+        let evm_rpc = AlloyEvmRpc::new(&evm_rpc_url)?.into_dyn();
         Ok(Usdt::new(cfg, evm_rpc))
     }
 

@@ -81,16 +81,20 @@ impl Drop for AnvilHandle {
 /// Spawns a local `anvil` dev-node for hermetic EVM integration tests.
 ///
 /// Resolves the binary from the `FM_ANVIL_BASE_EXECUTABLE` env var, falling
-/// back to `anvil` on `PATH`. If the binary can't be spawned at all (neither
-/// is available), returns `Ok(None)` so callers can skip the test instead of
-/// failing outright — anvil is a test-only dependency, not something every
-/// dev/CI environment is guaranteed to have.
+/// back to `anvil` on `PATH`. If the binary genuinely isn't installed
+/// (`std::io::ErrorKind::NotFound`), returns `Ok(None)` so callers can skip
+/// the test instead of failing outright — anvil is a test-only dependency,
+/// not something every dev/CI environment is guaranteed to have.
 ///
 /// # Errors
 ///
 /// Returns an error if the binary spawns but never becomes ready to serve
 /// JSON-RPC requests within the poll budget, since that indicates a real
-/// problem (as opposed to "anvil isn't installed").
+/// problem (as opposed to "anvil isn't installed"). Also returns an error
+/// (rather than skipping) if the spawn itself fails for any reason other
+/// than "binary not found" — e.g. a misconfigured `FM_ANVIL_BASE_EXECUTABLE`
+/// pointing at a path with the wrong permissions should surface as a hard
+/// failure, not silently skip the test.
 pub async fn spawn_anvil() -> anyhow::Result<Option<AnvilHandle>> {
     let binary = env::var("FM_ANVIL_BASE_EXECUTABLE").unwrap_or_else(|_| "anvil".to_string());
 
@@ -120,7 +124,10 @@ pub async fn spawn_anvil() -> anyhow::Result<Option<AnvilHandle>> {
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to spawn anvil binary ({binary})"));
+        }
     };
 
     let mut handle = AnvilHandle {
