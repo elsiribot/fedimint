@@ -45,6 +45,9 @@ pub mod io;
 pub mod peer_handle;
 pub mod setup;
 
+#[cfg(test)]
+mod tests;
+
 /// The default maximum open connections the API can handle
 pub const DEFAULT_MAX_CLIENT_CONNECTIONS: u32 = 1000;
 

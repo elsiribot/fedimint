@@ -71,6 +71,8 @@ url = { workspace = true }
 z32 = { workspace = true }
 
 [dev-dependencies]
+fedimint-mint-common = { workspace = true }
+fedimint-mint-server = { workspace = true }
 test-log = { workspace = true }
 
 [build-dependencies]
