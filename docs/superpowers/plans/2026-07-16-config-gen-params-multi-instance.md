@@ -60,9 +60,13 @@ impl ModuleRegistry<ConfigGenModuleParams> {
 
 ---
 
-### Task 1: Reintroduce core params types + trait + all-module updates + config-gen + wiring
+## Scope decision (elsirion, 2026-07-16): FULL CLEAN, in a SEPARATE commit
 
-**This is the large atomic task.** Port the pre-removal mechanism forward, adapting to the current tree. The workspace won't compile until every `ServerModuleInit` impl and every config-gen call site is updated, so this is one task ending in a green `cargo check --workspace`.
+`enabled_modules` is consumed in ~8 non-test files (config-gen, `fedimint-server/src/config/setup.rs`, `fedimint-server-core/src/setup_ui.rs`, `fedimint-server-ui/src/setup.rs`, `fedimint-core/src/setup_code.rs`, `fedimint-core/src/admin_client.rs`, `fedimint-api-client/src/api/mod.rs` + `with_cache.rs`). elsirion chose the **full-clean** migration (instance-list becomes the single source of truth everywhere, duplicate kinds expressible incl. in the setup UI), and wants the `enabled_modules`→instance-list surface migration in a **separate commit** from the core params reintroduction. Task 1 is therefore split into **1a** (params mechanism, behavior-preserving, `enabled_modules` still drives selection) and **1b** (the `enabled_modules`→instance-list surface migration). Each commits independently and compiles.
+
+### Task 1a: Reintroduce core params types + trait + all-module updates + config-gen (params channel)
+
+**The large atomic trait change.** Port the pre-removal mechanism forward (hybrid with `args`), adapting to the current tree. The workspace won't compile until every `ServerModuleInit` impl and every config-gen call site is updated, so this ends in a green `cargo check --workspace`. **In this task, `enabled_modules` stays the source of truth for WHICH modules run** — config-gen builds a params registry *derived from* `enabled_modules` + default params per kind, then iterates it. This introduces the typed-params channel and preserves behavior without touching the setup/admin/API surface (that's Task 1b).
 
 **Files (mirrors the removal commit's 36-file footprint):**
 - `fedimint-core/src/config.rs` — reintroduce `ConfigGenModuleParams`, `ServerModuleConfigGenParamsRegistry`, `attach_config_gen_params*`, `from_instances`; re-add the `ServerModuleConfigGenParamsRegistry` field to `ConfigGenSettings`/`ConfigGenParams` where the pre-removal code had it.
@@ -84,13 +88,27 @@ impl ModuleRegistry<ConfigGenModuleParams> {
 
 - [ ] **Step 4: Update config-gen loops** in `fedimint-server/src/config/mod.rs` to iterate the params registry (port the pre-removal `modules.iter_modules().map(|(id, kind, params)| registry.get(kind).trusted_dealer_gen(peers, &args, params))` pattern), taking `args` from the current `ConfigGenModuleArgs` construction. Reconcile `distributed_gen` similarly.
 
-- [ ] **Step 5: Wire fedimintd + setup + fixtures.** `default_modules()` → params registry with default params per enabled-by-default module. **Critical for behavior preservation:** the default params registry must assign the SAME instance ids as the current `.enumerate()` scheme did for a default federation (so existing DBs/tests don't break). Build the default registry by iterating the init registry in the SAME order the current code uses (legacy order when `FM_BACKWARDS_COMPATIBILITY_TEST`, else kind-sorted) and `append_module`-ing each — this reproduces the id assignment. Update `setup.rs` to carry the params registry, and `fixtures.rs` `with_module(params)`.
+- [ ] **Step 5: Wire fedimintd + setup + fixtures (params channel, keep enabled_modules).** `default_modules()` returns a params registry with default params per enabled-by-default module. `setup.rs`/`config/mod.rs` still use `enabled_modules` to decide WHICH modules run, but now build a params registry by iterating the enabled+init registry in the SAME order the current code uses (legacy order under `FM_BACKWARDS_COMPATIBILITY_TEST`, else kind-sorted) and `append_module`-ing each with default params — reproducing the current instance-id assignment (behavior preservation). `fixtures.rs` `with_module(params)` gains the params arg. Do NOT change the `enabled_modules` type or its setup-UI/admin/API consumers yet (that is Task 1b).
 
-- [ ] **Step 6: Compile the whole workspace.** `cargo check --workspace` — must pass. Fix all impls until green. (This is the atomicity gate.)
+- [ ] **Step 6: Compile the whole workspace.** `cargo check --workspace` — must pass. Fix all impls until green. (Atomicity gate.)
 
-- [ ] **Step 7: Run the existing config-gen + module tests** to prove behavior preserved: `cargo test --release -p fedimint-usdt-server` (our DKG test — uses the config-gen path), `cargo test --release -p fedimint-mint-tests` (or a lighter mint config test), and any `fedimint-server` config-gen unit tests. Existing federations must config-gen identically. Report which tests you ran + results.
+- [ ] **Step 7: Run the existing config-gen + module tests** to prove behavior preserved: `cargo test --release -p fedimint-usdt-server` (our DKG test — uses the config-gen path), plus a mint/server config-gen test. Existing federations must config-gen identically (same ids, same configs). Report which tests you ran + results.
 
-- [ ] **Step 8: Format, lint, commit.** `just format`; `cargo clippy` on the core crates touched (`fedimint-core`, `fedimint-server-core`, `fedimint-server`, `fedimintd`, and each module server crate) `-- -D warnings`; `just cargo-sort-check`. Commit: `feat(config): reintroduce typed config-gen params (hybrid with args)`
+- [ ] **Step 8: Format, lint, commit.** `just format`; clippy `-D warnings` on the touched core crates (`fedimint-core`, `fedimint-server-core`, `fedimint-server`, `fedimintd`) + each module server crate; `just cargo-sort-check`. Commit: `feat(config): reintroduce typed config-gen params (hybrid with args)`
+
+---
+
+### Task 1b: Migrate `enabled_modules` → instance-list across the setup/admin/API surface (separate commit)
+
+**Files:** `fedimint-server/src/config/{mod.rs,setup.rs}`, `fedimint-server-core/src/setup_ui.rs`, `fedimint-server-ui/src/setup.rs`, `fedimint-core/src/{setup_code.rs,admin_client.rs}`, `fedimint-api-client/src/api/{mod.rs,global_api/with_cache.rs}`.
+
+Replace `enabled_modules: BTreeSet<ModuleKind>` with the instance-list (the `ServerModuleConfigGenParamsRegistry` params registry) as the single source of truth for which instances exist — making duplicate kinds expressible end-to-end incl. the setup UI. Config-gen stops deriving the registry from `enabled_modules` (Task 1a's bridge) and uses the instance-list directly.
+
+- [ ] **Step 1: Grep every `enabled_modules` consumer** (`git grep enabled_modules`) and note what each needs: some only need "the set of enabled kinds" (derive via `.kinds()` on the instance-list); the setup UI needs operator add/configure of instances (incl. two of a kind + params). Write the per-consumer migration before editing.
+- [ ] **Step 2: Change the field type** on `ConfigGenParams`/`ConfigGenSettings`/setup-code from `BTreeSet<ModuleKind>` to the instance-list; config-gen iterates it directly (drop Task 1a's enabled_modules-derived-registry bridge).
+- [ ] **Step 3: Update each consumer** — setup codes, admin client, API client (mechanical: read kinds/instances from the list); setup UI (real: instance add/configure — if the full UI is large, implement a functional minimum supporting the default set + an extra instance, note UI polish as follow-up).
+- [ ] **Step 4: Compile + boot.** `cargo check --workspace`; re-run a config-gen + a fixtures/devimint boot test to confirm the setup path still stands up a federation, default federation unchanged (same instances/ids).
+- [ ] **Step 5: Format, lint, commit.** Commit: `refactor(config): instance-list replaces enabled_modules as source of truth`
 
 ---
 
