@@ -19,6 +19,7 @@ path = "tests/config_gen_tests.rs"
 anyhow = { workspace = true }
 bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
+fedimint-aead = { workspace = true }
 fedimint-api-client = { workspace = true }
 serde_json = { workspace = true }
 bls12_381 = { workspace = true }

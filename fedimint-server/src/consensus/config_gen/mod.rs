@@ -9,6 +9,7 @@
 //! evaluatable from the log and the item alone.
 
 pub mod manager;
+pub mod secrets;
 pub mod transport;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, bail, ensure};
 use fedimint_core::config::ServerModuleConsensusConfig;
 use fedimint_core::config_gen::{
-    ConfigGenAbortReason, ConfigGenItem, ModuleConfigProposal, ModuleGenerationId,
+    ConfigGenAbortReason, ConfigGenItem, MAX_ENCRYPTED_PRIVATE_CONFIG_BYTES, ModuleConfigProposal,
+    ModuleGenerationId,
 };
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::{NumPeers, PeerId};
@@ -36,17 +38,29 @@ pub enum GenerationState {
     /// reports its resulting consensus config.
     Approved {
         proposal: ModuleConfigProposal,
-        results: BTreeMap<PeerId, ServerModuleConsensusConfig>,
+        results: BTreeMap<PeerId, GenerationResult>,
     },
     /// Every guardian reported an identical consensus config. Terminal
-    /// until activation lands in a later phase.
+    /// until activation lands in a later phase. The encrypted private
+    /// configs are retained so a recovering guardian can fetch and decrypt
+    /// its own from any peer.
     Generated {
         proposal: ModuleConfigProposal,
         consensus_config: ServerModuleConsensusConfig,
+        encrypted_private_configs: BTreeMap<PeerId, Vec<u8>>,
     },
     /// Aborted by a guardian. Terminal; retrying requires a fresh proposal
     /// under a new generation id.
     Aborted { reason: ConfigGenAbortReason },
+}
+
+/// One guardian's reported generation result.
+#[derive(Debug, Clone, PartialEq, Eq, Encodable, Decodable, Serialize)]
+pub struct GenerationResult {
+    pub consensus_config: ServerModuleConsensusConfig,
+    /// This guardian's private module config, encrypted under a key only it
+    /// can derive; see [`secrets`].
+    pub encrypted_private_config: Vec<u8>,
 }
 
 impl GenerationState {
@@ -148,6 +162,7 @@ pub fn process_item(
         ConfigGenItem::Result {
             generation_id,
             consensus_config,
+            encrypted_private_config,
         } => {
             let state = log
                 .generations
@@ -168,22 +183,41 @@ pub fn process_item(
                 "Result for {generation_id} with mismatched consensus version"
             );
 
+            ensure!(
+                encrypted_private_config.len() <= MAX_ENCRYPTED_PRIVATE_CONFIG_BYTES,
+                "Result for {generation_id} with oversized encrypted private config"
+            );
+
             if let Some(first) = results.values().next() {
                 ensure!(
-                    *first == consensus_config,
+                    first.consensus_config == consensus_config,
                     "Result for {generation_id} by {peer} does not match previous results"
                 );
             }
 
             ensure!(
-                results.insert(peer, consensus_config.clone()).is_none(),
+                results
+                    .insert(
+                        peer,
+                        GenerationResult {
+                            consensus_config: consensus_config.clone(),
+                            encrypted_private_config,
+                        }
+                    )
+                    .is_none(),
                 "Duplicate result for {generation_id} by {peer}"
             );
 
             if results.len() == num_peers.total() {
+                let encrypted_private_configs = results
+                    .iter()
+                    .map(|(peer, result)| (*peer, result.encrypted_private_config.clone()))
+                    .collect();
+
                 *state = GenerationState::Generated {
                     proposal: proposal.clone(),
                     consensus_config,
+                    encrypted_private_configs,
                 };
             }
         }
@@ -265,6 +299,7 @@ mod tests {
             ConfigGenItem::Result {
                 generation_id: ModuleGenerationId(id),
                 consensus_config: consensus_config(config),
+                encrypted_private_config: format!("encrypted-{peer}").into_bytes(),
             },
             PeerId::from(peer),
         )
@@ -384,10 +419,41 @@ mod tests {
             result(&mut log, 0, peer, b"config").expect("result accepted");
         }
 
-        assert!(matches!(
-            log.generations()[&ModuleGenerationId(0)],
-            GenerationState::Generated { .. }
-        ));
+        let GenerationState::Generated {
+            encrypted_private_configs,
+            ..
+        } = &log.generations()[&ModuleGenerationId(0)]
+        else {
+            panic!("Generation is not generated");
+        };
+
+        // Every guardian's encrypted private config is retained
+        assert_eq!(
+            encrypted_private_configs[&PeerId::from(2)],
+            b"encrypted-2".to_vec()
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_encrypted_private_config() {
+        let mut log = GenerationLog::default();
+
+        propose(&mut log, 0, 0).expect("proposal accepted");
+        approve_all(&mut log, 0);
+
+        assert!(
+            process_item(
+                NumPeers::from(NUM_PEERS_TOTAL),
+                &mut log,
+                ConfigGenItem::Result {
+                    generation_id: ModuleGenerationId(0),
+                    consensus_config: consensus_config(b"config"),
+                    encrypted_private_config: vec![0; MAX_ENCRYPTED_PRIVATE_CONFIG_BYTES + 1],
+                },
+                PeerId::from(0),
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -57,6 +57,11 @@ pub struct ModuleConfigProposal {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct ConfigGenAbortReason(pub String);
 
+/// Maximum size of an encrypted private module config committed to
+/// consensus, bounded well below the aleph unit byte limit so result items
+/// always fit into a unit.
+pub const MAX_ENCRYPTED_PRIVATE_CONFIG_BYTES: usize = 40_000;
+
 /// Request body of the abort-module-generation admin endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AbortModuleGenerationRequest {
@@ -82,11 +87,15 @@ pub enum ConfigGenItem {
     Approve { generation_id: ModuleGenerationId },
     /// Report this guardian's completion of the DKG for an approved
     /// generation. A generation completes once every guardian reported an
-    /// identical consensus config; private configs never leave the
-    /// guardian.
+    /// identical consensus config.
+    ///
+    /// The private config is committed to consensus history encrypted under
+    /// a key only this guardian can derive, so a guardian can recover it
+    /// from its root secret and the federation's signed history.
     Result {
         generation_id: ModuleGenerationId,
         consensus_config: ServerModuleConsensusConfig,
+        encrypted_private_config: Vec<u8>,
     },
     /// Abort the currently proposed generation. Any single guardian may
     /// abort; retrying requires a new proposal under a fresh id.

@@ -112,6 +112,9 @@ pub struct LocalGenerationOutcome {
     /// The private module config as `serde_json` encoded
     /// [`fedimint_core::config::JsonWithKind`]
     pub private_json: String,
+    /// The private config encrypted for the consensus commitment; stored so
+    /// resubmissions after a crash are byte identical.
+    pub encrypted_private_json: Vec<u8>,
     pub consensus: fedimint_core::config::ServerModuleConsensusConfig,
 }
 

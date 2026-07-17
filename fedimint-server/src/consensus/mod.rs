@@ -207,6 +207,7 @@ pub async fn run(
         connections.clone(),
         config_gen_receiver,
         submission_sender.clone(),
+        crate::consensus::config_gen::secrets::config_gen_root(&cfg.private.broadcast_secret_key),
     )
     .spawn(task_group);
 

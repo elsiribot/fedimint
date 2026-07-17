@@ -82,6 +82,12 @@ impl FederationTest {
     }
 
     /// Create a new admin api for the given PeerId
+    /// Returns a peer's full server config, e.g. to derive its secrets in
+    /// tests
+    pub fn server_config(&self, peer_id: PeerId) -> &ServerConfig {
+        self.configs.get(&peer_id).expect("peer to have config")
+    }
+
     pub async fn new_admin_api(&self, peer_id: PeerId) -> anyhow::Result<DynGlobalApi> {
         let config = self.configs.get(&peer_id).expect("peer to have config");
 

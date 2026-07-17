@@ -152,7 +152,37 @@ async fn generates_mint_config_on_running_federation() -> anyhow::Result<()> {
         "Peers reported different consensus configs"
     );
 
-    info!(target: LOG_TEST, "All peers generated identical mint consensus config");
+    // The private config committed to consensus is recoverable from the
+    // guardian's root secret: fetch peer 1's encrypted blob from peer 0's
+    // log and decrypt it with a key derived from peer 1's secret.
+    let generated = await_state(&apis[0], generation_id, "Generated").await;
+
+    let mut encrypted_private_config: Vec<u8> =
+        serde_json::from_value(generated["encrypted_private_configs"]["1"].clone())?;
+
+    let root = fedimint_server::consensus::config_gen::secrets::config_gen_root(
+        &fed.server_config(PeerId::from(1))
+            .private
+            .broadcast_secret_key,
+    );
+
+    let decrypted = fedimint_aead::decrypt(
+        &mut encrypted_private_config,
+        &fedimint_server::consensus::config_gen::secrets::result_encryption_key(
+            &root,
+            generation_id,
+        ),
+    )
+    .expect("guardian can decrypt its own committed private config");
+
+    let private_config: serde_json::Value = serde_json::from_slice(decrypted)?;
+
+    assert_eq!(private_config["kind"], "mint");
+
+    info!(
+        target: LOG_TEST,
+        "All peers generated identical mint consensus config; private config recoverable"
+    );
 
     Ok(())
 }

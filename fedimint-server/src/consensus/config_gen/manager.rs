@@ -22,10 +22,12 @@ use fedimint_core::net::peers::{DynP2PConnections, IP2PConnections};
 use fedimint_core::task::TaskGroup;
 use fedimint_core::util::FmtCompactAnyhow;
 use fedimint_core::{NumPeers, PeerId};
+use fedimint_derive_secret::DerivableSecret;
 use fedimint_logging::LOG_CONSENSUS;
 use fedimint_server_core::{ConfigGenModuleArgs, ServerModuleInitRegistry};
 use tracing::{info, warn};
 
+use super::secrets::result_encryption_key;
 use super::transport::GenerationTransport;
 use super::{GenerationLog, GenerationState};
 use crate::config::peer_handle::PeerHandle;
@@ -46,6 +48,7 @@ pub struct GenerationManager {
     connections: DynP2PConnections<P2PMessage>,
     incoming: async_channel::Receiver<(PeerId, P2PMessage)>,
     submission_sender: async_channel::Sender<ConsensusItem>,
+    config_gen_root: DerivableSecret,
 }
 
 impl GenerationManager {
@@ -58,6 +61,7 @@ impl GenerationManager {
         connections: DynP2PConnections<P2PMessage>,
         incoming: async_channel::Receiver<(PeerId, P2PMessage)>,
         submission_sender: async_channel::Sender<ConsensusItem>,
+        config_gen_root: DerivableSecret,
     ) -> Self {
         Self {
             db,
@@ -67,6 +71,7 @@ impl GenerationManager {
             connections,
             incoming,
             submission_sender,
+            config_gen_root,
         }
     }
 
@@ -128,6 +133,7 @@ impl GenerationManager {
             self.submit(ConfigGenItem::Result {
                 generation_id,
                 consensus_config: outcome.consensus,
+                encrypted_private_config: outcome.encrypted_private_json,
             })
             .await;
 
@@ -216,11 +222,35 @@ impl GenerationManager {
                 let private_json = serde_json::to_string(&config.private)
                     .expect("Private module config is serializable");
 
+                let encrypted_private_json = fedimint_aead::encrypt(
+                    private_json.clone().into_bytes(),
+                    &result_encryption_key(&self.config_gen_root, generation_id),
+                )
+                .expect("Encryption does not fail");
+
+                if encrypted_private_json.len()
+                    > fedimint_core::config_gen::MAX_ENCRYPTED_PRIVATE_CONFIG_BYTES
+                {
+                    self.submit(ConfigGenItem::Abort {
+                        generation_id,
+                        reason: ConfigGenAbortReason(format!(
+                            "Encrypted private config of {} bytes exceeds the size limit",
+                            encrypted_private_json.len()
+                        )),
+                    })
+                    .await;
+
+                    self.await_log_change().await;
+
+                    return;
+                }
+
                 let mut dbtx = self.db.begin_transaction().await;
                 dbtx.insert_entry(
                     &LocalGenerationOutcomeKey(generation_id),
                     &LocalGenerationOutcome {
                         private_json,
+                        encrypted_private_json: encrypted_private_json.clone(),
                         consensus: config.consensus.clone(),
                     },
                 )
@@ -236,6 +266,7 @@ impl GenerationManager {
                 self.submit(ConfigGenItem::Result {
                     generation_id,
                     consensus_config: config.consensus,
+                    encrypted_private_config: encrypted_private_json,
                 })
                 .await;
             }
