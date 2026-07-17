@@ -19,7 +19,7 @@ use fedimint_core::module::{
     ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
     api_endpoint,
 };
-use fedimint_core::{InPoint, NumPeersExt, OutPoint, PeerId};
+use fedimint_core::{InPoint, NumPeersExt, OutPoint, PeerId, push_db_pair_items};
 use fedimint_server_core::config::PeerHandleOps;
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
 use fedimint_server_core::{
@@ -30,14 +30,18 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::GROUP_PUBLIC_KEY_ENDPOINT;
 use fedimint_usdt_common::{
-    MODULE_CONSENSUS_VERSION, UsdtCommonInit, UsdtConsensusItem, UsdtInput, UsdtInputError,
-    UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
+    DepositObservation, MODULE_CONSENSUS_VERSION, UsdtCommonInit, UsdtConsensusItem, UsdtInput,
+    UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
 };
+use futures::StreamExt as _;
 use rand::rngs::OsRng;
 use strum::IntoEnumIterator;
 
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
-use crate::db::DbKeyPrefix;
+use crate::db::{
+    BlockCountVotePrefix, DbKeyPrefix, DepositObservationVotePrefix, DepositRecord,
+    DepositRecordPrefix, PendingCheck, PendingCheckPrefix,
+};
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 
 mod dkg;
@@ -56,18 +60,56 @@ impl ModuleInit for UsdtInit {
     /// Dumps all database items for debugging
     async fn dump_database(
         &self,
-        _dbtx: &mut DatabaseTransaction<'_>,
+        dbtx: &mut DatabaseTransaction<'_>,
         prefix_names: Vec<String>,
     ) -> Box<dyn Iterator<Item = (String, Box<dyn erased_serde::Serialize + Send>)> + '_> {
-        let items: BTreeMap<String, Box<dyn erased_serde::Serialize + Send>> = BTreeMap::new();
+        let mut items: BTreeMap<String, Box<dyn erased_serde::Serialize + Send>> = BTreeMap::new();
         let filtered_prefixes = DbKeyPrefix::iter().filter(|f| {
             prefix_names.is_empty() || prefix_names.contains(&f.to_string().to_lowercase())
         });
 
-        // No consensus state is persisted yet; nothing to dump for any prefix.
         for table in filtered_prefixes {
             match table {
-                DbKeyPrefix::Reserved => {}
+                DbKeyPrefix::BlockCountVote => {
+                    push_db_pair_items!(
+                        dbtx,
+                        BlockCountVotePrefix,
+                        crate::db::BlockCountVoteKey,
+                        u64,
+                        items,
+                        "Block Count Votes"
+                    );
+                }
+                DbKeyPrefix::DepositRecord => {
+                    push_db_pair_items!(
+                        dbtx,
+                        DepositRecordPrefix,
+                        crate::db::DepositRecordKey,
+                        DepositRecord,
+                        items,
+                        "Deposit Records"
+                    );
+                }
+                DbKeyPrefix::DepositObservationVote => {
+                    push_db_pair_items!(
+                        dbtx,
+                        DepositObservationVotePrefix,
+                        crate::db::DepositObservationVoteKey,
+                        DepositObservation,
+                        items,
+                        "Deposit Observation Votes"
+                    );
+                }
+                DbKeyPrefix::PendingCheck => {
+                    push_db_pair_items!(
+                        dbtx,
+                        PendingCheckPrefix,
+                        crate::db::PendingCheckKey,
+                        PendingCheck,
+                        items,
+                        "Pending Checks"
+                    );
+                }
             }
         }
 
