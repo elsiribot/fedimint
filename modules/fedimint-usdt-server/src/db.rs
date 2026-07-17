@@ -1,7 +1,7 @@
 use fedimint_core::encoding::{Decodable, Encodable};
+use fedimint_core::secp256k1::PublicKey;
 use fedimint_core::{PeerId, impl_db_lookup, impl_db_record};
 use fedimint_usdt_common::{DepositObservation, EvmAddress, UsdtAmount};
-use secp256k1::PublicKey;
 use serde::Serialize;
 use strum_macros::EnumIter;
 

@@ -3,6 +3,9 @@
 #![allow(clippy::must_use_candidate)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, ensure};
 use async_trait::async_trait;
@@ -11,15 +14,21 @@ use fedimint_core::config::{
     TypedServerModuleConsensusConfig,
 };
 use fedimint_core::core::ModuleInstanceId;
-use fedimint_core::db::{DatabaseTransaction, DatabaseVersion};
-use fedimint_core::envs::{FM_ENABLE_MODULE_USDT_ENV, FM_USDT_EVM_RPC_URL_ENV, is_env_var_set_opt};
+use fedimint_core::db::{
+    Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
+};
+use fedimint_core::envs::{
+    FM_ENABLE_MODULE_USDT_ENV, FM_USDT_EVM_RPC_URL_ENV, is_env_var_set_opt, is_running_in_test_env,
+};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
     ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
     ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
     api_endpoint,
 };
-use fedimint_core::{InPoint, NumPeersExt, OutPoint, PeerId, push_db_pair_items};
+use fedimint_core::task::TaskGroup;
+use fedimint_core::util::FmtCompactAnyhow as _;
+use fedimint_core::{InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, push_db_pair_items};
 use fedimint_server_core::config::PeerHandleOps;
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
 use fedimint_server_core::{
@@ -36,11 +45,12 @@ use fedimint_usdt_common::{
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
 use strum::IntoEnumIterator;
+use tracing::warn;
 
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 use crate::db::{
-    BlockCountVotePrefix, DbKeyPrefix, DepositObservationVotePrefix, DepositRecord,
-    DepositRecordPrefix, PendingCheck, PendingCheckPrefix,
+    BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, DepositObservationVotePrefix,
+    DepositRecord, DepositRecordPrefix, PendingCheck, PendingCheckPrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 
@@ -164,7 +174,14 @@ impl ServerModuleInit for UsdtInit {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| cfg.private.local.evm_rpc_url.clone());
         let evm_rpc = AlloyEvmRpc::new(&evm_rpc_url)?.into_dyn();
-        Ok(Usdt::new(cfg, evm_rpc))
+        Ok(Usdt::new(
+            cfg,
+            evm_rpc,
+            args.db().clone(),
+            args.task_group().clone(),
+            args.our_peer_id(),
+            args.num_peers(),
+        ))
     }
 
     /// Generates configs for all peers in a trusted manner for testing.
@@ -291,9 +308,34 @@ impl ServerModuleInit for UsdtInit {
 pub struct Usdt {
     pub cfg: UsdtConfig,
     /// Read (and, later, broadcast) access to this guardian's configured EVM
-    /// node. Unused by any consensus method yet; wired in for Phase 5's
-    /// deposit detection and beyond.
+    /// node.
     pub evm_rpc: DynServerEvmRpc,
+    /// Kept for the deposit-checker task spawned in Task 7 (it needs `db` to
+    /// read/write `PendingCheck`/deposit-observation state) and for test
+    /// scaffolding (`db_for_test`, `#[cfg(test)]`); no production consensus
+    /// method reads it directly yet.
+    #[allow(dead_code)]
+    db: Database,
+    our_peer_id: PeerId,
+    num_peers: NumPeers,
+    /// This guardian's most recently polled view of the EVM chain head,
+    /// refreshed in the background by the poller task spawned in
+    /// [`Usdt::new`] (wallet-style block-count cache, but push-updated by a
+    /// dedicated poller instead of pulled synchronously on every
+    /// `consensus_proposal`, since EVM RPC calls are not guaranteed to be as
+    /// cheap/local as the wallet's bitcoind status cache).
+    block_count: Arc<AtomicU64>,
+    /// Kept for the deposit-checker task spawned in Task 7 (it needs a
+    /// `TaskGroup` handle to spawn onto); the poller task spawned in
+    /// [`Usdt::new`] is handed its own reference before this field is set,
+    /// so no production method reads it directly yet.
+    #[allow(dead_code)]
+    task_group: TaskGroup,
+    /// Deposit observations gathered by the deposit-checker task (Task 7),
+    /// drained into `consensus_proposal` there.
+    // populated by the deposit-checker task and drained in consensus_proposal (Task 7)
+    #[allow(dead_code)]
+    deposit_proposals: Arc<Mutex<Vec<DepositObservation>>>,
 }
 
 /// Implementation of consensus for the server module
@@ -305,21 +347,56 @@ impl ServerModule for Usdt {
 
     async fn consensus_proposal(
         &self,
-        _dbtx: &mut DatabaseTransaction<'_>,
+        dbtx: &mut DatabaseTransaction<'_>,
     ) -> Vec<UsdtConsensusItem> {
-        Vec::new()
+        let mut items = Vec::new();
+
+        let head = self.block_count.load(Ordering::Relaxed);
+        let current_consensus = self.consensus_block_count(dbtx).await;
+        let mut vote = head;
+        if current_consensus != 0 {
+            // This prevents catching up more than a handful of blocks in a
+            // single consensus round if the federation (or this guardian's
+            // EVM node) was offline for a prolonged period of time.
+            vote = vote.min(current_consensus + if is_running_in_test_env() { 100 } else { 5 });
+        }
+
+        let current_vote = dbtx
+            .get_value(&BlockCountVoteKey(self.our_peer_id))
+            .await
+            .unwrap_or(0);
+
+        if vote > current_vote {
+            items.push(UsdtConsensusItem::BlockCount(vote));
+        }
+
+        items
     }
 
     async fn process_consensus_item<'a, 'b>(
         &'a self,
-        _dbtx: &mut DatabaseTransaction<'b>,
-        _consensus_item: UsdtConsensusItem,
-        _peer_id: PeerId,
+        dbtx: &mut DatabaseTransaction<'b>,
+        consensus_item: UsdtConsensusItem,
+        peer_id: PeerId,
     ) -> anyhow::Result<()> {
         // WARNING: `process_consensus_item` should return an `Err` for items that do
         // not change any internal consensus state. Failure to do so, will result in an
         // (potentially significantly) increased consensus history size.
-        bail!("The usdt module does not use consensus items yet");
+        match consensus_item {
+            UsdtConsensusItem::BlockCount(vote) => {
+                let current_vote = dbtx
+                    .get_value(&BlockCountVoteKey(peer_id))
+                    .await
+                    .unwrap_or(0);
+
+                ensure!(vote > current_vote, "Block count vote is redundant");
+
+                dbtx.insert_entry(&BlockCountVoteKey(peer_id), &vote).await;
+
+                Ok(())
+            }
+            _ => bail!("The usdt module does not support this consensus item yet"),
+        }
     }
 
     async fn process_input<'a, 'b, 'c>(
@@ -369,9 +446,118 @@ impl ServerModule for Usdt {
 }
 
 impl Usdt {
-    /// Create new module instance
-    pub fn new(cfg: UsdtConfig, evm_rpc: DynServerEvmRpc) -> Usdt {
-        Usdt { cfg, evm_rpc }
+    /// Create new module instance, spawning the background block-count
+    /// poller task (see [`Usdt::spawn_block_count_poller`]).
+    pub fn new(
+        cfg: UsdtConfig,
+        evm_rpc: DynServerEvmRpc,
+        db: Database,
+        task_group: TaskGroup,
+        our_peer_id: PeerId,
+        num_peers: NumPeers,
+    ) -> Usdt {
+        let block_count = Arc::new(AtomicU64::new(0));
+        Self::spawn_block_count_poller(&task_group, evm_rpc.clone(), block_count.clone());
+
+        Usdt {
+            cfg,
+            evm_rpc,
+            db,
+            our_peer_id,
+            num_peers,
+            block_count,
+            task_group,
+            deposit_proposals: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Test-only constructor: builds the module without spawning the
+    /// background poller task, using a fresh, unstarted [`TaskGroup`]. Tests
+    /// set `block_count` directly instead of relying on the poller.
+    #[cfg(test)]
+    pub fn new_for_test(
+        cfg: UsdtConfig,
+        evm_rpc: DynServerEvmRpc,
+        db: Database,
+        our_peer_id: PeerId,
+        num_peers: NumPeers,
+    ) -> Usdt {
+        Usdt {
+            cfg,
+            evm_rpc,
+            db,
+            our_peer_id,
+            num_peers,
+            block_count: Arc::new(AtomicU64::new(0)),
+            task_group: TaskGroup::new(),
+            deposit_proposals: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Returns this guardian's stored [`Database`], for test scaffolding
+    /// that needs to open transactions against the same database the module
+    /// was constructed with. Returns a reference (rather than a clone) so
+    /// the resulting `DatabaseTransaction` can borrow through it.
+    #[cfg(test)]
+    pub fn db_for_test(&self) -> &Database {
+        &self.db
+    }
+
+    /// Spawns a background task that polls `evm_rpc.get_block_number()` into
+    /// `block_count` on a fixed interval, so `consensus_proposal` can read a
+    /// cheap, cached view of the EVM chain head instead of making a
+    /// synchronous RPC call on every consensus round.
+    fn spawn_block_count_poller(
+        task_group: &TaskGroup,
+        evm_rpc: DynServerEvmRpc,
+        block_count: Arc<AtomicU64>,
+    ) {
+        task_group.spawn_cancellable("usdt-block-count-poller", async move {
+            loop {
+                match evm_rpc.get_block_number().await {
+                    Ok(n) => {
+                        block_count.store(n, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "usdt",
+                            err = %err.fmt_compact_anyhow(),
+                            "block count poll failed"
+                        );
+                    }
+                }
+
+                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
+                    1
+                } else {
+                    10
+                }))
+                .await;
+            }
+        });
+    }
+
+    /// Median (over all peers, unresponsive peers counted as `0`) of the
+    /// most recent `BlockCount` votes, mirroring
+    /// `Wallet::consensus_block_count` (but `u64`-valued since EVM block
+    /// numbers do not fit the wallet's `u32` bitcoin block heights).
+    pub async fn consensus_block_count(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
+        let peer_count = self.num_peers.total();
+
+        let mut counts = dbtx
+            .find_by_prefix(&BlockCountVotePrefix)
+            .await
+            .map(|entry| entry.1)
+            .collect::<Vec<u64>>()
+            .await;
+
+        while counts.len() < peer_count {
+            counts.push(0);
+        }
+
+        counts.sort_unstable();
+
+        counts[peer_count / 2]
     }
 }
 
@@ -458,6 +644,132 @@ mod tests {
         assert_eq!(client_cfg.usdt_contract, params.usdt_contract);
         assert_eq!(client_cfg.confirmation_depth, 6);
         assert_eq!(client_cfg.chain_id, 1);
+    }
+
+    /// A no-op [`IServerEvmRpc`] sufficient for constructing a [`Usdt`]
+    /// module in tests that exercise consensus logic (block-count
+    /// median/redundancy) rather than EVM-RPC-driven behavior. This is
+    /// deliberately separate from `fedimint-usdt-tests`' scriptable
+    /// `MockEvmRpc`: `fedimint-usdt-server` cannot depend on
+    /// `fedimint-usdt-tests` (which itself depends on this crate) without a
+    /// dependency cycle.
+    #[derive(Debug, Default)]
+    struct MockEvmRpc;
+
+    #[async_trait::async_trait]
+    impl crate::rpc::IServerEvmRpc for MockEvmRpc {
+        async fn get_chain_id(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+
+        async fn get_block_number(&self) -> anyhow::Result<u64> {
+            Ok(0)
+        }
+
+        async fn get_erc20_balance(
+            &self,
+            _token: fedimint_usdt_common::EvmAddress,
+            _holder: fedimint_usdt_common::EvmAddress,
+            _at_block: u64,
+        ) -> anyhow::Result<fedimint_usdt_common::UsdtAmount> {
+            Ok(fedimint_usdt_common::UsdtAmount(0))
+        }
+
+        async fn get_fee_estimate(&self) -> anyhow::Result<fedimint_usdt_common::FeeVote> {
+            Ok(fedimint_usdt_common::FeeVote {
+                max_fee_per_gas_wei: 0,
+                usdt_per_eth_e6: 0,
+            })
+        }
+
+        async fn get_code_len(
+            &self,
+            _addr: fedimint_usdt_common::EvmAddress,
+        ) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn send_raw_transaction(&self, _signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]> {
+            Ok([0u8; 32])
+        }
+    }
+
+    /// Builds a [`Usdt`] module (via [`Usdt::new_for_test`], so no poller
+    /// task is spawned) over a fresh in-memory database, backed by a
+    /// trusted-dealer-generated config for `num_peers` guardians, acting as
+    /// peer 0, with its block-count cache pre-seeded to `cached_head`.
+    ///
+    /// `async` for parity with the module's other async test helpers/callers
+    /// (`test_module_with_block_count(..).await`), even though this
+    /// particular helper has no `.await` point of its own today.
+    #[allow(clippy::unused_async)]
+    async fn test_module_with_block_count(num_peers: u16, cached_head: u64) -> Usdt {
+        let peers = (0..num_peers).map(PeerId::from).collect::<Vec<_>>();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let server_cfgs = UsdtInit.trusted_dealer_gen(
+            &peers,
+            &args,
+            &fedimint_usdt_common::UsdtGenParams::default(),
+        );
+        let cfg = server_cfgs[&peers[0]]
+            .clone()
+            .to_typed::<UsdtConfig>()
+            .expect("config was just generated by the same configgen");
+
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+
+        let module = Usdt::new_for_test(
+            cfg,
+            MockEvmRpc.into_dyn(),
+            db,
+            PeerId::from(0),
+            peers.to_num_peers(),
+        );
+        module.block_count.store(cached_head, Ordering::Relaxed);
+        module
+    }
+
+    #[tokio::test]
+    async fn block_count_median_and_redundancy_guard() {
+        let module = test_module_with_block_count(4, 0).await; // 4 peers, cached head 0
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        // No votes → median 0.
+        assert_eq!(module.consensus_block_count(&mut dbtx.to_ref_nc()).await, 0);
+
+        // Three of four peers vote 100 → median (index 2 of sorted [0,100,100,100]) =
+        // 100.
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::BlockCount(100),
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            module.consensus_block_count(&mut dbtx.to_ref_nc()).await,
+            100
+        );
+
+        // Re-submitting the same or lower vote is rejected (unbounded-history rule).
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::BlockCount(100),
+                PeerId::from(0),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("redundant"));
     }
 }
 
