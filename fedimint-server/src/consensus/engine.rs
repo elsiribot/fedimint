@@ -47,6 +47,7 @@ use crate::consensus::db::{
     SignedSessionOutcomeKey, SignedSessionOutcomePrefix,
 };
 use crate::consensus::debug::{DebugConsensusItem, DebugConsensusItemCompact};
+use crate::db::ConfigGenerationLogKey;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
 use crate::metrics::{
     CONSENSUS_ITEM_PROCESSING_DURATION_SECONDS,
@@ -1062,10 +1063,23 @@ impl ConsensusEngine {
 
                 Ok(())
             }
-            ConsensusItem::ConfigGen(_) => {
-                // Processing is added together with the persisted generation
-                // state machine; until then reject deterministically.
-                bail!("Config generation items are not processed yet");
+            ConsensusItem::ConfigGen(config_gen_item) => {
+                let mut generation_log = dbtx
+                    .get_value(&ConfigGenerationLogKey)
+                    .await
+                    .unwrap_or_default();
+
+                crate::consensus::config_gen::process_item(
+                    self.num_peers(),
+                    &mut generation_log,
+                    config_gen_item,
+                    peer_id,
+                )?;
+
+                dbtx.insert_entry(&ConfigGenerationLogKey, &generation_log)
+                    .await;
+
+                Ok(())
             }
             ConsensusItem::Default { variant, .. } => {
                 warn!(

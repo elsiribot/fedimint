@@ -20,6 +20,7 @@ pub enum DbKeyPrefix {
     ApiAnnouncements = 0x06,
     ServerInfo = 0x07,
     GuardianMetadata = 0x08,
+    ConfigGeneration = 0x09,
 
     DatabaseVersion = fedimint_core::db::DbKeyPrefix::DatabaseVersion as u8,
     ClientBackup = fedimint_core::db::DbKeyPrefix::ClientBackup as u8,
@@ -67,4 +68,17 @@ impl_db_record!(
     value = ServerInfo,
     db_prefix = DbKeyPrefix::ServerInfo,
     notify_on_modify = false,
+);
+
+/// The [`crate::consensus::config_gen::GenerationLog`] tracking all module
+/// config generations, updated in the same transaction as the consensus
+/// items driving it.
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct ConfigGenerationLogKey;
+
+impl_db_record!(
+    key = ConfigGenerationLogKey,
+    value = crate::consensus::config_gen::GenerationLog,
+    db_prefix = DbKeyPrefix::ConfigGeneration,
+    notify_on_modify = true,
 );
