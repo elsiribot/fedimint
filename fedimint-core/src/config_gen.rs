@@ -97,6 +97,12 @@ pub enum ConfigGenItem {
         consensus_config: ServerModuleConsensusConfig,
         encrypted_private_config: Vec<u8>,
     },
+    /// Activate a completed generation as a module instance. On acceptance
+    /// the generation is deterministically assigned the next module
+    /// instance id and an activation session a safe margin after the item's
+    /// own session; every guardian schedules a restart before that session
+    /// and loads the module on startup.
+    Activate { generation_id: ModuleGenerationId },
     /// Abort the currently proposed generation. Any single guardian may
     /// abort; retrying requires a new proposal under a fresh id.
     Abort {

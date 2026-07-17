@@ -27,8 +27,8 @@ use fedimint_core::db::{
 #[allow(deprecated)]
 use fedimint_core::endpoint_constants::AWAIT_OUTPUT_OUTCOME_ENDPOINT;
 use fedimint_core::endpoint_constants::{
-    ABORT_MODULE_GENERATION_ENDPOINT, API_ANNOUNCEMENTS_ENDPOINT,
-    APPROVE_MODULE_GENERATION_ENDPOINT, AUDIT_ENDPOINT, AUTH_ENDPOINT,
+    ABORT_MODULE_GENERATION_ENDPOINT, ACTIVATE_MODULE_GENERATION_ENDPOINT,
+    API_ANNOUNCEMENTS_ENDPOINT, APPROVE_MODULE_GENERATION_ENDPOINT, AUDIT_ENDPOINT, AUTH_ENDPOINT,
     AWAIT_OUTPUTS_OUTCOMES_ENDPOINT, AWAIT_SESSION_OUTCOME_ENDPOINT,
     AWAIT_SIGNED_SESSION_OUTCOME_ENDPOINT, AWAIT_TRANSACTION_ENDPOINT, BACKUP_ENDPOINT,
     BACKUP_STATISTICS_ENDPOINT, CHAIN_ID_ENDPOINT, CLIENT_CONFIG_ENDPOINT,
@@ -75,7 +75,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::io::{CONSENSUS_CONFIG, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG};
 use crate::config::{ServerConfig, legacy_consensus_config_hash};
-use crate::consensus::config_gen::GenerationLog;
+use crate::consensus::config_gen::{GenerationLog, GenerationState};
 use crate::consensus::db::{AcceptedItemPrefix, AcceptedTransactionKey, SignedSessionOutcomeKey};
 use crate::consensus::engine::get_finished_session_count_static;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
@@ -1103,6 +1103,26 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
                 }
                 fedimint
                     .submit_config_gen_item(ConfigGenItem::Approve { generation_id })
+                    .await;
+                Ok(())
+            }
+        },
+        api_endpoint! {
+            ACTIVATE_MODULE_GENERATION_ENDPOINT,
+            ApiVersion::new(0, 10),
+            async |fedimint: &ConsensusApi, context, generation_id: ModuleGenerationId| -> () {
+                check_auth(context)?;
+                let log = fedimint.generation_log().await;
+                match log.generations().get(&generation_id) {
+                    Some(GenerationState::Generated { .. }) => {}
+                    _ => {
+                        return Err(ApiError::bad_request(format!(
+                            "No generated {generation_id} to activate"
+                        )));
+                    }
+                }
+                fedimint
+                    .submit_config_gen_item(ConfigGenItem::Activate { generation_id })
                     .await;
                 Ok(())
             }

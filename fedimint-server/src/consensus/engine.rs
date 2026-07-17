@@ -10,7 +10,8 @@ use async_channel::Receiver;
 use fedimint_api_client::api::{DynGlobalApi, FederationApiExt, ServerError};
 use fedimint_api_client::query::FilterMap;
 use fedimint_core::config::P2PMessage;
-use fedimint_core::core::{DynOutput, MODULE_INSTANCE_ID_GLOBAL};
+use fedimint_core::config_gen::ConfigGenItem;
+use fedimint_core::core::{DynInput, DynOutput, MODULE_INSTANCE_ID_GLOBAL, ModuleInstanceId};
 use fedimint_core::db::{Database, DatabaseTransaction, IDatabaseTransactionOpsCoreTyped};
 use fedimint_core::encoding::Decodable;
 use fedimint_core::endpoint_constants::AWAIT_SIGNED_SESSION_OUTCOME_ENDPOINT;
@@ -42,6 +43,7 @@ use crate::consensus::aleph_bft::keychain::Keychain;
 use crate::consensus::aleph_bft::network::Network;
 use crate::consensus::aleph_bft::spawner::Spawner;
 use crate::consensus::aleph_bft::to_node_index;
+use crate::consensus::config_gen::GenerationState;
 use crate::consensus::db::{
     AcceptedItemKey, AcceptedItemPrefix, AcceptedTransactionKey, AlephUnitsPrefix,
     SignedSessionOutcomeKey, SignedSessionOutcomePrefix,
@@ -67,8 +69,13 @@ pub struct ConsensusEngine {
     pub cfg: ServerConfig,
     pub submission_receiver: Receiver<ConsensusItem>,
     pub shutdown_receiver: watch::Receiver<Option<u64>>,
+    /// Used to schedule the coordinated restart activating a module
+    pub shutdown_sender: watch::Sender<Option<u64>>,
     /// Forwards runtime DKG messages to the config generation worker
     pub config_gen_sender: async_channel::Sender<(PeerId, P2PMessage)>,
+    /// Activation sessions of dynamically added modules; their items are
+    /// rejected in earlier sessions
+    pub dynamic_module_activation: BTreeMap<ModuleInstanceId, u64>,
     pub connections: DynP2PConnections<P2PMessage>,
     pub ci_status_senders: BTreeMap<PeerId, watch::Sender<Option<u64>>>,
     pub ord_latency_sender: watch::Sender<Option<Duration>>,
@@ -85,6 +92,33 @@ impl ConsensusEngine {
 
     fn identity(&self) -> PeerId {
         self.cfg.local.identity
+    }
+
+    /// First instance id available for dynamically added modules, one above
+    /// the highest statically configured instance id.
+    fn dynamic_instance_id_base(&self) -> ModuleInstanceId {
+        self.cfg
+            .consensus
+            .modules
+            .keys()
+            .max()
+            .map_or(0, |max_static_id| max_static_id + 1)
+    }
+
+    /// Rejects items of dynamically added modules before their activation
+    /// session.
+    fn ensure_module_active(
+        &self,
+        instance_id: ModuleInstanceId,
+        session_index: u64,
+    ) -> anyhow::Result<()> {
+        if let Some(active_from_session) = self.dynamic_module_activation.get(&instance_id)
+            && session_index < *active_from_session
+        {
+            bail!("Module {instance_id} is not active until session {active_from_session}");
+        }
+
+        Ok(())
     }
 
     #[instrument(target = LOG_CONSENSUS, name = "run", skip_all, fields(id=%self.cfg.local.identity))]
@@ -927,18 +961,23 @@ impl ConsensusEngine {
             );
         }
 
-        self.process_consensus_item_with_db_transaction(&mut dbtx.to_ref_nc(), item.clone(), peer)
-            .await
-            .inspect_err(|err| {
-                // Rejected items are very common, so only trace level
-                trace!(
-                    target: LOG_CONSENSUS,
-                    %peer,
-                    item = ?DebugConsensusItem(&item),
-                    err = %err.fmt_compact_anyhow(),
-                    "Rejected consensus item"
-                );
-            })?;
+        self.process_consensus_item_with_db_transaction(
+            &mut dbtx.to_ref_nc(),
+            item.clone(),
+            peer,
+            session_index,
+        )
+        .await
+        .inspect_err(|err| {
+            // Rejected items are very common, so only trace level
+            trace!(
+                target: LOG_CONSENSUS,
+                %peer,
+                item = ?DebugConsensusItem(&item),
+                err = %err.fmt_compact_anyhow(),
+                "Rejected consensus item"
+            );
+        })?;
 
         // After this point we have to commit the database transaction since the
         // item has been fully processed without errors
@@ -1013,6 +1052,7 @@ impl ConsensusEngine {
         dbtx: &mut DatabaseTransaction<'_>,
         consensus_item: ConsensusItem,
         peer_id: PeerId,
+        session_index: u64,
     ) -> anyhow::Result<()> {
         // We rely on decoding rejecting any unknown module instance ids to avoid
         // peer-triggered panic here
@@ -1022,6 +1062,8 @@ impl ConsensusEngine {
             ConsensusItem::Module(module_item) => {
                 let instance_id = module_item.module_instance_id();
 
+                self.ensure_module_active(instance_id, session_index)?;
+
                 let module_dbtx = &mut dbtx.to_ref_with_prefix_module_id(instance_id).0;
 
                 self.modules
@@ -1030,6 +1072,20 @@ impl ConsensusEngine {
                     .await
             }
             ConsensusItem::Transaction(transaction) => {
+                for instance_id in transaction
+                    .inputs
+                    .iter()
+                    .map(DynInput::module_instance_id)
+                    .chain(
+                        transaction
+                            .outputs
+                            .iter()
+                            .map(DynOutput::module_instance_id),
+                    )
+                {
+                    self.ensure_module_active(instance_id, session_index)?;
+                }
+
                 let txid = transaction.tx_hash();
                 if dbtx
                     .get_value(&AcceptedTransactionKey(txid))
@@ -1073,14 +1129,39 @@ impl ConsensusEngine {
                     .unwrap_or_default();
 
                 crate::consensus::config_gen::process_item(
-                    self.num_peers(),
+                    crate::consensus::config_gen::ProcessItemContext {
+                        num_peers: self.num_peers(),
+                        instance_id_base: self.dynamic_instance_id_base(),
+                        session_index,
+                    },
                     &mut generation_log,
-                    config_gen_item,
+                    config_gen_item.clone(),
                     peer_id,
                 )?;
 
                 dbtx.insert_entry(&ConfigGenerationLogKey, &generation_log)
                     .await;
+
+                // An accepted activation requires every guardian to restart
+                // before the activation session in order to load the module
+                if let ConfigGenItem::Activate { generation_id } = config_gen_item
+                    && let Some(GenerationState::Active {
+                        instance_id,
+                        active_from_session,
+                        ..
+                    }) = generation_log.generations().get(&generation_id)
+                {
+                    info!(
+                        target: LOG_CONSENSUS,
+                        %generation_id,
+                        instance_id,
+                        active_from_session,
+                        "Module activated, scheduling restart before activation session"
+                    );
+
+                    self.shutdown_sender
+                        .send_replace(Some(active_from_session.saturating_sub(1)));
+                }
 
                 Ok(())
             }

@@ -15,8 +15,9 @@ use fedimint_core::config_gen::{
 };
 use fedimint_core::core::ModuleKind;
 use fedimint_core::endpoint_constants::{
-    ABORT_MODULE_GENERATION_ENDPOINT, APPROVE_MODULE_GENERATION_ENDPOINT,
-    MODULE_GENERATIONS_ENDPOINT, PROPOSE_MODULE_GENERATION_ENDPOINT,
+    ABORT_MODULE_GENERATION_ENDPOINT, ACTIVATE_MODULE_GENERATION_ENDPOINT,
+    APPROVE_MODULE_GENERATION_ENDPOINT, AUDIT_ENDPOINT, MODULE_GENERATIONS_ENDPOINT,
+    PROPOSE_MODULE_GENERATION_ENDPOINT, SESSION_COUNT_ENDPOINT,
 };
 use fedimint_core::module::{ApiAuth, ApiRequestErased};
 use fedimint_core::task::sleep_in_test;
@@ -183,6 +184,101 @@ async fn generates_mint_config_on_running_federation() -> anyhow::Result<()> {
         target: LOG_TEST,
         "All peers generated identical mint consensus config; private config recoverable"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activated_module_runs_after_restart() -> anyhow::Result<()> {
+    let fixtures = Fixtures::new_primary(MintClientInit, MintInit);
+    let mut fed = fixtures.new_fed_not_degraded().await;
+
+    let mut apis = Vec::new();
+    for peer in 0..NUM_PEERS {
+        apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
+    }
+
+    let generation_id = propose(&apis, "mint").await;
+
+    approve_all(&apis, generation_id).await;
+
+    for api in &apis {
+        await_state(api, generation_id, "Generated").await;
+    }
+
+    // Activation schedules a coordinated restart on every guardian before
+    // the activation session
+    apis[0]
+        .request_admin::<()>(
+            ACTIVATE_MODULE_GENERATION_ENDPOINT,
+            ApiRequestErased::new(generation_id),
+            auth(),
+        )
+        .await?;
+
+    let active = await_state(&apis[0], generation_id, "Active").await;
+
+    let instance_id = active["instance_id"]
+        .as_u64()
+        .expect("instance id is a number");
+    let active_from_session = active["active_from_session"]
+        .as_u64()
+        .expect("activation session is a number");
+
+    info!(
+        target: LOG_TEST,
+        instance_id,
+        active_from_session,
+        "Module activated, waiting for the scheduled shutdown"
+    );
+
+    for api in &apis {
+        while api
+            .request_admin_no_auth::<u64>(SESSION_COUNT_ENDPOINT, ApiRequestErased::default())
+            .await
+            .is_ok()
+        {
+            sleep_in_test(
+                "Waiting for peer to shut down for activation",
+                Duration::from_millis(200),
+            )
+            .await;
+        }
+    }
+
+    fed.restart_all_peers().await;
+
+    // The dynamically added mint instance is now part of the running
+    // federation: it shows up in the guardian audit...
+    let audit: serde_json::Value = apis[0]
+        .request_admin(AUDIT_ENDPOINT, ApiRequestErased::default(), auth())
+        .await?;
+
+    let module_summary = audit["module_summaries"][instance_id.to_string()].clone();
+
+    assert!(
+        module_summary.is_object(),
+        "Audit is missing the activated module: {audit}"
+    );
+
+    // ...and consensus keeps advancing past the activation session
+    loop {
+        let session_count: u64 = apis[0]
+            .request_admin_no_auth(SESSION_COUNT_ENDPOINT, ApiRequestErased::default())
+            .await?;
+
+        if session_count > active_from_session {
+            break;
+        }
+
+        sleep_in_test(
+            "Waiting for consensus to advance past activation",
+            Duration::from_millis(200),
+        )
+        .await;
+    }
+
+    info!(target: LOG_TEST, "Dynamically added module is live after restart");
 
     Ok(())
 }

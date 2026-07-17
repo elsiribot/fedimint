@@ -20,9 +20,15 @@ use fedimint_core::config_gen::{
     ConfigGenAbortReason, ConfigGenItem, MAX_ENCRYPTED_PRIVATE_CONFIG_BYTES, ModuleConfigProposal,
     ModuleGenerationId,
 };
+use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::{NumPeers, PeerId};
 use serde::Serialize;
+
+/// Sessions between accepting an activation and the module becoming
+/// active, leaving guardians time to process the item and schedule their
+/// restart before the activation session starts.
+pub const ACTIVATION_SESSION_MARGIN: u64 = 2;
 
 /// State of a single module config generation attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Encodable, Decodable, Serialize)]
@@ -40,14 +46,23 @@ pub enum GenerationState {
         proposal: ModuleConfigProposal,
         results: BTreeMap<PeerId, GenerationResult>,
     },
-    /// Every guardian reported an identical consensus config. Terminal
-    /// until activation lands in a later phase. The encrypted private
-    /// configs are retained so a recovering guardian can fetch and decrypt
-    /// its own from any peer.
+    /// Every guardian reported an identical consensus config; the module
+    /// can be activated. The encrypted private configs are retained so a
+    /// recovering guardian can fetch and decrypt its own from any peer.
     Generated {
         proposal: ModuleConfigProposal,
         consensus_config: ServerModuleConsensusConfig,
         encrypted_private_configs: BTreeMap<PeerId, Vec<u8>>,
+    },
+    /// Scheduled to run as a module instance from `active_from_session` on.
+    /// Every guardian restarts before that session and loads the module on
+    /// startup; module items are rejected in earlier sessions.
+    Active {
+        proposal: ModuleConfigProposal,
+        consensus_config: ServerModuleConsensusConfig,
+        encrypted_private_configs: BTreeMap<PeerId, Vec<u8>>,
+        instance_id: ModuleInstanceId,
+        active_from_session: u64,
     },
     /// Aborted by a guardian. Terminal; retrying requires a fresh proposal
     /// under a new generation id.
@@ -96,6 +111,54 @@ impl GenerationLog {
             .iter()
             .find_map(|(id, state)| state.is_pending().then_some(*id))
     }
+
+    /// All activated generations as dynamic module instances, in instance
+    /// id order.
+    pub fn active_modules(&self) -> Vec<ActiveModule> {
+        let mut modules = self
+            .generations
+            .iter()
+            .filter_map(|(generation_id, state)| match state {
+                GenerationState::Active {
+                    consensus_config,
+                    instance_id,
+                    active_from_session,
+                    ..
+                } => Some(ActiveModule {
+                    generation_id: *generation_id,
+                    instance_id: *instance_id,
+                    active_from_session: *active_from_session,
+                    consensus_config: consensus_config.clone(),
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        modules.sort_by_key(|module| module.instance_id);
+
+        modules
+    }
+}
+
+/// An activated generation running as a dynamic module instance.
+#[derive(Debug, Clone)]
+pub struct ActiveModule {
+    pub generation_id: ModuleGenerationId,
+    pub instance_id: ModuleInstanceId,
+    pub active_from_session: u64,
+    pub consensus_config: ServerModuleConsensusConfig,
+}
+
+/// Consensus context an item is processed in. All fields are identical on
+/// every honest peer at the same item position.
+#[derive(Debug, Copy, Clone)]
+pub struct ProcessItemContext {
+    pub num_peers: NumPeers,
+    /// First instance id available for dynamic modules, one above the
+    /// highest statically configured instance id.
+    pub instance_id_base: ModuleInstanceId,
+    /// The session the item was ordered in.
+    pub session_index: u64,
 }
 
 /// Applies one consensus item contributed by `peer` to the log.
@@ -103,7 +166,7 @@ impl GenerationLog {
 /// Returns an error to deterministically reject the item, leaving the log
 /// untouched.
 pub fn process_item(
-    num_peers: NumPeers,
+    ctx: ProcessItemContext,
     log: &mut GenerationLog,
     item: ConfigGenItem,
     peer: PeerId,
@@ -152,7 +215,7 @@ pub fn process_item(
                 "Duplicate approval for {generation_id} by {peer}"
             );
 
-            if approvals.len() == num_peers.total() {
+            if approvals.len() == ctx.num_peers.total() {
                 *state = GenerationState::Approved {
                     proposal: proposal.clone(),
                     results: BTreeMap::new(),
@@ -208,7 +271,7 @@ pub fn process_item(
                 "Duplicate result for {generation_id} by {peer}"
             );
 
-            if results.len() == num_peers.total() {
+            if results.len() == ctx.num_peers.total() {
                 let encrypted_private_configs = results
                     .iter()
                     .map(|(peer, result)| (*peer, result.encrypted_private_config.clone()))
@@ -220,6 +283,38 @@ pub fn process_item(
                     encrypted_private_configs,
                 };
             }
+        }
+        ConfigGenItem::Activate { generation_id } => {
+            let next_instance_id = ctx.instance_id_base
+                + u16::try_from(
+                    log.generations
+                        .values()
+                        .filter(|state| matches!(state, GenerationState::Active { .. }))
+                        .count(),
+                )
+                .expect("Active generation count fits u16");
+
+            let state = log
+                .generations
+                .get_mut(&generation_id)
+                .with_context(|| format!("Activation for unknown {generation_id}"))?;
+
+            let GenerationState::Generated {
+                proposal,
+                consensus_config,
+                encrypted_private_configs,
+            } = state
+            else {
+                bail!("Activation for {generation_id} which is not generated");
+            };
+
+            *state = GenerationState::Active {
+                proposal: proposal.clone(),
+                consensus_config: consensus_config.clone(),
+                encrypted_private_configs: encrypted_private_configs.clone(),
+                instance_id: next_instance_id,
+                active_from_session: ctx.session_index + ACTIVATION_SESSION_MARGIN,
+            };
         }
         ConfigGenItem::Abort {
             generation_id,
@@ -252,6 +347,14 @@ mod tests {
 
     const NUM_PEERS_TOTAL: usize = 4;
 
+    fn test_ctx() -> ProcessItemContext {
+        ProcessItemContext {
+            num_peers: NumPeers::from(NUM_PEERS_TOTAL),
+            instance_id_base: 10,
+            session_index: 5,
+        }
+    }
+
     fn proposal() -> ModuleConfigProposal {
         ModuleConfigProposal {
             module_kind: ModuleKind::from_static_str("mint"),
@@ -263,7 +366,7 @@ mod tests {
 
     fn propose(log: &mut GenerationLog, id: u64, peer: u16) -> anyhow::Result<()> {
         process_item(
-            NumPeers::from(NUM_PEERS_TOTAL),
+            test_ctx(),
             log,
             ConfigGenItem::Propose {
                 generation_id: ModuleGenerationId(id),
@@ -275,7 +378,7 @@ mod tests {
 
     fn approve(log: &mut GenerationLog, id: u64, peer: u16) -> anyhow::Result<()> {
         process_item(
-            NumPeers::from(NUM_PEERS_TOTAL),
+            test_ctx(),
             log,
             ConfigGenItem::Approve {
                 generation_id: ModuleGenerationId(id),
@@ -294,7 +397,7 @@ mod tests {
 
     fn result(log: &mut GenerationLog, id: u64, peer: u16, config: &[u8]) -> anyhow::Result<()> {
         process_item(
-            NumPeers::from(NUM_PEERS_TOTAL),
+            test_ctx(),
             log,
             ConfigGenItem::Result {
                 generation_id: ModuleGenerationId(id),
@@ -313,7 +416,7 @@ mod tests {
 
     fn abort(log: &mut GenerationLog, id: u64, peer: u16) -> anyhow::Result<()> {
         process_item(
-            NumPeers::from(NUM_PEERS_TOTAL),
+            test_ctx(),
             log,
             ConfigGenItem::Abort {
                 generation_id: ModuleGenerationId(id),
@@ -443,7 +546,7 @@ mod tests {
 
         assert!(
             process_item(
-                NumPeers::from(NUM_PEERS_TOTAL),
+                test_ctx(),
                 &mut log,
                 ConfigGenItem::Result {
                     generation_id: ModuleGenerationId(0),
@@ -504,6 +607,70 @@ mod tests {
             log.generations()[&ModuleGenerationId(0)],
             GenerationState::Aborted { .. }
         ));
+    }
+
+    fn activate(log: &mut GenerationLog, id: u64, peer: u16) -> anyhow::Result<()> {
+        process_item(
+            test_ctx(),
+            log,
+            ConfigGenItem::Activate {
+                generation_id: ModuleGenerationId(id),
+            },
+            PeerId::from(peer),
+        )
+    }
+
+    fn generate(log: &mut GenerationLog, id: u64) {
+        propose(log, id, 0).expect("proposal accepted");
+        approve_all(log, id);
+        for peer in 0..NUM_PEERS_TOTAL as u16 {
+            result(log, id, peer, b"config").expect("result accepted");
+        }
+    }
+
+    #[test]
+    fn activation_assigns_monotonic_instance_ids() {
+        let mut log = GenerationLog::default();
+
+        generate(&mut log, 0);
+        activate(&mut log, 0, 3).expect("activation accepted");
+
+        generate(&mut log, 1);
+        activate(&mut log, 1, 0).expect("activation accepted");
+
+        let modules = log.active_modules();
+
+        assert_eq!(modules.len(), 2);
+        // Instance ids start at the context's base and never repeat
+        assert_eq!(modules[0].instance_id, 10);
+        assert_eq!(modules[1].instance_id, 11);
+        // Activation lies a safe margin after the item's session
+        assert_eq!(
+            modules[0].active_from_session,
+            test_ctx().session_index + ACTIVATION_SESSION_MARGIN
+        );
+    }
+
+    #[test]
+    fn rejects_activation_of_non_generated_generation() {
+        let mut log = GenerationLog::default();
+
+        propose(&mut log, 0, 0).expect("proposal accepted");
+
+        // Not yet generated
+        assert!(activate(&mut log, 0, 0).is_err());
+
+        approve_all(&mut log, 0);
+        assert!(activate(&mut log, 0, 0).is_err());
+
+        for peer in 0..NUM_PEERS_TOTAL as u16 {
+            result(&mut log, 0, peer, b"config").expect("result accepted");
+        }
+
+        activate(&mut log, 0, 0).expect("activation accepted");
+
+        // Already active
+        assert!(activate(&mut log, 0, 1).is_err());
     }
 
     #[test]

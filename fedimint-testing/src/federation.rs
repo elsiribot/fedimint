@@ -37,11 +37,14 @@ use tracing::info;
 #[derive(Clone)]
 pub struct FederationTest {
     configs: BTreeMap<PeerId, ServerConfig>,
+    databases: BTreeMap<PeerId, Database>,
     server_init: ServerModuleInitRegistry,
     client_init: ClientModuleInitRegistry,
-    _task: TaskGroup,
+    task: TaskGroup,
     num_peers: u16,
     num_offline: u16,
+    base_port: u16,
+    bitcoin_rpc: DynServerBitcoinRpc,
     connectors: ConnectorRegistry,
 }
 
@@ -81,13 +84,68 @@ impl FederationTest {
         .await
     }
 
-    /// Create a new admin api for the given PeerId
     /// Returns a peer's full server config, e.g. to derive its secrets in
     /// tests
     pub fn server_config(&self, peer_id: PeerId) -> &ServerConfig {
         self.configs.get(&peer_id).expect("peer to have config")
     }
 
+    /// Waits until every online peer's api answers requests
+    pub async fn await_apis_online(&self) {
+        for peer_id in self.online_peer_ids() {
+            let api = self
+                .new_admin_api(peer_id)
+                .await
+                .expect("Failed to create admin api");
+
+            while let Err(e) = api
+                .request_admin_no_auth::<u64>(SESSION_COUNT_ENDPOINT, ApiRequestErased::default())
+                .await
+            {
+                sleep_in_test(
+                    format!("Waiting for api of peer {peer_id} to come online: {e}"),
+                    Duration::from_millis(500),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Stops all peers and starts them again with their existing databases
+    /// and configs, e.g. to activate a dynamically generated module.
+    pub async fn restart_all_peers(&mut self) {
+        info!(target: LOG_TEST, "Restarting all federation peers");
+
+        self.task
+            .clone()
+            .shutdown_join_all(Duration::from_secs(60))
+            .await
+            .expect("Could not shut down federation cleanly");
+
+        let task_group = TaskGroup::new();
+
+        for (peer_id, cfg) in self.configs.clone() {
+            if u16::from(peer_id) >= self.num_peers - self.num_offline {
+                continue;
+            }
+
+            start_peer(
+                cfg,
+                self.databases[&peer_id].clone(),
+                self.server_init.clone(),
+                self.base_port,
+                &task_group,
+                self.bitcoin_rpc.clone(),
+            )
+            .await;
+        }
+
+        self.task = task_group;
+
+        self.await_apis_online().await;
+    }
+
+    /// Create a new admin api for the given PeerId
     pub async fn new_admin_api(&self, peer_id: PeerId) -> anyhow::Result<DynGlobalApi> {
         let config = self.configs.get(&peer_id).expect("peer to have config");
 
@@ -339,13 +397,8 @@ impl FederationTestBuilder {
             ServerConfig::trusted_dealer_gen(&params, &self.server_init, &self.version_hash);
 
         let task_group = TaskGroup::new();
+        let mut databases = BTreeMap::new();
         for (peer_id, cfg) in configs.clone() {
-            let peer_port = self.base_port + u16::from(peer_id) * 3;
-
-            let p2p_bind = format!("127.0.0.1:{peer_port}").parse().unwrap();
-            let api_bind = format!("127.0.0.1:{}", peer_port + 1).parse().unwrap();
-            let ui_bind = format!("127.0.0.1:{}", peer_port + 2).parse().unwrap();
-
             if u16::from(peer_id) >= self.num_peers - self.num_offline {
                 continue;
             }
@@ -353,111 +406,113 @@ impl FederationTestBuilder {
             let instances = cfg.consensus.iter_module_instances();
             let decoders = self.server_init.available_decoders(instances).unwrap();
             let db = Database::new(MemDatabase::new(), decoders);
-            let module_init_registry = self.server_init.clone();
-            let subgroup = task_group.make_subgroup();
-            let checkpoint_dir = tempfile::Builder::new().tempdir().unwrap().keep();
-            let code_version_str = env!("CARGO_PKG_VERSION");
+            databases.insert(peer_id, db.clone());
 
-            let connector = TlsTcpConnector::new(
-                cfg.tls_config(),
-                p2p_bind,
-                cfg.local.p2p_endpoints.clone(),
-                cfg.local.identity,
-            )
-            .await
-            .into_dyn();
-
-            let (p2p_status_senders, p2p_status_receivers) = p2p_status_channels(connector.peers());
-
-            let connections = ReconnectP2PConnections::new(
-                cfg.local.identity,
-                connector,
+            start_peer(
+                cfg,
+                db,
+                self.server_init.clone(),
+                self.base_port,
                 &task_group,
-                p2p_status_senders,
+                self.bitcoin_rpc_connection.clone(),
             )
-            .into_dyn();
-
-            let bitcoin_rpc_connection = self.bitcoin_rpc_connection.clone();
-
-            task_group.spawn("fedimintd", move |_| async move {
-                Box::pin(consensus::run(
-                    ConnectorRegistry::build_from_testing_env()
-                        .unwrap()
-                        .bind()
-                        .await
-                        .unwrap(),
-                    Some(ApiAuth::new("pass".to_string())),
-                    Some(ApiAuth::new("pass".to_string())),
-                    connections,
-                    p2p_status_receivers,
-                    api_bind,
-                    None,
-                    vec![],
-                    cfg.clone(),
-                    db.clone(),
-                    module_init_registry,
-                    &subgroup,
-                    ApiSecrets::default(),
-                    checkpoint_dir,
-                    code_version_str.to_string(),
-                    String::new(),
-                    bitcoin_rpc_connection,
-                    ui_bind,
-                    Box::new(|_| axum::Router::new()),
-                    1,
-                    Duration::from_secs(3600),
-                    ConnectionLimits {
-                        max_connections: 1000,
-                        max_requests_per_connection: 100,
-                    },
-                ))
-                .await
-                .expect("Could not initialise consensus");
-            });
+            .await;
         }
 
-        for (peer_id, config) in configs.clone() {
-            if u16::from(peer_id) >= self.num_peers - self.num_offline {
-                continue;
-            }
-
-            let connectors = ConnectorRegistry::build_from_testing_env()
-                .unwrap()
-                .bind()
-                .await
-                .unwrap();
-            let api = DynGlobalApi::new_admin(
-                connectors,
-                peer_id,
-                config.consensus.api_endpoints()[&peer_id].url.clone(),
-                None,
-            )
-            .unwrap();
-
-            while let Err(e) = api
-                .request_admin_no_auth::<u64>(SESSION_COUNT_ENDPOINT, ApiRequestErased::default())
-                .await
-            {
-                sleep_in_test(
-                    format!("Waiting for api of peer {peer_id} to come online: {e}"),
-                    Duration::from_millis(500),
-                )
-                .await;
-            }
-        }
-
-        FederationTest {
+        let fed = FederationTest {
             configs,
+            databases,
             server_init: self.server_init,
             client_init: self.client_init,
-            _task: task_group,
+            task: task_group,
             num_peers: self.num_peers,
             num_offline: self.num_offline,
+            base_port: self.base_port,
+            bitcoin_rpc: self.bitcoin_rpc_connection,
             connectors: ConnectorRegistry::build_from_testing_env()
                 .expect("Failed to initialize endpoints for testing (env)")
                 .bind()
                 .await
                 .expect("Failed to initialize endpoints for testing"),
-        }
+        };
+
+        fed.await_apis_online().await;
+
+        fed
     }
+}
+
+/// Starts one federation peer, used for the initial start and restarts.
+async fn start_peer(
+    cfg: ServerConfig,
+    db: Database,
+    server_init: ServerModuleInitRegistry,
+    base_port: u16,
+    task_group: &TaskGroup,
+    bitcoin_rpc: DynServerBitcoinRpc,
+) {
+    let peer_port = base_port + u16::from(cfg.local.identity) * 3;
+
+    let p2p_bind = format!("127.0.0.1:{peer_port}").parse().unwrap();
+    let api_bind = format!("127.0.0.1:{}", peer_port + 1).parse().unwrap();
+    let ui_bind = format!("127.0.0.1:{}", peer_port + 2).parse().unwrap();
+
+    let subgroup = task_group.make_subgroup();
+    let checkpoint_dir = tempfile::Builder::new().tempdir().unwrap().keep();
+    let code_version_str = env!("CARGO_PKG_VERSION");
+
+    let connector = TlsTcpConnector::new(
+        cfg.tls_config(),
+        p2p_bind,
+        cfg.local.p2p_endpoints.clone(),
+        cfg.local.identity,
+    )
+    .await
+    .into_dyn();
+
+    let (p2p_status_senders, p2p_status_receivers) = p2p_status_channels(connector.peers());
+
+    let connections = ReconnectP2PConnections::new(
+        cfg.local.identity,
+        connector,
+        task_group,
+        p2p_status_senders,
+    )
+    .into_dyn();
+
+    task_group.spawn("fedimintd", move |_| async move {
+        Box::pin(consensus::run(
+            ConnectorRegistry::build_from_testing_env()
+                .unwrap()
+                .bind()
+                .await
+                .unwrap(),
+            Some(ApiAuth::new("pass".to_string())),
+            Some(ApiAuth::new("pass".to_string())),
+            connections,
+            p2p_status_receivers,
+            api_bind,
+            None,
+            vec![],
+            cfg.clone(),
+            db.clone(),
+            server_init,
+            &subgroup,
+            ApiSecrets::default(),
+            checkpoint_dir,
+            code_version_str.to_string(),
+            String::new(),
+            bitcoin_rpc,
+            ui_bind,
+            Box::new(|_| axum::Router::new()),
+            1,
+            Duration::from_secs(3600),
+            ConnectionLimits {
+                max_connections: 1000,
+                max_requests_per_connection: 100,
+            },
+        ))
+        .await
+        .expect("Could not initialise consensus");
+    });
 }

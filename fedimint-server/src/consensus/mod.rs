@@ -20,7 +20,10 @@ use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::NumPeers;
 use fedimint_core::config::P2PMessage;
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
-use fedimint_core::db::{Database, apply_migrations_dbtx, verify_module_db_integrity_dbtx};
+use fedimint_core::db::{
+    Database, IDatabaseTransactionOpsCoreTyped, apply_migrations_dbtx,
+    verify_module_db_integrity_dbtx,
+};
 use fedimint_core::envs::is_running_in_test_env;
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::module::registry::ModuleRegistry;
@@ -187,12 +190,108 @@ pub async fn run(
         }
     }
 
+    // Load dynamically generated modules that were activated via consensus;
+    // see [`crate::consensus::config_gen`].
+    let generation_log = db
+        .begin_transaction_nc()
+        .await
+        .get_value(&crate::db::ConfigGenerationLogKey)
+        .await
+        .unwrap_or_default();
+
+    let dynamic_modules = generation_log.active_modules();
+
+    let db = if dynamic_modules.is_empty() {
+        db
+    } else {
+        // The database decoders have to know all dynamic modules, e.g. to
+        // decode module items in accepted consensus items on replay
+        db.with_decoders(
+            module_init_registry.available_decoders(
+                cfg.consensus.iter_module_instances().chain(
+                    dynamic_modules
+                        .iter()
+                        .map(|module| (module.instance_id, &module.consensus_config.kind)),
+                ),
+            )?,
+        )
+    };
+
+    let mut dynamic_module_activation = BTreeMap::new();
+
+    for dynamic_module in dynamic_modules {
+        let kind = dynamic_module.consensus_config.kind.clone();
+
+        let module_init = module_init_registry.get(&kind).ok_or_else(|| {
+            anyhow::anyhow!("Activated dynamic module of unsupported kind {kind}")
+        })?;
+
+        let outcome = db
+            .begin_transaction_nc()
+            .await
+            .get_value(&crate::db::LocalGenerationOutcomeKey(
+                dynamic_module.generation_id,
+            ))
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing local outcome for activated {}",
+                    dynamic_module.generation_id
+                )
+            })?;
+
+        info!(
+            target: LOG_CORE,
+            instance_id = dynamic_module.instance_id,
+            %kind,
+            active_from_session = dynamic_module.active_from_session,
+            "Initialise dynamic module..."
+        );
+
+        let mut dbtx = db.begin_transaction().await;
+        apply_migrations_dbtx(
+            &mut dbtx.to_ref_nc(),
+            Arc::new(ServerDbMigrationContext) as Arc<_>,
+            module_init.module_kind().to_string(),
+            module_init.get_database_migrations(),
+            Some(dynamic_module.instance_id),
+            None,
+        )
+        .await?;
+        dbtx.commit_tx_result().await?;
+
+        let module_cfg = fedimint_core::config::ServerModuleConfig::from(
+            serde_json::from_str(&outcome.private_json)?,
+            dynamic_module.consensus_config.clone(),
+        );
+
+        let module = module_init
+            .init(
+                NumPeers::from(cfg.consensus.api_endpoints().len()),
+                module_cfg,
+                db.with_prefix_module_id(dynamic_module.instance_id).0,
+                task_group,
+                cfg.local.identity,
+                global_api.with_module(dynamic_module.instance_id),
+                bitcoin_rpc_connection.clone(),
+            )
+            .await?;
+
+        modules.insert(dynamic_module.instance_id, (kind, module));
+
+        dynamic_module_activation.insert(
+            dynamic_module.instance_id,
+            dynamic_module.active_from_session,
+        );
+    }
+
     let module_registry = ModuleRegistry::from(modules);
 
     let client_cfg = cfg.consensus.to_client_config(&module_init_registry)?;
 
     let (submission_sender, submission_receiver) = async_channel::bounded(TRANSACTION_BUFFER);
     let (shutdown_sender, shutdown_receiver) = watch::channel(None);
+    let shutdown_sender_engine = shutdown_sender.clone();
     let (ord_latency_sender, ord_latency_receiver) = watch::channel(None);
     // Carries runtime DKG messages from the p2p receive loop to the config
     // generation manager.
@@ -341,7 +440,9 @@ pub async fn run(
         ci_status_senders,
         submission_receiver,
         shutdown_receiver,
+        shutdown_sender: shutdown_sender_engine,
         config_gen_sender,
+        dynamic_module_activation,
         modules: module_registry,
         task_group: task_group.clone(),
         data_dir,
