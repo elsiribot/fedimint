@@ -25,7 +25,8 @@
   - Unit: `cargo test -p fedimint-server config_gen` — state machine transitions + transport demultiplexing (13 tests)
   - E2E: `cargo test -p fedimint-mint-tests --test fedimint_mint_config_gen_tests` — real in-process federations (AlephBFT + p2p + api): full mint generation to `Generated` with identical configs on all peers, abort + retry under fresh id, unsupported-kind abort (3 tests, ~6s)
   - Regression: `just clippy` and the existing suite via `just test-ci-all` (new tests are ordinary cargo test targets, so CI picks them up automatically)
-- **Next:** Phase 3 (guardian root derivation + deterministic gen secrets + encrypted Result), Phase 4 (DB-resident configs + restart activation). devimint exercise deferred — the in-process e2e covers the full stack except process boundaries.
+- **Phase 3 (partial): DONE** — encrypted Result commitment: per-generation ChaCha20-Poly1305 keys derived from a domain-separated config-gen root (`consensus/config_gen/secrets.rs`), encrypted private configs carried in Result items (bounded at 40KB, below the 50KB aleph unit limit) and retained in `Generated` state for recovery; e2e test decrypts a peer's committed config from another peer's log. Root is derived from the broadcast secret key as a **placeholder for a guardian BIP39 mnemonic** — swapping the source only changes `config_gen_root()`. Still open from Phase 3: deterministic module-gen randomness (`ModuleConfigGenSecret` injected into `distributed_gen`, fixing wallet `OsRng` restart-sensitivity).
+- **Next:** Phase 3 remainder (deterministic gen randomness), Phase 4 (DB-resident module configs + instance-ID allocator + coordinated-restart activation), Phase 5 (client config revisions + attestation). devimint exercise deferred — the in-process e2e covers the full stack except process boundaries.
 
 ## Phasing (master plan)
 
