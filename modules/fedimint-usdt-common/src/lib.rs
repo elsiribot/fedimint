@@ -190,13 +190,17 @@ pub struct CheckDepositRequest {
     pub claim_pk: secp256k1::PublicKey,
 }
 
-/// Response to [`CheckDepositRequest`]: the derived deposit account, and
-/// whether this call is what enqueued the guardian-local check (`false` if
-/// one was already enqueued for this account).
+/// Response to [`CheckDepositRequest`]: the derived deposit account.
+///
+/// Deliberately does not report whether this call is what enqueued the
+/// guardian-local check: that is guardian-local state (some guardians may
+/// already have a `PendingCheck` enqueued for this account, others
+/// may not), so including it here would let honest guardians return
+/// different responses to the same request, breaking the threshold-identical
+/// response requirement of `request_current_consensus`.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct CheckDepositResponse {
     pub account: EvmAddress,
-    pub enqueued: bool,
 }
 
 /// Request for the current credited/claimed/claimable state of `claim_pk`'s

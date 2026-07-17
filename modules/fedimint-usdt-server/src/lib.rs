@@ -875,7 +875,14 @@ impl Usdt {
     /// [`PendingCheck`] for it, so this guardian's deposit-checker task (see
     /// [`scan_pending_deposits`]) starts watching that address. Idempotent:
     /// if a `PendingCheck` already exists for the account, it is left
-    /// untouched and `enqueued: false` is returned instead.
+    /// untouched.
+    ///
+    /// The response only ever carries `account` (deterministic from
+    /// `claim_pk`), never whether this call is what enqueued the
+    /// `PendingCheck`: that is guardian-local state and would let honest
+    /// guardians return different responses to the same request, breaking
+    /// the threshold-identical response requirement of
+    /// `request_current_consensus`.
     async fn handle_check_deposit(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -884,10 +891,7 @@ impl Usdt {
         let account = derive_deposit_account(&self.cfg.consensus.group_public_key, &claim_pk);
 
         if dbtx.get_value(&PendingCheckKey(account)).await.is_some() {
-            return CheckDepositResponse {
-                account,
-                enqueued: false,
-            };
+            return CheckDepositResponse { account };
         }
 
         let requested_at_block = self.consensus_block_count(dbtx).await;
@@ -900,10 +904,7 @@ impl Usdt {
         )
         .await;
 
-        CheckDepositResponse {
-            account,
-            enqueued: true,
-        }
+        CheckDepositResponse { account }
     }
 
     /// Reports `claim_pk`'s deposit account state: `claimable` is
@@ -1878,7 +1879,6 @@ mod tests {
         dbtx.commit_tx().await;
 
         assert_eq!(response.account, expected_account);
-        assert!(response.enqueued);
 
         let pending = db
             .begin_transaction_nc()
@@ -1887,8 +1887,33 @@ mod tests {
             .await
             .expect("PendingCheck must have been inserted");
         assert_eq!(pending.claim_pk, claim_pk);
+        assert_eq!(pending.requested_at_block, 0);
 
-        // Second call for the same claim_pk: idempotent, must not overwrite.
+        // Advance the consensus block count so a bug that re-derives
+        // requested_at_block on every call (instead of leaving an existing
+        // PendingCheck untouched) would be caught below.
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::BlockCount(100),
+                    PeerId::from(p),
+                )
+                .await
+                .expect("valid consensus item");
+        }
+        dbtx.commit_tx().await;
+        let mut dbtx = db.begin_transaction().await;
+        assert_eq!(
+            module.consensus_block_count(&mut dbtx.to_ref_nc()).await,
+            100
+        );
+        dbtx.commit_tx().await;
+
+        // Second call for the same claim_pk: idempotent, must not overwrite the
+        // existing PendingCheck (in particular, requested_at_block must stay 0,
+        // not be bumped to the now-advanced block count of 100).
         let mut dbtx = db.begin_transaction().await;
         let response2 = module
             .handle_check_deposit(&mut dbtx.to_ref_nc(), claim_pk)
@@ -1896,7 +1921,14 @@ mod tests {
         dbtx.commit_tx().await;
 
         assert_eq!(response2.account, expected_account);
-        assert!(!response2.enqueued);
+
+        let pending_after_second_call = db
+            .begin_transaction_nc()
+            .await
+            .get_value(&PendingCheckKey(expected_account))
+            .await
+            .expect("PendingCheck must still be present");
+        assert_eq!(pending_after_second_call, pending);
     }
 
     #[tokio::test]

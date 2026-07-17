@@ -259,9 +259,8 @@ impl UsdtClientModule {
 
             if Instant::now() >= deadline_at {
                 bail!(
-                    "Deposit to {} was not claimable before the deadline (enqueued={})",
+                    "Deposit to {} was not claimable before the deadline",
                     checked.account,
-                    checked.enqueued
                 );
             }
 
