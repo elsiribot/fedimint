@@ -65,6 +65,16 @@ impl FederationTest {
             .await
     }
 
+    /// Create a client connected to this fed using the given database
+    pub async fn new_client_with_db(&self, db: Database) -> ClientHandleArc {
+        let client_config = self.configs[&PeerId::from(0)]
+            .consensus
+            .to_client_config(&self.server_init)
+            .unwrap();
+
+        self.new_client_with(client_config, db, None).await
+    }
+
     /// Create a client connected to this fed but using RocksDB instead of MemDB
     pub async fn new_client_rocksdb(&self) -> ClientHandleArc {
         let client_config = self.configs[&PeerId::from(0)]

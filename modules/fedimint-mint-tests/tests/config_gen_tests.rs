@@ -9,11 +9,16 @@
 use std::time::Duration;
 
 use fedimint_api_client::api::{DynGlobalApi, FederationApiExt};
+use fedimint_client::db::PendingClientConfigKey;
+use fedimint_client::{Client, RootSecret};
+use fedimint_client_module::secret::{PlainRootSecretStrategy, RootSecretStrategy};
 use fedimint_core::PeerId;
 use fedimint_core::config_gen::{
     AbortModuleGenerationRequest, ModuleConfigProposal, ModuleGenerationId,
 };
 use fedimint_core::core::ModuleKind;
+use fedimint_core::db::mem_impl::MemDatabase;
+use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped};
 use fedimint_core::endpoint_constants::{
     ABORT_MODULE_GENERATION_ENDPOINT, ACTIVATE_MODULE_GENERATION_ENDPOINT,
     APPROVE_MODULE_GENERATION_ENDPOINT, AUDIT_ENDPOINT, MODULE_GENERATIONS_ENDPOINT,
@@ -278,7 +283,67 @@ async fn activated_module_runs_after_restart() -> anyhow::Result<()> {
         .await;
     }
 
-    info!(target: LOG_TEST, "Dynamically added module is live after restart");
+    // A client joining with the pre-activation config picks the new module
+    // up through its additive config refresh: the refreshed config is
+    // stored as pending and promoted on the next client start.
+    let client_db: Database = MemDatabase::new().into();
+
+    let client = fed.new_client_with_db(client_db.clone()).await;
+
+    assert!(
+        !client
+            .config()
+            .await
+            .modules
+            .contains_key(&(instance_id as u16)),
+        "Client joined with a config that already contains the dynamic module"
+    );
+
+    while client_db
+        .begin_transaction_nc()
+        .await
+        .get_value(&PendingClientConfigKey)
+        .await
+        .is_none()
+    {
+        sleep_in_test(
+            "Waiting for client to fetch the refreshed config",
+            Duration::from_millis(200),
+        )
+        .await;
+    }
+
+    drop(client);
+
+    let client_secret = Client::load_or_generate_client_secret(&client_db).await?;
+
+    let client = fed
+        .open_client_with_db(
+            client_db,
+            RootSecret::StandardDoubleDerive(PlainRootSecretStrategy::to_root_secret(
+                &client_secret,
+            )),
+        )
+        .await;
+
+    assert!(
+        client
+            .config()
+            .await
+            .modules
+            .contains_key(&(instance_id as u16)),
+        "Client config is missing the dynamically added module"
+    );
+
+    assert!(
+        client.has_module(instance_id as u16),
+        "Client did not initialize the dynamically added module"
+    );
+
+    info!(
+        target: LOG_TEST,
+        "Dynamically added module is live after restart and visible to clients"
+    );
 
     Ok(())
 }

@@ -1212,6 +1212,9 @@ impl ClientBuilder {
                 .await;
             // Remove the pending config
             dbtx.remove_entry(&PendingClientConfigKey).await;
+            // The cached api version negotiation does not cover modules
+            // added by the new config, so renegotiate on this start
+            dbtx.remove_entry(&crate::db::CachedApiVersionSetKey).await;
             dbtx.commit_tx().await;
 
             debug!(target: LOG_CLIENT, "Successfully migrated pending config to current config");

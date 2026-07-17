@@ -219,7 +219,7 @@ pub async fn run(
 
     let mut dynamic_module_activation = BTreeMap::new();
 
-    for dynamic_module in dynamic_modules {
+    for dynamic_module in &dynamic_modules {
         let kind = dynamic_module.consensus_config.kind.clone();
 
         let module_init = module_init_registry.get(&kind).ok_or_else(|| {
@@ -287,7 +287,30 @@ pub async fn run(
 
     let module_registry = ModuleRegistry::from(modules);
 
-    let client_cfg = cfg.consensus.to_client_config(&module_init_registry)?;
+    // The client config and advertised api versions cover dynamic modules
+    // as well, so clients pick them up via their additive config refresh
+    let mut client_cfg = cfg.consensus.to_client_config(&module_init_registry)?;
+
+    let mut all_module_configs = cfg.consensus.modules.clone();
+
+    for dynamic_module in &dynamic_modules {
+        let module_init = module_init_registry
+            .get(&dynamic_module.consensus_config.kind)
+            .expect("Checked during dynamic module initialization");
+
+        client_cfg.modules.insert(
+            dynamic_module.instance_id,
+            module_init
+                .get_client_config(dynamic_module.instance_id, &dynamic_module.consensus_config)?,
+        );
+
+        all_module_configs.insert(
+            dynamic_module.instance_id,
+            dynamic_module.consensus_config.clone(),
+        );
+    }
+
+    let client_cfg = client_cfg;
 
     let (submission_sender, submission_receiver) = async_channel::bounded(TRANSACTION_BUFFER);
     let (shutdown_sender, shutdown_receiver) = watch::channel(None);
@@ -329,7 +352,7 @@ pub async fn run(
         shutdown_sender,
         shutdown_receiver: shutdown_receiver.clone(),
         supported_api_versions: ServerConfig::supported_api_versions_summary(
-            &cfg.consensus.modules,
+            &all_module_configs,
             &module_init_registry,
         ),
         auth_ui,

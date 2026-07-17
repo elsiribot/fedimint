@@ -1,5 +1,7 @@
 [default.extend-words]
 substituters = "substituters"
+# experimental branch name, experiment + mint
+experimint = "experimint"
 # trips on some base64 string in the test
 wel = "wel"
 # common mistake that typos doesn't detect automatically
