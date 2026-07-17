@@ -1,5 +1,6 @@
 pub mod aleph_bft;
 pub mod api;
+pub mod config_gen;
 pub mod db;
 pub mod debug;
 pub mod engine;
