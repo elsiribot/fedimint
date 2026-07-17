@@ -512,7 +512,7 @@ pub fn default_modules() -> ServerModuleInitRegistry {
     server_gens.attach(LightningInit);
     server_gens.attach(fedimint_lnv2_server::LightningInit);
 
-    server_gens.attach(fedimint_usdt_server::UsdtInit);
+    server_gens.attach(fedimint_usdt_server::UsdtInit::default());
 
     if !is_env_var_set(FM_DISABLE_META_MODULE_ENV) {
         server_gens.attach(MetaInit);

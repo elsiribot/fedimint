@@ -66,8 +66,27 @@ pub mod db;
 pub mod rpc;
 
 /// Generates the module
-#[derive(Debug, Clone)]
-pub struct UsdtInit;
+#[derive(Debug, Clone, Default)]
+pub struct UsdtInit {
+    /// Test-only injected EVM RPC. `None` in production, in which case
+    /// [`ServerModuleInit::init`] builds an [`AlloyEvmRpc`] from the
+    /// guardian's configured `evm_rpc_url`. `Some` lets hermetic tests
+    /// (`fedimint-usdt-tests`) share one `MockEvmRpc` across every
+    /// guardian's module instance, so their reads agree (deposit consensus
+    /// needs identical observations).
+    evm_rpc_override: Option<crate::rpc::DynServerEvmRpc>,
+}
+
+impl UsdtInit {
+    /// Builds a `UsdtInit` that hands every guardian the same injected
+    /// `evm_rpc` instead of building an `AlloyEvmRpc`, for hermetic tests.
+    #[must_use]
+    pub fn with_evm_rpc(evm_rpc: crate::rpc::DynServerEvmRpc) -> Self {
+        Self {
+            evm_rpc_override: Some(evm_rpc),
+        }
+    }
+}
 
 impl ModuleInit for UsdtInit {
     type Common = UsdtCommonInit;
@@ -174,11 +193,15 @@ impl ServerModuleInit for UsdtInit {
     /// Initialize the module
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
         let cfg: UsdtConfig = args.cfg().to_typed()?;
-        let evm_rpc_url = std::env::var(FM_USDT_EVM_RPC_URL_ENV)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| cfg.private.local.evm_rpc_url.clone());
-        let evm_rpc = AlloyEvmRpc::new(&evm_rpc_url)?.into_dyn();
+        let evm_rpc = if let Some(evm_rpc) = &self.evm_rpc_override {
+            evm_rpc.clone()
+        } else {
+            let evm_rpc_url = std::env::var(FM_USDT_EVM_RPC_URL_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| cfg.private.local.evm_rpc_url.clone());
+            AlloyEvmRpc::new(&evm_rpc_url)?.into_dyn()
+        };
         Ok(Usdt::new(
             cfg,
             evm_rpc,
@@ -506,10 +529,31 @@ impl ServerModule for Usdt {
 
     async fn audit(
         &self,
-        _dbtx: &mut DatabaseTransaction<'_>,
-        _audit: &mut Audit,
-        _module_instance_id: ModuleInstanceId,
+        dbtx: &mut DatabaseTransaction<'_>,
+        audit: &mut Audit,
+        module_instance_id: ModuleInstanceId,
     ) {
+        // Every `credited` (guardian-observed, confirmed on-chain) deposit is
+        // an asset backing the USDT-`mintv2` instance's issued e-cash
+        // liability. `claimed <= credited` always (`process_input` only ever
+        // moves `claimed` up to `credited`), so reporting the full
+        // `credited` amount here -- not `credited - claimed` -- can only
+        // create a surplus (deposits credited but not yet claimed into
+        // e-cash), never a deficit, keeping the federation's global balance
+        // sheet (`fedimint_core::module::audit::Audit::net_assets`) solvent.
+        //
+        // PROVISIONAL (Phase 5, mirrors `deposit_address`'s doc comment):
+        // the on-chain deposit account is derived from the group public key
+        // (`derive_deposit_account`), so once the federation has reached
+        // consensus that it holds `credited` USDT there, it is already
+        // vouching for that balance the same way the wallet module vouches
+        // for UTXOs it controls, even though the withdrawal/sweep signing
+        // path is reconciled later.
+        audit
+            .add_items(dbtx, module_instance_id, &DepositRecordPrefix, |_k, v| {
+                i64::try_from(v.credited.0).unwrap_or(i64::MAX)
+            })
+            .await;
     }
 
     fn api_endpoints(&self) -> Vec<ApiEndpoint<Self>> {
@@ -968,7 +1012,7 @@ mod tests {
             disable_base_fees: false,
         };
 
-        let server_cfgs = UsdtInit.trusted_dealer_gen(
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(
             &peers,
             &args,
             &fedimint_usdt_common::UsdtGenParams::default(),
@@ -999,7 +1043,7 @@ mod tests {
         }
 
         for peer in &peers {
-            UsdtInit
+            UsdtInit::default()
                 .validate_config(peer, server_cfgs[peer].clone())
                 .expect("dealer-generated config must validate for every peer");
         }
@@ -1019,7 +1063,7 @@ mod tests {
             check_ttl_blocks: 500,
         };
 
-        let server_cfgs = UsdtInit.trusted_dealer_gen(&peers, &args, &params);
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(&peers, &args, &params);
         let cfg0 = server_cfgs[&peers[0]]
             .clone()
             .to_typed::<UsdtConfig>()
@@ -1028,7 +1072,7 @@ mod tests {
         assert_eq!(cfg0.consensus.confirmation_depth, 6);
         assert_eq!(cfg0.consensus.check_ttl_blocks, 500);
 
-        let client_cfg = UsdtInit
+        let client_cfg = UsdtInit::default()
             .get_client_config(&cfg0.clone().to_erased().consensus)
             .unwrap();
         assert_eq!(client_cfg.usdt_contract, params.usdt_contract);
@@ -1138,7 +1182,7 @@ mod tests {
             network: Network::Regtest,
             disable_base_fees: false,
         };
-        let server_cfgs = UsdtInit.trusted_dealer_gen(
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(
             &peers,
             &args,
             &fedimint_usdt_common::UsdtGenParams::default(),
@@ -1880,7 +1924,7 @@ mod distributed_gen_tests {
             // sequentially on one task.
             // nosemgrep: ban-tokio-spawn
             tasks.push(tokio::spawn(async move {
-                UsdtInit
+                UsdtInit::default()
                     .distributed_gen(&net, &args, &fedimint_usdt_common::UsdtGenParams::default())
                     .await
             }));
@@ -1919,7 +1963,7 @@ mod distributed_gen_tests {
         }
 
         for peer in peer_ids {
-            UsdtInit
+            UsdtInit::default()
                 .validate_config(peer, configs[peer.to_usize()].clone().to_erased())
                 .expect("distributed_gen output must validate for every guardian");
         }

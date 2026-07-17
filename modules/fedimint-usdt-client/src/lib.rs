@@ -89,14 +89,27 @@ impl ClientModule for UsdtClientModule {
         }
     }
 
+    // The usdt module charges no client-side fee on claim inputs (mirroring
+    // the server's `process_input`, which always returns `fees:
+    // Amounts::ZERO`): the transaction-balancing framework calls this for
+    // every input in a transaction being built (`Client::finalize_and_submit_
+    // transaction` sums `input_fee`/`output_fee` across all modules involved
+    // to compute the primary module's balancing output), not only when this
+    // module happens to be the primary one, so it must return `Some` for the
+    // only real input variant (`UsdtInput::V0`) rather than `unreachable!()`.
     fn input_fee(
         &self,
         _amount: &Amounts,
         _input: &<Self::Common as ModuleCommon>::Input,
     ) -> Option<Amounts> {
-        unreachable!()
+        Some(Amounts::ZERO)
     }
 
+    // This module never constructs a `UsdtOutput` client-side (the server's
+    // `process_output` unconditionally returns `UsdtOutputError::
+    // NotSupported`), so this is never called in practice; `unreachable!()`
+    // documents that invariant rather than guessing at a fee for a variant
+    // that can't occur.
     fn output_fee(
         &self,
         _amount: &Amounts,

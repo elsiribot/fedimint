@@ -23,6 +23,9 @@ fedimint-logging = { workspace = true }
 fedimint-mint-client = { workspace = true }
 fedimint-mint-common = { workspace = true }
 fedimint-mint-server = { workspace = true }
+fedimint-mintv2-client = { workspace = true }
+fedimint-mintv2-common = { workspace = true }
+fedimint-mintv2-server = { workspace = true }
 fedimint-server = { workspace = true }
 fedimint-testing = { workspace = true }
 fedimint-usdt-client = { workspace = true }
