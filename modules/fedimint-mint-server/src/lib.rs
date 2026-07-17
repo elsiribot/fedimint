@@ -9,7 +9,7 @@ mod metrics;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use fedimint_core::bitcoin::hashes::sha256;
 use fedimint_core::config::{
     ServerModuleConfig, ServerModuleConsensusConfig, TypedServerModuleConfig,
@@ -24,8 +24,8 @@ use fedimint_core::encoding::Encodable;
 use fedimint_core::envs::{FM_ENABLE_MODULE_MINT_ENV, is_env_var_set_opt};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion,
-    InputMeta, ModuleConsensusVersion, ModuleInit, SerdeModuleEncodingBase64,
+    AmountUnit, Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION,
+    CoreConsensusVersion, InputMeta, ModuleConsensusVersion, ModuleInit, SerdeModuleEncodingBase64,
     SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
 };
 use fedimint_core::{
@@ -79,6 +79,20 @@ use crate::db::{
     RecoveryBlindNonceOutpointKey, RecoveryBlindNonceOutpointKeyPrefix, RecoveryItemKey,
     RecoveryItemKeyPrefix,
 };
+
+const CONFIG_PARAM_AMOUNT_UNIT: &str = "amount_unit";
+
+fn parse_amount_unit(params: &BTreeMap<String, String>) -> anyhow::Result<AmountUnit> {
+    let Some(amount_unit) = params.get(CONFIG_PARAM_AMOUNT_UNIT) else {
+        return Ok(AmountUnit::BITCOIN);
+    };
+
+    let amount_unit_id = amount_unit.parse::<u64>().with_context(|| {
+        format!("mint config param {CONFIG_PARAM_AMOUNT_UNIT:?} must be an unsigned integer")
+    })?;
+
+    Ok(AmountUnit::new_custom(amount_unit_id))
+}
 
 #[derive(Debug, Clone)]
 pub struct MintInit;
@@ -210,6 +224,8 @@ impl ServerModuleInit for MintInit {
         args: &ConfigGenModuleArgs,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         let denominations = gen_denominations();
+        let amount_unit =
+            parse_amount_unit(&args.params).expect("mint amount_unit config param must be valid");
 
         let tbs_keys = denominations
             .iter()
@@ -225,6 +241,7 @@ impl ServerModuleInit for MintInit {
             .map(|&peer| {
                 let config = MintConfig {
                     consensus: MintConfigConsensus {
+                        amount_unit,
                         peer_tbs_pks: peers
                             .iter()
                             .map(|&key_peer| {
@@ -267,6 +284,7 @@ impl ServerModuleInit for MintInit {
         args: &ConfigGenModuleArgs,
     ) -> anyhow::Result<ServerModuleConfig> {
         let denominations = gen_denominations();
+        let amount_unit = parse_amount_unit(&args.params)?;
 
         let mut amount_keys = BTreeMap::new();
 
@@ -282,6 +300,7 @@ impl ServerModuleInit for MintInit {
                     .collect(),
             },
             consensus: MintConfigConsensus {
+                amount_unit,
                 peer_tbs_pks: peers
                     .num_peers()
                     .peer_ids()
@@ -357,6 +376,7 @@ impl ServerModuleInit for MintInit {
                 .collect();
 
         Ok(MintClientConfig {
+            amount_unit: config.amount_unit,
             tbs_pks,
             fee_consensus: config.fee_consensus.clone(),
             peer_tbs_pks: config.peer_tbs_pks.clone(),
@@ -622,8 +642,8 @@ impl ServerModule for Mint {
 
         Ok(InputMeta {
             amount: TransactionItemAmounts {
-                amounts: Amounts::new_bitcoin(amount),
-                fees: Amounts::new_bitcoin(fee),
+                amounts: Amounts::new_custom(self.cfg.consensus.amount_unit, amount),
+                fees: Amounts::new_custom(self.cfg.consensus.amount_unit, fee),
             },
             pub_key: *input.note.spend_key(),
         })
@@ -696,8 +716,8 @@ impl ServerModule for Mint {
         calculate_mint_issued_ecash_metrics(dbtx, amount, fee);
 
         Ok(TransactionItemAmounts {
-            amounts: Amounts::new_bitcoin(amount),
-            fees: Amounts::new_bitcoin(fee),
+            amounts: Amounts::new_custom(self.cfg.consensus.amount_unit, amount),
+            fees: Amounts::new_custom(self.cfg.consensus.amount_unit, fee),
         })
     }
 

@@ -2,8 +2,8 @@ use assert_matches::assert_matches;
 use fedimint_core::config::{ClientModuleConfig, ServerModuleConfig};
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped};
-use fedimint_core::module::ModuleConsensusVersion;
 use fedimint_core::module::registry::ModuleRegistry;
+use fedimint_core::module::{AmountUnit, ModuleConsensusVersion};
 use fedimint_core::{Amount, BitcoinHash, InPoint, OutPoint, PeerId, TransactionId, secp256k1};
 use fedimint_mint_common::config::FeeConsensus;
 use fedimint_mint_common::{BlindNonce, MintInput, MintOutput, Nonce, Note};
@@ -37,6 +37,91 @@ fn build_configs() -> (Vec<ServerModuleConfig>, ClientModuleConfig) {
 }
 
 #[test_log::test]
+fn test_config_gen_honors_amount_unit_param() {
+    let peers = (0..MINTS).map(PeerId::from).collect::<Vec<_>>();
+    let args = ConfigGenModuleArgs {
+        network: bitcoin::Network::Regtest,
+        disable_base_fees: false,
+        params: std::collections::BTreeMap::from([("amount_unit".to_owned(), "1".to_owned())]),
+    };
+
+    let mint_cfg = MintInit.trusted_dealer_gen(&peers, &args);
+    let server_cfg = mint_cfg[&PeerId::from(0)]
+        .to_typed::<MintConfig>()
+        .expect("trusted dealer generated mint config");
+    let client_cfg = MintInit
+        .get_client_config(&mint_cfg[&PeerId::from(0)].consensus)
+        .expect("client config can be derived from server consensus config");
+
+    assert_eq!(
+        server_cfg.consensus.amount_unit,
+        AmountUnit::new_custom(1),
+        "server config should store the per-instance amount unit"
+    );
+    assert_eq!(
+        client_cfg.amount_unit,
+        AmountUnit::new_custom(1),
+        "client config should inherit the per-instance amount unit"
+    );
+}
+
+#[test_log::test(tokio::test)]
+async fn test_process_output_reports_configured_amount_unit() {
+    let stable_unit = AmountUnit::new_custom(1);
+    let peers = (0..MINTS).map(PeerId::from).collect::<Vec<_>>();
+    let args = ConfigGenModuleArgs {
+        network: bitcoin::Network::Regtest,
+        disable_base_fees: false,
+        params: std::collections::BTreeMap::from([("amount_unit".to_owned(), "1".to_owned())]),
+    };
+    let mint_cfg = MintInit.trusted_dealer_gen(&peers, &args);
+    let mint = Mint::new(
+        mint_cfg[&PeerId::from(0)]
+            .to_typed::<MintConfig>()
+            .expect("trusted dealer generated mint config"),
+    );
+    let (_, tiered) = mint
+        .cfg
+        .consensus
+        .peer_tbs_pks
+        .first_key_value()
+        .expect("mint has peers");
+    let denomination = *tiered.max_tier();
+
+    let blind_nonce = BlindNonce(blind_message(
+        Message::from_bytes(b"stable-mint-output-unit-test"),
+        BlindingKey::random(),
+    ));
+    let output = MintOutput::new_v0(denomination, blind_nonce);
+    let db = Database::new(MemDatabase::new(), ModuleRegistry::default());
+    let mut dbtx = db.begin_transaction().await;
+    let mut module_dbtx = dbtx.to_ref_with_prefix_module_id(42).0.into_nc();
+
+    let transaction_amounts = mint
+        .process_output(
+            &mut module_dbtx,
+            &output,
+            OutPoint {
+                txid: TransactionId::all_zeros(),
+                out_idx: 0,
+            },
+        )
+        .await
+        .expect("valid output is accepted");
+
+    assert_eq!(
+        transaction_amounts.amounts.get(&stable_unit),
+        Some(&denomination),
+        "mint output value should be reported in the configured amount unit"
+    );
+    assert_eq!(
+        transaction_amounts.amounts.get(&AmountUnit::BITCOIN),
+        None,
+        "custom mint outputs must not be reported as Bitcoin"
+    );
+}
+
+#[test_log::test]
 #[should_panic(expected = "Own key not found among pub keys.")]
 fn test_new_panic_without_own_pub_key() {
     let (mint_server_cfg1, _) = build_configs();
@@ -44,6 +129,7 @@ fn test_new_panic_without_own_pub_key() {
 
     Mint::new(MintConfig {
         consensus: MintConfigConsensus {
+            amount_unit: AmountUnit::BITCOIN,
             peer_tbs_pks: mint_server_cfg2[0]
                 .to_typed::<MintConfig>()
                 .unwrap()

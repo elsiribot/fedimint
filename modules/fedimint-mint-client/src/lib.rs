@@ -905,6 +905,7 @@ pub struct MintClientContext {
     pub federation_id: FederationId,
     pub client_ctx: ClientContext<MintClientModule>,
     pub mint_decoder: Decoder,
+    pub amount_unit: AmountUnit,
     pub tbs_pks: Tiered<AggregatePublicKey>,
     pub peer_tbs_pks: BTreeMap<PeerId, Tiered<tbs::PublicKeyShare>>,
     pub secret: DerivableSecret,
@@ -950,6 +951,7 @@ impl ClientModule for MintClientModule {
             federation_id: self.federation_id,
             client_ctx: self.client_ctx.clone(),
             mint_decoder: self.decoder(),
+            amount_unit: self.amount_unit(),
             tbs_pks: self.cfg.tbs_pks.clone(),
             peer_tbs_pks: self.cfg.peer_tbs_pks.clone(),
             secret: self.secret.clone(),
@@ -963,9 +965,7 @@ impl ClientModule for MintClientModule {
         amount: &Amounts,
         _input: &<Self::Common as ModuleCommon>::Input,
     ) -> Option<Amounts> {
-        Some(Amounts::new_bitcoin(
-            self.cfg.fee_consensus.fee(amount.get_bitcoin()),
-        ))
+        Some(self.amounts_for_unit(self.cfg.fee_consensus.fee(self.amount_from_unit(amount))))
     }
 
     fn output_fee(
@@ -973,9 +973,7 @@ impl ClientModule for MintClientModule {
         amount: &Amounts,
         _output: &<Self::Common as ModuleCommon>::Output,
     ) -> Option<Amounts> {
-        Some(Amounts::new_bitcoin(
-            self.cfg.fee_consensus.fee(amount.get_bitcoin()),
-        ))
+        Some(self.amounts_for_unit(self.cfg.fee_consensus.fee(self.amount_from_unit(amount))))
     }
 
     #[cfg(feature = "cli")]
@@ -1009,7 +1007,7 @@ impl ClientModule for MintClientModule {
     }
 
     fn supports_being_primary(&self) -> PrimaryModuleSupport {
-        PrimaryModuleSupport::selected(PrimaryModulePriority::HIGH, [AmountUnit::BITCOIN])
+        PrimaryModuleSupport::selected(PrimaryModulePriority::HIGH, [self.amount_unit()])
     }
 
     async fn create_final_inputs_and_outputs(
@@ -1025,18 +1023,26 @@ impl ClientModule for MintClientModule {
     )> {
         let consolidation_inputs = self.consolidate_notes(dbtx).await?;
 
-        if unit != AmountUnit::BITCOIN {
-            bail!("Module can only handle Bitcoin");
+        if unit != self.amount_unit() {
+            bail!(
+                "Mint instance handles amount unit {:?}, not {:?}",
+                self.amount_unit(),
+                unit
+            );
         }
 
         input_amount += consolidation_inputs
             .iter()
-            .map(|input| input.0.amounts.get_bitcoin())
+            .map(|input| self.amount_from_unit(&input.0.amounts))
             .sum();
 
         output_amount += consolidation_inputs
             .iter()
-            .map(|input| self.cfg.fee_consensus.fee(input.0.amounts.get_bitcoin()))
+            .map(|input| {
+                self.cfg
+                    .fee_consensus
+                    .fee(self.amount_from_unit(&input.0.amounts))
+            })
             .sum();
 
         let additional_inputs = self
@@ -1045,12 +1051,16 @@ impl ClientModule for MintClientModule {
 
         input_amount += additional_inputs
             .iter()
-            .map(|input| input.0.amounts.get_bitcoin())
+            .map(|input| self.amount_from_unit(&input.0.amounts))
             .sum();
 
         output_amount += additional_inputs
             .iter()
-            .map(|input| self.cfg.fee_consensus.fee(input.0.amounts.get_bitcoin()))
+            .map(|input| {
+                self.cfg
+                    .fee_consensus
+                    .fee(self.amount_from_unit(&input.0.amounts))
+            })
             .sum();
 
         let outputs = self
@@ -1066,6 +1076,7 @@ impl ClientModule for MintClientModule {
             create_bundle_for_inputs(
                 [consolidation_inputs, additional_inputs].concat(),
                 operation_id,
+                self.amount_unit(),
             ),
             outputs,
         ))
@@ -1080,7 +1091,7 @@ impl ClientModule for MintClientModule {
     }
 
     async fn get_balance(&self, dbtx: &mut DatabaseTransaction<'_>, unit: AmountUnit) -> Amount {
-        if unit != AmountUnit::BITCOIN {
+        if unit != self.amount_unit() {
             return Amount::ZERO;
         }
         self.get_note_counts_by_denomination(dbtx)
@@ -1089,8 +1100,8 @@ impl ClientModule for MintClientModule {
     }
 
     async fn get_balances(&self, dbtx: &mut DatabaseTransaction<'_>) -> Amounts {
-        Amounts::new_bitcoin(
-            <Self as ClientModule>::get_balance(self, dbtx, AmountUnit::BITCOIN).await,
+        self.amounts_for_unit(
+            <Self as ClientModule>::get_balance(self, dbtx, self.amount_unit()).await,
         )
     }
 
@@ -1250,6 +1261,21 @@ pub enum ReissueExternalNotesError {
 }
 
 impl MintClientModule {
+    fn amount_unit(&self) -> AmountUnit {
+        self.cfg.amount_unit
+    }
+
+    fn amounts_for_unit(&self, amount: Amount) -> Amounts {
+        Amounts::new_custom(self.amount_unit(), amount)
+    }
+
+    fn amount_from_unit(&self, amounts: &Amounts) -> Amount {
+        amounts
+            .get(&self.amount_unit())
+            .copied()
+            .unwrap_or_default()
+    }
+
     async fn create_sufficient_input(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -1409,7 +1435,7 @@ impl MintClientModule {
 
                 outputs.push(ClientOutput {
                     output: MintOutput::new_v0(amount, blind_nonce),
-                    amounts: Amounts::new_bitcoin(amount),
+                    amounts: self.amounts_for_unit(amount),
                 });
 
                 issuance_requests.push((amount, issuance_request));
@@ -1632,7 +1658,7 @@ impl MintClientModule {
                 ClientInput {
                     input: MintInput::new_v0(amount, note),
                     keys: vec![spendable_note.spend_key],
-                    amounts: Amounts::new_bitcoin(amount),
+                    amounts: self.amounts_for_unit(amount),
                 },
                 spendable_note,
             ));
@@ -1860,9 +1886,9 @@ impl MintClientModule {
             .fee_quote(
                 OperationId::new_random(),
                 FeeQuoteRequest {
-                    input_amount: Amounts::new_bitcoin(input_amount),
+                    input_amount: self.amounts_for_unit(input_amount),
                     output_amount: Amounts::ZERO,
-                    input_fee: Amounts::new_bitcoin(input_fee),
+                    input_fee: self.amounts_for_unit(input_fee),
                     output_fee: Amounts::ZERO,
                 },
             )
@@ -1922,9 +1948,9 @@ impl MintClientModule {
                 OperationId::new_random(),
                 FeeQuoteRequest {
                     input_amount: Amounts::ZERO,
-                    output_amount: Amounts::new_bitcoin(output_amount),
+                    output_amount: self.amounts_for_unit(output_amount),
                     input_fee: Amounts::ZERO,
-                    output_fee: Amounts::new_bitcoin(output_fee),
+                    output_fee: self.amounts_for_unit(output_fee),
                 },
             )
             .await
@@ -1969,10 +1995,9 @@ impl MintClientModule {
         let amount = notes.total_amount();
         let mint_inputs = self.create_input_from_notes(notes)?;
 
-        let tx = TransactionBuilder::new().with_inputs(
-            self.client_ctx
-                .make_dyn(create_bundle_for_inputs(mint_inputs, operation_id)),
-        );
+        let tx = TransactionBuilder::new().with_inputs(self.client_ctx.make_dyn(
+            create_bundle_for_inputs(mint_inputs, operation_id, self.amount_unit()),
+        ));
 
         let extra_meta = serde_json::to_value(extra_meta)
             .expect("MintClientModule::reissue_external_notes extra_meta is serializable");
@@ -3161,6 +3186,7 @@ pub fn represent_amount<K>(
 pub(crate) fn create_bundle_for_inputs(
     inputs_and_notes: Vec<(ClientInput<MintInput>, SpendableNote)>,
     operation_id: OperationId,
+    amount_unit: AmountUnit,
 ) -> ClientInputBundle<MintInput, MintClientStateMachines> {
     let mut inputs = Vec::new();
     let mut input_states = Vec::new();
@@ -3181,7 +3207,15 @@ pub(crate) fn create_bundle_for_inputs(
             state: MintInputStates::CreatedBundle(MintInputStateCreatedBundle {
                 notes: input_states
                     .iter()
-                    .map(|(amounts, note)| (amounts.expect_only_bitcoin(), *note))
+                    .map(|(amounts, note)| {
+                        (
+                            amounts
+                                .get(&amount_unit)
+                                .copied()
+                                .expect("mint input amount must use this mint instance's unit"),
+                            *note,
+                        )
+                    })
                     .collect(),
             }),
         })]

@@ -5,7 +5,7 @@ use fedimint_client_module::sm::{ClientSMDatabaseTransaction, State, StateTransi
 use fedimint_client_module::transaction::{ClientInput, ClientInputBundle};
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::module::Amounts;
+use fedimint_core::module::{AmountUnit, Amounts};
 use fedimint_core::util::FmtCompactAnyhow;
 use fedimint_core::{Amount, TransactionId};
 use fedimint_logging::LOG_CLIENT_MODULE_MINT;
@@ -79,18 +79,26 @@ impl State for MintInputStateMachine {
     #[allow(deprecated)]
     fn transitions(
         &self,
-        _context: &Self::ModuleContext,
+        context: &Self::ModuleContext,
         global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<Self>> {
         match &self.state {
             MintInputStates::Created(_) => {
-                MintInputStateCreated::transitions(self.common, global_context)
+                MintInputStateCreated::transitions(self.common, context.amount_unit, global_context)
             }
             MintInputStates::CreatedBundle(_) => {
-                MintInputStateCreatedBundle::transitions(self.common, global_context)
+                MintInputStateCreatedBundle::transitions(
+                    self.common,
+                    context.amount_unit,
+                    global_context,
+                )
             }
             MintInputStates::RefundedBundle(state) => {
-                MintInputStateRefundedBundle::transitions(state, global_context)
+                MintInputStateRefundedBundle::transitions(
+                    state,
+                    context.amount_unit,
+                    global_context,
+                )
             }
             MintInputStates::Refund(refund) => refund.transitions(global_context),
             MintInputStates::Success(_)
@@ -186,6 +194,7 @@ pub struct MintInputStateCreated {
 impl MintInputStateCreated {
     fn transitions(
         common: MintInputCommon,
+        amount_unit: AmountUnit,
         global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<MintInputStateMachine>> {
         let global_context = global_context.clone();
@@ -196,6 +205,7 @@ impl MintInputStateCreated {
                     result,
                     old_state,
                     dbtx,
+                    amount_unit,
                     global_context.clone(),
                 ))
             },
@@ -216,6 +226,7 @@ impl MintInputStateCreated {
         result: Result<(), String>,
         old_state: MintInputStateMachine,
         dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
+        amount_unit: AmountUnit,
         global_context: DynGlobalClientContext,
     ) -> MintInputStateMachine {
         assert_matches!(old_state.state, MintInputStates::Created(_));
@@ -231,7 +242,7 @@ impl MintInputStateCreated {
             Err(err) => {
                 // Transaction rejected: attempting to refund
                 debug!(target: LOG_CLIENT_MODULE_MINT, err = %err.as_str(), "Refunding mint transaction input due to transaction error");
-                Self::refund(dbtx, old_state, global_context).await
+                Self::refund(dbtx, old_state, amount_unit, global_context).await
             }
         }
     }
@@ -240,6 +251,7 @@ impl MintInputStateCreated {
     async fn refund(
         dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
         old_state: MintInputStateMachine,
+        amount_unit: AmountUnit,
         global_context: DynGlobalClientContext,
     ) -> MintInputStateMachine {
         let (amount, spendable_note) = match old_state.state {
@@ -250,7 +262,7 @@ impl MintInputStateCreated {
         let refund_input = ClientInput::<MintInput> {
             input: MintInput::new_v0(amount, spendable_note.note()),
             keys: vec![spendable_note.spend_key],
-            amounts: Amounts::new_bitcoin(amount),
+            amounts: Amounts::new_custom(amount_unit, amount),
         };
 
         let change_range = global_context
@@ -280,6 +292,7 @@ pub struct MintInputStateCreatedBundle {
 impl MintInputStateCreatedBundle {
     fn transitions(
         common: MintInputCommon,
+        amount_unit: AmountUnit,
         global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<MintInputStateMachine>> {
         let global_context = global_context.clone();
@@ -290,6 +303,7 @@ impl MintInputStateCreatedBundle {
                     result,
                     old_state,
                     dbtx,
+                    amount_unit,
                     global_context.clone(),
                 ))
             },
@@ -309,6 +323,7 @@ impl MintInputStateCreatedBundle {
         result: Result<(), String>,
         old_state: MintInputStateMachine,
         dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
+        amount_unit: AmountUnit,
         global_context: DynGlobalClientContext,
     ) -> MintInputStateMachine {
         assert_matches!(old_state.state, MintInputStates::CreatedBundle(_));
@@ -324,7 +339,7 @@ impl MintInputStateCreatedBundle {
             Err(err) => {
                 // Transaction rejected: attempting to refund
                 debug!(target: LOG_CLIENT_MODULE_MINT, err = %err.as_str(), "Refunding mint transaction input due to transaction error");
-                Self::refund(dbtx, old_state, global_context).await
+                Self::refund(dbtx, old_state, amount_unit, global_context).await
             }
         }
     }
@@ -332,6 +347,7 @@ impl MintInputStateCreatedBundle {
     async fn refund(
         dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
         old_state: MintInputStateMachine,
+        amount_unit: AmountUnit,
         global_context: DynGlobalClientContext,
     ) -> MintInputStateMachine {
         let spendable_notes = match old_state.state {
@@ -345,7 +361,7 @@ impl MintInputStateCreatedBundle {
             inputs.push(ClientInput::<MintInput> {
                 input: MintInput::new_v0(amount, spendable_note.note()),
                 keys: vec![spendable_note.spend_key],
-                amounts: Amounts::new_bitcoin(amount),
+                amounts: Amounts::new_custom(amount_unit, amount),
             });
         }
 
@@ -385,6 +401,7 @@ pub struct MintInputStateRefundedBundle {
 impl MintInputStateRefundedBundle {
     fn transitions(
         state: &MintInputStateRefundedBundle,
+        amount_unit: AmountUnit,
         global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<MintInputStateMachine>> {
         let global_context = global_context.clone();
@@ -395,6 +412,7 @@ impl MintInputStateRefundedBundle {
                     result,
                     old_state,
                     dbtx,
+                    amount_unit,
                     global_context.clone(),
                 ))
             },
@@ -412,6 +430,7 @@ impl MintInputStateRefundedBundle {
         result: Result<(), String>,
         old_state: MintInputStateMachine,
         dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
+        amount_unit: AmountUnit,
         global_context: DynGlobalClientContext,
     ) -> MintInputStateMachine {
         assert_matches!(old_state.state, MintInputStates::RefundedBundle(_));
@@ -427,7 +446,7 @@ impl MintInputStateRefundedBundle {
             Err(err) => {
                 // Transaction rejected: attempting to refund
                 debug!(target: LOG_CLIENT_MODULE_MINT, err = %err.as_str(), "Refunding mint transaction input due to transaction error on multi-note refund");
-                Self::refund(dbtx, old_state, global_context).await
+                Self::refund(dbtx, old_state, amount_unit, global_context).await
             }
         }
     }
@@ -435,6 +454,7 @@ impl MintInputStateRefundedBundle {
     async fn refund(
         dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
         old_state: MintInputStateMachine,
+        amount_unit: AmountUnit,
         global_context: DynGlobalClientContext,
     ) -> MintInputStateMachine {
         let spendable_notes = match old_state.state {
@@ -447,7 +467,7 @@ impl MintInputStateRefundedBundle {
             let refund_input = ClientInput::<MintInput> {
                 input: MintInput::new_v0(amount, spendable_note.note()),
                 keys: vec![spendable_note.spend_key],
-                amounts: Amounts::new_bitcoin(amount),
+                amounts: Amounts::new_custom(amount_unit, amount),
             };
             match global_context
                 .claim_inputs(
