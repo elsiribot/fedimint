@@ -5,7 +5,7 @@ use fedimint_core::core::ModuleKind;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::{PeerId, plugin_types_trait_impl_config};
 use fedimint_threshold_ecdsa::KeyShare;
-use fedimint_usdt_common::UsdtCommonInit;
+use fedimint_usdt_common::{EvmAddress, UsdtCommonInit};
 use secp256k1::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +99,17 @@ pub struct UsdtConfigConsensus {
     /// The network this federation is configured for, mirroring the
     /// `Network` type used by other fedimint modules (e.g. lnv2).
     pub network: Network,
+    /// The ERC-20 contract address of the USDT token this federation
+    /// custodies deposits of.
+    pub usdt_contract: EvmAddress,
+    /// The EVM chain id this federation's deposit accounts are watched on.
+    pub chain_id: u64,
+    /// The number of block confirmations a deposit must accumulate before
+    /// guardians consider it final.
+    pub confirmation_depth: u64,
+    /// Guardian-side: how many blocks a claimed-but-unconfirmed deposit
+    /// check remains valid for before it must be re-issued.
+    pub check_ttl_blocks: u64,
 }
 
 // Wire together the configs for this module

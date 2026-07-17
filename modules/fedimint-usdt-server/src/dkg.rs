@@ -19,6 +19,7 @@ use fedimint_threshold_ecdsa::transport::{
     EncryptedRoundCodec, drive_over_exchange, spawn_protocol,
 };
 use fedimint_threshold_ecdsa::{Curve, assemble_key_share, group_public_key};
+use fedimint_usdt_common::UsdtGenParams;
 use rand::rngs::OsRng;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest as _, Sha256};
@@ -271,6 +272,7 @@ async fn run_aux_gen(
 pub(crate) async fn distributed_gen(
     peers: &(dyn PeerHandleOps + Send + Sync),
     args: &ConfigGenModuleArgs,
+    params: &UsdtGenParams,
 ) -> anyhow::Result<UsdtConfig> {
     let secp = Secp256k1::new();
     let mpc_encryption_sk = SecretKey::new(&mut OsRng);
@@ -307,6 +309,10 @@ pub(crate) async fn distributed_gen(
             mpc_encryption_pks: assignment.enc_pk_map,
             threshold: assignment.threshold,
             network: args.network,
+            usdt_contract: params.usdt_contract,
+            chain_id: params.chain_id,
+            confirmation_depth: params.confirmation_depth,
+            check_ttl_blocks: params.check_ttl_blocks,
         },
     })
 }

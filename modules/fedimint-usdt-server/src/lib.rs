@@ -79,7 +79,7 @@ impl ModuleInit for UsdtInit {
 #[async_trait]
 impl ServerModuleInit for UsdtInit {
     type Module = Usdt;
-    type Params = ();
+    type Params = fedimint_usdt_common::UsdtGenParams;
 
     /// Returns the version of this module
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
@@ -135,7 +135,7 @@ impl ServerModuleInit for UsdtInit {
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
-        _params: &Self::Params,
+        params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         let num_peers = peers.to_num_peers();
         let n = u16::try_from(num_peers.total())
@@ -180,6 +180,10 @@ impl ServerModuleInit for UsdtInit {
                         mpc_encryption_pks: mpc_encryption_pks.clone(),
                         threshold,
                         network: args.network,
+                        usdt_contract: params.usdt_contract,
+                        chain_id: params.chain_id,
+                        confirmation_depth: params.confirmation_depth,
+                        check_ttl_blocks: params.check_ttl_blocks,
                     },
                 };
 
@@ -193,9 +197,9 @@ impl ServerModuleInit for UsdtInit {
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
-        _params: &Self::Params,
+        params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
-        let config = dkg::distributed_gen(peers, args).await?;
+        let config = dkg::distributed_gen(peers, args, params).await?;
         Ok(config.to_erased())
     }
 
@@ -208,6 +212,9 @@ impl ServerModuleInit for UsdtInit {
         Ok(UsdtClientConfig {
             group_public_key: config.group_public_key,
             network: config.network,
+            usdt_contract: config.usdt_contract,
+            chain_id: config.chain_id,
+            confirmation_depth: config.confirmation_depth,
         })
     }
 
@@ -279,7 +286,8 @@ impl ServerModule for Usdt {
         _input: &'b UsdtInput,
         _in_point: InPoint,
     ) -> Result<InputMeta, UsdtInputError> {
-        Err(UsdtInputError::NotSupported)
+        // Phase 5 Task 8 replaces this with real claim processing
+        Err(UsdtInputError::UnknownDepositAccount)
     }
 
     async fn process_output<'a, 'b>(
@@ -342,7 +350,11 @@ mod tests {
             disable_base_fees: false,
         };
 
-        let server_cfgs = UsdtInit.trusted_dealer_gen(&peers, &args, &());
+        let server_cfgs = UsdtInit.trusted_dealer_gen(
+            &peers,
+            &args,
+            &fedimint_usdt_common::UsdtGenParams::default(),
+        );
         assert_eq!(server_cfgs.len(), usize::from(NUM_PEERS));
 
         let typed_cfgs = server_cfgs
@@ -373,6 +385,37 @@ mod tests {
                 .validate_config(peer, server_cfgs[peer].clone())
                 .expect("dealer-generated config must validate for every peer");
         }
+    }
+
+    #[test]
+    fn config_gen_params_flow_into_consensus_and_client_config() {
+        let peers = (0..NUM_PEERS).map(PeerId::from).collect::<Vec<_>>();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let params = fedimint_usdt_common::UsdtGenParams {
+            usdt_contract: fedimint_usdt_common::EvmAddress([0xab; 20]),
+            chain_id: 1,
+            confirmation_depth: 6,
+            check_ttl_blocks: 500,
+        };
+
+        let server_cfgs = UsdtInit.trusted_dealer_gen(&peers, &args, &params);
+        let cfg0 = server_cfgs[&peers[0]]
+            .clone()
+            .to_typed::<UsdtConfig>()
+            .unwrap();
+        assert_eq!(cfg0.consensus.usdt_contract, params.usdt_contract);
+        assert_eq!(cfg0.consensus.confirmation_depth, 6);
+        assert_eq!(cfg0.consensus.check_ttl_blocks, 500);
+
+        let client_cfg = UsdtInit
+            .get_client_config(&cfg0.clone().to_erased().consensus)
+            .unwrap();
+        assert_eq!(client_cfg.usdt_contract, params.usdt_contract);
+        assert_eq!(client_cfg.confirmation_depth, 6);
+        assert_eq!(client_cfg.chain_id, 1);
     }
 }
 
@@ -523,7 +566,9 @@ mod distributed_gen_tests {
             // sequentially on one task.
             // nosemgrep: ban-tokio-spawn
             tasks.push(tokio::spawn(async move {
-                UsdtInit.distributed_gen(&net, &args, &()).await
+                UsdtInit
+                    .distributed_gen(&net, &args, &fedimint_usdt_common::UsdtGenParams::default())
+                    .await
             }));
         }
 

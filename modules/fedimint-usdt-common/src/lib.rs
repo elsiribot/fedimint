@@ -88,8 +88,9 @@ pub const DEPOSIT_ADDRESS_DOMAIN: &[u8] = b"fedimint-usdt-deposit-v0";
 /// The standard Ethereum address of a secp256k1 public key: last 20 bytes of
 /// `keccak256` over the 64-byte uncompressed point (SEC1 with the `0x04`
 /// prefix stripped). WASM-safe (pure-Rust `sha3`); mirrors
-/// `fedimint_threshold_ecdsa::evm_address`, and a round-trip test keeps them
-/// byte-identical.
+/// `fedimint_threshold_ecdsa::evm_address`, and is independently verified
+/// against the same canonical test vector as
+/// `fedimint_threshold_ecdsa::evm_address`.
 #[must_use]
 pub fn evm_address(pk: &secp256k1::PublicKey) -> EvmAddress {
     let uncompressed = pk.serialize_uncompressed();
@@ -136,12 +137,36 @@ pub fn derive_deposit_account(
     evm_address(&derived)
 }
 
-/// Non-transaction items that will be submitted to consensus
+/// Payload of a `UsdtConsensusItem::Deposit` observation.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct DepositObservation {
     pub account: EvmAddress,
     pub balance: UsdtAmount,
     pub block: u64,
+}
+
+/// Per-instance config-gen params for the USDT module (Phase 4.5 mechanism).
+///
+/// `Default` targets a local `anvil` dev federation: chain id 31337, a fast
+/// confirmation depth, and the test ERC-20 address deployed by the devimint
+/// anvil harness. Real deployments override every field at config-gen time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsdtGenParams {
+    pub usdt_contract: EvmAddress,
+    pub chain_id: u64,
+    pub confirmation_depth: u64,
+    pub check_ttl_blocks: u64,
+}
+
+impl Default for UsdtGenParams {
+    fn default() -> Self {
+        Self {
+            usdt_contract: EvmAddress([0u8; 20]),
+            chain_id: 31337,
+            confirmation_depth: 1,
+            check_ttl_blocks: 10_000,
+        }
+    }
 }
 
 /// Non-transaction items that will be submitted to consensus
