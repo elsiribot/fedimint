@@ -3,7 +3,7 @@
 //! consensus logic against known, programmable EVM state without spinning up
 //! a real (or even `anvil`'d) chain.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use fedimint_usdt_common::{EvmAddress, FeeVote, UsdtAmount};
@@ -15,14 +15,13 @@ use fedimint_usdt_server::rpc::IServerEvmRpc;
 struct State {
     chain_id: u64,
     block_number: u64,
-    /// Current ERC-20 balances, keyed by `(token, holder)`. `MockEvmRpc`
-    /// does not model historical per-block balances: `get_erc20_balance`
-    /// always returns the latest scripted value regardless of `at_block`,
-    /// which is sufficient for module unit tests that script a sequence of
-    /// deposits rather than asserting on confirmation-depth semantics
-    /// (that property is instead proven against a real chain in
-    /// `tests/evm_adapter.rs`).
-    balances: HashMap<(EvmAddress, EvmAddress), UsdtAmount>,
+    /// Current ERC-20 balances, keyed by `(token, holder)`, and then by the
+    /// block at which each scripted value takes effect. `get_erc20_balance`
+    /// returns the value for the greatest scripted block `<= at_block`,
+    /// allowing tests to script balances that change across a sequence of
+    /// blocks (needed for deposit-detection consensus tests that read
+    /// balances "as of block N - confirmation_depth").
+    balances: HashMap<(EvmAddress, EvmAddress), BTreeMap<u64, UsdtAmount>>,
     /// Addresses with "contract code" present, and its length.
     code_len: HashMap<EvmAddress, usize>,
     fee: FeeVote,
@@ -76,11 +75,29 @@ impl MockEvmRpc {
     }
 
     /// Scripts the balance returned by
-    /// [`IServerEvmRpc::get_erc20_balance`] for `(token, holder)`,
-    /// regardless of the `at_block` argument passed at read time (see
-    /// [`State::balances`]).
+    /// [`IServerEvmRpc::get_erc20_balance`] for `(token, holder)`, effective
+    /// from block 0 onward. Shorthand for
+    /// `set_erc20_balance_at(token, holder, 0, balance)`.
     pub fn set_erc20_balance(&self, token: EvmAddress, holder: EvmAddress, balance: UsdtAmount) {
-        self.lock().balances.insert((token, holder), balance);
+        self.set_erc20_balance_at(token, holder, 0, balance);
+    }
+
+    /// Scripts the balance returned by
+    /// [`IServerEvmRpc::get_erc20_balance`] for `(token, holder)`, effective
+    /// from `block` onward: a read `at_block >= block` (and before any later
+    /// scripted block) will see this value (see [`State::balances`]).
+    pub fn set_erc20_balance_at(
+        &self,
+        token: EvmAddress,
+        holder: EvmAddress,
+        block: u64,
+        balance: UsdtAmount,
+    ) {
+        self.lock()
+            .balances
+            .entry((token, holder))
+            .or_default()
+            .insert(block, balance);
     }
 
     /// Scripts the code length returned by
@@ -124,13 +141,14 @@ impl IServerEvmRpc for MockEvmRpc {
         &self,
         token: EvmAddress,
         holder: EvmAddress,
-        _at_block: u64,
+        at_block: u64,
     ) -> anyhow::Result<UsdtAmount> {
-        Ok(self
-            .lock()
+        let state = self.lock();
+        anyhow::ensure!(at_block <= state.block_number, "header not found");
+        Ok(state
             .balances
             .get(&(token, holder))
-            .copied()
+            .and_then(|by_block| by_block.range(..=at_block).next_back().map(|(_, v)| *v))
             .unwrap_or(UsdtAmount(0)))
     }
 
@@ -168,6 +186,7 @@ mod tests {
         let token = EvmAddress([0x01; 20]);
         let holder = EvmAddress([0x02; 20]);
 
+        mock.set_block_number(1);
         mock.set_erc20_balance(token, holder, UsdtAmount(42));
 
         assert_eq!(
@@ -184,6 +203,7 @@ mod tests {
         let token = EvmAddress([0x01; 20]);
         let unknown_holder = EvmAddress([0xff; 20]);
 
+        mock.set_block_number(1);
         assert_eq!(
             mock.get_erc20_balance(token, unknown_holder, 0)
                 .await
@@ -211,6 +231,35 @@ mod tests {
 
         assert_eq!(mock.get_code_len(contract).await.expect("infallible"), 128);
         assert_eq!(mock.get_code_len(eoa).await.expect("infallible"), 0);
+    }
+
+    #[tokio::test]
+    async fn balance_is_read_as_of_block() {
+        let mock = MockEvmRpc::new();
+        let (t, h) = (EvmAddress([1; 20]), EvmAddress([2; 20]));
+        mock.set_block_number(100);
+        mock.set_erc20_balance_at(t, h, 10, UsdtAmount(0));
+        mock.set_erc20_balance_at(t, h, 20, UsdtAmount(5_000_000));
+
+        assert_eq!(
+            mock.get_erc20_balance(t, h, 15).await.unwrap(),
+            UsdtAmount(0)
+        );
+        assert_eq!(
+            mock.get_erc20_balance(t, h, 25).await.unwrap(),
+            UsdtAmount(5_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_above_head_errors() {
+        let mock = MockEvmRpc::new();
+        mock.set_block_number(30);
+        let err = mock
+            .get_erc20_balance(EvmAddress([1; 20]), EvmAddress([2; 20]), 31)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("header not found"));
     }
 
     #[tokio::test]
