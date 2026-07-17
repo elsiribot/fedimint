@@ -17,6 +17,12 @@
 - New server DB prefix: `ConfigGeneration = 0x09` (0x03 is historically burned; 0x01–0x08 taken).
 - One active generation at a time; `ModuleGenerationId`s are monotonic and single-use.
 
+## Status (2026-07-17)
+
+- **Phase 1: DONE** — `ConfigGen` consensus item (`Propose/Approve/Result/Abort`), persisted `GenerationLog` state machine (`Proposed → Approved → Generated | Aborted`), engine processing under db prefix 0x09, admin endpoints (`propose/approve/abort_module_generation`, `module_generations`) at api version 0.10.
+- **Phase 2: DONE** — `P2PMessage::ConfigGen` variant, `GenerationTransport` (implements `IP2PConnections`, so `PeerHandle` + module `distributed_gen` run unchanged), aleph network loop forwards to a long-lived channel, `GenerationManager` runs DKGs on approval, stores private config locally (prefixes 0x0a/0x0b), submits `Result`, aborts crashed generations. Deviation from the design doc: `Result` does not yet carry the encrypted private config — that lands with root-secret derivation in Phase 3, keeping plaintext-adjacent material out of consensus in the meantime.
+- **Next:** end-to-end exercise in devimint (needs admin CLI plumbing for the new endpoints), then Phase 3 (guardian root derivation + encrypted Result), Phase 4 (DB-resident configs + restart activation).
+
 ## Phasing (master plan)
 
 Deviation from the design's production sequence, deliberately: on this experimental branch we de-risk the novel protocol core first; the configs-to-DB refactor and client attestation (design steps 1–2) come after the protocol works end-to-end. The design doc's sequence remains the plan of record for production PRs.
