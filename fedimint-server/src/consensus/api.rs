@@ -15,6 +15,10 @@ use fedimint_core::backup::{
     BackupStatistics, ClientBackupKey, ClientBackupKeyPrefix, ClientBackupSnapshot,
 };
 use fedimint_core::config::{ClientConfig, JsonClientConfig, META_FEDERATION_NAME_KEY};
+use fedimint_core::config_gen::{
+    AbortModuleGenerationRequest, ConfigGenAbortReason, ConfigGenItem, ModuleConfigProposal,
+    ModuleGenerationId,
+};
 use fedimint_core::core::backup::{BACKUP_REQUEST_MAX_PAYLOAD_SIZE_BYTES, SignedBackupRequest};
 use fedimint_core::core::{DynOutputOutcome, ModuleInstanceId, ModuleKind};
 use fedimint_core::db::{
@@ -36,10 +40,6 @@ use fedimint_core::endpoint_constants::{
     SETUP_STATUS_ENDPOINT, SHUTDOWN_ENDPOINT, SIGN_API_ANNOUNCEMENT_ENDPOINT,
     SIGN_GUARDIAN_METADATA_ENDPOINT, STATUS_ENDPOINT, SUBMIT_API_ANNOUNCEMENT_ENDPOINT,
     SUBMIT_GUARDIAN_METADATA_ENDPOINT, SUBMIT_TRANSACTION_ENDPOINT, VERSION_ENDPOINT,
-};
-use fedimint_core::config_gen::{
-    AbortModuleGenerationRequest, ConfigGenAbortReason, ConfigGenItem, ModuleConfigProposal,
-    ModuleGenerationId,
 };
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::invite_code::InviteCode;
@@ -77,9 +77,9 @@ use crate::config::io::{CONSENSUS_CONFIG, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG
 use crate::config::{ServerConfig, legacy_consensus_config_hash};
 use crate::consensus::config_gen::GenerationLog;
 use crate::consensus::db::{AcceptedItemPrefix, AcceptedTransactionKey, SignedSessionOutcomeKey};
-use crate::db::ConfigGenerationLogKey;
 use crate::consensus::engine::get_finished_session_count_static;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
+use crate::db::ConfigGenerationLogKey;
 use crate::metrics::{BACKUP_WRITE_SIZE_BYTES, STORED_BACKUPS_COUNT};
 use crate::net::api::HasApiContext;
 use crate::net::api::announcement::{ApiAnnouncementKey, ApiAnnouncementPrefix, get_api_urls};

@@ -47,8 +47,8 @@ use crate::consensus::db::{
     SignedSessionOutcomeKey, SignedSessionOutcomePrefix,
 };
 use crate::consensus::debug::{DebugConsensusItem, DebugConsensusItemCompact};
-use crate::db::ConfigGenerationLogKey;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
+use crate::db::ConfigGenerationLogKey;
 use crate::metrics::{
     CONSENSUS_ITEM_PROCESSING_DURATION_SECONDS,
     CONSENSUS_ITEM_PROCESSING_MODULE_AUDIT_DURATION_SECONDS, CONSENSUS_ITEMS_PROCESSED_TOTAL,
