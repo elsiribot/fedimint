@@ -66,9 +66,11 @@ use fedimint_core::{ChainId, OutPoint, OutPointRange, PeerId, TransactionId, sec
 use fedimint_logging::LOG_NET_API;
 use fedimint_server_core::bitcoin_rpc::ServerBitcoinRpcMonitor;
 use fedimint_server_core::dashboard_ui::{
-    IDashboardApi, P2PConnectionStatus, ServerBitcoinRpcStatus,
+    IDashboardApi, ModuleGenerationSummary, P2PConnectionStatus, ServerBitcoinRpcStatus,
 };
-use fedimint_server_core::{DynServerModule, ServerModuleRegistry, ServerModuleRegistryExt};
+use fedimint_server_core::{
+    DynServerModule, ServerModuleInitRegistry, ServerModuleRegistry, ServerModuleRegistryExt,
+};
 use futures::StreamExt;
 use tokio::sync::watch::{self, Receiver, Sender};
 use tracing::{debug, info, warn};
@@ -93,6 +95,8 @@ pub struct ConsensusApi {
     pub db: Database,
     /// Modules registered with the federation
     pub modules: ServerModuleRegistry,
+    /// Module kinds this binary supports, e.g. for generating new modules
+    pub module_inits: ServerModuleInitRegistry,
     /// Cached client config
     pub client_cfg: ClientConfig,
     pub force_api_secret: Option<String>,
@@ -331,6 +335,85 @@ impl ConsensusApi {
             .get_value(&ConfigGenerationLogKey)
             .await
             .unwrap_or_default()
+    }
+
+    /// Validates a proposal against the local generation log and submits it
+    async fn try_propose_module_generation(
+        &self,
+        proposal: ModuleConfigProposal,
+    ) -> anyhow::Result<ModuleGenerationId> {
+        let log = self.generation_log().await;
+
+        if let Some(pending) = log.pending_generation() {
+            anyhow::bail!("Generation {pending} is still pending");
+        }
+
+        let generation_id = log.next_id();
+
+        self.submit_config_gen_item(ConfigGenItem::Propose {
+            generation_id,
+            proposal,
+        })
+        .await;
+
+        Ok(generation_id)
+    }
+
+    async fn try_approve_module_generation(
+        &self,
+        generation_id: ModuleGenerationId,
+    ) -> anyhow::Result<()> {
+        let log = self.generation_log().await;
+
+        match log.generations().get(&generation_id) {
+            Some(state) if state.is_pending() => {}
+            _ => anyhow::bail!(
+                "No pending generation {generation_id}; retry once the proposal is processed"
+            ),
+        }
+
+        self.submit_config_gen_item(ConfigGenItem::Approve { generation_id })
+            .await;
+
+        Ok(())
+    }
+
+    async fn try_activate_module_generation(
+        &self,
+        generation_id: ModuleGenerationId,
+    ) -> anyhow::Result<()> {
+        let log = self.generation_log().await;
+
+        match log.generations().get(&generation_id) {
+            Some(GenerationState::Generated { .. }) => {}
+            _ => anyhow::bail!("No generated {generation_id} to activate"),
+        }
+
+        self.submit_config_gen_item(ConfigGenItem::Activate { generation_id })
+            .await;
+
+        Ok(())
+    }
+
+    async fn try_abort_module_generation(
+        &self,
+        generation_id: ModuleGenerationId,
+        reason: String,
+    ) -> anyhow::Result<()> {
+        let log = self.generation_log().await;
+
+        match log.generations().get(&generation_id) {
+            Some(state) if state.is_pending() => {}
+            _ => anyhow::bail!("No pending generation {generation_id} to abort"),
+        }
+
+        self.submit_config_gen_item(ConfigGenItem::Abort {
+            generation_id,
+            reason: ConfigGenAbortReason(reason),
+        })
+        .await;
+
+        Ok(())
     }
 
     /// Submits a config generation lifecycle item into consensus. Whether it
@@ -801,6 +884,130 @@ impl IDashboardApi for ConsensusApi {
             })
     }
 
+    async fn available_module_kinds(&self) -> Vec<ModuleKind> {
+        self.module_inits.kinds().into_iter().collect()
+    }
+
+    async fn module_generations(&self) -> Vec<ModuleGenerationSummary> {
+        let identity = self.cfg.local.identity;
+        let num_peers = self.cfg.consensus.broadcast_public_keys.len();
+
+        self.generation_log()
+            .await
+            .generations()
+            .iter()
+            .map(|(generation_id, state)| {
+                let (module_kind, state_label, detail, can_approve, can_activate, can_abort) =
+                    match state {
+                        GenerationState::Proposed {
+                            proposal,
+                            approvals,
+                            ..
+                        } => (
+                            proposal.module_kind.clone(),
+                            "Proposed",
+                            format!("{}/{num_peers} approvals", approvals.len()),
+                            !approvals.contains(&identity),
+                            false,
+                            true,
+                        ),
+                        GenerationState::Approved { proposal, results } => (
+                            proposal.module_kind.clone(),
+                            "Running DKG",
+                            format!("{}/{num_peers} results", results.len()),
+                            false,
+                            false,
+                            true,
+                        ),
+                        GenerationState::Generated { proposal, .. } => (
+                            proposal.module_kind.clone(),
+                            "Generated",
+                            "Ready for activation".to_string(),
+                            false,
+                            true,
+                            false,
+                        ),
+                        GenerationState::Active {
+                            proposal,
+                            instance_id,
+                            active_from_session,
+                            ..
+                        } => (
+                            proposal.module_kind.clone(),
+                            "Active",
+                            format!(
+                                "Instance {instance_id}, active from session {active_from_session}"
+                            ),
+                            false,
+                            false,
+                            false,
+                        ),
+                        GenerationState::Aborted { proposal, reason } => (
+                            proposal.module_kind.clone(),
+                            "Aborted",
+                            reason.0.clone(),
+                            false,
+                            false,
+                            false,
+                        ),
+                    };
+
+                ModuleGenerationSummary {
+                    generation_id: generation_id.0,
+                    module_kind,
+                    state: state_label.to_string(),
+                    detail,
+                    can_approve,
+                    can_activate,
+                    can_abort,
+                }
+            })
+            .collect()
+    }
+
+    async fn propose_module_generation(&self, kind: ModuleKind) -> anyhow::Result<()> {
+        let module_init = self
+            .module_inits
+            .get(&kind)
+            .with_context(|| format!("Unsupported module kind {kind}"))?;
+
+        let consensus_version = module_init.supported_api_versions().module_consensus;
+
+        let network = self
+            .bitcoin_rpc_connection
+            .status()
+            .context("Bitcoin backend is not connected yet")?
+            .network;
+
+        self.try_propose_module_generation(ModuleConfigProposal {
+            module_kind: kind,
+            consensus_version,
+            network,
+            disable_base_fees: false,
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    async fn approve_module_generation(&self, generation_id: u64) -> anyhow::Result<()> {
+        self.try_approve_module_generation(ModuleGenerationId(generation_id))
+            .await
+    }
+
+    async fn activate_module_generation(&self, generation_id: u64) -> anyhow::Result<()> {
+        self.try_activate_module_generation(ModuleGenerationId(generation_id))
+            .await
+    }
+
+    async fn abort_module_generation(&self, generation_id: u64) -> anyhow::Result<()> {
+        self.try_abort_module_generation(
+            ModuleGenerationId(generation_id),
+            "Aborted via dashboard".to_string(),
+        )
+        .await
+    }
+
     async fn fedimintd_version(&self) -> String {
         self.code_version_str.clone()
     }
@@ -1074,17 +1281,10 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             ApiVersion::new(0, 10),
             async |fedimint: &ConsensusApi, context, proposal: ModuleConfigProposal| -> ModuleGenerationId {
                 check_auth(context)?;
-                let log = fedimint.generation_log().await;
-                if let Some(pending) = log.pending_generation() {
-                    return Err(ApiError::bad_request(format!(
-                        "Generation {pending} is still pending"
-                    )));
-                }
-                let generation_id = log.next_id();
                 fedimint
-                    .submit_config_gen_item(ConfigGenItem::Propose { generation_id, proposal })
-                    .await;
-                Ok(generation_id)
+                    .try_propose_module_generation(proposal)
+                    .await
+                    .map_err(|err| ApiError::bad_request(err.to_string()))
             }
         },
         api_endpoint! {
@@ -1092,19 +1292,10 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             ApiVersion::new(0, 10),
             async |fedimint: &ConsensusApi, context, generation_id: ModuleGenerationId| -> () {
                 check_auth(context)?;
-                let log = fedimint.generation_log().await;
-                match log.generations().get(&generation_id) {
-                    Some(state) if state.is_pending() => {}
-                    _ => {
-                        return Err(ApiError::bad_request(format!(
-                            "No pending generation {generation_id}; retry once the proposal is processed"
-                        )));
-                    }
-                }
                 fedimint
-                    .submit_config_gen_item(ConfigGenItem::Approve { generation_id })
-                    .await;
-                Ok(())
+                    .try_approve_module_generation(generation_id)
+                    .await
+                    .map_err(|err| ApiError::bad_request(err.to_string()))
             }
         },
         api_endpoint! {
@@ -1112,19 +1303,10 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             ApiVersion::new(0, 10),
             async |fedimint: &ConsensusApi, context, generation_id: ModuleGenerationId| -> () {
                 check_auth(context)?;
-                let log = fedimint.generation_log().await;
-                match log.generations().get(&generation_id) {
-                    Some(GenerationState::Generated { .. }) => {}
-                    _ => {
-                        return Err(ApiError::bad_request(format!(
-                            "No generated {generation_id} to activate"
-                        )));
-                    }
-                }
                 fedimint
-                    .submit_config_gen_item(ConfigGenItem::Activate { generation_id })
-                    .await;
-                Ok(())
+                    .try_activate_module_generation(generation_id)
+                    .await
+                    .map_err(|err| ApiError::bad_request(err.to_string()))
             }
         },
         api_endpoint! {
@@ -1133,12 +1315,9 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             async |fedimint: &ConsensusApi, context, request: AbortModuleGenerationRequest| -> () {
                 check_auth(context)?;
                 fedimint
-                    .submit_config_gen_item(ConfigGenItem::Abort {
-                        generation_id: request.generation_id,
-                        reason: ConfigGenAbortReason(request.reason),
-                    })
-                    .await;
-                Ok(())
+                    .try_abort_module_generation(request.generation_id, request.reason)
+                    .await
+                    .map_err(|err| ApiError::bad_request(err.to_string()))
             }
         },
         api_endpoint! {

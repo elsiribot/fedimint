@@ -347,6 +347,7 @@ pub async fn run(
         cfg: cfg.clone(),
         db: db.clone(),
         modules: module_registry.clone(),
+        module_inits: module_init_registry.clone(),
         client_cfg: client_cfg.clone(),
         submission_sender: submission_sender.clone(),
         shutdown_sender,

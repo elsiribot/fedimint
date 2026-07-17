@@ -66,7 +66,10 @@ pub enum GenerationState {
     },
     /// Aborted by a guardian. Terminal; retrying requires a fresh proposal
     /// under a new generation id.
-    Aborted { reason: ConfigGenAbortReason },
+    Aborted {
+        proposal: ModuleConfigProposal,
+        reason: ConfigGenAbortReason,
+    },
 }
 
 /// One guardian's reported generation result.
@@ -325,12 +328,13 @@ pub fn process_item(
                 .get_mut(&generation_id)
                 .with_context(|| format!("Abort for unknown {generation_id}"))?;
 
-            ensure!(
-                state.is_pending(),
-                "Abort for {generation_id} which is not pending"
-            );
+            let proposal = match state {
+                GenerationState::Proposed { proposal, .. }
+                | GenerationState::Approved { proposal, .. } => proposal.clone(),
+                _ => bail!("Abort for {generation_id} which is not pending"),
+            };
 
-            *state = GenerationState::Aborted { reason };
+            *state = GenerationState::Aborted { proposal, reason };
         }
     }
 

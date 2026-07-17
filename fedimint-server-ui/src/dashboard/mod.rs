@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod bitcoin;
+pub mod config_gen;
 pub(crate) mod consensus_explorer;
 pub mod general;
 pub mod invite;
@@ -151,6 +152,12 @@ async fn dashboard_view(
             }
         }
 
+        div class="row gy-4 mt-2" {
+            div class="col-12" {
+                (config_gen::render(&state.api).await)
+            }
+        }
+
         // Conditionally add Lightning V2 UI if the module is available
         @if let Some(lightning) = state.api.get_module::<fedimint_lnv2_server::Lightning>() {
             div class="row gy-4 mt-2" {
@@ -239,6 +246,24 @@ pub fn router(api: DynDashboardApi) -> Router {
     if requires_auth {
         app = app.route(LOGIN_ROUTE, get(login_form_handler).post(login_submit));
     }
+
+    app = app
+        .route(
+            config_gen::CONFIG_GEN_PROPOSE_ROUTE,
+            post(config_gen::post_propose),
+        )
+        .route(
+            config_gen::CONFIG_GEN_APPROVE_ROUTE,
+            post(config_gen::post_approve),
+        )
+        .route(
+            config_gen::CONFIG_GEN_ACTIVATE_ROUTE,
+            post(config_gen::post_activate),
+        )
+        .route(
+            config_gen::CONFIG_GEN_ABORT_ROUTE,
+            post(config_gen::post_abort),
+        );
 
     // routeradd LNv2 gateway routes if the module exists
     if api

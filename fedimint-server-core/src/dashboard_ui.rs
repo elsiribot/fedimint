@@ -88,6 +88,26 @@ pub trait IDashboardApi {
     /// Get reference to a server module instance by module kind
     fn get_module_by_kind(&self, kind: ModuleKind) -> Option<&DynServerModule>;
 
+    /// Module kinds this server could generate a new module instance for
+    async fn available_module_kinds(&self) -> Vec<ModuleKind>;
+
+    /// All module config generations of this federation
+    async fn module_generations(&self) -> Vec<ModuleGenerationSummary>;
+
+    /// Propose generating a new module instance of the given kind, using
+    /// the latest supported consensus version and the backend's network
+    async fn propose_module_generation(&self, kind: ModuleKind) -> anyhow::Result<()>;
+
+    /// Approve the given pending module generation
+    async fn approve_module_generation(&self, generation_id: u64) -> anyhow::Result<()>;
+
+    /// Activate the given generated module; all guardians restart before
+    /// the activation session
+    async fn activate_module_generation(&self, generation_id: u64) -> anyhow::Result<()>;
+
+    /// Abort the given pending module generation
+    async fn abort_module_generation(&self, generation_id: u64) -> anyhow::Result<()>;
+
     /// Get the fedimintd version
     async fn fedimintd_version(&self) -> String;
 
@@ -116,6 +136,23 @@ impl DashboardApiModuleExt for DynDashboardApi {
             .as_any()
             .downcast_ref::<M>()
     }
+}
+
+/// UI summary of one module config generation
+#[derive(Debug, Clone)]
+pub struct ModuleGenerationSummary {
+    pub generation_id: u64,
+    pub module_kind: ModuleKind,
+    /// Human-readable lifecycle state, e.g. "Proposed"
+    pub state: String,
+    /// Human-readable state detail, e.g. the approval count or abort reason
+    pub detail: String,
+    /// This guardian can approve the generation
+    pub can_approve: bool,
+    /// The generation completed and can be activated
+    pub can_activate: bool,
+    /// The generation can be aborted
+    pub can_abort: bool,
 }
 
 #[derive(Debug, Clone)]
