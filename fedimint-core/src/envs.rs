@@ -37,6 +37,26 @@ pub const FM_ENABLE_MODULE_USDT_ENV: &str = "FM_ENABLE_MODULE_USDT";
 /// time.
 pub const FM_USDT_EVM_RPC_URL_ENV: &str = "FM_USDT_EVM_RPC_URL";
 
+/// Env var to override the USDT module's `usdt_contract` config-gen param
+/// (a `0x`-prefixed 20-byte hex EVM address).
+///
+/// The module's compiled-in default is a placeholder
+/// (`EvmAddress([0u8; 20])`); this lets a config-gen leader (e.g. `devimint`,
+/// after deploying a test ERC-20 to its `anvil` instance) point a real
+/// federation at the actual deployed contract without a code change.
+pub const FM_USDT_CONTRACT_ENV: &str = "FM_USDT_CONTRACT";
+
+/// Env var to override the `mintv2` module's `amount_unit` config-gen param
+/// (a decimal [`crate::module::AmountUnit`] id, e.g. `1` for
+/// `fedimint_usdt_common::USDT_UNIT`).
+///
+/// The module's compiled-in default denominates in the native Bitcoin unit
+/// (`AmountUnit::BITCOIN`); this lets a config-gen leader stand up a
+/// USDT-denominated `mintv2` instance -- e.g. for the usdt module's
+/// devimint/anvil e2e, which needs a primary module registered for
+/// `USDT_UNIT` to mint the claimed e-cash into -- without a code change.
+pub const FM_MINTV2_AMOUNT_UNIT_ENV: &str = "FM_MINTV2_AMOUNT_UNIT";
+
 /// Disable mint base fees for testing and development environments
 pub const FM_DISABLE_BASE_FEES_ENV: &str = "FM_DISABLE_BASE_FEES";
 

@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use anyhow::Context as _;
 use config::UsdtClientConfig;
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -51,6 +52,29 @@ impl fmt::Display for EvmAddress {
         }
 
         Ok(())
+    }
+}
+
+impl std::str::FromStr for EvmAddress {
+    type Err = anyhow::Error;
+
+    /// Parses the inverse of [`Self::fmt`]: an optionally `0x`-prefixed,
+    /// 40-hex-character (20-byte) address.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let hex_str = s.strip_prefix("0x").unwrap_or(s);
+        anyhow::ensure!(
+            hex_str.len() == 40,
+            "EvmAddress must be a (optionally 0x-prefixed) 20-byte hex address, got {} hex chars in {s:?}",
+            hex_str.len()
+        );
+
+        let mut bytes = [0u8; 20];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16)
+                .with_context(|| format!("invalid hex byte at position {i} in {s:?}"))?;
+        }
+
+        Ok(Self(bytes))
     }
 }
 
@@ -186,9 +210,10 @@ pub struct DepositStatusResponse {
 
 /// Per-instance config-gen params for the USDT module (Phase 4.5 mechanism).
 ///
-/// `Default` targets a local `anvil` dev federation: chain id 31337, a fast
-/// confirmation depth, and the test ERC-20 address deployed by the devimint
-/// anvil harness. Real deployments override every field at config-gen time.
+/// `Default` targets a local `anvil` dev federation: chain id 31337 and a
+/// fast confirmation depth. `usdt_contract` is a placeholder — real
+/// deployments (and the devimint e2e) must override this with the deployed
+/// contract address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsdtGenParams {
     pub usdt_contract: EvmAddress,

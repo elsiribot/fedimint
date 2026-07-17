@@ -19,12 +19,14 @@ use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::encoding::Encodable;
-use fedimint_core::envs::{FM_ENABLE_MODULE_MINTV2_ENV, is_env_var_set_opt};
+use fedimint_core::envs::{
+    FM_ENABLE_MODULE_MINTV2_ENV, FM_MINTV2_AMOUNT_UNIT_ENV, is_env_var_set_opt,
+};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion,
-    InputMeta, ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions,
-    TransactionItemAmounts, api_endpoint,
+    AmountUnit, Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION,
+    CoreConsensusVersion, InputMeta, ModuleConsensusVersion, ModuleInit,
+    SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
 };
 use fedimint_core::{
     Amount, BitcoinHash, InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, apply,
@@ -156,11 +158,41 @@ impl ServerModuleInit for MintInit {
         is_env_var_set_opt(FM_ENABLE_MODULE_MINTV2_ENV).unwrap_or(false)
     }
 
+    /// The compiled-in [`MintGenParams::default`] denominates the default
+    /// instance in the native Bitcoin unit (`AmountUnit::BITCOIN`). This
+    /// override lets a config-gen leader stand up a federation whose single
+    /// `mintv2` instance is denominated in a custom [`AmountUnit`] instead
+    /// (e.g. `fedimint_usdt_common::USDT_UNIT`, for the usdt module's
+    /// devimint/anvil e2e, which needs a primary module registered for that
+    /// unit to mint claimed e-cash into) via [`FM_MINTV2_AMOUNT_UNIT_ENV`],
+    /// without a code change.
+    fn default_config_gen_params(&self) -> Self::Params {
+        let mut params = MintGenParams::default();
+
+        match std::env::var(FM_MINTV2_AMOUNT_UNIT_ENV) {
+            Ok(unit) if !unit.is_empty() => {
+                let unit: u64 = unit.parse().unwrap_or_else(|err| {
+                    panic!("{FM_MINTV2_AMOUNT_UNIT_ENV} must be a u64: {err}")
+                });
+                params.amount_unit = AmountUnit::new_custom(unit);
+            }
+            _ => {}
+        }
+
+        params
+    }
+
     fn get_documented_env_vars(&self) -> Vec<EnvVarDoc> {
-        vec![EnvVarDoc {
-            name: FM_ENABLE_MODULE_MINTV2_ENV,
-            description: "Set to 1/true to enable the MintV2 module (experimental). Disabled by default.",
-        }]
+        vec![
+            EnvVarDoc {
+                name: FM_ENABLE_MODULE_MINTV2_ENV,
+                description: "Set to 1/true to enable the MintV2 module (experimental). Disabled by default.",
+            },
+            EnvVarDoc {
+                name: FM_MINTV2_AMOUNT_UNIT_ENV,
+                description: "Overrides the default instance's `amount_unit` config-gen param (a decimal AmountUnit id) for the config-gen leader.",
+            },
+        ]
     }
 
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {

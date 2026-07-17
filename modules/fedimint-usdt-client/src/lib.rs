@@ -4,9 +4,11 @@
 #![allow(clippy::missing_panics_doc)]
 
 use std::collections::BTreeMap;
+#[cfg(feature = "cli")]
+use std::ffi;
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use api::UsdtFederationApi;
 use db::{ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix};
 use fedimint_api_client::api::DynModuleApi;
@@ -30,8 +32,8 @@ use fedimint_core::{Amount, apply, async_trait_maybe_send, push_db_pair_items};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
-    EvmAddress, KIND, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtInput, UsdtInputV0,
-    UsdtModuleTypes,
+    CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND, USDT_UNIT, UsdtAmount,
+    UsdtCommonInit, UsdtInput, UsdtInputV0, UsdtModuleTypes,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -39,6 +41,8 @@ use states::UsdtStateMachine;
 use strum::IntoEnumIterator;
 
 pub mod api;
+#[cfg(feature = "cli")]
+mod cli;
 pub mod db;
 pub mod states;
 
@@ -125,6 +129,14 @@ impl ClientModule for UsdtClientModule {
     async fn get_balance(&self, _dbtx: &mut DatabaseTransaction<'_>, _unit: AmountUnit) -> Amount {
         Amount::ZERO
     }
+
+    #[cfg(feature = "cli")]
+    async fn handle_cli_command(
+        &self,
+        args: &[ffi::OsString],
+    ) -> anyhow::Result<serde_json::Value> {
+        cli::handle_cli_command(self, args).await
+    }
 }
 
 impl UsdtClientModule {
@@ -154,14 +166,75 @@ impl UsdtClientModule {
         Ok((claim_keypair, account))
     }
 
+    /// Enqueues this guardian's local deposit-checker task to start watching
+    /// `claim_pk`'s deposit address (thin wrapper around the federation API
+    /// call; see [`UsdtFederationApi::check_deposit`]).
+    pub async fn check_deposit(
+        &self,
+        claim_pk: secp256k1::PublicKey,
+    ) -> anyhow::Result<CheckDepositResponse> {
+        Ok(self.module_api.check_deposit(claim_pk).await?)
+    }
+
+    /// Reports the credited/claimed/claimable state of `claim_pk`'s deposit
+    /// account (thin wrapper around the federation API call; see
+    /// [`UsdtFederationApi::deposit_status`]).
+    pub async fn deposit_status(
+        &self,
+        claim_pk: secp256k1::PublicKey,
+    ) -> anyhow::Result<DepositStatusResponse> {
+        Ok(self.module_api.deposit_status(claim_pk).await?)
+    }
+
+    /// Looks up the claim keypair persisted by [`Self::allocate_deposit`] for
+    /// `claim_pk`'s derived deposit account.
+    async fn load_claim_keypair(
+        &self,
+        claim_pk: &secp256k1::PublicKey,
+    ) -> anyhow::Result<(EvmAddress, Keypair)> {
+        let account = self.deposit_address(claim_pk);
+
+        let mut dbtx = self.db.begin_transaction_nc().await;
+        let claim_keypair = dbtx
+            .get_value(&ClaimKeyKey(account))
+            .await
+            .context("No claim key found for this deposit address; run `deposit-address` first")?;
+
+        Ok((account, claim_keypair))
+    }
+
+    /// One-shot claim for `claim_pk`'s deposit account: reads the current
+    /// [`Self::deposit_status`] (no polling, unlike [`Self::check_and_claim`])
+    /// and, if there is a nonzero claimable balance, submits the claim
+    /// transaction using the keypair [`Self::allocate_deposit`] persisted for
+    /// `claim_pk`. Returns the claimed amount.
+    ///
+    /// Callers should have already called [`Self::check_deposit`] (to enqueue
+    /// the deposit-checker task) and waited for the federation to observe and
+    /// credit the on-chain transfer; use [`Self::deposit_status`] to poll for
+    /// that.
+    pub async fn claim(&self, claim_pk: secp256k1::PublicKey) -> anyhow::Result<UsdtAmount> {
+        let (account, claim_keypair) = self.load_claim_keypair(&claim_pk).await?;
+        let status = self.module_api.deposit_status(claim_pk).await?;
+
+        if status.claimable.0 == 0 {
+            bail!(
+                "Nothing claimable yet for {account} (credited={}, claimed={}); \
+                 run `check-deposit` and wait for the deposit checker, or poll `deposit-status`",
+                status.credited.0,
+                status.claimed.0,
+            );
+        }
+
+        self.submit_claim(&claim_keypair, account, status.claimable)
+            .await?;
+
+        Ok(status.claimable)
+    }
+
     /// Asks the federation to start watching `claim_keypair`'s deposit
     /// address, polls until a credited deposit becomes claimable (or
     /// `deadline` elapses), then submits a fedimint transaction claiming it.
-    ///
-    /// The claimed funds are absorbed directly into the transaction's
-    /// implicit funding, which the USDT-`mintv2` primary module (routed to by
-    /// `USDT_UNIT`) balances by minting e-cash notes; no explicit output is
-    /// added here.
     pub async fn check_and_claim(
         &self,
         claim_keypair: &Keypair,
@@ -196,13 +269,28 @@ impl UsdtClientModule {
             backoff = (backoff * 2).min(CHECK_AND_CLAIM_MAX_BACKOFF);
         };
 
+        self.submit_claim(claim_keypair, account, claimable).await
+    }
+
+    /// Builds and submits the transaction claiming `amount` from `account`,
+    /// funding it with `claim_keypair`. Shared by [`Self::check_and_claim`]
+    /// (which polls until an amount is claimable) and [`Self::claim`] (which
+    /// takes a single already-known claimable amount).
+    ///
+    /// The claimed funds are absorbed directly into the transaction's
+    /// implicit funding, which the USDT-`mintv2` primary module (routed to by
+    /// `USDT_UNIT`) balances by minting e-cash notes; no explicit output is
+    /// added here.
+    async fn submit_claim(
+        &self,
+        claim_keypair: &Keypair,
+        account: EvmAddress,
+        amount: UsdtAmount,
+    ) -> anyhow::Result<()> {
         let input = ClientInput {
-            input: UsdtInput::V0(UsdtInputV0 {
-                account,
-                amount: claimable,
-            }),
+            input: UsdtInput::V0(UsdtInputV0 { account, amount }),
             keys: vec![*claim_keypair],
-            amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(claimable.0)),
+            amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0)),
         };
 
         let operation_id = OperationId::new_random();
@@ -215,10 +303,7 @@ impl UsdtClientModule {
             .finalize_and_submit_transaction(
                 operation_id,
                 KIND.as_str(),
-                move |_range| UsdtOperationMeta::Claim {
-                    account,
-                    amount: claimable,
-                },
+                move |_range| UsdtOperationMeta::Claim { account, amount },
                 tx,
             )
             .await?;

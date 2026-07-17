@@ -18,7 +18,8 @@ use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::envs::{
-    FM_ENABLE_MODULE_USDT_ENV, FM_USDT_EVM_RPC_URL_ENV, is_env_var_set_opt, is_running_in_test_env,
+    FM_ENABLE_MODULE_USDT_ENV, FM_USDT_CONTRACT_ENV, FM_USDT_EVM_RPC_URL_ENV, is_env_var_set_opt,
+    is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -177,6 +178,26 @@ impl ServerModuleInit for UsdtInit {
         is_env_var_set_opt(FM_ENABLE_MODULE_USDT_ENV).unwrap_or(false)
     }
 
+    /// The compiled-in [`fedimint_usdt_common::UsdtGenParams::default`]'s
+    /// `usdt_contract` is a placeholder (`EvmAddress([0u8; 20])`): no real
+    /// on-chain address is known at compile time. This override lets a
+    /// config-gen leader (e.g. `devimint`, after deploying a test ERC-20 to
+    /// its `anvil` instance) point the default instance at the real deployed
+    /// contract via [`FM_USDT_CONTRACT_ENV`], without a code change.
+    fn default_config_gen_params(&self) -> Self::Params {
+        let mut params = fedimint_usdt_common::UsdtGenParams::default();
+
+        if let Ok(contract) = std::env::var(FM_USDT_CONTRACT_ENV)
+            && !contract.is_empty()
+        {
+            params.usdt_contract = contract.parse().unwrap_or_else(|err| {
+                panic!("{FM_USDT_CONTRACT_ENV} must be a valid EvmAddress: {err}")
+            });
+        }
+
+        params
+    }
+
     fn get_documented_env_vars(&self) -> Vec<EnvVarDoc> {
         vec![
             EnvVarDoc {
@@ -186,6 +207,10 @@ impl ServerModuleInit for UsdtInit {
             EnvVarDoc {
                 name: FM_USDT_EVM_RPC_URL_ENV,
                 description: "Overrides the EVM RPC URL for this guardian at runtime, taking priority over the configured `evm_rpc_url`.",
+            },
+            EnvVarDoc {
+                name: FM_USDT_CONTRACT_ENV,
+                description: "Overrides the default instance's `usdt_contract` config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.",
             },
         ]
     }
