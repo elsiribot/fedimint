@@ -39,8 +39,8 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::GROUP_PUBLIC_KEY_ENDPOINT;
 use fedimint_usdt_common::{
-    DepositObservation, MODULE_CONSENSUS_VERSION, UsdtCommonInit, UsdtConsensusItem, UsdtInput,
-    UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
+    DepositObservation, MODULE_CONSENSUS_VERSION, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
+    UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -49,8 +49,9 @@ use tracing::warn;
 
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 use crate::db::{
-    BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, DepositObservationVotePrefix,
-    DepositRecord, DepositRecordPrefix, PendingCheck, PendingCheckPrefix,
+    BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, DepositObservationVoteAccountPrefix,
+    DepositObservationVoteKey, DepositObservationVotePrefix, DepositRecord, DepositRecordKey,
+    DepositRecordPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 
@@ -395,7 +396,30 @@ impl ServerModule for Usdt {
 
                 Ok(())
             }
-            _ => bail!("The usdt module does not support this consensus item yet"),
+            UsdtConsensusItem::Deposit(obs) => {
+                // Store this peer's vote; redundancy guard (unbounded-history rule).
+                let key = DepositObservationVoteKey(obs.account, peer_id);
+                if dbtx.insert_entry(&key, &obs).await.as_ref() == Some(&obs) {
+                    bail!("Deposit observation vote is redundant");
+                }
+
+                // Count identical observations for this account.
+                let votes: Vec<DepositObservation> = dbtx
+                    .find_by_prefix(&DepositObservationVoteAccountPrefix(obs.account))
+                    .await
+                    .map(|(_, v)| v)
+                    .collect()
+                    .await;
+                let agreeing = votes.iter().filter(|v| **v == obs).count();
+
+                if agreeing >= self.num_peers.threshold() {
+                    self.credit_deposit(dbtx, &obs).await?;
+                }
+                Ok(())
+            }
+            UsdtConsensusItem::Default { .. } => {
+                bail!("The usdt module does not support this consensus item yet")
+            }
         }
     }
 
@@ -559,12 +583,55 @@ impl Usdt {
 
         counts[peer_count / 2]
     }
+
+    /// Credits a deposit observation that has reached threshold agreement:
+    /// creates the account's [`DepositRecord`] (using the claim key from its
+    /// [`PendingCheck`] if the record does not exist yet), advances
+    /// `credited` monotonically forward to `obs.balance` (balance is
+    /// monotonic between sweeps since only the federation moves funds out),
+    /// updates `last_observed_block`, and clears the round's votes and the
+    /// account's `PendingCheck`.
+    async fn credit_deposit(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        obs: &DepositObservation,
+    ) -> anyhow::Result<()> {
+        let claim_pk = match dbtx.get_value(&PendingCheckKey(obs.account)).await {
+            Some(p) => p.claim_pk,
+            None => match dbtx.get_value(&DepositRecordKey(obs.account)).await {
+                Some(r) => r.claim_pk,
+                None => bail!("Deposit observation for an account with no pending check or record"),
+            },
+        };
+        let mut record = dbtx
+            .get_value(&DepositRecordKey(obs.account))
+            .await
+            .unwrap_or(DepositRecord {
+                claim_pk,
+                credited: UsdtAmount(0),
+                claimed: UsdtAmount(0),
+                last_observed_block: 0,
+            });
+        // Only credit forward; balance is monotonic between sweeps.
+        if obs.balance.0 > record.credited.0 {
+            record.credited = obs.balance;
+        }
+        record.last_observed_block = obs.block;
+        dbtx.insert_entry(&DepositRecordKey(obs.account), &record)
+            .await;
+        // Clear the round's votes + the pending check.
+        dbtx.remove_by_prefix(&DepositObservationVoteAccountPrefix(obs.account))
+            .await;
+        dbtx.remove_entry(&PendingCheckKey(obs.account)).await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use fedimint_core::PeerId;
     use fedimint_core::bitcoin::Network;
+    use fedimint_usdt_common::EvmAddress;
 
     use super::*;
 
@@ -765,6 +832,162 @@ mod tests {
             .process_consensus_item(
                 &mut dbtx.to_ref_nc(),
                 UsdtConsensusItem::BlockCount(100),
+                PeerId::from(0),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("redundant"));
+    }
+
+    /// Deterministic `secp256k1::PublicKey` derived from `byte`, for tests
+    /// that need a `claim_pk` but do not exercise the key's signing
+    /// properties.
+    fn test_pubkey(byte: u8) -> secp256k1::PublicKey {
+        let secp = secp256k1::Secp256k1::new();
+        secp256k1::SecretKey::from_slice(&[byte; 32])
+            .expect("valid scalar")
+            .public_key(&secp)
+    }
+
+    #[tokio::test]
+    async fn deposit_credited_only_at_threshold_of_identical_observations() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+        let account = EvmAddress([7; 20]);
+        let claim_pk = test_pubkey(0xaa);
+
+        // A PendingCheck must exist so the credit knows the claim key.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PendingCheckKey(account),
+                &PendingCheck {
+                    claim_pk,
+                    requested_at_block: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = DepositObservation {
+            account,
+            balance: UsdtAmount(2_000_000),
+            block: 50,
+        };
+        let mut dbtx = db.begin_transaction().await;
+
+        // Two identical votes: no credit yet.
+        for p in [0u16, 1] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::Deposit(obs.clone()),
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .is_none()
+        );
+
+        // A DIFFERENT balance from peer 2 does not count toward the 2M quorum.
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::Deposit(DepositObservation {
+                    balance: UsdtAmount(9),
+                    ..obs.clone()
+                }),
+                PeerId::from(2),
+            )
+            .await
+            .unwrap();
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .is_none()
+        );
+
+        // Third identical 2M vote reaches threshold → credited, votes + pending
+        // cleared.
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::Deposit(obs.clone()),
+                PeerId::from(3),
+            )
+            .await
+            .unwrap();
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .unwrap();
+        assert_eq!(record.credited, UsdtAmount(2_000_000));
+        assert_eq!(record.claimed, UsdtAmount(0));
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&PendingCheckKey(account))
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .find_by_prefix(&DepositObservationVoteAccountPrefix(account))
+                .await
+                .count()
+                .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn redundant_deposit_vote_errors() {
+        // Same peer submitting the same observation twice must Err.
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([8; 20]);
+        let claim_pk = test_pubkey(0xbb);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PendingCheckKey(account),
+                &PendingCheck {
+                    claim_pk,
+                    requested_at_block: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = DepositObservation {
+            account,
+            balance: UsdtAmount(1_000_000),
+            block: 10,
+        };
+        let mut dbtx = db.begin_transaction().await;
+
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::Deposit(obs.clone()),
+                PeerId::from(0),
+            )
+            .await
+            .unwrap();
+
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::Deposit(obs.clone()),
                 PeerId::from(0),
             )
             .await
