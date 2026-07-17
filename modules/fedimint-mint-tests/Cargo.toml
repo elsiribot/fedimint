@@ -11,9 +11,16 @@ version = { workspace = true }
 name = "fedimint_mint_tests"
 path = "tests/tests.rs"
 
+[[test]]
+name = "fedimint_mint_config_gen_tests"
+path = "tests/config_gen_tests.rs"
+
 [dependencies]
 anyhow = { workspace = true }
+bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
+fedimint-api-client = { workspace = true }
+serde_json = { workspace = true }
 bls12_381 = { workspace = true }
 clap = { workspace = true }
 devimint = { workspace = true }

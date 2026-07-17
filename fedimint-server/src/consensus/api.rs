@@ -1074,7 +1074,13 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             ApiVersion::new(0, 10),
             async |fedimint: &ConsensusApi, context, proposal: ModuleConfigProposal| -> ModuleGenerationId {
                 check_auth(context)?;
-                let generation_id = fedimint.generation_log().await.next_id();
+                let log = fedimint.generation_log().await;
+                if let Some(pending) = log.pending_generation() {
+                    return Err(ApiError::bad_request(format!(
+                        "Generation {pending} is still pending"
+                    )));
+                }
+                let generation_id = log.next_id();
                 fedimint
                     .submit_config_gen_item(ConfigGenItem::Propose { generation_id, proposal })
                     .await;
@@ -1086,6 +1092,15 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             ApiVersion::new(0, 10),
             async |fedimint: &ConsensusApi, context, generation_id: ModuleGenerationId| -> () {
                 check_auth(context)?;
+                let log = fedimint.generation_log().await;
+                match log.generations().get(&generation_id) {
+                    Some(state) if state.is_pending() => {}
+                    _ => {
+                        return Err(ApiError::bad_request(format!(
+                            "No pending generation {generation_id}; retry once the proposal is processed"
+                        )));
+                    }
+                }
                 fedimint
                     .submit_config_gen_item(ConfigGenItem::Approve { generation_id })
                     .await;

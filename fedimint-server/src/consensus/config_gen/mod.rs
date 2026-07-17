@@ -50,7 +50,9 @@ pub enum GenerationState {
 }
 
 impl GenerationState {
-    fn is_pending(&self) -> bool {
+    /// A pending generation is either awaiting approvals or results and
+    /// blocks new proposals.
+    pub fn is_pending(&self) -> bool {
         matches!(
             self,
             GenerationState::Proposed { .. } | GenerationState::Approved { .. }
@@ -75,7 +77,7 @@ impl GenerationLog {
         &self.generations
     }
 
-    fn pending_generation(&self) -> Option<ModuleGenerationId> {
+    pub fn pending_generation(&self) -> Option<ModuleGenerationId> {
         self.generations
             .iter()
             .find_map(|(id, state)| state.is_pending().then_some(*id))
