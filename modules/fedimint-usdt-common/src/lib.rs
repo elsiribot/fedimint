@@ -158,7 +158,7 @@ pub struct CheckDepositRequest {
 /// Response to [`CheckDepositRequest`]: the derived deposit account, and
 /// whether this call is what enqueued the guardian-local check (`false` if
 /// one was already enqueued for this account).
-#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct CheckDepositResponse {
     pub account: EvmAddress,
     pub enqueued: bool,
@@ -176,7 +176,7 @@ pub struct DepositStatusRequest {
 /// `credited`/`claimed`/`claimable` are all zero, with `account` still set to
 /// the derived deposit address so the client can poll this endpoint before
 /// any credit lands.
-#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct DepositStatusResponse {
     pub account: EvmAddress,
     pub credited: UsdtAmount,
