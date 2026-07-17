@@ -145,6 +145,45 @@ pub struct DepositObservation {
     pub block: u64,
 }
 
+/// Request to enqueue this guardian's local deposit-checker task to start
+/// watching `claim_pk`'s deposit address (see [`derive_deposit_account`]),
+/// and to have the derived address returned to the caller. Idempotent: a
+/// repeated request for the same `claim_pk` does not overwrite an
+/// already-enqueued [check][CheckDepositResponse].
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct CheckDepositRequest {
+    pub claim_pk: secp256k1::PublicKey,
+}
+
+/// Response to [`CheckDepositRequest`]: the derived deposit account, and
+/// whether this call is what enqueued the guardian-local check (`false` if
+/// one was already enqueued for this account).
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct CheckDepositResponse {
+    pub account: EvmAddress,
+    pub enqueued: bool,
+}
+
+/// Request for the current credited/claimed/claimable state of `claim_pk`'s
+/// deposit account.
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct DepositStatusRequest {
+    pub claim_pk: secp256k1::PublicKey,
+}
+
+/// Response to [`DepositStatusRequest`]. `claimable` is `credited − claimed`
+/// (saturating). If no deposit has been credited yet (or observed at all),
+/// `credited`/`claimed`/`claimable` are all zero, with `account` still set to
+/// the derived deposit address so the client can poll this endpoint before
+/// any credit lands.
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct DepositStatusResponse {
+    pub account: EvmAddress,
+    pub credited: UsdtAmount,
+    pub claimed: UsdtAmount,
+    pub claimable: UsdtAmount,
+}
+
 /// Per-instance config-gen params for the USDT module (Phase 4.5 mechanism).
 ///
 /// `Default` targets a local `anvil` dev federation: chain id 31337, a fast

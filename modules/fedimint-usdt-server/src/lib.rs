@@ -37,11 +37,14 @@ use fedimint_server_core::{
 use fedimint_threshold_ecdsa::group_public_key;
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
-use fedimint_usdt_common::endpoint_constants::GROUP_PUBLIC_KEY_ENDPOINT;
+use fedimint_usdt_common::endpoint_constants::{
+    CHECK_DEPOSIT_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
+};
 use fedimint_usdt_common::{
-    DepositObservation, MODULE_CONSENSUS_VERSION, USDT_UNIT, UsdtAmount, UsdtCommonInit,
+    CheckDepositRequest, CheckDepositResponse, DepositObservation, DepositStatusRequest,
+    DepositStatusResponse, MODULE_CONSENSUS_VERSION, USDT_UNIT, UsdtAmount, UsdtCommonInit,
     UsdtConsensusItem, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
-    UsdtOutputOutcome,
+    UsdtOutputOutcome, derive_deposit_account,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -510,13 +513,46 @@ impl ServerModule for Usdt {
     }
 
     fn api_endpoints(&self) -> Vec<ApiEndpoint<Self>> {
-        vec![api_endpoint! {
-            GROUP_PUBLIC_KEY_ENDPOINT,
-            ApiVersion::new(0, 0),
-            async |module: &Usdt, _context, _params: ()| -> secp256k1::PublicKey {
-                Ok(module.cfg.consensus.group_public_key)
-            }
-        }]
+        vec![
+            api_endpoint! {
+                GROUP_PUBLIC_KEY_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, _context, _params: ()| -> secp256k1::PublicKey {
+                    Ok(module.cfg.consensus.group_public_key)
+                }
+            },
+            api_endpoint! {
+                CHECK_DEPOSIT_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, req: CheckDepositRequest| -> CheckDepositResponse {
+                    // Writes a `PendingCheck`, so this needs a committable
+                    // transaction (mirroring lnv2's `add_gateway`), unlike
+                    // the read-only `deposit_status` endpoint below.
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction().await;
+                    let response = module
+                        .handle_check_deposit(&mut dbtx.to_ref_nc(), req.claim_pk)
+                        .await;
+                    dbtx.commit_tx().await;
+
+                    Ok(response)
+                }
+            },
+            api_endpoint! {
+                DEPOSIT_STATUS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, req: DepositStatusRequest| -> DepositStatusResponse {
+                    // Read-only: mirrors lnv2's
+                    // `DECRYPTION_KEY_SHARE_ENDPOINT`.
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+
+                    Ok(module
+                        .handle_deposit_status(&mut dbtx.to_ref_nc(), req.claim_pk)
+                        .await)
+                }
+            },
+        ]
     }
 }
 
@@ -736,6 +772,67 @@ impl Usdt {
             .await;
         dbtx.remove_entry(&PendingCheckKey(obs.account)).await;
         Ok(())
+    }
+
+    /// Derives `claim_pk`'s deposit account and enqueues a guardian-local
+    /// [`PendingCheck`] for it, so this guardian's deposit-checker task (see
+    /// [`scan_pending_deposits`]) starts watching that address. Idempotent:
+    /// if a `PendingCheck` already exists for the account, it is left
+    /// untouched and `enqueued: false` is returned instead.
+    async fn handle_check_deposit(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        claim_pk: secp256k1::PublicKey,
+    ) -> CheckDepositResponse {
+        let account = derive_deposit_account(&self.cfg.consensus.group_public_key, &claim_pk);
+
+        if dbtx.get_value(&PendingCheckKey(account)).await.is_some() {
+            return CheckDepositResponse {
+                account,
+                enqueued: false,
+            };
+        }
+
+        let requested_at_block = self.consensus_block_count(dbtx).await;
+        dbtx.insert_entry(
+            &PendingCheckKey(account),
+            &PendingCheck {
+                claim_pk,
+                requested_at_block,
+            },
+        )
+        .await;
+
+        CheckDepositResponse {
+            account,
+            enqueued: true,
+        }
+    }
+
+    /// Reports `claim_pk`'s deposit account state: `claimable` is
+    /// `credited - claimed` (saturating). Returns all-zero amounts (with the
+    /// derived `account` still populated) if no [`DepositRecord`] exists yet,
+    /// so a client can poll this before any credit has landed.
+    async fn handle_deposit_status(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        claim_pk: secp256k1::PublicKey,
+    ) -> DepositStatusResponse {
+        let account = derive_deposit_account(&self.cfg.consensus.group_public_key, &claim_pk);
+
+        let (credited, claimed) = dbtx
+            .get_value(&DepositRecordKey(account))
+            .await
+            .map_or((UsdtAmount(0), UsdtAmount(0)), |record| {
+                (record.credited, record.claimed)
+            });
+
+        DepositStatusResponse {
+            account,
+            credited,
+            claimed,
+            claimable: UsdtAmount(credited.0.saturating_sub(claimed.0)),
+        }
     }
 }
 
@@ -1537,6 +1634,102 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, UsdtInputError::UnknownDepositAccount);
+    }
+
+    #[tokio::test]
+    async fn check_deposit_enqueues_pending_check_and_is_idempotent() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x01);
+        let expected_account = fedimint_usdt_common::derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            &claim_pk,
+        );
+
+        // First call: derives the account and enqueues a PendingCheck.
+        let mut dbtx = db.begin_transaction().await;
+        let response = module
+            .handle_check_deposit(&mut dbtx.to_ref_nc(), claim_pk)
+            .await;
+        dbtx.commit_tx().await;
+
+        assert_eq!(response.account, expected_account);
+        assert!(response.enqueued);
+
+        let pending = db
+            .begin_transaction_nc()
+            .await
+            .get_value(&PendingCheckKey(expected_account))
+            .await
+            .expect("PendingCheck must have been inserted");
+        assert_eq!(pending.claim_pk, claim_pk);
+
+        // Second call for the same claim_pk: idempotent, must not overwrite.
+        let mut dbtx = db.begin_transaction().await;
+        let response2 = module
+            .handle_check_deposit(&mut dbtx.to_ref_nc(), claim_pk)
+            .await;
+        dbtx.commit_tx().await;
+
+        assert_eq!(response2.account, expected_account);
+        assert!(!response2.enqueued);
+    }
+
+    #[tokio::test]
+    async fn deposit_status_returns_zeros_for_unknown_account() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x02);
+        let expected_account = fedimint_usdt_common::derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            &claim_pk,
+        );
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let response = module
+            .handle_deposit_status(&mut dbtx.to_ref_nc(), claim_pk)
+            .await;
+
+        assert_eq!(response.account, expected_account);
+        assert_eq!(response.credited, UsdtAmount(0));
+        assert_eq!(response.claimed, UsdtAmount(0));
+        assert_eq!(response.claimable, UsdtAmount(0));
+    }
+
+    #[tokio::test]
+    async fn deposit_status_reports_claimable_as_credited_minus_claimed() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x03);
+        let account = fedimint_usdt_common::derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            &claim_pk,
+        );
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(5_000_000),
+                    claimed: UsdtAmount(2_000_000),
+                    last_observed_block: 42,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let response = module
+            .handle_deposit_status(&mut dbtx.to_ref_nc(), claim_pk)
+            .await;
+
+        assert_eq!(response.account, account);
+        assert_eq!(response.credited, UsdtAmount(5_000_000));
+        assert_eq!(response.claimed, UsdtAmount(2_000_000));
+        assert_eq!(response.claimable, UsdtAmount(3_000_000));
     }
 }
 
