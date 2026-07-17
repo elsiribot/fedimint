@@ -21,6 +21,8 @@ pub enum DbKeyPrefix {
     ServerInfo = 0x07,
     GuardianMetadata = 0x08,
     ConfigGeneration = 0x09,
+    ConfigGenerationStarted = 0x0a,
+    ConfigGenerationOutcome = 0x0b,
 
     DatabaseVersion = fedimint_core::db::DbKeyPrefix::DatabaseVersion as u8,
     ClientBackup = fedimint_core::db::DbKeyPrefix::ClientBackup as u8,
@@ -81,4 +83,40 @@ impl_db_record!(
     value = crate::consensus::config_gen::GenerationLog,
     db_prefix = DbKeyPrefix::ConfigGeneration,
     notify_on_modify = true,
+);
+
+/// Local marker that this guardian started the DKG of a generation.
+///
+/// A marker without a matching [`LocalGenerationOutcomeKey`] after a restart
+/// means we crashed mid generation; since generation randomness cannot be
+/// replayed the generation is aborted and has to be retried under a fresh
+/// id.
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct LocalGenerationStartedKey(pub fedimint_core::config_gen::ModuleGenerationId);
+
+impl_db_record!(
+    key = LocalGenerationStartedKey,
+    value = (),
+    db_prefix = DbKeyPrefix::ConfigGenerationStarted,
+);
+
+/// This guardian's locally generated module config for a completed DKG.
+///
+/// The private part never leaves the guardian; only the consensus part is
+/// reported into consensus via a result item.
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct LocalGenerationOutcomeKey(pub fedimint_core::config_gen::ModuleGenerationId);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct LocalGenerationOutcome {
+    /// The private module config as `serde_json` encoded
+    /// [`fedimint_core::config::JsonWithKind`]
+    pub private_json: String,
+    pub consensus: fedimint_core::config::ServerModuleConsensusConfig,
+}
+
+impl_db_record!(
+    key = LocalGenerationOutcomeKey,
+    value = LocalGenerationOutcome,
+    db_prefix = DbKeyPrefix::ConfigGenerationOutcome,
 );

@@ -317,7 +317,9 @@ impl DatabaseDump {
             | server_db::DbKeyPrefix::ServerInfo
             | server_db::DbKeyPrefix::DatabaseVersion
             | server_db::DbKeyPrefix::ClientBackup
-            | server_db::DbKeyPrefix::ConfigGeneration => {}
+            | server_db::DbKeyPrefix::ConfigGeneration
+            | server_db::DbKeyPrefix::ConfigGenerationStarted
+            | server_db::DbKeyPrefix::ConfigGenerationOutcome => {}
             server_db::DbKeyPrefix::ApiAnnouncements => {
                 push_db_pair_items_no_serde!(
                     dbtx,

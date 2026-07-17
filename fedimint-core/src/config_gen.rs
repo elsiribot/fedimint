@@ -8,6 +8,7 @@
 use bitcoin::Network;
 use serde::{Deserialize, Serialize};
 
+use crate::config::ServerModuleConsensusConfig;
 use crate::core::ModuleKind;
 use crate::encoding::{Decodable, Encodable};
 use crate::module::ModuleConsensusVersion;
@@ -79,6 +80,14 @@ pub enum ConfigGenItem {
     /// Approve the currently proposed generation. A generation only moves
     /// forward once every guardian has approved it.
     Approve { generation_id: ModuleGenerationId },
+    /// Report this guardian's completion of the DKG for an approved
+    /// generation. A generation completes once every guardian reported an
+    /// identical consensus config; private configs never leave the
+    /// guardian.
+    Result {
+        generation_id: ModuleGenerationId,
+        consensus_config: ServerModuleConsensusConfig,
+    },
     /// Abort the currently proposed generation. Any single guardian may
     /// abort; retrying requires a new proposal under a fresh id.
     Abort {

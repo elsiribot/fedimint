@@ -211,7 +211,9 @@ async fn test_server_db_migrations() -> anyhow::Result<()> {
                     | DbKeyPrefix::ServerInfo
                     | DbKeyPrefix::DatabaseVersion
                     | DbKeyPrefix::ClientBackup
-                    | DbKeyPrefix::ConfigGeneration => {}
+                    | DbKeyPrefix::ConfigGeneration
+                    | DbKeyPrefix::ConfigGenerationStarted
+                    | DbKeyPrefix::ConfigGenerationOutcome => {}
                     DbKeyPrefix::ApiAnnouncements => {
                         let announcements = dbtx
                             .find_by_prefix(&ApiAnnouncementPrefix)

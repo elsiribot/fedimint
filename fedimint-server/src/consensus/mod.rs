@@ -49,6 +49,7 @@ use tracing::{info, warn};
 use crate::config::{ServerConfig, ServerConfigLocal};
 use crate::connection_limits::ConnectionLimits;
 use crate::consensus::api::{ConsensusApi, server_endpoints};
+use crate::consensus::config_gen::manager::GenerationManager;
 use crate::consensus::engine::ConsensusEngine;
 use crate::db::verify_server_db_integrity_dbtx;
 use crate::metrics::{
@@ -194,9 +195,20 @@ pub async fn run(
     let (shutdown_sender, shutdown_receiver) = watch::channel(None);
     let (ord_latency_sender, ord_latency_receiver) = watch::channel(None);
     // Carries runtime DKG messages from the p2p receive loop to the config
-    // generation worker; consumed once the generation manager lands.
-    let (config_gen_sender, _config_gen_receiver) =
+    // generation manager.
+    let (config_gen_sender, config_gen_receiver) =
         async_channel::bounded::<(fedimint_core::PeerId, fedimint_core::config::P2PMessage)>(1024);
+
+    GenerationManager::new(
+        db.clone(),
+        NumPeers::from(cfg.consensus.api_endpoints().len()),
+        cfg.local.identity,
+        module_init_registry.clone(),
+        connections.clone(),
+        config_gen_receiver,
+        submission_sender.clone(),
+    )
+    .spawn(task_group);
 
     let mut ci_status_senders = BTreeMap::new();
     let mut ci_status_receivers = BTreeMap::new();

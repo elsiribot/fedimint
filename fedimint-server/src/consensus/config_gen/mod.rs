@@ -8,11 +8,13 @@
 //! every peer alike, so all acceptance rules in this module must be
 //! evaluatable from the log and the item alone.
 
+pub mod manager;
 pub mod transport;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, bail, ensure};
+use fedimint_core::config::ServerModuleConsensusConfig;
 use fedimint_core::config_gen::{
     ConfigGenAbortReason, ConfigGenItem, ModuleConfigProposal, ModuleGenerationId,
 };
@@ -30,9 +32,18 @@ pub enum GenerationState {
         proposer: PeerId,
         approvals: BTreeSet<PeerId>,
     },
-    /// Unanimously approved. In later phases this state starts the DKG
-    /// worker and transitions further; for now it is terminal.
-    Approved { proposal: ModuleConfigProposal },
+    /// Unanimously approved: every guardian runs the module DKG and
+    /// reports its resulting consensus config.
+    Approved {
+        proposal: ModuleConfigProposal,
+        results: BTreeMap<PeerId, ServerModuleConsensusConfig>,
+    },
+    /// Every guardian reported an identical consensus config. Terminal
+    /// until activation lands in a later phase.
+    Generated {
+        proposal: ModuleConfigProposal,
+        consensus_config: ServerModuleConsensusConfig,
+    },
     /// Aborted by a guardian. Terminal; retrying requires a fresh proposal
     /// under a new generation id.
     Aborted { reason: ConfigGenAbortReason },
@@ -40,7 +51,10 @@ pub enum GenerationState {
 
 impl GenerationState {
     fn is_pending(&self) -> bool {
-        matches!(self, GenerationState::Proposed { .. })
+        matches!(
+            self,
+            GenerationState::Proposed { .. } | GenerationState::Approved { .. }
+        )
     }
 }
 
@@ -125,6 +139,49 @@ pub fn process_item(
             if approvals.len() == num_peers.total() {
                 *state = GenerationState::Approved {
                     proposal: proposal.clone(),
+                    results: BTreeMap::new(),
+                };
+            }
+        }
+        ConfigGenItem::Result {
+            generation_id,
+            consensus_config,
+        } => {
+            let state = log
+                .generations
+                .get_mut(&generation_id)
+                .with_context(|| format!("Result for unknown {generation_id}"))?;
+
+            let GenerationState::Approved { proposal, results } = state else {
+                bail!("Result for {generation_id} which is not approved");
+            };
+
+            ensure!(
+                consensus_config.kind == proposal.module_kind,
+                "Result for {generation_id} with mismatched module kind"
+            );
+
+            ensure!(
+                consensus_config.version == proposal.consensus_version,
+                "Result for {generation_id} with mismatched consensus version"
+            );
+
+            if let Some(first) = results.values().next() {
+                ensure!(
+                    *first == consensus_config,
+                    "Result for {generation_id} by {peer} does not match previous results"
+                );
+            }
+
+            ensure!(
+                results.insert(peer, consensus_config.clone()).is_none(),
+                "Duplicate result for {generation_id} by {peer}"
+            );
+
+            if results.len() == num_peers.total() {
+                *state = GenerationState::Generated {
+                    proposal: proposal.clone(),
+                    consensus_config,
                 };
             }
         }
@@ -189,6 +246,32 @@ mod tests {
             },
             PeerId::from(peer),
         )
+    }
+
+    fn consensus_config(config: &[u8]) -> ServerModuleConsensusConfig {
+        ServerModuleConsensusConfig {
+            kind: ModuleKind::from_static_str("mint"),
+            version: ModuleConsensusVersion::new(2, 0),
+            config: config.to_vec(),
+        }
+    }
+
+    fn result(log: &mut GenerationLog, id: u64, peer: u16, config: &[u8]) -> anyhow::Result<()> {
+        process_item(
+            NumPeers::from(NUM_PEERS_TOTAL),
+            log,
+            ConfigGenItem::Result {
+                generation_id: ModuleGenerationId(id),
+                consensus_config: consensus_config(config),
+            },
+            PeerId::from(peer),
+        )
+    }
+
+    fn approve_all(log: &mut GenerationLog, id: u64) {
+        for peer in 1..NUM_PEERS_TOTAL as u16 {
+            approve(log, id, peer).expect("approval accepted");
+        }
     }
 
     fn abort(log: &mut GenerationLog, id: u64, peer: u16) -> anyhow::Result<()> {
@@ -284,6 +367,74 @@ mod tests {
         assert!(matches!(
             log.generations()[&ModuleGenerationId(1)],
             GenerationState::Approved { .. }
+        ));
+    }
+
+    #[test]
+    fn results_complete_generation() {
+        let mut log = GenerationLog::default();
+
+        propose(&mut log, 0, 0).expect("proposal accepted");
+        approve_all(&mut log, 0);
+
+        // Results are only accepted once approved unanimously
+        for peer in 0..4 {
+            result(&mut log, 0, peer, b"config").expect("result accepted");
+        }
+
+        assert!(matches!(
+            log.generations()[&ModuleGenerationId(0)],
+            GenerationState::Generated { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_result_before_approval() {
+        let mut log = GenerationLog::default();
+
+        propose(&mut log, 0, 0).expect("proposal accepted");
+
+        assert!(result(&mut log, 0, 0, b"config").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_and_mismatched_results() {
+        let mut log = GenerationLog::default();
+
+        propose(&mut log, 0, 0).expect("proposal accepted");
+        approve_all(&mut log, 0);
+
+        result(&mut log, 0, 0, b"config").expect("result accepted");
+
+        assert!(result(&mut log, 0, 0, b"config").is_err());
+        assert!(result(&mut log, 0, 1, b"different").is_err());
+
+        result(&mut log, 0, 1, b"config").expect("result accepted");
+    }
+
+    #[test]
+    fn rejects_proposal_while_generation_runs() {
+        let mut log = GenerationLog::default();
+
+        propose(&mut log, 0, 0).expect("proposal accepted");
+        approve_all(&mut log, 0);
+
+        assert!(propose(&mut log, 1, 1).is_err());
+    }
+
+    #[test]
+    fn abort_while_approved() {
+        let mut log = GenerationLog::default();
+
+        propose(&mut log, 0, 0).expect("proposal accepted");
+        approve_all(&mut log, 0);
+        result(&mut log, 0, 1, b"config").expect("result accepted");
+
+        abort(&mut log, 0, 2).expect("abort accepted");
+
+        assert!(matches!(
+            log.generations()[&ModuleGenerationId(0)],
+            GenerationState::Aborted { .. }
         ));
     }
 

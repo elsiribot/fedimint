@@ -618,7 +618,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct ServerModuleConsensusConfig {
     pub kind: ModuleKind,
     pub version: ModuleConsensusVersion,
