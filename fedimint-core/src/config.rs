@@ -769,6 +769,10 @@ pub enum P2PMessage {
     DkgG1(DkgMessageG1),
     DkgG2(DkgMessageG2),
     Encodable(Vec<u8>),
+    /// A message of a runtime module config generation DKG, namespaced by
+    /// its generation id so late messages of aborted generations can be
+    /// discarded.
+    ConfigGen(crate::config_gen::ModuleGenerationId, Box<Self>),
     #[encodable_default]
     Default {
         variant: u64,

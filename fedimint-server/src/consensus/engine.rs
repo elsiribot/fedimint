@@ -67,6 +67,8 @@ pub struct ConsensusEngine {
     pub cfg: ServerConfig,
     pub submission_receiver: Receiver<ConsensusItem>,
     pub shutdown_receiver: watch::Receiver<Option<u64>>,
+    /// Forwards runtime DKG messages to the config generation worker
+    pub config_gen_sender: async_channel::Sender<(PeerId, P2PMessage)>,
     pub connections: DynP2PConnections<P2PMessage>,
     pub ci_status_senders: BTreeMap<PeerId, watch::Sender<Option<u64>>>,
     pub ord_latency_sender: watch::Sender<Option<Duration>>,
@@ -293,6 +295,7 @@ impl ConsensusEngine {
                     connections.clone(),
                     signed_outcomes_sender,
                     signatures_sender,
+                    self.config_gen_sender.clone(),
                     self.db.clone(),
                 ),
                 Keychain::new(&self.cfg),

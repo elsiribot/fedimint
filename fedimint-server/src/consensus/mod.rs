@@ -193,6 +193,10 @@ pub async fn run(
     let (submission_sender, submission_receiver) = async_channel::bounded(TRANSACTION_BUFFER);
     let (shutdown_sender, shutdown_receiver) = watch::channel(None);
     let (ord_latency_sender, ord_latency_receiver) = watch::channel(None);
+    // Carries runtime DKG messages from the p2p receive loop to the config
+    // generation worker; consumed once the generation manager lands.
+    let (config_gen_sender, _config_gen_receiver) =
+        async_channel::bounded::<(fedimint_core::PeerId, fedimint_core::config::P2PMessage)>(1024);
 
     let mut ci_status_senders = BTreeMap::new();
     let mut ci_status_receivers = BTreeMap::new();
@@ -324,6 +328,7 @@ pub async fn run(
         ci_status_senders,
         submission_receiver,
         shutdown_receiver,
+        config_gen_sender,
         modules: module_registry,
         task_group: task_group.clone(),
         data_dir,

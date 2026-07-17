@@ -40,6 +40,7 @@ pub struct Network {
     connections: DynP2PConnections<P2PMessage>,
     signed_outcomes_sender: Sender<(PeerId, SignedSessionOutcome)>,
     signatures_sender: Sender<(PeerId, schnorr::Signature)>,
+    config_gen_sender: Sender<(PeerId, P2PMessage)>,
     db: Database,
 }
 
@@ -48,12 +49,14 @@ impl Network {
         connections: DynP2PConnections<P2PMessage>,
         signed_outcomes_sender: Sender<(PeerId, SignedSessionOutcome)>,
         signatures_sender: Sender<(PeerId, schnorr::Signature)>,
+        config_gen_sender: Sender<(PeerId, P2PMessage)>,
         db: Database,
     ) -> Self {
         Self {
             connections,
             signed_outcomes_sender,
             signatures_sender,
+            config_gen_sender,
             db,
         }
     }
@@ -137,6 +140,11 @@ impl aleph_bft::Network<NetworkData> for Network {
                             );
                         }
                     }
+                }
+                message @ P2PMessage::ConfigGen(..) => {
+                    // Forwarded to the config generation worker, which is
+                    // the only other consumer of runtime p2p messages.
+                    self.config_gen_sender.try_send((peer_id, message)).ok();
                 }
                 message => {
                     error!(

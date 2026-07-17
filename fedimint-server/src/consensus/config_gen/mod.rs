@@ -8,6 +8,8 @@
 //! every peer alike, so all acceptance rules in this module must be
 //! evaluatable from the log and the item alone.
 
+pub mod transport;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, bail, ensure};
