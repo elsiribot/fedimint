@@ -45,7 +45,7 @@ use fedimint_usdt_common::{
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
 use strum::IntoEnumIterator;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 use crate::db::{
@@ -311,10 +311,10 @@ pub struct Usdt {
     /// Read (and, later, broadcast) access to this guardian's configured EVM
     /// node.
     pub evm_rpc: DynServerEvmRpc,
-    /// Kept for the deposit-checker task spawned in Task 7 (it needs `db` to
-    /// read/write `PendingCheck`/deposit-observation state) and for test
-    /// scaffolding (`db_for_test`, `#[cfg(test)]`); no production consensus
-    /// method reads it directly yet.
+    /// Kept for test scaffolding (`db_for_test`, `#[cfg(test)]`); the
+    /// deposit-checker task spawned in [`Usdt::new`] is handed its own clone
+    /// before this field is set, so no production consensus method reads it
+    /// directly.
     #[allow(dead_code)]
     db: Database,
     our_peer_id: PeerId,
@@ -326,17 +326,30 @@ pub struct Usdt {
     /// `consensus_proposal`, since EVM RPC calls are not guaranteed to be as
     /// cheap/local as the wallet's bitcoind status cache).
     block_count: Arc<AtomicU64>,
-    /// Kept for the deposit-checker task spawned in Task 7 (it needs a
-    /// `TaskGroup` handle to spawn onto); the poller task spawned in
+    /// Kept for test scaffolding; the deposit-checker task spawned in
     /// [`Usdt::new`] is handed its own reference before this field is set,
-    /// so no production method reads it directly yet.
+    /// so no production method reads it directly.
     #[allow(dead_code)]
     task_group: TaskGroup,
-    /// Deposit observations gathered by the deposit-checker task (Task 7),
-    /// drained into `consensus_proposal` there.
-    // populated by the deposit-checker task and drained in consensus_proposal (Task 7)
-    #[allow(dead_code)]
+    /// Deposit observations gathered by the background deposit-checker task
+    /// (spawned in [`Usdt::new`]; see [`scan_pending_deposits`]), drained
+    /// into `UsdtConsensusItem::Deposit` proposals in `consensus_proposal`.
     deposit_proposals: Arc<Mutex<Vec<DepositObservation>>>,
+}
+
+/// Grouped handles/config for [`Usdt::spawn_deposit_checker`], bundling its
+/// many related parameters into one utility struct (per this workspace's
+/// convention for functions that would otherwise take too many individual
+/// parameters) instead of listing them all out.
+struct DepositCheckerHandles {
+    db: Database,
+    evm_rpc: DynServerEvmRpc,
+    block_count: Arc<AtomicU64>,
+    deposit_proposals: Arc<Mutex<Vec<DepositObservation>>>,
+    usdt_contract: fedimint_usdt_common::EvmAddress,
+    confirmation_depth: u64,
+    check_ttl_blocks: u64,
+    num_peers: NumPeers,
 }
 
 /// Implementation of consensus for the server module
@@ -369,6 +382,20 @@ impl ServerModule for Usdt {
 
         if vote > current_vote {
             items.push(UsdtConsensusItem::BlockCount(vote));
+        }
+
+        // Drain observations gathered by the background deposit-checker task
+        // (see `scan_pending_deposits`), proposing only those that differ
+        // from what this peer has already voted for the account (avoiding
+        // redundant proposals that `process_consensus_item` would reject).
+        let pending = std::mem::take(&mut *self.deposit_proposals.lock().expect("not poisoned"));
+        for obs in pending {
+            let current_vote = dbtx
+                .get_value(&DepositObservationVoteKey(obs.account, self.our_peer_id))
+                .await;
+            if current_vote != Some(obs.clone()) {
+                items.push(UsdtConsensusItem::Deposit(obs));
+            }
         }
 
         items
@@ -471,7 +498,8 @@ impl ServerModule for Usdt {
 
 impl Usdt {
     /// Create new module instance, spawning the background block-count
-    /// poller task (see [`Usdt::spawn_block_count_poller`]).
+    /// poller task (see [`Usdt::spawn_block_count_poller`]) and the
+    /// deposit-checker task (see [`Usdt::spawn_deposit_checker`]).
     pub fn new(
         cfg: UsdtConfig,
         evm_rpc: DynServerEvmRpc,
@@ -483,6 +511,21 @@ impl Usdt {
         let block_count = Arc::new(AtomicU64::new(0));
         Self::spawn_block_count_poller(&task_group, evm_rpc.clone(), block_count.clone());
 
+        let deposit_proposals = Arc::new(Mutex::new(Vec::new()));
+        Self::spawn_deposit_checker(
+            &task_group,
+            DepositCheckerHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.clone(),
+                block_count: block_count.clone(),
+                deposit_proposals: deposit_proposals.clone(),
+                usdt_contract: cfg.consensus.usdt_contract,
+                confirmation_depth: cfg.consensus.confirmation_depth,
+                check_ttl_blocks: cfg.consensus.check_ttl_blocks,
+                num_peers,
+            },
+        );
+
         Usdt {
             cfg,
             evm_rpc,
@@ -491,7 +534,7 @@ impl Usdt {
             num_peers,
             block_count,
             task_group,
-            deposit_proposals: Arc::new(Mutex::new(Vec::new())),
+            deposit_proposals,
         }
     }
 
@@ -561,27 +604,72 @@ impl Usdt {
         });
     }
 
+    /// Spawns a background task that periodically scans this guardian's
+    /// [`PendingCheck`]s (see [`scan_pending_deposits`]) and extends
+    /// `deposit_proposals` with any newly observed deposits, for
+    /// `consensus_proposal` to drain into `UsdtConsensusItem::Deposit`
+    /// proposals.
+    ///
+    /// Like [`Usdt::spawn_block_count_poller`], this task only *reads* the
+    /// module DB (via `db.begin_transaction_nc()`) and never commits writes
+    /// to it: fedimint server-module background tasks must not commit
+    /// writes to the module DB outside the consensus flow. All
+    /// `PendingCheck` writes happen in the check-deposit API handler and in
+    /// [`Usdt::credit_deposit`] (via `process_consensus_item`), never from a
+    /// background task.
+    fn spawn_deposit_checker(task_group: &TaskGroup, handles: DepositCheckerHandles) {
+        let DepositCheckerHandles {
+            db,
+            evm_rpc,
+            block_count,
+            deposit_proposals,
+            usdt_contract,
+            confirmation_depth,
+            check_ttl_blocks,
+            num_peers,
+        } = handles;
+
+        task_group.spawn_cancellable("usdt-deposit-checker", async move {
+            loop {
+                let mut dbtx = db.begin_transaction_nc().await;
+                let observations = scan_pending_deposits(
+                    &mut dbtx.to_ref_nc(),
+                    &evm_rpc,
+                    block_count.load(Ordering::Relaxed),
+                    usdt_contract,
+                    confirmation_depth,
+                    check_ttl_blocks,
+                    num_peers,
+                )
+                .await;
+                drop(dbtx);
+
+                deposit_proposals
+                    .lock()
+                    .expect("not poisoned")
+                    .extend(observations);
+
+                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
+                    1
+                } else {
+                    10
+                }))
+                .await;
+            }
+        });
+    }
+
     /// Median (over all peers, unresponsive peers counted as `0`) of the
     /// most recent `BlockCount` votes, mirroring
     /// `Wallet::consensus_block_count` (but `u64`-valued since EVM block
     /// numbers do not fit the wallet's `u32` bitcoin block heights).
+    ///
+    /// Delegates to the free [`consensus_block_count`] function so
+    /// [`scan_pending_deposits`] (which has no `Usdt` to call this method
+    /// on — it must run from a `'static` spawned task) can compute the same
+    /// value without duplicating the median logic.
     pub async fn consensus_block_count(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
-        let peer_count = self.num_peers.total();
-
-        let mut counts = dbtx
-            .find_by_prefix(&BlockCountVotePrefix)
-            .await
-            .map(|entry| entry.1)
-            .collect::<Vec<u64>>()
-            .await;
-
-        while counts.len() < peer_count {
-            counts.push(0);
-        }
-
-        counts.sort_unstable();
-
-        counts[peer_count / 2]
+        consensus_block_count(dbtx, self.num_peers).await
     }
 
     /// Credits a deposit observation that has reached threshold agreement:
@@ -625,6 +713,111 @@ impl Usdt {
         dbtx.remove_entry(&PendingCheckKey(obs.account)).await;
         Ok(())
     }
+}
+
+/// Free-function core of [`Usdt::consensus_block_count`], taking `num_peers`
+/// by value instead of borrowing it from `&self`, so it can be called both
+/// from that method and from [`scan_pending_deposits`] (which, running from a
+/// `'static` spawned task, cannot hold a `&Usdt` reference).
+async fn consensus_block_count(dbtx: &mut DatabaseTransaction<'_>, num_peers: NumPeers) -> u64 {
+    let peer_count = num_peers.total();
+
+    let mut counts = dbtx
+        .find_by_prefix(&BlockCountVotePrefix)
+        .await
+        .map(|entry| entry.1)
+        .collect::<Vec<u64>>()
+        .await;
+
+    while counts.len() < peer_count {
+        counts.push(0);
+    }
+
+    counts.sort_unstable();
+
+    counts[peer_count / 2]
+}
+
+/// Scans every guardian-local [`PendingCheck`] and returns the
+/// [`DepositObservation`]s this guardian is ready to propose for, without
+/// making any writes to `dbtx`.
+///
+/// This is a **pure reader**: fedimint server-module background tasks read
+/// the module DB via `db.begin_transaction_nc()` (non-committable) and must
+/// not commit writes to the module DB outside the consensus flow (mirroring
+/// e.g. the wallet module's read-only `run_broadcast_pending_tx`). All
+/// `PendingCheck` writes therefore live in the check-deposit API handler and
+/// in [`Usdt::credit_deposit`] (via `process_consensus_item`), never here.
+///
+/// The read block (`consensus_block_count(..) - confirmation_depth`) is
+/// derived from federation-wide consensus state, not this guardian's local
+/// EVM head, so that every honest guardian computes an identical observation
+/// for the same deposit and can reach agreement on it.
+///
+/// TTL-expired `PendingCheck`s are skipped (not deleted): garbage-collecting
+/// them is deferred, since deleting from a read-only scan would violate the
+/// pure-reader constraint above.
+async fn scan_pending_deposits(
+    dbtx: &mut DatabaseTransaction<'_>,
+    evm_rpc: &DynServerEvmRpc,
+    cached_head: u64,
+    usdt_contract: fedimint_usdt_common::EvmAddress,
+    confirmation_depth: u64,
+    check_ttl_blocks: u64,
+    num_peers: NumPeers,
+) -> Vec<DepositObservation> {
+    let ccount = consensus_block_count(dbtx, num_peers).await;
+    let at = ccount.saturating_sub(confirmation_depth);
+
+    let pending: Vec<(PendingCheckKey, PendingCheck)> = dbtx
+        .find_by_prefix(&PendingCheckPrefix)
+        .await
+        .collect()
+        .await;
+
+    let mut observations = Vec::new();
+    for (PendingCheckKey(account), check) in pending {
+        // Phase 9: stale expired PendingChecks are skipped here but not yet
+        // garbage-collected.
+        if check.requested_at_block + check_ttl_blocks < ccount {
+            continue;
+        }
+
+        if at > cached_head {
+            // This guardian's own EVM node hasn't confirmed that block yet;
+            // retry next tick.
+            continue;
+        }
+
+        let balance = match evm_rpc.get_erc20_balance(usdt_contract, account, at).await {
+            Ok(balance) => balance,
+            Err(err) => {
+                debug!(
+                    target: "usdt",
+                    err = %err.fmt_compact_anyhow(),
+                    ?account,
+                    at_block = at,
+                    "deposit balance check failed, retrying next tick"
+                );
+                continue;
+            }
+        };
+
+        let credited = dbtx
+            .get_value(&DepositRecordKey(account))
+            .await
+            .map_or(UsdtAmount(0), |record| record.credited);
+
+        if balance.0 > credited.0 {
+            observations.push(DepositObservation {
+                account,
+                balance,
+                block: at,
+            });
+        }
+    }
+
+    observations
 }
 
 #[cfg(test)]
@@ -713,15 +906,48 @@ mod tests {
         assert_eq!(client_cfg.chain_id, 1);
     }
 
-    /// A no-op [`IServerEvmRpc`] sufficient for constructing a [`Usdt`]
-    /// module in tests that exercise consensus logic (block-count
-    /// median/redundancy) rather than EVM-RPC-driven behavior. This is
-    /// deliberately separate from `fedimint-usdt-tests`' scriptable
-    /// `MockEvmRpc`: `fedimint-usdt-server` cannot depend on
-    /// `fedimint-usdt-tests` (which itself depends on this crate) without a
-    /// dependency cycle.
+    /// A mostly-no-op [`IServerEvmRpc`] sufficient for constructing a
+    /// [`Usdt`] module in tests that exercise consensus logic (block-count
+    /// median/redundancy) rather than EVM-RPC-driven behavior, plus minimal
+    /// scripting of `get_erc20_balance` (via `set_erc20_balance_at`) for the
+    /// deposit-checker tests. This is deliberately separate from
+    /// `fedimint-usdt-tests`' fuller scriptable `MockEvmRpc`:
+    /// `fedimint-usdt-server` cannot depend on `fedimint-usdt-tests` (which
+    /// itself depends on this crate) without a dependency cycle.
     #[derive(Debug, Default)]
-    struct MockEvmRpc;
+    struct MockEvmRpc {
+        #[allow(clippy::type_complexity)]
+        balances: Mutex<
+            std::collections::HashMap<
+                (
+                    fedimint_usdt_common::EvmAddress,
+                    fedimint_usdt_common::EvmAddress,
+                ),
+                BTreeMap<u64, fedimint_usdt_common::UsdtAmount>,
+            >,
+        >,
+    }
+
+    impl MockEvmRpc {
+        /// Scripts `get_erc20_balance(token, holder, at_block)` to return
+        /// `balance` for any `at_block >= block` (until a later, higher
+        /// scripted block for the same `(token, holder)` supersedes it),
+        /// mirroring `fedimint-usdt-tests`' `MockEvmRpc::set_erc20_balance_at`.
+        fn set_erc20_balance_at(
+            &self,
+            token: fedimint_usdt_common::EvmAddress,
+            holder: fedimint_usdt_common::EvmAddress,
+            block: u64,
+            balance: fedimint_usdt_common::UsdtAmount,
+        ) {
+            self.balances
+                .lock()
+                .expect("not poisoned")
+                .entry((token, holder))
+                .or_default()
+                .insert(block, balance);
+        }
+    }
 
     #[async_trait::async_trait]
     impl crate::rpc::IServerEvmRpc for MockEvmRpc {
@@ -735,11 +961,17 @@ mod tests {
 
         async fn get_erc20_balance(
             &self,
-            _token: fedimint_usdt_common::EvmAddress,
-            _holder: fedimint_usdt_common::EvmAddress,
-            _at_block: u64,
+            token: fedimint_usdt_common::EvmAddress,
+            holder: fedimint_usdt_common::EvmAddress,
+            at_block: u64,
         ) -> anyhow::Result<fedimint_usdt_common::UsdtAmount> {
-            Ok(fedimint_usdt_common::UsdtAmount(0))
+            Ok(self
+                .balances
+                .lock()
+                .expect("not poisoned")
+                .get(&(token, holder))
+                .and_then(|by_block| by_block.range(..=at_block).next_back())
+                .map_or(fedimint_usdt_common::UsdtAmount(0), |(_, balance)| *balance))
         }
 
         async fn get_fee_estimate(&self) -> anyhow::Result<fedimint_usdt_common::FeeVote> {
@@ -793,7 +1025,7 @@ mod tests {
 
         let module = Usdt::new_for_test(
             cfg,
-            MockEvmRpc.into_dyn(),
+            MockEvmRpc::default().into_dyn(),
             db,
             PeerId::from(0),
             peers.to_num_peers(),
@@ -993,6 +1225,140 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("redundant"));
+    }
+
+    /// Sets up a fresh in-memory DB with `BlockCountVote`s from a majority of
+    /// `num_peers` peers so that the free `consensus_block_count(dbtx,
+    /// num_peers)` (and therefore `scan_pending_deposits`) computes exactly
+    /// `ccount`.
+    async fn seed_block_count_votes(db: &Database, num_peers: u16, ccount: u64) {
+        let mut dbtx = db.begin_transaction().await;
+        // A majority (more than half) voting `ccount`, with the rest left
+        // unvoted (defaulting to 0), makes the median exactly `ccount` for
+        // any `num_peers` >= 1.
+        for p in 0..=(num_peers / 2) {
+            dbtx.insert_entry(&BlockCountVoteKey(PeerId::from(p)), &ccount)
+                .await;
+        }
+        dbtx.commit_tx().await;
+    }
+
+    #[tokio::test]
+    async fn scan_pending_deposits_finds_confirmed_balance_above_credited() {
+        let num_peers = 4u16;
+        let confirmation_depth = 6u64;
+        let check_ttl_blocks = 500u64;
+        let ccount = 100u64;
+        let usdt_contract = EvmAddress([0x11; 20]);
+        let account = EvmAddress([0x22; 20]);
+        let claim_pk = test_pubkey(0xcc);
+
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+        seed_block_count_votes(&db, num_peers, ccount).await;
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PendingCheckKey(account),
+                &PendingCheck {
+                    claim_pk,
+                    requested_at_block: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let at = ccount - confirmation_depth;
+        let evm_rpc = MockEvmRpc::default();
+        evm_rpc.set_erc20_balance_at(usdt_contract, account, at, UsdtAmount(3_000_000));
+        let evm_rpc: DynServerEvmRpc = std::sync::Arc::new(evm_rpc);
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let observations = scan_pending_deposits(
+            &mut dbtx.to_ref_nc(),
+            &evm_rpc,
+            ccount, // cached head is at least as fresh as `at`
+            usdt_contract,
+            confirmation_depth,
+            check_ttl_blocks,
+            (0..num_peers)
+                .map(PeerId::from)
+                .collect::<Vec<_>>()
+                .to_num_peers(),
+        )
+        .await;
+
+        assert_eq!(
+            observations,
+            vec![DepositObservation {
+                account,
+                balance: UsdtAmount(3_000_000),
+                block: at,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_pending_deposits_skips_expired_pending_check_without_deleting() {
+        let num_peers = 4u16;
+        let confirmation_depth = 6u64;
+        let check_ttl_blocks = 10u64;
+        let ccount = 1_000u64; // far past requested_at_block(0) + ttl(10)
+        let usdt_contract = EvmAddress([0x33; 20]);
+        let account = EvmAddress([0x44; 20]);
+        let claim_pk = test_pubkey(0xdd);
+
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+        seed_block_count_votes(&db, num_peers, ccount).await;
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PendingCheckKey(account),
+                &PendingCheck {
+                    claim_pk,
+                    requested_at_block: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let evm_rpc: DynServerEvmRpc = std::sync::Arc::new(MockEvmRpc::default());
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let observations = scan_pending_deposits(
+            &mut dbtx.to_ref_nc(),
+            &evm_rpc,
+            ccount,
+            usdt_contract,
+            confirmation_depth,
+            check_ttl_blocks,
+            (0..num_peers)
+                .map(PeerId::from)
+                .collect::<Vec<_>>()
+                .to_num_peers(),
+        )
+        .await;
+
+        assert!(
+            observations.is_empty(),
+            "expired pending check must not be proposed"
+        );
+
+        // The expired PendingCheck must NOT have been deleted: removal of
+        // stale expired entries is deferred to Phase 9 (see
+        // `scan_pending_deposits`'s doc comment).
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert!(
+            dbtx.get_value(&PendingCheckKey(account)).await.is_some(),
+            "the read-only scan must not delete the PendingCheck"
+        );
     }
 }
 
