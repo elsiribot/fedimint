@@ -22,13 +22,13 @@ use fedimint_core::envs::{
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
+    Amounts, ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
     ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
     api_endpoint,
 };
 use fedimint_core::task::TaskGroup;
 use fedimint_core::util::FmtCompactAnyhow as _;
-use fedimint_core::{InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, push_db_pair_items};
+use fedimint_core::{Amount, InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, push_db_pair_items};
 use fedimint_server_core::config::PeerHandleOps;
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
 use fedimint_server_core::{
@@ -39,8 +39,9 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::GROUP_PUBLIC_KEY_ENDPOINT;
 use fedimint_usdt_common::{
-    DepositObservation, MODULE_CONSENSUS_VERSION, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
-    UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
+    DepositObservation, MODULE_CONSENSUS_VERSION, USDT_UNIT, UsdtAmount, UsdtCommonInit,
+    UsdtConsensusItem, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
+    UsdtOutputOutcome,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -452,12 +453,35 @@ impl ServerModule for Usdt {
 
     async fn process_input<'a, 'b, 'c>(
         &'a self,
-        _dbtx: &mut DatabaseTransaction<'c>,
-        _input: &'b UsdtInput,
+        dbtx: &mut DatabaseTransaction<'c>,
+        input: &'b UsdtInput,
         _in_point: InPoint,
     ) -> Result<InputMeta, UsdtInputError> {
-        // Phase 5 Task 8 replaces this with real claim processing
-        Err(UsdtInputError::UnknownDepositAccount)
+        let UsdtInput::V0(input) = input else {
+            return Err(UsdtInputError::UnknownDepositAccount); // unknown/default variant
+        };
+        let mut record = dbtx
+            .get_value(&DepositRecordKey(input.account))
+            .await
+            .ok_or(UsdtInputError::UnknownDepositAccount)?;
+        let available = record.credited.0.saturating_sub(record.claimed.0);
+        if input.amount.0 > available {
+            return Err(UsdtInputError::InsufficientCredit {
+                available: UsdtAmount(available),
+                requested: input.amount,
+            });
+        }
+        record.claimed = UsdtAmount(record.claimed.0 + input.amount.0);
+        dbtx.insert_entry(&DepositRecordKey(input.account), &record)
+            .await;
+
+        Ok(InputMeta {
+            amount: TransactionItemAmounts {
+                amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(input.amount.0)),
+                fees: Amounts::ZERO,
+            },
+            pub_key: record.claim_pk,
+        })
     }
 
     async fn process_output<'a, 'b>(
@@ -822,11 +846,20 @@ async fn scan_pending_deposits(
 
 #[cfg(test)]
 mod tests {
-    use fedimint_core::PeerId;
     use fedimint_core::bitcoin::Network;
-    use fedimint_usdt_common::EvmAddress;
+    use fedimint_core::{BitcoinHash, PeerId, TransactionId};
+    use fedimint_usdt_common::{EvmAddress, UsdtInputV0};
 
     use super::*;
+
+    /// An arbitrary [`InPoint`] for `process_input` tests, which never read
+    /// `_in_point` today (the txid/index are irrelevant to claim processing).
+    fn test_in_point() -> InPoint {
+        InPoint {
+            txid: TransactionId::all_zeros(),
+            in_idx: 0,
+        }
+    }
 
     const NUM_PEERS: u16 = 4;
 
@@ -1359,6 +1392,151 @@ mod tests {
             dbtx.get_value(&PendingCheckKey(account)).await.is_some(),
             "the read-only scan must not delete the PendingCheck"
         );
+    }
+
+    #[tokio::test]
+    async fn process_input_claims_credited_deposit_and_guards_against_double_claim() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([0x55; 20]);
+        let claim_pk = test_pubkey(0xee);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(5_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // First claim of 2M succeeds, funding USDT_UNIT and bumping `claimed`.
+        let mut dbtx = db.begin_transaction().await;
+        let meta = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::V0(UsdtInputV0 {
+                    account,
+                    amount: UsdtAmount(2_000_000),
+                }),
+                test_in_point(),
+            )
+            .await
+            .expect("first claim within credited balance must succeed");
+        assert_eq!(
+            meta.amount.amounts,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(2_000_000))
+        );
+        assert_eq!(meta.amount.fees, Amounts::ZERO);
+        assert_eq!(meta.pub_key, claim_pk);
+        dbtx.commit_tx().await;
+
+        let record = db
+            .begin_transaction_nc()
+            .await
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record still exists");
+        assert_eq!(record.claimed, UsdtAmount(2_000_000));
+
+        // Second claim of 2M succeeds (4M of 5M now claimed).
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::V0(UsdtInputV0 {
+                    account,
+                    amount: UsdtAmount(2_000_000),
+                }),
+                test_in_point(),
+            )
+            .await
+            .expect("second claim within remaining credited balance must succeed");
+        dbtx.commit_tx().await;
+
+        let record = db
+            .begin_transaction_nc()
+            .await
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record still exists");
+        assert_eq!(record.claimed, UsdtAmount(4_000_000));
+
+        // Third claim of 2M exceeds the remaining 1M: double-claim/over-claim guard.
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::V0(UsdtInputV0 {
+                    account,
+                    amount: UsdtAmount(2_000_000),
+                }),
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UsdtInputError::InsufficientCredit {
+                available: UsdtAmount(1_000_000),
+                requested: UsdtAmount(2_000_000),
+            }
+        );
+
+        // `claimed` must not have been bumped by the rejected claim.
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record still exists");
+        assert_eq!(record.claimed, UsdtAmount(4_000_000));
+    }
+
+    #[tokio::test]
+    async fn process_input_unknown_account_errors() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([0x66; 20]);
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::V0(UsdtInputV0 {
+                    account,
+                    amount: UsdtAmount(1),
+                }),
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, UsdtInputError::UnknownDepositAccount);
+    }
+
+    #[tokio::test]
+    async fn process_input_default_variant_errors() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::Default {
+                    variant: 99,
+                    bytes: Vec::new(),
+                },
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, UsdtInputError::UnknownDepositAccount);
     }
 }
 
