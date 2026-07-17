@@ -56,6 +56,13 @@ pub struct ModuleConfigProposal {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct ConfigGenAbortReason(pub String);
 
+/// Request body of the abort-module-generation admin endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbortModuleGenerationRequest {
+    pub generation_id: ModuleGenerationId,
+    pub reason: String,
+}
+
 /// Consensus items driving the module config generation lifecycle.
 ///
 /// The item author is the consensus peer that contributed the item; approval

@@ -23,17 +23,23 @@ use fedimint_core::db::{
 #[allow(deprecated)]
 use fedimint_core::endpoint_constants::AWAIT_OUTPUT_OUTCOME_ENDPOINT;
 use fedimint_core::endpoint_constants::{
-    API_ANNOUNCEMENTS_ENDPOINT, AUDIT_ENDPOINT, AUTH_ENDPOINT, AWAIT_OUTPUTS_OUTCOMES_ENDPOINT,
-    AWAIT_SESSION_OUTCOME_ENDPOINT, AWAIT_SIGNED_SESSION_OUTCOME_ENDPOINT,
-    AWAIT_TRANSACTION_ENDPOINT, BACKUP_ENDPOINT, BACKUP_STATISTICS_ENDPOINT, CHAIN_ID_ENDPOINT,
-    CLIENT_CONFIG_ENDPOINT, CLIENT_CONFIG_JSON_ENDPOINT, CONSENSUS_ORD_LATENCY_ENDPOINT,
-    FEDERATION_ID_ENDPOINT, FEDIMINTD_VERSION_ENDPOINT, GUARDIAN_CONFIG_BACKUP_ENDPOINT,
-    GUARDIAN_METADATA_ENDPOINT, INVITE_CODE_ENDPOINT, P2P_CONNECTION_STATUS_ENDPOINT,
-    RECOVER_ENDPOINT, SERVER_CONFIG_CONSENSUS_HASH_ENDPOINT, SESSION_COUNT_ENDPOINT,
-    SESSION_STATUS_ENDPOINT, SESSION_STATUS_V2_ENDPOINT, SETUP_STATUS_ENDPOINT, SHUTDOWN_ENDPOINT,
-    SIGN_API_ANNOUNCEMENT_ENDPOINT, SIGN_GUARDIAN_METADATA_ENDPOINT, STATUS_ENDPOINT,
-    SUBMIT_API_ANNOUNCEMENT_ENDPOINT, SUBMIT_GUARDIAN_METADATA_ENDPOINT,
-    SUBMIT_TRANSACTION_ENDPOINT, VERSION_ENDPOINT,
+    ABORT_MODULE_GENERATION_ENDPOINT, API_ANNOUNCEMENTS_ENDPOINT,
+    APPROVE_MODULE_GENERATION_ENDPOINT, AUDIT_ENDPOINT, AUTH_ENDPOINT,
+    AWAIT_OUTPUTS_OUTCOMES_ENDPOINT, AWAIT_SESSION_OUTCOME_ENDPOINT,
+    AWAIT_SIGNED_SESSION_OUTCOME_ENDPOINT, AWAIT_TRANSACTION_ENDPOINT, BACKUP_ENDPOINT,
+    BACKUP_STATISTICS_ENDPOINT, CHAIN_ID_ENDPOINT, CLIENT_CONFIG_ENDPOINT,
+    CLIENT_CONFIG_JSON_ENDPOINT, CONSENSUS_ORD_LATENCY_ENDPOINT, FEDERATION_ID_ENDPOINT,
+    FEDIMINTD_VERSION_ENDPOINT, GUARDIAN_CONFIG_BACKUP_ENDPOINT, GUARDIAN_METADATA_ENDPOINT,
+    INVITE_CODE_ENDPOINT, MODULE_GENERATIONS_ENDPOINT, P2P_CONNECTION_STATUS_ENDPOINT,
+    PROPOSE_MODULE_GENERATION_ENDPOINT, RECOVER_ENDPOINT, SERVER_CONFIG_CONSENSUS_HASH_ENDPOINT,
+    SESSION_COUNT_ENDPOINT, SESSION_STATUS_ENDPOINT, SESSION_STATUS_V2_ENDPOINT,
+    SETUP_STATUS_ENDPOINT, SHUTDOWN_ENDPOINT, SIGN_API_ANNOUNCEMENT_ENDPOINT,
+    SIGN_GUARDIAN_METADATA_ENDPOINT, STATUS_ENDPOINT, SUBMIT_API_ANNOUNCEMENT_ENDPOINT,
+    SUBMIT_GUARDIAN_METADATA_ENDPOINT, SUBMIT_TRANSACTION_ENDPOINT, VERSION_ENDPOINT,
+};
+use fedimint_core::config_gen::{
+    AbortModuleGenerationRequest, ConfigGenAbortReason, ConfigGenItem, ModuleConfigProposal,
+    ModuleGenerationId,
 };
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::invite_code::InviteCode;
@@ -69,7 +75,9 @@ use tracing::{debug, info, warn};
 
 use crate::config::io::{CONSENSUS_CONFIG, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG};
 use crate::config::{ServerConfig, legacy_consensus_config_hash};
+use crate::consensus::config_gen::GenerationLog;
 use crate::consensus::db::{AcceptedItemPrefix, AcceptedTransactionKey, SignedSessionOutcomeKey};
+use crate::db::ConfigGenerationLogKey;
 use crate::consensus::engine::get_finished_session_count_static;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
 use crate::metrics::{BACKUP_WRITE_SIZE_BYTES, STORED_BACKUPS_COUNT};
@@ -313,6 +321,32 @@ impl ConsensusApi {
 
     fn shutdown(&self, index: Option<u64>) {
         self.shutdown_sender.send_replace(index);
+    }
+
+    /// Returns the log of all module config generations.
+    async fn generation_log(&self) -> GenerationLog {
+        self.db
+            .begin_transaction_nc()
+            .await
+            .get_value(&ConfigGenerationLogKey)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Submits a config generation lifecycle item into consensus. Whether it
+    /// is accepted is determined once it is processed in consensus order.
+    async fn submit_config_gen_item(&self, item: ConfigGenItem) {
+        let _ = self
+            .submission_sender
+            .send(ConsensusItem::ConfigGen(item))
+            .await
+            .inspect_err(|err| {
+                warn!(
+                    target: LOG_NET_API,
+                    err = %err.fmt_compact(),
+                    "Unable to submit config gen item into consensus"
+                );
+            });
     }
 
     async fn get_federation_audit(&self) -> ApiResult<AuditSummary> {
@@ -1033,6 +1067,51 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             async |fedimint: &ConsensusApi, context, metadata: fedimint_core::net::guardian_metadata::GuardianMetadata| -> fedimint_core::net::guardian_metadata::SignedGuardianMetadata {
                 check_auth(context)?;
                 Ok(fedimint.sign_guardian_metadata(metadata).await)
+            }
+        },
+        api_endpoint! {
+            PROPOSE_MODULE_GENERATION_ENDPOINT,
+            ApiVersion::new(0, 10),
+            async |fedimint: &ConsensusApi, context, proposal: ModuleConfigProposal| -> ModuleGenerationId {
+                check_auth(context)?;
+                let generation_id = fedimint.generation_log().await.next_id();
+                fedimint
+                    .submit_config_gen_item(ConfigGenItem::Propose { generation_id, proposal })
+                    .await;
+                Ok(generation_id)
+            }
+        },
+        api_endpoint! {
+            APPROVE_MODULE_GENERATION_ENDPOINT,
+            ApiVersion::new(0, 10),
+            async |fedimint: &ConsensusApi, context, generation_id: ModuleGenerationId| -> () {
+                check_auth(context)?;
+                fedimint
+                    .submit_config_gen_item(ConfigGenItem::Approve { generation_id })
+                    .await;
+                Ok(())
+            }
+        },
+        api_endpoint! {
+            ABORT_MODULE_GENERATION_ENDPOINT,
+            ApiVersion::new(0, 10),
+            async |fedimint: &ConsensusApi, context, request: AbortModuleGenerationRequest| -> () {
+                check_auth(context)?;
+                fedimint
+                    .submit_config_gen_item(ConfigGenItem::Abort {
+                        generation_id: request.generation_id,
+                        reason: ConfigGenAbortReason(request.reason),
+                    })
+                    .await;
+                Ok(())
+            }
+        },
+        api_endpoint! {
+            MODULE_GENERATIONS_ENDPOINT,
+            ApiVersion::new(0, 10),
+            async |fedimint: &ConsensusApi, context, _v: ()| -> GenerationLog {
+                check_auth(context)?;
+                Ok(fedimint.generation_log().await)
             }
         },
         api_endpoint! {
