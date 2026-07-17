@@ -21,7 +21,11 @@
 
 - **Phase 1: DONE** — `ConfigGen` consensus item (`Propose/Approve/Result/Abort`), persisted `GenerationLog` state machine (`Proposed → Approved → Generated | Aborted`), engine processing under db prefix 0x09, admin endpoints (`propose/approve/abort_module_generation`, `module_generations`) at api version 0.10.
 - **Phase 2: DONE** — `P2PMessage::ConfigGen` variant, `GenerationTransport` (implements `IP2PConnections`, so `PeerHandle` + module `distributed_gen` run unchanged), aleph network loop forwards to a long-lived channel, `GenerationManager` runs DKGs on approval, stores private config locally (prefixes 0x0a/0x0b), submits `Result`, aborts crashed generations. Deviation from the design doc: `Result` does not yet carry the encrypted private config — that lands with root-secret derivation in Phase 3, keeping plaintext-adjacent material out of consensus in the meantime.
-- **Next:** end-to-end exercise in devimint (needs admin CLI plumbing for the new endpoints), then Phase 3 (guardian root derivation + encrypted Result), Phase 4 (DB-resident configs + restart activation).
+- **Acceptance suite** (run after every phase):
+  - Unit: `cargo test -p fedimint-server config_gen` — state machine transitions + transport demultiplexing (13 tests)
+  - E2E: `cargo test -p fedimint-mint-tests --test fedimint_mint_config_gen_tests` — real in-process federations (AlephBFT + p2p + api): full mint generation to `Generated` with identical configs on all peers, abort + retry under fresh id, unsupported-kind abort (3 tests, ~6s)
+  - Regression: `just clippy` and the existing suite via `just test-ci-all` (new tests are ordinary cargo test targets, so CI picks them up automatically)
+- **Next:** Phase 3 (guardian root derivation + deterministic gen secrets + encrypted Result), Phase 4 (DB-resident configs + restart activation). devimint exercise deferred — the in-process e2e covers the full stack except process boundaries.
 
 ## Phasing (master plan)
 
