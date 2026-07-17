@@ -146,6 +146,7 @@ fn format_item_type(item: &ConsensusItem) -> String {
     match item {
         ConsensusItem::Transaction(_) => "Transaction".to_string(),
         ConsensusItem::Module(_) => "Module".to_string(),
+        ConsensusItem::ConfigGen(_) => "ConfigGen".to_string(),
         ConsensusItem::Default { variant, .. } => format!("Unknown ({variant})"),
     }
 }
@@ -259,6 +260,15 @@ fn format_item_details(item: &AcceptedItem) -> Markup {
 
                     div class="mb-2" {
                         "Module Item: " code { (module_item.to_string()) }
+                    }
+                }
+            }
+        }
+        ConsensusItem::ConfigGen(config_gen_item) => {
+            html! {
+                div class="consensus-item-details" {
+                    div class="mb-2" {
+                        "Config Generation Item: " code { (format!("{config_gen_item:?}")) }
                     }
                 }
             }

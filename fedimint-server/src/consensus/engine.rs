@@ -1062,6 +1062,11 @@ impl ConsensusEngine {
 
                 Ok(())
             }
+            ConsensusItem::ConfigGen(_) => {
+                // Processing is added together with the persisted generation
+                // state machine; until then reject deterministically.
+                bail!("Config generation items are not processed yet");
+            }
             ConsensusItem::Default { variant, .. } => {
                 warn!(
                     target: LOG_CONSENSUS,

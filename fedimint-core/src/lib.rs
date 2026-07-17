@@ -74,6 +74,8 @@ pub mod backup;
 pub mod bls12_381_serde;
 /// Federation configuration
 pub mod config;
+/// Runtime module config generation wire types
+pub mod config_gen;
 /// Fundamental types
 pub mod core;
 /// Database handling

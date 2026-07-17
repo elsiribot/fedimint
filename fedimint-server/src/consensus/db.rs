@@ -149,6 +149,9 @@ impl IServerDbMigrationContext for ServerDbMigrationContext {
                                     vec![]
                                 }
                             }
+                            ConsensusItem::ConfigGen(_) => {
+                                vec![]
+                            }
                             ConsensusItem::Default { .. } => {
                                 unreachable!("We never save unknown CIs on the server side")
                             }

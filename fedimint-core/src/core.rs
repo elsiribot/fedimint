@@ -160,7 +160,7 @@ pub const MODULE_INSTANCE_ID_GLOBAL: u16 = u16::MAX;
 /// This is a short string that identifies type of a module.
 /// Authors of 3rd party modules are free to come up with a string,
 /// long enough to avoid conflicts with similar modules.
-#[derive(PartialEq, Eq, Clone, PartialOrd, Ord, Serialize, Deserialize, Encodable, Decodable)]
+#[derive(PartialEq, Eq, Clone, PartialOrd, Ord, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct ModuleKind(Cow<'static, str>);
 
 impl ModuleKind {
