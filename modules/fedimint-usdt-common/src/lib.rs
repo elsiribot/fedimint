@@ -162,11 +162,22 @@ pub fn derive_deposit_account(
 }
 
 /// Payload of a `UsdtConsensusItem::Deposit` observation.
+///
+/// `claim_pk` is carried in the observation itself (rather than being
+/// recovered from a guardian's local `PendingCheck` when the item is
+/// processed) so that crediting a deposit is a pure function of consensus
+/// data: `process_consensus_item` must be byte-identical across every
+/// honest guardian, but `PendingCheck` is guardian-local state that not
+/// every guardian is guaranteed to have (e.g. a `check_deposit` API call
+/// only reaches a threshold of guardians, not all of them). See
+/// `Usdt::credit_deposit`'s doc comment in `fedimint-usdt-server` for the
+/// full argument.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct DepositObservation {
     pub account: EvmAddress,
     pub balance: UsdtAmount,
     pub block: u64,
+    pub claim_pk: secp256k1::PublicKey,
 }
 
 /// Request to enqueue this guardian's local deposit-checker task to start
@@ -478,10 +489,14 @@ mod tests {
 
     #[test]
     fn test_usdt_consensus_item_deposit_round_trips_through_consensus_encoding() {
+        let claim_pk = secp256k1::SecretKey::from_slice(&[5u8; 32])
+            .unwrap()
+            .public_key(secp256k1::SECP256K1);
         let item = UsdtConsensusItem::Deposit(DepositObservation {
             account: EvmAddress([9; 20]),
             balance: UsdtAmount(1_000_000),
             block: 42,
+            claim_pk,
         });
         let bytes = item.consensus_encode_to_vec();
         let decoded =

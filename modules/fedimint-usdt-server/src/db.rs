@@ -161,10 +161,12 @@ mod tests {
         let account_a = EvmAddress([0xaa; 20]);
         let account_b = EvmAddress([0xbb; 20]);
 
+        let claim_pk = test_pubkey();
         let vote = |account: EvmAddress, block: u64| DepositObservation {
             account,
             balance: UsdtAmount(2_000_000),
             block,
+            claim_pk,
         };
 
         let mut dbtx = db.begin_transaction().await;

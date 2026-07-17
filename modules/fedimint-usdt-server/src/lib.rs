@@ -802,24 +802,49 @@ impl Usdt {
     }
 
     /// Credits a deposit observation that has reached threshold agreement:
-    /// creates the account's [`DepositRecord`] (using the claim key from its
-    /// [`PendingCheck`] if the record does not exist yet), advances
-    /// `credited` monotonically forward to `obs.balance` (balance is
-    /// monotonic between sweeps since only the federation moves funds out),
-    /// updates `last_observed_block`, and clears the round's votes and the
-    /// account's `PendingCheck`.
+    /// creates the account's [`DepositRecord`] (using `obs.claim_pk`) if it
+    /// does not exist yet, advances `credited` monotonically forward to
+    /// `obs.balance` (balance is monotonic between sweeps since only the
+    /// federation moves funds out), updates `last_observed_block`, and
+    /// clears the round's votes and the account's `PendingCheck`.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// `process_consensus_item` must be a pure function of `(ordered
+    /// consensus items, prior consensus DB state)` — byte-identical on every
+    /// honest guardian. The claim key therefore MUST come from `obs` itself,
+    /// never from this guardian's local [`PendingCheck`] (or an existing
+    /// [`DepositRecord`]): `PendingCheck` is guardian-local, non-consensus
+    /// state written only by the `check_deposit` API handler, which a
+    /// client's request reaches via a *threshold* of guardians, not all of
+    /// them. A guardian that never received the `check_deposit` call would
+    /// have no `PendingCheck` for this account, yet must still process the
+    /// same ordered `Deposit` item identically to every other guardian.
+    /// Reading local state here previously caused exactly that: guardians
+    /// with the `PendingCheck` credited the deposit while a guardian without
+    /// it hit a `bail!` and diverged permanently.
+    ///
+    /// `ensure!` below is a self-authentication check, not a local-state
+    /// read: it is a pure function of `obs` and this module's consensus
+    /// config (`group_public_key`), so every honest guardian computes the
+    /// same result. It also prevents a byzantine guardian from proposing an
+    /// observation whose `claim_pk` does not actually derive `account`
+    /// (which would let it credit an attacker-chosen claim key for someone
+    /// else's deposit account).
     async fn credit_deposit(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
         obs: &DepositObservation,
     ) -> anyhow::Result<()> {
-        let claim_pk = match dbtx.get_value(&PendingCheckKey(obs.account)).await {
-            Some(p) => p.claim_pk,
-            None => match dbtx.get_value(&DepositRecordKey(obs.account)).await {
-                Some(r) => r.claim_pk,
-                None => bail!("Deposit observation for an account with no pending check or record"),
-            },
-        };
+        let claim_pk = obs.claim_pk;
+        ensure!(
+            fedimint_usdt_common::derive_deposit_account(
+                &self.cfg.consensus.group_public_key,
+                &claim_pk
+            ) == obs.account,
+            "observation claim_pk does not derive its account"
+        );
+
         let mut record = dbtx
             .get_value(&DepositRecordKey(obs.account))
             .await
@@ -836,7 +861,10 @@ impl Usdt {
         record.last_observed_block = obs.block;
         dbtx.insert_entry(&DepositRecordKey(obs.account), &record)
             .await;
-        // Clear the round's votes + the pending check.
+        // Clear the round's votes. The `PendingCheck` removal below is local
+        // cleanup only (a guardian lacking one just no-ops the remove) — it
+        // is not read to obtain `claim_pk` above, so its absence cannot
+        // cause divergence.
         dbtx.remove_by_prefix(&DepositObservationVoteAccountPrefix(obs.account))
             .await;
         dbtx.remove_entry(&PendingCheckKey(obs.account)).await;
@@ -1003,6 +1031,7 @@ async fn scan_pending_deposits(
                 account,
                 balance,
                 block: at,
+                claim_pk: check.claim_pk,
             });
         }
     }
@@ -1284,10 +1313,14 @@ mod tests {
     async fn deposit_credited_only_at_threshold_of_identical_observations() {
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let db = module.db_for_test();
-        let account = EvmAddress([7; 20]);
         let claim_pk = test_pubkey(0xaa);
+        let account = derive_deposit_account(&module.cfg.consensus.group_public_key, &claim_pk);
 
-        // A PendingCheck must exist so the credit knows the claim key.
+        // A PendingCheck is not required for crediting (that is the whole
+        // point of this fix — see `credit_deposit`'s doc comment), but a
+        // real guardian that itself handled the `check_deposit` call would
+        // have one, and this test also exercises that it gets cleared on
+        // credit.
         {
             let mut dbtx = db.begin_transaction().await;
             dbtx.insert_entry(
@@ -1305,6 +1338,7 @@ mod tests {
             account,
             balance: UsdtAmount(2_000_000),
             block: 50,
+            claim_pk,
         };
         let mut dbtx = db.begin_transaction().await;
 
@@ -1383,8 +1417,8 @@ mod tests {
         // Same peer submitting the same observation twice must Err.
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
-        let account = EvmAddress([8; 20]);
         let claim_pk = test_pubkey(0xbb);
+        let account = derive_deposit_account(&module.cfg.consensus.group_public_key, &claim_pk);
 
         {
             let mut dbtx = db.begin_transaction().await;
@@ -1403,6 +1437,7 @@ mod tests {
             account,
             balance: UsdtAmount(1_000_000),
             block: 10,
+            claim_pk,
         };
         let mut dbtx = db.begin_transaction().await;
 
@@ -1424,6 +1459,125 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("redundant"));
+    }
+
+    /// Regression test for the consensus-safety fix: a guardian that never
+    /// saw the `check_deposit` API call (so has NO local [`PendingCheck`]
+    /// for this account — e.g. a momentarily-slow guardian that a client's
+    /// `check_deposit` did not happen to reach, since
+    /// `request_current_consensus` only hits a threshold of peers, not all
+    /// of them) must still credit the deposit identically to every other
+    /// guardian once threshold-identical `Deposit` votes are ordered,
+    /// because `claim_pk` now comes from the observation itself rather than
+    /// from local state.
+    ///
+    /// Before the fix, `credit_deposit` recovered the claim key by reading
+    /// `PendingCheckKey(obs.account)` and `bail!`ed with "no pending check or
+    /// record" when it was absent — so this exact scenario (no `PendingCheck`
+    /// ever inserted) would return `Err` while guardians that did have the
+    /// `PendingCheck` returned `Ok` for the same ordered consensus item: a
+    /// permanent consensus DB divergence.
+    #[tokio::test]
+    async fn credit_deposit_succeeds_without_any_local_pending_check() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x42);
+        let account = derive_deposit_account(&module.cfg.consensus.group_public_key, &claim_pk);
+
+        // Deliberately do NOT insert a `PendingCheck` for `account` —
+        // simulating the guardian that `check_deposit` never reached.
+        assert!(
+            db.begin_transaction_nc()
+                .await
+                .get_value(&PendingCheckKey(account))
+                .await
+                .is_none(),
+            "test setup: this guardian must have no PendingCheck for the account"
+        );
+
+        let obs = DepositObservation {
+            account,
+            balance: UsdtAmount(2_000_000),
+            block: 50,
+            claim_pk,
+        };
+        let mut dbtx = db.begin_transaction().await;
+
+        // Three (threshold) identical votes, exactly as the ordered
+        // consensus items would arrive on any guardian, PendingCheck or not.
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::Deposit(obs.clone()),
+                    PeerId::from(p),
+                )
+                .await
+                .expect("crediting must not depend on a local PendingCheck");
+        }
+
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("DepositRecord must be created purely from the observation");
+        assert_eq!(record.credited, UsdtAmount(2_000_000));
+        assert_eq!(record.claimed, UsdtAmount(0));
+        assert_eq!(record.claim_pk, claim_pk);
+    }
+
+    /// A `Deposit` observation whose `claim_pk` does not actually derive its
+    /// `account` must be rejected by the self-authentication check in
+    /// `credit_deposit`, deterministically (a pure function of `obs` and the
+    /// consensus config, so every honest guardian rejects it identically —
+    /// this also guards against a byzantine guardian crediting an
+    /// attacker-chosen claim key onto someone else's deposit account).
+    #[tokio::test]
+    async fn deposit_with_mismatched_claim_pk_is_rejected() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x43);
+        let wrong_account = EvmAddress([0x99; 20]); // does NOT derive from claim_pk
+
+        let obs = DepositObservation {
+            account: wrong_account,
+            balance: UsdtAmount(2_000_000),
+            block: 50,
+            claim_pk,
+        };
+        let mut dbtx = db.begin_transaction().await;
+
+        // First two votes just accumulate below threshold, no error yet.
+        for p in [0u16, 1] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::Deposit(obs.clone()),
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Third vote reaches threshold and triggers `credit_deposit`, which
+        // must reject the mismatched claim_pk/account pairing.
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::Deposit(obs.clone()),
+                PeerId::from(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not derive its account"));
+
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&DepositRecordKey(wrong_account))
+                .await
+                .is_none(),
+            "no DepositRecord must be created for a self-authentication failure"
+        );
     }
 
     /// Sets up a fresh in-memory DB with `BlockCountVote`s from a majority of
@@ -1496,6 +1650,7 @@ mod tests {
                 account,
                 balance: UsdtAmount(3_000_000),
                 block: at,
+                claim_pk,
             }]
         );
     }
