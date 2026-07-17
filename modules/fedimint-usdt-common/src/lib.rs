@@ -7,8 +7,9 @@ use config::UsdtClientConfig;
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{AmountUnit, CommonModuleInit, ModuleCommon, ModuleConsensusVersion};
-use fedimint_core::plugin_types_trait_impl_common;
+use fedimint_core::{plugin_types_trait_impl_common, secp256k1};
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
 // Common contains types shared by both the client and server
@@ -81,13 +82,97 @@ impl fmt::Display for FeeVote {
     }
 }
 
+/// Domain-separation tag mixed into the provisional deposit-address tweak.
+pub const DEPOSIT_ADDRESS_DOMAIN: &[u8] = b"fedimint-usdt-deposit-v0";
+
+/// The standard Ethereum address of a secp256k1 public key: last 20 bytes of
+/// `keccak256` over the 64-byte uncompressed point (SEC1 with the `0x04`
+/// prefix stripped). WASM-safe (pure-Rust `sha3`); mirrors
+/// `fedimint_threshold_ecdsa::evm_address`, and a round-trip test keeps them
+/// byte-identical.
+#[must_use]
+pub fn evm_address(pk: &secp256k1::PublicKey) -> EvmAddress {
+    let uncompressed = pk.serialize_uncompressed();
+    let hash = Keccak256::digest(&uncompressed[1..]);
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&hash[12..]);
+    EvmAddress(address)
+}
+
+/// Derives the per-user deposit EOA from the federation group key and the
+/// user's claim key via an additive tweak: `group_pk ⊕ t·G` where
+/// `t = keccak256(DOMAIN ‖ group_pk ‖ claim_pk)`.
+///
+/// PROVISIONAL (Phase 5): detection-only. The federation does not sign for
+/// this address in Phase 5; signing custody (SLIP-10 / additive-tweak /
+/// CREATE2 `SimpleAccount`) is reconciled in Phase 7. Both the client (wasm)
+/// and every guardian call this exact function so the address they watch is
+/// bit-for-bit identical.
+///
+/// # Panics
+///
+/// Panics only in the astronomically unlikely event that the keccak digest
+/// used as the tweak is not a valid secp256k1 scalar, or that the resulting
+/// tweaked point is not a valid public key.
+#[must_use]
+pub fn derive_deposit_account(
+    group_public_key: &secp256k1::PublicKey,
+    claim_pk: &secp256k1::PublicKey,
+) -> EvmAddress {
+    let mut hasher = Keccak256::new();
+    hasher.update(DEPOSIT_ADDRESS_DOMAIN);
+    hasher.update(group_public_key.serialize()); // 33-byte compressed
+    hasher.update(claim_pk.serialize());
+    let tweak_bytes: [u8; 32] = hasher.finalize().into();
+
+    // keccak output ≥ curve order only with negligible probability; mirror
+    // the wallet's `tweak_public_key` which treats this as infallible.
+    let tweak = secp256k1::Scalar::from_be_bytes(tweak_bytes)
+        .expect("keccak digest is a valid secp256k1 scalar with overwhelming probability");
+    let derived = group_public_key
+        .add_exp_tweak(secp256k1::SECP256K1, &tweak)
+        .expect("additive tweak of a valid point is a valid point");
+
+    evm_address(&derived)
+}
+
 /// Non-transaction items that will be submitted to consensus
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
-pub struct UsdtConsensusItem;
+pub struct DepositObservation {
+    pub account: EvmAddress,
+    pub balance: UsdtAmount,
+    pub block: u64,
+}
+
+/// Non-transaction items that will be submitted to consensus
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
+pub enum UsdtConsensusItem {
+    /// Guardian's view of the EVM chain head (median-voted, wallet-style).
+    BlockCount(u64),
+    /// Guardian's observation of a pending deposit account's confirmed
+    /// balance (claim-triggered, D7).
+    Deposit(DepositObservation),
+    #[encodable_default]
+    Default { variant: u64, bytes: Vec<u8> },
+}
 
 /// Input for a fedimint transaction
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
-pub struct UsdtInput;
+pub enum UsdtInput {
+    /// Claim credited deposit funds. Core verifies the fedimint transaction is
+    /// signed by `InputMeta.pub_key` = the deposit's claim key; there is no
+    /// extra signature inside the input.
+    V0(UsdtInputV0),
+    #[encodable_default]
+    Default { variant: u64, bytes: Vec<u8> },
+}
+
+/// Data for a `UsdtInput::V0`
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+pub struct UsdtInputV0 {
+    pub account: EvmAddress,
+    pub amount: UsdtAmount,
+}
 
 /// Output for a fedimint transaction
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
@@ -100,8 +185,13 @@ pub struct UsdtOutputOutcome;
 /// Errors that might be returned by the server
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Error, Encodable, Decodable)]
 pub enum UsdtInputError {
-    #[error("This module does not support inputs")]
-    NotSupported,
+    #[error("No credited deposit record exists for this account")]
+    UnknownDepositAccount,
+    #[error("Claim of {requested} exceeds the {available} still claimable for this account")]
+    InsufficientCredit {
+        available: UsdtAmount,
+        requested: UsdtAmount,
+    },
 }
 
 /// Errors that might be returned by the server
@@ -143,7 +233,7 @@ impl CommonModuleInit for UsdtCommonInit {
 
 impl fmt::Display for UsdtInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UsdtInput")
+        write!(f, "{self:?}")
     }
 }
 
@@ -161,7 +251,7 @@ impl fmt::Display for UsdtOutputOutcome {
 
 impl fmt::Display for UsdtConsensusItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UsdtConsensusItem")
+        write!(f, "{self:?}")
     }
 }
 
@@ -232,5 +322,96 @@ mod tests {
     #[test]
     fn test_module_decoder_builds() {
         let _decoder = UsdtModuleTypes::decoder_builder().build();
+    }
+
+    fn hex_20(s: &str) -> [u8; 20] {
+        let bytes = (0..20)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        bytes.try_into().unwrap()
+    }
+
+    #[test]
+    fn evm_address_matches_keccak_last_20_of_uncompressed() {
+        // A fixed secp256k1 pubkey → its well-known Ethereum address.
+        // Secret key = 0x0000...0001; address is the canonical test vector.
+        let sk = secp256k1::SecretKey::from_slice(&{
+            let mut b = [0u8; 32];
+            b[31] = 1;
+            b
+        })
+        .expect("valid scalar");
+        let pk = sk.public_key(secp256k1::SECP256K1);
+        // keccak256(uncompressed[1..])[12..] for sk=1:
+        let expected = EvmAddress(hex_20("7e5f4552091a69125d5dfcb7b8c2659029395bdf"));
+        assert_eq!(evm_address(&pk), expected);
+    }
+
+    #[test]
+    fn derive_deposit_account_is_deterministic_and_claim_specific() {
+        let group = secp256k1::SecretKey::from_slice(&[2u8; 32])
+            .unwrap()
+            .public_key(secp256k1::SECP256K1);
+        let claim_a = secp256k1::SecretKey::from_slice(&[3u8; 32])
+            .unwrap()
+            .public_key(secp256k1::SECP256K1);
+        let claim_b = secp256k1::SecretKey::from_slice(&[4u8; 32])
+            .unwrap()
+            .public_key(secp256k1::SECP256K1);
+
+        // Deterministic
+        assert_eq!(
+            derive_deposit_account(&group, &claim_a),
+            derive_deposit_account(&group, &claim_a)
+        );
+        // Distinct per claim key
+        assert_ne!(
+            derive_deposit_account(&group, &claim_a),
+            derive_deposit_account(&group, &claim_b)
+        );
+        // Distinct from the untweaked group address (tweak is non-zero)
+        assert_ne!(
+            derive_deposit_account(&group, &claim_a),
+            evm_address(&group)
+        );
+    }
+
+    #[test]
+    fn test_usdt_consensus_item_block_count_round_trips_through_consensus_encoding() {
+        let item = UsdtConsensusItem::BlockCount(7);
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("UsdtConsensusItem::BlockCount should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn test_usdt_consensus_item_deposit_round_trips_through_consensus_encoding() {
+        let item = UsdtConsensusItem::Deposit(DepositObservation {
+            account: EvmAddress([9; 20]),
+            balance: UsdtAmount(1_000_000),
+            block: 42,
+        });
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("UsdtConsensusItem::Deposit should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn test_usdt_input_v0_round_trips_through_consensus_encoding() {
+        let input = UsdtInput::V0(UsdtInputV0 {
+            account: EvmAddress([9; 20]),
+            amount: UsdtAmount(1_000_000),
+        });
+        let bytes = input.consensus_encode_to_vec();
+        let decoded = UsdtInput::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+            .expect("UsdtInput::V0 should decode what it just encoded");
+
+        assert_eq!(input, decoded);
     }
 }

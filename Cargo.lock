@@ -6122,6 +6122,7 @@ dependencies = [
  "fedimint-core",
  "secp256k1 0.29.1",
  "serde",
+ "sha3 0.10.8",
  "thiserror 2.0.18",
 ]
 
