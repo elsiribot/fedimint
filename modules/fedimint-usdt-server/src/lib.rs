@@ -35,7 +35,7 @@ use fedimint_server_core::migration::ServerModuleDbMigrationFn;
 use fedimint_server_core::{
     ConfigGenModuleArgs, EnvVarDoc, ServerModule, ServerModuleInit, ServerModuleInitArgs,
 };
-use fedimint_threshold_ecdsa::group_public_key;
+use fedimint_threshold_ecdsa::{convert_signature, group_public_key};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
@@ -43,9 +43,9 @@ use fedimint_usdt_common::endpoint_constants::{
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositObservation, DepositStatusRequest,
-    DepositStatusResponse, MODULE_CONSENSUS_VERSION, USDT_UNIT, UsdtAmount, UsdtCommonInit,
-    UsdtConsensusItem, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
-    UsdtOutputOutcome, derive_deposit_account,
+    DepositStatusResponse, MODULE_CONSENSUS_VERSION, MpcRoundItem, SigningSessionId, USDT_UNIT,
+    UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtInput, UsdtInputError, UsdtModuleTypes,
+    UsdtOutput, UsdtOutputError, UsdtOutputOutcome, derive_deposit_account, signing_session_id,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -56,11 +56,12 @@ use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfig
 use crate::db::{
     BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, DepositObservationVoteAccountPrefix,
     DepositObservationVoteKey, DepositObservationVotePrefix, DepositRecord, DepositRecordKey,
-    DepositRecordPrefix, MpcRoundSeenPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
-    SigningSession, SigningSessionPrefix,
+    DepositRecordPrefix, MpcRoundSeenKey, MpcRoundSeenPrefix, MpcRoundSeenSessionRoundPrefix,
+    PendingCheck, PendingCheckKey, PendingCheckPrefix, SessionState, SigningPurpose,
+    SigningSession, SigningSessionKey, SigningSessionPrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
-use crate::signing::SessionStore;
+use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
 
 mod dkg;
 
@@ -411,12 +412,21 @@ pub struct Usdt {
     /// into `UsdtConsensusItem::Deposit` proposals in `consensus_proposal`.
     deposit_proposals: Arc<Mutex<Vec<DepositObservation>>>,
     /// This guardian's in-memory table of currently-running off-thread
-    /// threshold-ECDSA signing sessions (see [`crate::signing`]). No task
-    /// spawned yet: the consensus wiring that spawns/pumps sessions into
-    /// this store (`consensus_proposal`/`process_consensus_item`) lands in
-    /// a later Phase 6a task.
-    #[allow(dead_code)]
+    /// threshold-ECDSA signing sessions (see [`crate::signing`]), spawned by
+    /// [`Usdt::start_session`] and pumped round-by-round from
+    /// `consensus_proposal`/`process_consensus_item` over `MpcRound`
+    /// consensus items.
     signing_sessions: SessionStore,
+    /// This guardian-LOCAL table of assembled signatures, keyed by session:
+    /// the compact 64-byte secp256k1 signature a signer produced once its
+    /// off-thread state machine finished. Deliberately NOT consensus DB
+    /// state — a non-signer guardian cannot compute the signature, so writing
+    /// it to the consensus DB (signers would, non-signers would not) would
+    /// diverge the federation. In Phase 6a the consensus `SigningSession`
+    /// tracks only `round`; federation-wide agreement on the final signature
+    /// (so non-signers hold it too) is a Phase 6b concern. Read by Task 4's
+    /// status endpoint.
+    completed_signatures: Arc<Mutex<BTreeMap<SigningSessionId, Vec<u8>>>>,
 }
 
 /// Grouped handles/config for [`Usdt::spawn_deposit_checker`], bundling its
@@ -480,6 +490,63 @@ impl ServerModule for Usdt {
             }
         }
 
+        // Propose this guardian's payload for the current round of every
+        // signing session it is a signer of, unless it has already been
+        // recorded for that round (the redundancy guard `process_consensus_item`
+        // enforces). The payload is pulled from the session's off-thread state
+        // machine; a signer whose payload is not yet ready simply proposes
+        // nothing this round and tries again next `consensus_proposal`.
+        let sessions: Vec<(SigningSessionId, SigningSession)> = dbtx
+            .find_by_prefix(&SigningSessionPrefix)
+            .await
+            .map(|(SigningSessionKey(id), session)| (id, session))
+            .collect()
+            .await;
+        for (session_id, session) in sessions {
+            if !session.signers.contains(&self.our_peer_id) {
+                continue;
+            }
+            if dbtx
+                .get_value(&MpcRoundSeenKey(
+                    session_id,
+                    session.round,
+                    self.our_peer_id,
+                ))
+                .await
+                .is_some()
+            {
+                continue;
+            }
+
+            // Take the slot out of the store, pump it on the owned value (so no
+            // `std::sync::MutexGuard` is alive across the `.await`), then put it
+            // back. `consensus_proposal`/`process_consensus_item` run
+            // sequentially on a module, so nothing else can touch the slot in
+            // the gap.
+            let slot = self
+                .signing_sessions
+                .lock()
+                .expect("not poisoned")
+                .remove(&session_id);
+            let Some(mut slot) = slot else {
+                continue;
+            };
+            pump_slot_outgoing(&mut slot).await;
+            let payload = slot.pending_outgoing.clone();
+            self.signing_sessions
+                .lock()
+                .expect("not poisoned")
+                .insert(session_id, slot);
+
+            if let Some(payload) = payload {
+                items.push(UsdtConsensusItem::MpcRound(MpcRoundItem {
+                    session_id,
+                    round: session.round,
+                    payload,
+                }));
+            }
+        }
+
         items
     }
 
@@ -526,12 +593,89 @@ impl ServerModule for Usdt {
                 }
                 Ok(())
             }
-            UsdtConsensusItem::MpcRound(_) => {
-                // Wire type + DB schema only (Phase 6a task 1); the
-                // round-advance consensus logic that reads/writes
-                // `SigningSession`/`MpcRoundSeenKey` lands in a later task of
-                // this phase.
-                bail!("The usdt module does not support MpcRound consensus items yet")
+            UsdtConsensusItem::MpcRound(item) => {
+                let MpcRoundItem {
+                    session_id,
+                    round,
+                    payload,
+                } = item;
+
+                // DETERMINISM (Phase-5-CRITICAL): everything below that writes
+                // the consensus DB or decides `Ok`/`Err` is a pure function of
+                // the ordered item, prior consensus-DB state
+                // (`SigningSession`/`MpcRoundSeenKey`), and config
+                // (`signers`) — byte-identical on every guardian, signer or
+                // not. The ONLY consensus-DB writes in this arm are the
+                // `MpcRoundSeenKey` insert and the `session.round += 1` bump.
+                // The off-thread state-machine interactions
+                // (`submit_round`/`into_output`) and the `completed_signatures`
+                // write are guardian-LOCAL and MUST NOT feed either.
+                let session = dbtx
+                    .get_value(&SigningSessionKey(session_id))
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("MpcRound for unknown signing session"))?;
+
+                ensure!(
+                    session.signers.contains(&peer_id),
+                    "MpcRound from a peer outside the session's signer subset"
+                );
+                ensure!(
+                    round == session.round,
+                    "MpcRound for a stale or future round"
+                );
+
+                // Redundancy guard (unbounded-history rule): a repeat payload
+                // for the same (session, round, peer) changes no consensus
+                // state, so it must be rejected.
+                if dbtx
+                    .insert_entry(&MpcRoundSeenKey(session_id, round, peer_id), &payload)
+                    .await
+                    .is_some()
+                {
+                    bail!("redundant MpcRound");
+                }
+
+                // Ordered by ascending subset position (the sorted signer
+                // list), so every signer submits the round's payloads to its
+                // state machine in the identical party order.
+                let mut signers = session.signers.clone();
+                signers.sort_unstable();
+
+                let seen: Vec<PeerId> = dbtx
+                    .find_by_prefix(&MpcRoundSeenSessionRoundPrefix(session_id, round))
+                    .await
+                    .map(|(MpcRoundSeenKey(_, _, peer), _)| peer)
+                    .collect()
+                    .await;
+
+                if signers.iter().all(|peer| seen.contains(peer)) {
+                    // Every signer's payload for this round is in — advance the
+                    // consensus round counter. DETERMINISTIC: every guardian
+                    // (signer or not) performs exactly this write.
+                    let mut advanced = session.clone();
+                    advanced.round += 1;
+                    dbtx.insert_entry(&SigningSessionKey(session_id), &advanced)
+                        .await;
+
+                    // Guardian-LOCAL, signer-only: feed the round's payloads to
+                    // this guardian's off-thread state machine and, if it then
+                    // finishes, stash the assembled signature. Never touches the
+                    // consensus DB or the `Ok`/`Err` decision below.
+                    if session.signers.contains(&self.our_peer_id) {
+                        let mut payloads = Vec::with_capacity(signers.len());
+                        for peer in &signers {
+                            payloads.push(
+                                dbtx.get_value(&MpcRoundSeenKey(session_id, round, *peer))
+                                    .await
+                                    .expect("every signer's payload was just confirmed present"),
+                            );
+                        }
+                        self.advance_local_signer(session_id, advanced.round, payloads)
+                            .await;
+                    }
+                }
+
+                Ok(())
             }
             UsdtConsensusItem::Default { .. } => {
                 bail!("The usdt module does not support this consensus item yet")
@@ -702,6 +846,7 @@ impl Usdt {
             task_group,
             deposit_proposals,
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -726,6 +871,7 @@ impl Usdt {
             task_group: TaskGroup::new(),
             deposit_proposals: Arc::new(Mutex::new(Vec::new())),
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -969,6 +1115,150 @@ impl Usdt {
             credited,
             claimed,
             claimable: UsdtAmount(credited.0.saturating_sub(claimed.0)),
+        }
+    }
+
+    /// Starts (idempotently) a threshold-ECDSA signing session over `digest`.
+    ///
+    /// Writes the consensus [`SigningSession`] — signer subset = the lowest-`t`
+    /// peer ids, `round: 0`, [`SessionState::InProgress`] — and no-ops if a
+    /// session for this digest already exists. If this guardian is in the
+    /// subset it also spawns the off-thread signing state machine into
+    /// `signing_sessions` and pre-pumps round 0's payload, so the next
+    /// `consensus_proposal` can propose it immediately.
+    ///
+    /// The signer subset is a pure function of `num_peers`: peer ids are
+    /// exactly `0..n` and [`NumPeers::peer_ids`] yields them in order, so
+    /// `take(t)` is the lowest-`t` subset every guardian independently agrees
+    /// on.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this guardian's config is malformed for the signer subset
+    /// (see [`spawn_signing_session`]'s panics), or if the in-memory
+    /// `signing_sessions` mutex is poisoned (a prior panic while holding it).
+    pub async fn start_session(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        purpose: SigningPurpose,
+        digest: [u8; 32],
+    ) {
+        let session_id = signing_session_id(&digest, 0);
+        if dbtx
+            .get_value(&SigningSessionKey(session_id))
+            .await
+            .is_some()
+        {
+            return;
+        }
+
+        let threshold = self.num_peers.threshold();
+        let signers: Vec<PeerId> = self.num_peers.peer_ids().take(threshold).collect();
+
+        dbtx.insert_new_entry(
+            &SigningSessionKey(session_id),
+            &SigningSession {
+                purpose,
+                digest,
+                signers: signers.clone(),
+                round: 0,
+                state: SessionState::InProgress,
+            },
+        )
+        .await;
+
+        if signers.contains(&self.our_peer_id)
+            && let Some(handle) =
+                spawn_signing_session(session_id, digest, &signers, self.our_peer_id, &self.cfg)
+        {
+            let mut slot = SessionSlot {
+                handle,
+                pending_outgoing: None,
+                round: 0,
+                done: false,
+            };
+            pump_slot_outgoing(&mut slot).await;
+            self.signing_sessions
+                .lock()
+                .expect("not poisoned")
+                .insert(session_id, slot);
+        }
+    }
+
+    /// Guardian-LOCAL signer step for a round that just reached consensus:
+    /// submits the round's `payloads` (party-ordered by ascending subset
+    /// position) to this guardian's off-thread signing state machine, pumps
+    /// it, and — once the machine finishes — stores the assembled compact
+    /// 64-byte signature in `completed_signatures` and drops the slot.
+    ///
+    /// # Determinism
+    ///
+    /// This is IN-MEMORY, signer-only state that must never influence
+    /// `process_consensus_item`'s consensus-DB writes or its `Ok`/`Err`
+    /// result — those are identical on signers and non-signers. Errors here
+    /// (a dead state-machine thread, an unconvertible signature) are
+    /// therefore logged and swallowed, never propagated: a signer's local
+    /// failure changing control flow would diverge the federation. A guardian
+    /// with no slot for `session_id` (not a signer, or restarted mid-session)
+    /// simply no-ops.
+    async fn advance_local_signer(
+        &self,
+        session_id: SigningSessionId,
+        round: u16,
+        payloads: Vec<Vec<u8>>,
+    ) {
+        let slot = self
+            .signing_sessions
+            .lock()
+            .expect("not poisoned")
+            .remove(&session_id);
+        let Some(mut slot) = slot else {
+            return;
+        };
+
+        if let Err(err) = slot.handle.submit_round(payloads).await {
+            warn!(
+                target: "usdt",
+                err = %err.fmt_compact_anyhow(),
+                "submitting round payloads to the off-thread signer failed; dropping session"
+            );
+            return;
+        }
+        slot.pending_outgoing = None;
+        slot.round = round;
+        pump_slot_outgoing(&mut slot).await;
+
+        if !slot.done {
+            // More rounds to go; park the slot back in the store for the next
+            // `consensus_proposal` to pull round `round`'s payload from.
+            self.signing_sessions
+                .lock()
+                .expect("not poisoned")
+                .insert(session_id, slot);
+            return;
+        }
+
+        // Finished: reap the output and stash the compact signature
+        // (guardian-local — never the consensus DB).
+        match slot.handle.into_output().await {
+            Ok(sig) => match convert_signature(sig) {
+                Ok(sig) => {
+                    self.completed_signatures
+                        .lock()
+                        .expect("not poisoned")
+                        .insert(session_id, sig.serialize_compact().to_vec());
+                }
+                Err(err) => warn!(
+                    target: "usdt",
+                    err = %err.fmt_compact_anyhow(),
+                    "off-thread signer produced an unconvertible signature"
+                ),
+            },
+            Err(err) => warn!(
+                target: "usdt",
+                err = %err.fmt_compact_anyhow(),
+                "off-thread signer failed to produce its final output"
+            ),
         }
     }
 }
@@ -2025,6 +2315,182 @@ mod tests {
         assert_eq!(response.credited, UsdtAmount(5_000_000));
         assert_eq!(response.claimed, UsdtAmount(2_000_000));
         assert_eq!(response.claimable, UsdtAmount(3_000_000));
+    }
+
+    /// End-to-end drive of a runtime threshold-ECDSA signing session over
+    /// `MpcRound` consensus items, simulating ALL `n=4` guardians —
+    /// including the NON-signer peer 3 (the lowest-`t=3` subset `{0,1,2}`
+    /// signs) — by holding one [`Usdt`] module (each with its own DB + store)
+    /// per guardian and shuttling every guardian's proposed `MpcRound` items
+    /// to every guardian's `process_consensus_item`, round by round, exactly
+    /// as ordered consensus would.
+    ///
+    /// Asserts (a) every SIGNER assembled a signature that verifies against
+    /// the group key, (b) EVERY guardian's `SigningSession.round` advanced to
+    /// the SAME final value — the determinism guard, in particular the
+    /// non-signer's consensus DB matches the signers' — and (c) the non-signer
+    /// holds NO `completed_signatures` entry (it cannot compute the sig, so it
+    /// must never touch that guardian-local, non-consensus state).
+    ///
+    /// Slow: this runs real cggmp21 signing across several parked rounds.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn mpc_round_consensus_drives_signing_to_completion() {
+        use sha2::{Digest as _, Sha256};
+
+        const N: u16 = 4;
+        let peers: Vec<PeerId> = (0..N).map(PeerId::from).collect();
+        let num_peers = peers.to_num_peers();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(
+            &peers,
+            &args,
+            &fedimint_usdt_common::UsdtGenParams::default(),
+        );
+
+        // One module per guardian, each with its own in-memory DB and its own
+        // signing-session store. Peer 3 is outside the lowest-3 signer subset.
+        let mut modules: BTreeMap<PeerId, Usdt> = BTreeMap::new();
+        for &peer in &peers {
+            let cfg = server_cfgs[&peer]
+                .clone()
+                .to_typed::<UsdtConfig>()
+                .expect("config was just generated by the same configgen");
+            let db = fedimint_core::db::Database::new(
+                fedimint_core::db::mem_impl::MemDatabase::new(),
+                fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+            );
+            modules.insert(
+                peer,
+                Usdt::new_for_test(cfg, MockEvmRpc::default().into_dyn(), db, peer, num_peers),
+            );
+        }
+
+        let digest: [u8; 32] = Sha256::digest(b"usdt mpc-round consensus signing test").into();
+        let session_id = fedimint_usdt_common::signing_session_id(&digest, 0);
+        let purpose = SigningPurpose::Test(digest);
+
+        // Every guardian starts the (identical) session: writes its own
+        // consensus `SigningSession` and, if in the subset, spawns its
+        // off-thread signer + pre-pumps round 0.
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Consensus round loop: collect every guardian's proposed `MpcRound`
+        // items, order them deterministically (the in-test analogue of
+        // consensus ordering), then feed EVERY item to EVERY guardian's
+        // `process_consensus_item` in its own committed transaction. Continue
+        // until no guardian proposes anything (the signers have finished).
+        let mut consensus_rounds = 0u32;
+        loop {
+            let mut proposed: Vec<(PeerId, MpcRoundItem)> = Vec::new();
+            for (&peer, module) in &modules {
+                let mut dbtx = module.db_for_test().begin_transaction().await;
+                let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+                dbtx.commit_tx().await;
+                for item in items {
+                    if let UsdtConsensusItem::MpcRound(mpc) = item {
+                        proposed.push((peer, mpc));
+                    }
+                }
+            }
+
+            if proposed.is_empty() {
+                break;
+            }
+
+            proposed.sort_by(|(a, ia), (b, ib)| {
+                (a, ia.session_id.0, ia.round).cmp(&(b, ib.session_id.0, ib.round))
+            });
+
+            for (proposer, item) in &proposed {
+                for module in modules.values() {
+                    let mut dbtx = module.db_for_test().begin_transaction().await;
+                    module
+                        .process_consensus_item(
+                            &mut dbtx.to_ref_nc(),
+                            UsdtConsensusItem::MpcRound(item.clone()),
+                            *proposer,
+                        )
+                        .await
+                        .expect("every proposed MpcRound item must process cleanly");
+                    dbtx.commit_tx().await;
+                }
+            }
+
+            consensus_rounds += 1;
+            assert!(consensus_rounds < 1_000, "signing failed to converge");
+        }
+        assert!(
+            consensus_rounds >= 1,
+            "signing must have taken at least one consensus round"
+        );
+
+        // (a) Every signer holds a compact signature that verifies against the
+        // group public key.
+        let group_pk = server_cfgs[&peers[0]]
+            .clone()
+            .to_typed::<UsdtConfig>()
+            .expect("valid config")
+            .consensus
+            .group_public_key;
+        let msg = secp256k1::Message::from_digest(digest);
+        let verifier = secp256k1::Secp256k1::verification_only();
+        for &peer in &peers[..3] {
+            let sig_bytes = modules[&peer]
+                .completed_signatures
+                .lock()
+                .expect("not poisoned")
+                .get(&session_id)
+                .cloned()
+                .expect("each signer assembled its signature");
+            assert_eq!(sig_bytes.len(), 64, "compact signature is 64 bytes");
+            let sig = secp256k1::ecdsa::Signature::from_compact(&sig_bytes)
+                .expect("stored bytes are a valid compact signature");
+            verifier
+                .verify_ecdsa(&msg, &sig, &group_pk)
+                .expect("assembled signature must verify against the group key");
+        }
+
+        // (c) The non-signer holds NO signature (it cannot compute one).
+        assert!(
+            modules[&peers[3]]
+                .completed_signatures
+                .lock()
+                .expect("not poisoned")
+                .is_empty(),
+            "the non-signer must never populate completed_signatures"
+        );
+
+        // (b) Determinism guard: every guardian's consensus `SigningSession`
+        // advanced to the SAME final round — signer and non-signer DBs
+        // identical.
+        let mut final_rounds = Vec::new();
+        for &peer in &peers {
+            let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
+            let session = dbtx
+                .get_value(&SigningSessionKey(session_id))
+                .await
+                .expect("SigningSession present on every guardian");
+            final_rounds.push(session.round);
+        }
+        assert!(
+            final_rounds.iter().all(|r| *r == final_rounds[0]),
+            "every guardian (signer AND non-signer) must reach the same final round: \
+             {final_rounds:?}"
+        );
+        assert!(
+            final_rounds[0] >= 1,
+            "the session must have advanced at least one round"
+        );
     }
 }
 
