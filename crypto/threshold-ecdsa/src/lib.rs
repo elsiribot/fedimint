@@ -135,7 +135,13 @@ pub fn group_public_key(share: &KeyShare) -> anyhow::Result<secp256k1::PublicKey
         .context("group public key is not a valid secp256k1 point")
 }
 
-fn convert_signature(
+/// Convert a raw cggmp21 signature into the workspace's canonical compact,
+/// low-s `secp256k1::ecdsa::Signature`. Exposed (not crate-private) so
+/// consumers that drive `cggmp21::signing` directly — e.g. an off-thread
+/// runtime signing session pumped round-by-round across consensus, rather
+/// than through [`run_signing`]'s single-shot `party` transport — can
+/// convert the state machine's raw output themselves.
+pub fn convert_signature(
     sig: cggmp21::Signature<Curve>,
 ) -> anyhow::Result<secp256k1::ecdsa::Signature> {
     let mut compact = [0u8; 64];

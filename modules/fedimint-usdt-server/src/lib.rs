@@ -60,12 +60,14 @@ use crate::db::{
     SigningSession, SigningSessionPrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
+use crate::signing::SessionStore;
 
 mod dkg;
 
 pub mod config;
 pub mod db;
 pub mod rpc;
+pub mod signing;
 
 /// Generates the module
 #[derive(Debug, Clone, Default)]
@@ -408,6 +410,13 @@ pub struct Usdt {
     /// (spawned in [`Usdt::new`]; see [`scan_pending_deposits`]), drained
     /// into `UsdtConsensusItem::Deposit` proposals in `consensus_proposal`.
     deposit_proposals: Arc<Mutex<Vec<DepositObservation>>>,
+    /// This guardian's in-memory table of currently-running off-thread
+    /// threshold-ECDSA signing sessions (see [`crate::signing`]). No task
+    /// spawned yet: the consensus wiring that spawns/pumps sessions into
+    /// this store (`consensus_proposal`/`process_consensus_item`) lands in
+    /// a later Phase 6a task.
+    #[allow(dead_code)]
+    signing_sessions: SessionStore,
 }
 
 /// Grouped handles/config for [`Usdt::spawn_deposit_checker`], bundling its
@@ -692,6 +701,7 @@ impl Usdt {
             block_count,
             task_group,
             deposit_proposals,
+            signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -715,6 +725,7 @@ impl Usdt {
             block_count: Arc::new(AtomicU64::new(0)),
             task_group: TaskGroup::new(),
             deposit_proposals: Arc::new(Mutex::new(Vec::new())),
+            signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
