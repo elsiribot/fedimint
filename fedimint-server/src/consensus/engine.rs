@@ -143,20 +143,39 @@ impl ConsensusEngine {
 
             let mut item_index = self.pending_accepted_items().await.len() as u64;
 
+            // Mirror the session duration of the atomic broadcast so sessions
+            // advance even without any item flow, e.g. for a federation
+            // without any modules generating consensus item proposals.
+            let session_duration = Duration::from_millis(
+                u64::from(self.cfg.consensus.broadcast_rounds_per_session)
+                    * u64::from(self.cfg.local.broadcast_round_delay_ms),
+            );
+
             let session_start_time = std::time::Instant::now();
 
-            while let Ok(item) = self.submission_receiver.recv().await {
-                if self
-                    .process_consensus_item(session_index, item_index, item, self.identity())
-                    .await
-                    .is_ok()
-                {
-                    item_index += 1;
+            loop {
+                let remaining_time = session_duration.saturating_sub(session_start_time.elapsed());
+
+                if remaining_time.is_zero() {
+                    break;
                 }
 
-                // we rely on the module consensus items to notice the timeout
-                if session_start_time.elapsed() > Duration::from_mins(1) {
-                    break;
+                match tokio::time::timeout(remaining_time, self.submission_receiver.recv()).await {
+                    Ok(Ok(item)) => {
+                        if self
+                            .process_consensus_item(
+                                session_index,
+                                item_index,
+                                item,
+                                self.identity(),
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            item_index += 1;
+                        }
+                    }
+                    Ok(Err(..)) | Err(..) => break,
                 }
             }
 
