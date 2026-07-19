@@ -189,14 +189,24 @@ pub fn process_item(
                 bail!("Cannot propose while {pending} is pending approval");
             }
 
-            log.generations.insert(
-                generation_id,
+            let approvals = BTreeSet::from([peer]);
+
+            // The proposer's approval is implicit, so a single guardian
+            // federation reaches unanimity at proposal time already.
+            let state = if approvals.len() == ctx.num_peers.total() {
+                GenerationState::Approved {
+                    proposal,
+                    results: BTreeMap::new(),
+                }
+            } else {
                 GenerationState::Proposed {
                     proposal,
                     proposer: peer,
-                    approvals: BTreeSet::from([peer]),
-                },
-            );
+                    approvals,
+                }
+            };
+
+            log.generations.insert(generation_id, state);
         }
         ConfigGenItem::Approve { generation_id } => {
             let state = log
@@ -451,6 +461,32 @@ mod tests {
             GenerationState::Approved { .. }
         ));
         assert_eq!(log.next_id(), ModuleGenerationId(1));
+    }
+
+    #[test]
+    fn single_guardian_proposal_is_approved_immediately() {
+        let mut log = GenerationLog::default();
+
+        let ctx = ProcessItemContext {
+            num_peers: NumPeers::from(1),
+            ..test_ctx()
+        };
+
+        process_item(
+            ctx,
+            &mut log,
+            ConfigGenItem::Propose {
+                generation_id: ModuleGenerationId(0),
+                proposal: proposal(),
+            },
+            PeerId::from(0),
+        )
+        .expect("proposal accepted");
+
+        assert!(matches!(
+            log.generations()[&ModuleGenerationId(0)],
+            GenerationState::Approved { .. }
+        ));
     }
 
     #[test]
