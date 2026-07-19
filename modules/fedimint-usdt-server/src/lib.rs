@@ -56,7 +56,8 @@ use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfig
 use crate::db::{
     BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, DepositObservationVoteAccountPrefix,
     DepositObservationVoteKey, DepositObservationVotePrefix, DepositRecord, DepositRecordKey,
-    DepositRecordPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
+    DepositRecordPrefix, MpcRoundSeenPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
+    SigningSession, SigningSessionPrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 
@@ -143,6 +144,26 @@ impl ModuleInit for UsdtInit {
                         PendingCheck,
                         items,
                         "Pending Checks"
+                    );
+                }
+                DbKeyPrefix::SigningSession => {
+                    push_db_pair_items!(
+                        dbtx,
+                        SigningSessionPrefix,
+                        crate::db::SigningSessionKey,
+                        SigningSession,
+                        items,
+                        "Signing Sessions"
+                    );
+                }
+                DbKeyPrefix::MpcRoundSeen => {
+                    push_db_pair_items!(
+                        dbtx,
+                        MpcRoundSeenPrefix,
+                        crate::db::MpcRoundSeenKey,
+                        Vec<u8>,
+                        items,
+                        "MPC Round Seen"
                     );
                 }
             }
@@ -495,6 +516,13 @@ impl ServerModule for Usdt {
                     self.credit_deposit(dbtx, &obs).await?;
                 }
                 Ok(())
+            }
+            UsdtConsensusItem::MpcRound(_) => {
+                // Wire type + DB schema only (Phase 6a task 1); the
+                // round-advance consensus logic that reads/writes
+                // `SigningSession`/`MpcRoundSeenKey` lands in a later task of
+                // this phase.
+                bail!("The usdt module does not support MpcRound consensus items yet")
             }
             UsdtConsensusItem::Default { .. } => {
                 bail!("The usdt module does not support this consensus item yet")

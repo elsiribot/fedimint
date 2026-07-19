@@ -109,6 +109,10 @@ impl fmt::Display for FeeVote {
 /// Domain-separation tag mixed into the provisional deposit-address tweak.
 pub const DEPOSIT_ADDRESS_DOMAIN: &[u8] = b"fedimint-usdt-deposit-v0";
 
+/// Domain-separation tag mixed into a signing session's id derivation (see
+/// [`signing_session_id`]).
+pub const SIGNING_SESSION_DOMAIN: &[u8] = b"fedimint-usdt-signing-v0";
+
 /// The standard Ethereum address of a secp256k1 public key: last 20 bytes of
 /// `keccak256` over the 64-byte uncompressed point (SEC1 with the `0x04`
 /// prefix stripped). WASM-safe (pure-Rust `sha3`); mirrors
@@ -159,6 +163,52 @@ pub fn derive_deposit_account(
         .expect("additive tweak of a valid point is a valid point");
 
     evm_address(&derived)
+}
+
+/// Identifies one instance of the guardians co-signing a single 32-byte
+/// digest (see [`signing_session_id`]). Plain data — wasm-safe, carries no
+/// cggmp21 state.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Eq,
+    PartialEq,
+    Hash,
+    Ord,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    Encodable,
+    Decodable,
+)]
+pub struct SigningSessionId(pub [u8; 32]);
+
+/// Derives the id of the signing session for `digest` on its `attempt`'th
+/// retry: `keccak256(SIGNING_SESSION_DOMAIN ‖ digest ‖ attempt.to_be_bytes())`.
+///
+/// Mirrors [`derive_deposit_account`]'s keccak-construction style. Including
+/// `attempt` lets the federation restart signing for the same digest (e.g.
+/// after a failed round) under a fresh session id, without colliding with the
+/// abandoned attempt's DB records.
+#[must_use]
+pub fn signing_session_id(digest: &[u8; 32], attempt: u32) -> SigningSessionId {
+    let mut hasher = Keccak256::new();
+    hasher.update(SIGNING_SESSION_DOMAIN);
+    hasher.update(digest);
+    hasher.update(attempt.to_be_bytes());
+    SigningSessionId(hasher.finalize().into())
+}
+
+/// One guardian's message for a single round of a signing session's cggmp21
+/// state machine. `payload` is an opaque, round-specific encoding of that
+/// guardian's protocol message; this module's consensus logic (added in a
+/// later phase) is the only thing that interprets it.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
+pub struct MpcRoundItem {
+    pub session_id: SigningSessionId,
+    pub round: u16,
+    pub payload: Vec<u8>,
 }
 
 /// Payload of a `UsdtConsensusItem::Deposit` observation.
@@ -256,6 +306,9 @@ pub enum UsdtConsensusItem {
     /// Guardian's observation of a pending deposit account's confirmed
     /// balance (claim-triggered, D7).
     Deposit(DepositObservation),
+    /// One guardian's message for a single round of a signing session's
+    /// cggmp21 state machine (Phase 6a).
+    MpcRound(MpcRoundItem),
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -508,6 +561,35 @@ mod tests {
                 .expect("UsdtConsensusItem::Deposit should decode what it just encoded");
 
         assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn test_usdt_consensus_item_mpc_round_round_trips_through_consensus_encoding() {
+        let item = UsdtConsensusItem::MpcRound(MpcRoundItem {
+            session_id: SigningSessionId([7; 32]),
+            round: 3,
+            payload: vec![1, 2, 3],
+        });
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("UsdtConsensusItem::MpcRound should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn signing_session_id_is_deterministic_and_attempt_sensitive() {
+        let digest = [9u8; 32];
+
+        assert_eq!(
+            signing_session_id(&digest, 0),
+            signing_session_id(&digest, 0)
+        );
+        assert_ne!(
+            signing_session_id(&digest, 0),
+            signing_session_id(&digest, 1)
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::secp256k1::PublicKey;
 use fedimint_core::{PeerId, impl_db_lookup, impl_db_record};
-use fedimint_usdt_common::{DepositObservation, EvmAddress, UsdtAmount};
+use fedimint_usdt_common::{DepositObservation, EvmAddress, SigningSessionId, UsdtAmount};
 use serde::Serialize;
 use strum_macros::EnumIter;
 
@@ -24,6 +24,12 @@ pub enum DbKeyPrefix {
     /// Guardian-local (non-consensus) bookkeeping for deposit accounts this
     /// guardian is actively polling.
     PendingCheck = 0x05,
+    /// Consensus-agreed state of a threshold-ECDSA signing session (Phase
+    /// 6a).
+    SigningSession = 0x06,
+    /// Per-(session, round, peer) record of an `MpcRound` consensus item
+    /// this guardian has already processed (Phase 6a).
+    MpcRoundSeen = 0x07,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -115,13 +121,87 @@ impl_db_record!(
 );
 impl_db_lookup!(key = PendingCheckKey, query_prefix = PendingCheckPrefix);
 
+/// What a signing session's digest is being signed for. Phase 6a only ever
+/// creates [`SigningPurpose::Test`] sessions (exercising the round-advance
+/// loop end to end); Phase 7 adds the real `DeployAndSweep`/`Withdraw`
+/// purposes that drive actual EVM transactions.
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub enum SigningPurpose {
+    Test([u8; 32]),
+}
+
+/// A threshold-ECDSA signing session's current progress: `InProgress` while
+/// guardians are still exchanging cggmp21 protocol messages, `Completed`
+/// once a valid compact secp256k1 signature has been assembled, `Failed` if
+/// the session could not converge (e.g. a participant misbehaved or dropped
+/// out) and must be retried under a fresh [`SigningSessionId`] (see
+/// [`fedimint_usdt_common::signing_session_id`]'s `attempt` parameter).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub enum SessionState {
+    InProgress,
+    /// A compact (64-byte) secp256k1 signature over the session's digest.
+    Completed(Vec<u8>),
+    Failed,
+}
+
+/// Consensus-agreed state of one threshold-ECDSA signing session: what is
+/// being signed ([`SigningPurpose`]/`digest`), which guardians are
+/// participating, how far the cggmp21 round-advance loop has progressed, and
+/// its outcome.
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub struct SigningSession {
+    pub purpose: SigningPurpose,
+    pub digest: [u8; 32],
+    pub signers: Vec<PeerId>,
+    pub round: u16,
+    pub state: SessionState,
+}
+
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct SigningSessionKey(pub SigningSessionId);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct SigningSessionPrefix;
+
+impl_db_record!(
+    key = SigningSessionKey,
+    value = SigningSession,
+    db_prefix = DbKeyPrefix::SigningSession,
+);
+impl_db_lookup!(key = SigningSessionKey, query_prefix = SigningSessionPrefix);
+
+/// One peer's payload for a single round of a signing session, keyed
+/// `(session, round, peer)` so that [`MpcRoundSeenSessionRoundPrefix`] can
+/// look up every peer's payload for one session's round (mirroring
+/// [`DepositObservationVoteKey`]'s dual-prefix pattern, with a leading
+/// `(session, round)` pair instead of a leading `account`).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct MpcRoundSeenKey(pub SigningSessionId, pub u16, pub PeerId);
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct MpcRoundSeenPrefix;
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct MpcRoundSeenSessionRoundPrefix(pub SigningSessionId, pub u16);
+
+impl_db_record!(
+    key = MpcRoundSeenKey,
+    value = Vec<u8>,
+    db_prefix = DbKeyPrefix::MpcRoundSeen,
+);
+impl_db_lookup!(
+    key = MpcRoundSeenKey,
+    query_prefix = MpcRoundSeenPrefix,
+    query_prefix = MpcRoundSeenSessionRoundPrefix,
+);
+
 #[cfg(test)]
 mod tests {
     use fedimint_core::PeerId;
     use fedimint_core::db::mem_impl::MemDatabase;
     use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped};
     use fedimint_core::module::registry::ModuleDecoderRegistry;
-    use fedimint_usdt_common::{DepositObservation, EvmAddress, UsdtAmount};
+    use fedimint_usdt_common::{DepositObservation, EvmAddress, UsdtAmount, signing_session_id};
     use futures::StreamExt;
     use secp256k1::Secp256k1;
 
@@ -227,5 +307,56 @@ mod tests {
             dbtx.get_value(&PendingCheckKey(account)).await,
             Some(pending)
         );
+    }
+
+    #[tokio::test]
+    async fn signing_session_round_trips() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let id = signing_session_id(&[1; 32], 0);
+        let session = SigningSession {
+            purpose: SigningPurpose::Test([2; 32]),
+            digest: [1; 32],
+            signers: vec![PeerId::from(0), PeerId::from(1), PeerId::from(2)],
+            round: 0,
+            state: SessionState::InProgress,
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&SigningSessionKey(id), &session)
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(dbtx.get_value(&SigningSessionKey(id)).await, Some(session));
+    }
+
+    #[tokio::test]
+    async fn mpc_round_seen_round_trips_and_filters_by_session_round_prefix() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let id = signing_session_id(&[3; 32], 0);
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&MpcRoundSeenKey(id, 2, PeerId::from(0)), &vec![1u8, 2, 3])
+            .await;
+        dbtx.insert_new_entry(&MpcRoundSeenKey(id, 2, PeerId::from(1)), &vec![4u8, 5, 6])
+            .await;
+        dbtx.insert_new_entry(&MpcRoundSeenKey(id, 3, PeerId::from(0)), &vec![9u8])
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&MpcRoundSeenKey(id, 2, PeerId::from(0)))
+                .await,
+            Some(vec![1u8, 2, 3])
+        );
+
+        let round_2: Vec<_> = dbtx
+            .find_by_prefix(&MpcRoundSeenSessionRoundPrefix(id, 2))
+            .await
+            .collect()
+            .await;
+        assert_eq!(round_2.len(), 2);
+        assert!(round_2.iter().all(|(key, _)| key.0 == id && key.1 == 2));
     }
 }
