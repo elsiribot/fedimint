@@ -10,6 +10,7 @@ use std::sync::Arc;
 use async_channel::Sender;
 use fedimint_api_client::api::DynGlobalApi;
 use fedimint_core::NumPeers;
+use fedimint_core::config::JsonWithKind;
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped, apply_migrations_dbtx};
 use fedimint_core::epoch::ConsensusItem;
@@ -45,6 +46,16 @@ pub struct DynModuleActivator {
     submission_sender: Sender<ConsensusItem>,
     global_api: DynGlobalApi,
     bitcoin_rpc_connection: ServerBitcoinRpcMonitor,
+}
+
+/// Parses the private module config json stored by the generation manager.
+///
+/// Applies the same [`JsonWithKind::with_fixed_empty_value`] workaround as
+/// `ServerConfig::get_module_config`: unit struct private configs serialize
+/// to a bare `{"kind": ...}` object and would otherwise deserialize with an
+/// empty map value that fails to parse back into the unit struct.
+fn parse_private_config(private_json: &str) -> anyhow::Result<JsonWithKind> {
+    Ok(serde_json::from_str::<JsonWithKind>(private_json)?.with_fixed_empty_value())
 }
 
 impl DynModuleActivator {
@@ -113,7 +124,7 @@ impl DynModuleActivator {
         dbtx.commit_tx_result().await?;
 
         let module_cfg = fedimint_core::config::ServerModuleConfig::from(
-            serde_json::from_str(&outcome.private_json)?,
+            parse_private_config(&outcome.private_json)?,
             active_module.consensus_config.clone(),
         );
 
@@ -148,5 +159,36 @@ impl DynModuleActivator {
             module,
             self.submission_sender.clone(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::config::JsonWithKind;
+    use fedimint_core::core::ModuleKind;
+    use serde::{Deserialize, Serialize};
+
+    use super::parse_private_config;
+
+    /// Private configs without fields, like the meta module's
+    /// `MetaConfigPrivate`, are unit structs that serialize to json `null`.
+    #[derive(Serialize, Deserialize)]
+    struct UnitConfigPrivate;
+
+    #[test]
+    fn parses_unit_struct_private_config() {
+        // The generation manager stores the private config by serializing the
+        // JsonWithKind returned from the module's distributed_gen, which
+        // flattens a null value into a bare `{"kind": ...}` object
+        let stored = serde_json::to_string(&JsonWithKind::new(
+            ModuleKind::from_static_str("meta"),
+            serde_json::to_value(UnitConfigPrivate).expect("serializable"),
+        ))
+        .expect("serializable");
+
+        let parsed = parse_private_config(&stored).expect("stored private config parses");
+
+        serde_json::from_value::<UnitConfigPrivate>(parsed.value().clone())
+            .expect("private config deserializes into the unit struct");
     }
 }

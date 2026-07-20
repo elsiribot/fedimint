@@ -24,8 +24,11 @@ use fedimint_core::endpoint_constants::{
     APPROVE_MODULE_GENERATION_ENDPOINT, AUDIT_ENDPOINT, MODULE_GENERATIONS_ENDPOINT,
     PROPOSE_MODULE_GENERATION_ENDPOINT, SESSION_COUNT_ENDPOINT,
 };
-use fedimint_core::module::{ApiAuth, ApiRequestErased};
+use fedimint_core::module::{ApiAuth, ApiRequestErased, ModuleConsensusVersion};
 use fedimint_core::task::sleep_in_test;
+use fedimint_dummy_client::DummyClientInit;
+use fedimint_dummy_common::MODULE_CONSENSUS_VERSION as DUMMY_MODULE_CONSENSUS_VERSION;
+use fedimint_dummy_server::DummyInit;
 use fedimint_logging::LOG_TEST;
 use fedimint_mint_client::MintClientInit;
 use fedimint_mint_common::MODULE_CONSENSUS_VERSION;
@@ -83,10 +86,14 @@ async fn await_state(
 }
 
 /// Proposes a generation from peer 0 and returns its id.
-async fn propose(apis: &[DynGlobalApi], module_kind: &'static str) -> ModuleGenerationId {
+async fn propose(
+    apis: &[DynGlobalApi],
+    module_kind: &'static str,
+    consensus_version: ModuleConsensusVersion,
+) -> ModuleGenerationId {
     let proposal = ModuleConfigProposal {
         module_kind: ModuleKind::from_static_str(module_kind),
-        consensus_version: MODULE_CONSENSUS_VERSION,
+        consensus_version,
         network: bitcoin::Network::Regtest,
         disable_base_fees: false,
     };
@@ -133,7 +140,7 @@ async fn generates_mint_config_on_running_federation() -> anyhow::Result<()> {
         apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
     }
 
-    let generation_id = propose(&apis, "mint").await;
+    let generation_id = propose(&apis, "mint", MODULE_CONSENSUS_VERSION).await;
 
     approve_all(&apis, generation_id).await;
 
@@ -266,7 +273,7 @@ async fn activated_module_runs_without_restart() -> anyhow::Result<()> {
         apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
     }
 
-    let generation_id = propose(&apis, "mint").await;
+    let generation_id = propose(&apis, "mint", MODULE_CONSENSUS_VERSION).await;
 
     approve_all(&apis, generation_id).await;
 
@@ -352,6 +359,48 @@ async fn activated_module_runs_without_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The dummy module's private config is a unit struct, like the production
+/// meta module's `MetaConfigPrivate`. Unit structs hit the `JsonWithKind`
+/// serde flatten quirk: they serialize to a bare `{"kind": ...}` object and
+/// deserialize back with an empty map value, which the activation path has
+/// to fix up before initializing the module.
+#[tokio::test(flavor = "multi_thread")]
+async fn activates_module_with_unit_struct_private_config() -> anyhow::Result<()> {
+    let fixtures =
+        Fixtures::new_primary(MintClientInit, MintInit).with_module(DummyClientInit, DummyInit);
+    let fed = fixtures.new_fed_not_degraded().await;
+
+    let mut apis = Vec::new();
+    for peer in 0..NUM_PEERS {
+        apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
+    }
+
+    let generation_id = propose(&apis, "dummy", DUMMY_MODULE_CONSENSUS_VERSION).await;
+
+    approve_all(&apis, generation_id).await;
+
+    for api in &apis {
+        await_state(api, generation_id, "Generated").await;
+    }
+
+    let (instance_id, active_from_session) = activate(&apis[0], generation_id).await;
+
+    for api in &apis {
+        await_session_past(api, active_from_session).await?;
+    }
+
+    for api in &apis {
+        await_module_in_audit(api, instance_id).await;
+    }
+
+    info!(
+        target: LOG_TEST,
+        "Module with unit struct private config hot activated on every guardian"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn offline_peer_catches_up_after_activation() -> anyhow::Result<()> {
     let fixtures = Fixtures::new_primary(MintClientInit, MintInit);
@@ -362,7 +411,7 @@ async fn offline_peer_catches_up_after_activation() -> anyhow::Result<()> {
         apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
     }
 
-    let generation_id = propose(&apis, "mint").await;
+    let generation_id = propose(&apis, "mint", MODULE_CONSENSUS_VERSION).await;
 
     approve_all(&apis, generation_id).await;
 
@@ -413,7 +462,7 @@ async fn aborted_generation_can_be_retried_under_fresh_id() -> anyhow::Result<()
         apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
     }
 
-    let generation_id = propose(&apis, "mint").await;
+    let generation_id = propose(&apis, "mint", MODULE_CONSENSUS_VERSION).await;
 
     // Any single guardian can abort a pending generation
     while generation_state(&apis[1], generation_id).await.is_none() {
@@ -436,7 +485,7 @@ async fn aborted_generation_can_be_retried_under_fresh_id() -> anyhow::Result<()
     }
 
     // A fresh proposal under the next id completes normally
-    let retry_id = propose(&apis, "mint").await;
+    let retry_id = propose(&apis, "mint", MODULE_CONSENSUS_VERSION).await;
     assert_eq!(retry_id.0, generation_id.0 + 1);
 
     approve_all(&apis, retry_id).await;
@@ -458,7 +507,7 @@ async fn unsupported_module_kind_is_aborted() -> anyhow::Result<()> {
         apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
     }
 
-    let generation_id = propose(&apis, "no-such-module").await;
+    let generation_id = propose(&apis, "no-such-module", MODULE_CONSENSUS_VERSION).await;
 
     approve_all(&apis, generation_id).await;
 

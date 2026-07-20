@@ -109,6 +109,7 @@ Two explicit caveats:
 - Exact client attestation mechanism: signed-session proof vs threshold-of-guardians config agreement?
 - The recoverability audit of non-consensus DB state (client backups, announcements): replicate, re-populate, or accept loss?
 - UX for proposing modules: dashboard flow, and how `ConfigGenModuleArgs` are agreed before `Propose`.
+- Dashboard login sessions are invalidated when the api surface is respawned on hot activation (in-memory session store); guardians have to log in again after activating.
 
 ## Implementation sequence
 
