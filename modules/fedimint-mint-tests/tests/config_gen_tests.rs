@@ -211,8 +211,6 @@ async fn activated_module_runs_after_restart() -> anyhow::Result<()> {
         await_state(api, generation_id, "Generated").await;
     }
 
-    // Activation schedules a coordinated restart on every guardian before
-    // the activation session
     apis[0]
         .request_admin::<()>(
             ACTIVATE_MODULE_GENERATION_ENDPOINT,
@@ -234,23 +232,11 @@ async fn activated_module_runs_after_restart() -> anyhow::Result<()> {
         target: LOG_TEST,
         instance_id,
         active_from_session,
-        "Module activated, waiting for the scheduled shutdown"
+        "Module activated, restarting all peers"
     );
 
-    for api in &apis {
-        while api
-            .request_admin_no_auth::<u64>(SESSION_COUNT_ENDPOINT, ApiRequestErased::default())
-            .await
-            .is_ok()
-        {
-            sleep_in_test(
-                "Waiting for peer to shut down for activation",
-                Duration::from_millis(200),
-            )
-            .await;
-        }
-    }
-
+    // Guardians hot activate the module without restarting; a restart after
+    // activation has to arrive at the same state via the startup path
     fed.restart_all_peers().await;
 
     // The dynamically added mint instance is now part of the running

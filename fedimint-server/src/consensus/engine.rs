@@ -17,7 +17,7 @@ use fedimint_core::encoding::Decodable;
 use fedimint_core::endpoint_constants::AWAIT_SIGNED_SESSION_OUTCOME_ENDPOINT;
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::module::audit::Audit;
-use fedimint_core::module::registry::ModuleDecoderRegistry;
+use fedimint_core::module::registry::{ModuleDecoderRegistry, ModuleRegistry};
 use fedimint_core::module::{ApiRequestErased, SerdeModuleEncoding};
 use fedimint_core::net::peers::DynP2PConnections;
 use fedimint_core::runtime::spawn;
@@ -43,7 +43,8 @@ use crate::consensus::aleph_bft::keychain::Keychain;
 use crate::consensus::aleph_bft::network::Network;
 use crate::consensus::aleph_bft::spawner::Spawner;
 use crate::consensus::aleph_bft::to_node_index;
-use crate::consensus::config_gen::GenerationState;
+use crate::consensus::config_gen::activation::{DynModuleActivator, ModuleSetSnapshot};
+use crate::consensus::config_gen::{ActiveModule, GenerationState};
 use crate::consensus::db::{
     AcceptedItemKey, AcceptedItemPrefix, AcceptedTransactionKey, AlephUnitsPrefix,
     SignedSessionOutcomeKey, SignedSessionOutcomePrefix,
@@ -69,8 +70,11 @@ pub struct ConsensusEngine {
     pub cfg: ServerConfig,
     pub submission_receiver: Receiver<ConsensusItem>,
     pub shutdown_receiver: watch::Receiver<Option<u64>>,
-    /// Used to schedule the coordinated restart activating a module
-    pub shutdown_sender: watch::Sender<Option<u64>>,
+    /// Initializes dynamically generated modules at their activation session
+    pub module_activator: DynModuleActivator,
+    /// Publishes the extended module set after a hot activation so the api
+    /// surface can be rebuilt to include the new module
+    pub snapshot_sender: watch::Sender<ModuleSetSnapshot>,
     /// Forwards runtime DKG messages to the config generation worker
     pub config_gen_sender: async_channel::Sender<(PeerId, P2PMessage)>,
     /// Activation sessions of dynamically added modules; their items are
@@ -122,22 +126,100 @@ impl ConsensusEngine {
     }
 
     #[instrument(target = LOG_CONSENSUS, name = "run", skip_all, fields(id=%self.cfg.local.identity))]
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        let task_handle = self.task_group.make_handle();
+
         if self.num_peers().total() == 1 {
-            self.run_single_guardian(self.task_group.make_handle())
-                .await
+            self.run_single_guardian(task_handle).await
         } else {
-            self.run_consensus(self.task_group.make_handle()).await
+            self.run_consensus(task_handle).await
         }
     }
 
-    pub async fn run_single_guardian(&self, task_handle: TaskHandle) -> anyhow::Result<()> {
+    /// Initializes dynamically generated modules whose activation session has
+    /// been reached, so they participate in consensus from the coming session
+    /// without a restart. The extended module set is published for the api
+    /// surface to be rebuilt; see [`crate::consensus::config_gen`].
+    async fn apply_pending_activations(&mut self, next_session: u64) -> anyhow::Result<()> {
+        let generation_log = self
+            .db
+            .begin_transaction_nc()
+            .await
+            .get_value(&ConfigGenerationLogKey)
+            .await
+            .unwrap_or_default();
+
+        let pending_modules: Vec<ActiveModule> = generation_log
+            .active_modules()
+            .into_iter()
+            .filter(|module| {
+                module.active_from_session <= next_session
+                    && self.modules.get(module.instance_id).is_none()
+            })
+            .collect();
+
+        if pending_modules.is_empty() {
+            return Ok(());
+        }
+
+        let mut modules: BTreeMap<_, _> = self
+            .modules
+            .iter_modules()
+            .map(|(id, kind, module)| (id, (kind.clone(), module.clone())))
+            .collect();
+
+        for active_module in &pending_modules {
+            let (kind, module) = self
+                .module_activator
+                .init_module(&self.db, active_module)
+                .await?;
+
+            modules.insert(active_module.instance_id, (kind, module));
+
+            info!(
+                target: LOG_CONSENSUS,
+                generation_id = %active_module.generation_id,
+                instance_id = active_module.instance_id,
+                session_index = next_session,
+                "Hot activated module"
+            );
+        }
+
+        self.modules = ModuleRegistry::from(modules);
+        self.db = self.db.with_decoders(self.modules.decoder_registry());
+
+        for active_module in &pending_modules {
+            let (kind, module) = self
+                .modules
+                .get_with_kind(active_module.instance_id)
+                .expect("Just inserted")
+                .clone();
+
+            self.module_activator.spawn_ci_submitter(
+                self.db.clone(),
+                active_module.instance_id,
+                kind,
+                module,
+            );
+        }
+
+        self.snapshot_sender.send_replace(ModuleSetSnapshot {
+            modules: self.modules.clone(),
+            db: self.db.clone(),
+        });
+
+        Ok(())
+    }
+
+    pub async fn run_single_guardian(&mut self, task_handle: TaskHandle) -> anyhow::Result<()> {
         assert_eq!(self.num_peers(), NumPeers::from(1));
 
         self.initialize_checkpoint_directory(self.get_finished_session_count().await)?;
 
         while !task_handle.is_shutting_down() {
             let session_index = self.get_finished_session_count().await;
+
+            self.apply_pending_activations(session_index).await?;
 
             CONSENSUS_SESSION_COUNT.set(session_index as i64);
 
@@ -210,7 +292,7 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    pub async fn run_consensus(&self, task_handle: TaskHandle) -> anyhow::Result<()> {
+    pub async fn run_consensus(&mut self, task_handle: TaskHandle) -> anyhow::Result<()> {
         // We need four peers to run the atomic broadcast
         assert!(self.num_peers().total() >= 4);
 
@@ -218,6 +300,8 @@ impl ConsensusEngine {
 
         while !task_handle.is_shutting_down() {
             let session_index = self.get_finished_session_count().await;
+
+            self.apply_pending_activations(session_index).await?;
 
             CONSENSUS_SESSION_COUNT.set(session_index as i64);
 
@@ -1161,8 +1245,8 @@ impl ConsensusEngine {
                 dbtx.insert_entry(&ConfigGenerationLogKey, &generation_log)
                     .await;
 
-                // An accepted activation requires every guardian to restart
-                // before the activation session in order to load the module
+                // The module is hot activated by the session loop once the
+                // activation session is reached; see apply_pending_activations
                 if let ConfigGenItem::Activate { generation_id } = config_gen_item
                     && let Some(GenerationState::Active {
                         instance_id,
@@ -1175,11 +1259,8 @@ impl ConsensusEngine {
                         %generation_id,
                         instance_id,
                         active_from_session,
-                        "Module activated, scheduling restart before activation session"
+                        "Module activated, will be initialized at its activation session"
                     );
-
-                    self.shutdown_sender
-                        .send_replace(Some(active_from_session.saturating_sub(1)));
                 }
 
                 Ok(())

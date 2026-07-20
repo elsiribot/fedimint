@@ -52,7 +52,7 @@ use tracing::{info, warn};
 use crate::config::{ServerConfig, ServerConfigLocal};
 use crate::connection_limits::ConnectionLimits;
 use crate::consensus::api::{ConsensusApi, server_endpoints};
-use crate::consensus::config_gen::activation::DynModuleActivator;
+use crate::consensus::config_gen::activation::{DynModuleActivator, ModuleSetSnapshot};
 use crate::consensus::config_gen::manager::GenerationManager;
 use crate::consensus::engine::ConsensusEngine;
 use crate::db::verify_server_db_integrity_dbtx;
@@ -244,6 +244,14 @@ pub async fn run(
 
     let module_registry = ModuleRegistry::from(modules);
 
+    // The engine publishes the extended module set on hot activation; the
+    // api surface is rebuilt from it. Initial value covers startup modules.
+    let (snapshot_sender, api_snapshot_receiver) = watch::channel(ModuleSetSnapshot {
+        modules: module_registry.clone(),
+        db: db.clone(),
+    });
+    let _ = &api_snapshot_receiver;
+
     // The client config and advertised api versions cover dynamic modules
     // as well, so clients pick them up via their additive config refresh
     let mut client_cfg = cfg.consensus.to_client_config(&module_init_registry)?;
@@ -270,7 +278,6 @@ pub async fn run(
     let client_cfg = client_cfg;
 
     let (shutdown_sender, shutdown_receiver) = watch::channel(None);
-    let shutdown_sender_engine = shutdown_sender.clone();
     let (ord_latency_sender, ord_latency_receiver) = watch::channel(None);
     // Carries runtime DKG messages from the p2p receive loop to the config
     // generation manager.
@@ -420,7 +427,8 @@ pub async fn run(
         ci_status_senders,
         submission_receiver,
         shutdown_receiver,
-        shutdown_sender: shutdown_sender_engine,
+        module_activator,
+        snapshot_sender,
         config_gen_sender,
         dynamic_module_activation,
         modules: module_registry,

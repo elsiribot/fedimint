@@ -25,6 +25,16 @@ use crate::consensus::db::ServerDbMigrationContext;
 use crate::consensus::submit_module_ci_proposals;
 use crate::db::LocalGenerationOutcomeKey;
 
+/// The current module set of the server, published by the consensus engine
+/// whenever a module is hot activated so the api surface can be rebuilt to
+/// include it.
+#[derive(Clone)]
+pub struct ModuleSetSnapshot {
+    pub modules: fedimint_server_core::ServerModuleRegistry,
+    /// Database handle whose decoders cover all modules in the snapshot
+    pub db: Database,
+}
+
 /// Initializes dynamically generated modules and spawns their consensus
 /// item proposal submitters.
 #[derive(Clone)]
