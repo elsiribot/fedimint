@@ -430,7 +430,8 @@ pub struct Usdt {
     /// status endpoint.
     completed_signatures: Arc<Mutex<BTreeMap<SigningSessionId, Vec<u8>>>>,
     /// Digests queued by the test-only `debug_start_signing` API endpoint
-    /// (gated by `is_running_in_test_env`), drained into
+    /// (Phase-6a scaffolding; not access-gated — see the endpoint), drained
+    /// into
     /// `UsdtConsensusItem::StartSigning` proposals in `consensus_proposal`.
     /// Mirrors `deposit_proposals`'s drain pattern. A test needs only to
     /// call `debug_start_signing` on ONE guardian: the resulting consensus

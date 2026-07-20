@@ -17,8 +17,10 @@ pub const DEPOSIT_STATUS_ENDPOINT: &str = "deposit_status";
 /// consensus (rather than being triggered on each guardian independently) so
 /// every guardian starts it atomically in the same consensus order; calling
 /// this on a single guardian is enough to reach every guardian via the
-/// resulting consensus item. Gated by
-/// `fedimint_core::runtime::is_running_in_test_env()`.
+/// resulting consensus item. Phase-6a scaffolding: intentionally not
+/// access-gated (the usdt module is experimental and opt-in via
+/// `FM_ENABLE_MODULE_USDT`); Phase 7 replaces it with deterministic session
+/// creation from pending sign-request records and removes this endpoint.
 pub const DEBUG_START_SIGNING_ENDPOINT: &str = "debug_start_signing";
 
 /// Reports THIS guardian's in-memory view of a threshold-ECDSA signing
