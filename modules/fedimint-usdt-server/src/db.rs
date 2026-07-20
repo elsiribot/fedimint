@@ -158,6 +158,19 @@ pub struct SigningSession {
     pub signers: Vec<PeerId>,
     pub round: u16,
     pub state: SessionState,
+    /// How many prior attempts at signing this digest timed out and were
+    /// retried under a rotated signer subset (Phase 6b, Task 3). `0` for a
+    /// session's first attempt; see
+    /// [`fedimint_usdt_common::signing_session_id`]'s `attempt` parameter,
+    /// which this value is passed into to derive the retried session's id.
+    pub attempt: u32,
+    /// The consensus block count (see `Usdt::consensus_block_count`) as of
+    /// this session's most recent progress: session creation, or — more
+    /// recently — the last time an `MpcRound` item advanced `round`.
+    /// Compared against a timeout threshold by `Usdt::timed_out` to detect a
+    /// stalled session deterministically (consensus-DB-only, never
+    /// wall-clock).
+    pub last_progress_block: u64,
 }
 
 #[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
@@ -342,6 +355,8 @@ mod tests {
             signers: vec![PeerId::from(0), PeerId::from(1), PeerId::from(2)],
             round: 0,
             state: SessionState::InProgress,
+            attempt: 0,
+            last_progress_block: 7,
         };
 
         let mut dbtx = db.begin_transaction().await;

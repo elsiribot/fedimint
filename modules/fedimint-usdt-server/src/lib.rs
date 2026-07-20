@@ -1055,6 +1055,38 @@ impl Usdt {
         consensus_block_count(dbtx, self.num_peers).await
     }
 
+    /// Whether `session` has gone `timeout_blocks()` consensus blocks
+    /// without progress (session creation or its last `round` advance —
+    /// see `last_progress_block`'s doc comment). Used by Task 3 to decide
+    /// when a stalled session should be retried under a rotated signer
+    /// subset instead of waited on forever. Only an `InProgress` session
+    /// can time out: `Completed`/`Failed` are already terminal.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of `session` (consensus DB) and
+    /// `consensus_block_count` (the Phase-5 median of `BlockCountVoteKey`
+    /// votes, identical on every guardian) — byte-identical everywhere it is
+    /// called from consensus code. Deliberately NOT wall-clock: per-guardian
+    /// clock skew would let honest guardians disagree about whether a
+    /// session had timed out, which would diverge any decision built on top
+    /// of it.
+    ///
+    /// Not yet called from production code (Task 3 wires the retry-on-timeout
+    /// flow into `consensus_proposal`/`process_consensus_item`); this task
+    /// only lands the deterministic detection primitive itself, exercised
+    /// directly by its unit test below.
+    #[allow(dead_code)]
+    async fn timed_out(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        session: &SigningSession,
+    ) -> bool {
+        matches!(session.state, SessionState::InProgress)
+            && self.consensus_block_count(dbtx).await
+                > session.last_progress_block + timeout_blocks()
+    }
+
     /// Credits a deposit observation that has reached threshold agreement:
     /// creates the account's [`DepositRecord`] (using `obs.claim_pk`) if it
     /// does not exist yet, advances `credited` monotonically forward to
@@ -1292,6 +1324,11 @@ impl Usdt {
             // not) performs exactly this write.
             let mut advanced = session.clone();
             advanced.round += 1;
+            // A round advancing is progress: reset the `timed_out` baseline
+            // so a healthy, slowly-progressing session is never mistaken for
+            // a stalled one. Deterministic — `consensus_block_count` is a
+            // pure function of the consensus DB.
+            advanced.last_progress_block = self.consensus_block_count(dbtx).await;
             dbtx.insert_entry(&SigningSessionKey(session_id), &advanced)
                 .await;
 
@@ -1410,6 +1447,11 @@ impl Usdt {
 
         let threshold = self.num_peers.threshold();
         let signers: Vec<PeerId> = self.num_peers.peer_ids().take(threshold).collect();
+        // The block count at creation is this session's initial "progress"
+        // baseline for `timed_out` — a session that never sees a round
+        // advance still gets `timeout_blocks()` consensus blocks before it
+        // is considered stalled, rather than starting out already timed out.
+        let last_progress_block = self.consensus_block_count(dbtx).await;
 
         dbtx.insert_new_entry(
             &SigningSessionKey(session_id),
@@ -1419,6 +1461,8 @@ impl Usdt {
                 signers: signers.clone(),
                 round: 0,
                 state: SessionState::InProgress,
+                attempt: 0,
+                last_progress_block,
             },
         )
         .await;
@@ -1544,6 +1588,19 @@ fn chunk_payload(payload: &[u8]) -> Vec<Vec<u8>> {
         .chunks(MPC_ROUND_CHUNK_SIZE)
         .map(<[u8]>::to_vec)
         .collect()
+}
+
+/// The number of consensus blocks a signing session may go without progress
+/// (see [`SigningSession::last_progress_block`]'s doc comment) before
+/// [`Usdt::timed_out`] considers it stalled. Small under
+/// `is_running_in_test_env()` so tests don't have to wait for 50 real
+/// consensus blocks to exercise the timeout path; both values are otherwise
+/// arbitrary safety margins with no consensus-correctness requirement beyond
+/// "every guardian computes the same one" (which `is_running_in_test_env()`
+/// does, being a pure function of the process environment, identical across
+/// a test federation's guardians).
+fn timeout_blocks() -> u64 {
+    if is_running_in_test_env() { 2 } else { 50 }
 }
 
 /// Free-function core of [`Usdt::consensus_block_count`], taking `num_peers`
@@ -2207,6 +2264,62 @@ mod tests {
                 .await;
         }
         dbtx.commit_tx().await;
+    }
+
+    /// `timed_out` must be a deterministic pure function of `session` and
+    /// the consensus block count (never wall-clock): an `InProgress`
+    /// session times out only once `consensus_block_count` outruns its
+    /// `last_progress_block` by more than `timeout_blocks()`, and a
+    /// `Completed` session never times out regardless of how far the block
+    /// count has advanced.
+    #[tokio::test]
+    async fn timed_out_detects_stalled_session_via_consensus_block_count() {
+        let num_peers = 4u16;
+        let module = test_module_with_block_count(num_peers, 0).await;
+        let db = module.db_for_test();
+
+        let session_id = signing_session_id(&[7; 32], 0);
+        let session = SigningSession {
+            purpose: SigningPurpose::Test([7; 32]),
+            digest: [7; 32],
+            signers: vec![PeerId::from(0), PeerId::from(1), PeerId::from(2)],
+            round: 0,
+            state: SessionState::InProgress,
+            attempt: 0,
+            last_progress_block: 10,
+        };
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(&SigningSessionKey(session_id), &session)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // consensus_block_count = last_progress_block + timeout_blocks() + 1
+        // strictly exceeds the threshold -> timed out.
+        seed_block_count_votes(db, num_peers, 10 + timeout_blocks() + 1).await;
+        {
+            let mut dbtx = db.begin_transaction_nc().await;
+            assert!(module.timed_out(&mut dbtx.to_ref_nc(), &session).await);
+        }
+
+        // Drop the block count back to exactly the threshold (not strictly
+        // past it) -> not timed out.
+        seed_block_count_votes(db, num_peers, 10 + timeout_blocks()).await;
+        {
+            let mut dbtx = db.begin_transaction_nc().await;
+            assert!(!module.timed_out(&mut dbtx.to_ref_nc(), &session).await);
+        }
+
+        // A Completed session never times out, no matter how far the block
+        // count has advanced.
+        let mut completed = session.clone();
+        completed.state = SessionState::Completed(vec![]);
+        seed_block_count_votes(db, num_peers, 10 + timeout_blocks() + 1_000).await;
+        {
+            let mut dbtx = db.begin_transaction_nc().await;
+            assert!(!module.timed_out(&mut dbtx.to_ref_nc(), &completed).await);
+        }
     }
 
     #[tokio::test]
