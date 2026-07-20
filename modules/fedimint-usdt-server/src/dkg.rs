@@ -312,6 +312,9 @@ pub(crate) async fn distributed_gen(
             usdt_contract: params.usdt_contract,
             chain_id: params.chain_id,
             confirmation_depth: params.confirmation_depth,
+            entry_point: params.entry_point,
+            account_factory: params.account_factory,
+            simple_account_impl: params.simple_account_impl,
             check_ttl_blocks: params.check_ttl_blocks,
         },
     })

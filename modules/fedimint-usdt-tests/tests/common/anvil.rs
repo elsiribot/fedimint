@@ -8,11 +8,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
+use alloy::sol_types::SolValue as _;
 use anyhow::Context as _;
 use fedimint_core::runtime::sleep;
 use fedimint_usdt_common::{EvmAddress, UsdtAmount};
@@ -252,4 +253,257 @@ pub async fn transfer_erc20_from_account_1(
         .context("failed to confirm transfer() transaction")?;
 
     Ok(())
+}
+
+// --- ERC-4337 v0.7 stack (Phase 7, Task 1) -------------------------------
+//
+// Vendored artifacts live in `tests/fixtures/erc4337/` (fetched verbatim
+// from `@account-abstraction/contracts@0.7.0` on unpkg). NOTE: the Phase-7
+// master plan sketches these as living under
+// `fedimint-usdt-common/contracts/`; that location is superseded here.
+// These are test-harness *deploy inputs* (full ABI + creation/deployed
+// bytecode, ~40-280KB each) for standing up a real ERC-4337 stack on
+// `anvil`, not something that may ever enter `fedimint-usdt-common`
+// (wasm-compiled, shipped to clients). Only Task 2's small derivation
+// constants (e.g. the `ERC1967Proxy` creation-code hash ingredient) belong
+// in `-common`; the deploy artifacts stay here, with the rest of this
+// harness.
+
+/// Canonical ERC-4337 v0.7 `EntryPoint` address, identical on every real
+/// chain (deployed there via a deterministic CREATE2 factory). `anvil` never
+/// had a real deployment transaction for it, so [`deploy_4337_stack`] fakes
+/// its presence at this exact address via `anvil_setCode` instead.
+pub const ENTRY_POINT_V07_ADDRESS: EvmAddress = EvmAddress([
+    0x00, 0x00, 0x00, 0x00, 0x71, 0x72, 0x7d, 0xe2, 0x2e, 0x5e, 0x9d, 0x8b, 0xaf, 0x0e, 0xda, 0xc6,
+    0xf3, 0x7d, 0xa0, 0x32,
+]);
+
+const ENTRY_POINT_ARTIFACT_JSON: &str = include_str!("../fixtures/erc4337/EntryPoint.json");
+const SIMPLE_ACCOUNT_FACTORY_ARTIFACT_JSON: &str =
+    include_str!("../fixtures/erc4337/SimpleAccountFactory.json");
+const LEGACY_TOKEN_PAYMASTER_ARTIFACT_JSON: &str =
+    include_str!("../fixtures/erc4337/LegacyTokenPaymaster.json");
+// Vendored for later Phase-7 tasks (Task 3's `PackedUserOperation`/
+// `userOpHash` self-verification needs `SimpleAccount`'s
+// `_validateSignature` wrapping behavior; Task 6 attempts the full
+// oracle-priced `TokenPaymaster` before falling back to
+// `LegacyTokenPaymaster` -- see the plan's paymaster-economics scope
+// decision). Not read by this Task-1 harness, so `include_str!` would trip
+// `dead_code`-style unused-const lints under some configurations; recorded
+// here only as a doc pointer to where they live.
+// - `tests/fixtures/erc4337/SimpleAccount.json`
+// - `tests/fixtures/erc4337/TokenPaymaster.json`
+// - `tests/fixtures/erc4337/OracleHelper.json`
+
+/// Extracts a top-level hex-string field (`"0x..."`) from a vendored
+/// artifact JSON, decoding it to raw bytes. Mirrors
+/// [`test_usdt_creation_bytecode`]'s parsing for the `erc4337/` fixtures'
+/// `bytecode`/`deployedBytecode` fields.
+fn artifact_hex_field(artifact_json: &str, field: &str) -> anyhow::Result<Vec<u8>> {
+    let artifact: serde_json::Value = serde_json::from_str(artifact_json)
+        .with_context(|| format!("failed to parse erc4337 artifact JSON (`{field}` lookup)"))?;
+    let hex_str = artifact[field]
+        .as_str()
+        .with_context(|| format!("artifact is missing a `{field}` string field"))?;
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+
+    hex::decode(hex_str).with_context(|| format!("artifact `{field}` is not valid hex"))
+}
+
+sol! {
+    #[sol(rpc)]
+    interface ISimpleAccountFactory {
+        function createAccount(address owner, uint256 salt) external returns (address);
+        function getAddress(address owner, uint256 salt) external view returns (address);
+        function accountImplementation() external view returns (address);
+    }
+}
+
+sol! {
+    #[sol(rpc)]
+    interface ILegacyTokenPaymaster {
+        function addStake(uint32 unstakeDelaySec) external payable;
+        function deposit() external payable;
+        function getDeposit() external view returns (uint256);
+        function entryPoint() external view returns (address);
+    }
+}
+
+/// The stake `anvil`'s account 0 puts up for [`Deployed4337`]'s paymaster on
+/// the `EntryPoint`, via `addStake`. An arbitrary non-zero amount: `anvil`
+/// account 0 is funded with far more than this by default.
+const PAYMASTER_STAKE_WEI: u128 = 1_000_000_000_000_000_000; // 1 ETH
+/// The gas deposit `anvil`'s account 0 funds [`Deployed4337`]'s paymaster
+/// with on the `EntryPoint`, via `deposit`.
+const PAYMASTER_DEPOSIT_WEI: u128 = 1_000_000_000_000_000_000; // 1 ETH
+/// Arbitrary, comfortably non-zero unstake delay for `addStake`.
+const PAYMASTER_UNSTAKE_DELAY_SECS: u32 = 86_400; // 1 day
+
+/// The full ERC-4337 v0.7 stack [`deploy_4337_stack`] brings up on `anvil`.
+#[derive(Debug, Clone, Copy)]
+pub struct Deployed4337 {
+    /// The canonical `EntryPoint` address ([`ENTRY_POINT_V07_ADDRESS`]),
+    /// faked into existence via `anvil_setCode`.
+    pub entry_point: EvmAddress,
+    /// The freshly deployed `SimpleAccountFactory`.
+    pub factory: EvmAddress,
+    /// The `SimpleAccount` implementation the factory proxies deployed
+    /// accounts to, read back from the factory's `accountImplementation()`.
+    pub simple_account_impl: EvmAddress,
+    /// The freshly deployed, staked, and deposit-funded paymaster. Always a
+    /// `LegacyTokenPaymaster` (see [`deploy_4337_stack`]'s doc comment for
+    /// why): the v0.7 sample `TokenPaymaster` (arbitrary ERC-20 via a price
+    /// oracle) needs a Uniswap router plus mock price oracles to stand up,
+    /// which is out of scope for this devnet harness (Phase 8 owns
+    /// paymaster/fee economics; Phase 7 Task 6 may attempt the full
+    /// `TokenPaymaster` path, falling back to broadcaster-fronted gas if
+    /// that proves impractical).
+    pub paymaster: EvmAddress,
+    /// The vendored `TestUsdt` ERC-20 fixture (reusing
+    /// [`deploy_test_erc20`]), independent of the paymaster's own internal
+    /// gas token (see [`Deployed4337::paymaster`]'s doc comment).
+    pub usdt: EvmAddress,
+}
+
+/// Brings up a full ERC-4337 v0.7 stack on `anvil`: the canonical
+/// `EntryPoint` (faked via `anvil_setCode`, since `anvil` never ran its real
+/// deployment transaction), a freshly deployed `SimpleAccountFactory`, a
+/// staked and deposit-funded paymaster, and the vendored `TestUsdt` ERC-20
+/// fixture minted to `usdt_holder`.
+///
+/// **Paymaster choice:** deploys `LegacyTokenPaymaster`, not the v0.7 sample
+/// `TokenPaymaster`. `TokenPaymaster`'s constructor requires a wrapped-native
+/// token, a Uniswap v3 `ISwapRouter`, and a pair of Chainlink-style price
+/// oracles (`OracleHelper`/`IOracle`) -- standing those up on a bare `anvil`
+/// devnet is disproportionate for what this harness needs to prove (a real
+/// `EntryPoint` + factory + staked paymaster exist and respond correctly).
+/// `LegacyTokenPaymaster`'s constructor only needs `(accountFactory, symbol,
+/// entryPoint)` and mints its own internal gas token, which this harness
+/// funds/stakes via its own `addStake`/`deposit` (both forward to the
+/// `EntryPoint`'s `StakeManager` under an `onlyOwner` gate, with the
+/// deploying account -- `anvil` account 0 -- as owner). This matches the
+/// Phase-7 plan's explicit fallback ("if its constructor needs oracles you
+/// can't easily stand up on anvil, deploy `LegacyTokenPaymaster` instead")
+/// and maintainer sign-off item 3.
+///
+/// # Errors
+///
+/// Returns an error if any deployment/configuration transaction fails to
+/// send or confirm, or if a vendored artifact is malformed.
+pub async fn deploy_4337_stack(
+    anvil: &AnvilHandle,
+    usdt_holder: EvmAddress,
+    usdt_amount: UsdtAmount,
+) -> anyhow::Result<Deployed4337> {
+    let provider = wallet_provider(anvil, ANVIL_ACCOUNT_0_PRIVATE_KEY)?;
+
+    // 1. Fake the canonical EntryPoint into existence at its real-world address via
+    //    the `anvil_setCode` cheatcode (a raw JSON-RPC call: the workspace's
+    //    `alloy` doesn't enable the `provider-anvil-api` feature, and pulling it in
+    //    just for this one call isn't worth the extra feature surface).
+    let entry_point_runtime_code =
+        artifact_hex_field(ENTRY_POINT_ARTIFACT_JSON, "deployedBytecode")
+            .context("failed to extract EntryPoint deployedBytecode")?;
+    provider
+        .raw_request::<_, ()>(
+            "anvil_setCode".into(),
+            (
+                Address::from(ENTRY_POINT_V07_ADDRESS.0),
+                Bytes::from(entry_point_runtime_code),
+            ),
+        )
+        .await
+        .context("anvil_setCode(EntryPoint) failed")?;
+
+    // 2. Deploy SimpleAccountFactory (constructor: `address _entryPoint`). Its own
+    //    constructor deploys the SimpleAccount implementation; capture that address
+    //    by reading it back via `accountImplementation()` rather than trying to
+    //    predict it, per the plan's guidance.
+    let factory_creation_bytecode =
+        artifact_hex_field(SIMPLE_ACCOUNT_FACTORY_ARTIFACT_JSON, "bytecode")
+            .context("failed to extract SimpleAccountFactory bytecode")?;
+    // Constructor arg encoding: a single static (32-byte) `address` param is
+    // just its left-padded word -- `abi_encode_params` on a 1-tuple gives
+    // exactly that, matching `abi.encode(entryPoint)`.
+    let factory_ctor_args = (Address::from(ENTRY_POINT_V07_ADDRESS.0),).abi_encode_params();
+    let mut factory_deploy_code = factory_creation_bytecode;
+    factory_deploy_code.extend_from_slice(&factory_ctor_args);
+
+    let factory_deploy_tx = TransactionRequest::default().with_deploy_code(factory_deploy_code);
+    let factory_receipt = provider
+        .send_transaction(factory_deploy_tx)
+        .await
+        .context("failed to send SimpleAccountFactory creation transaction")?
+        .get_receipt()
+        .await
+        .context("failed to confirm SimpleAccountFactory creation transaction")?;
+    let factory_address = factory_receipt
+        .contract_address
+        .context("SimpleAccountFactory creation receipt is missing a contract_address")?;
+
+    let factory = ISimpleAccountFactory::new(factory_address, &provider);
+    let simple_account_impl = factory
+        .accountImplementation()
+        .call()
+        .await
+        .context("failed to read SimpleAccountFactory.accountImplementation()")?;
+
+    // 3. Deploy LegacyTokenPaymaster (constructor: `(address accountFactory, string
+    //    _symbol, address _entryPoint)`), then stake + deposit-fund it on the
+    //    EntryPoint (both forward through the paymaster's own `onlyOwner`
+    //    `addStake`/`deposit`).
+    let paymaster_creation_bytecode =
+        artifact_hex_field(LEGACY_TOKEN_PAYMASTER_ARTIFACT_JSON, "bytecode")
+            .context("failed to extract LegacyTokenPaymaster bytecode")?;
+    let paymaster_ctor_args = (
+        factory_address,
+        "USDT".to_string(),
+        Address::from(ENTRY_POINT_V07_ADDRESS.0),
+    )
+        .abi_encode_params();
+    let mut paymaster_deploy_code = paymaster_creation_bytecode;
+    paymaster_deploy_code.extend_from_slice(&paymaster_ctor_args);
+
+    let paymaster_deploy_tx = TransactionRequest::default().with_deploy_code(paymaster_deploy_code);
+    let paymaster_receipt = provider
+        .send_transaction(paymaster_deploy_tx)
+        .await
+        .context("failed to send LegacyTokenPaymaster creation transaction")?
+        .get_receipt()
+        .await
+        .context("failed to confirm LegacyTokenPaymaster creation transaction")?;
+    let paymaster_address = paymaster_receipt
+        .contract_address
+        .context("LegacyTokenPaymaster creation receipt is missing a contract_address")?;
+
+    let paymaster = ILegacyTokenPaymaster::new(paymaster_address, &provider);
+    paymaster
+        .addStake(PAYMASTER_UNSTAKE_DELAY_SECS)
+        .value(U256::from(PAYMASTER_STAKE_WEI))
+        .send()
+        .await
+        .context("failed to send LegacyTokenPaymaster.addStake()")?
+        .get_receipt()
+        .await
+        .context("failed to confirm LegacyTokenPaymaster.addStake()")?;
+    paymaster
+        .deposit()
+        .value(U256::from(PAYMASTER_DEPOSIT_WEI))
+        .send()
+        .await
+        .context("failed to send LegacyTokenPaymaster.deposit()")?
+        .get_receipt()
+        .await
+        .context("failed to confirm LegacyTokenPaymaster.deposit()")?;
+
+    // 4. Reuse the Phase-4 TestUsdt fixture deployer for the USDT token.
+    let usdt = deploy_test_erc20(anvil, usdt_holder, usdt_amount).await?;
+
+    Ok(Deployed4337 {
+        entry_point: ENTRY_POINT_V07_ADDRESS,
+        factory: EvmAddress(factory_address.into_array()),
+        simple_account_impl: EvmAddress(simple_account_impl.into_array()),
+        paymaster: EvmAddress(paymaster_address.into_array()),
+        usdt,
+    })
 }

@@ -300,14 +300,24 @@ pub struct DepositStatusResponse {
 /// Per-instance config-gen params for the USDT module (Phase 4.5 mechanism).
 ///
 /// `Default` targets a local `anvil` dev federation: chain id 31337 and a
-/// fast confirmation depth. `usdt_contract` is a placeholder — real
-/// deployments (and the devimint e2e) must override this with the deployed
-/// contract address.
+/// fast confirmation depth. `usdt_contract`, `entry_point`,
+/// `account_factory`, and `simple_account_impl` are placeholders — real
+/// deployments (and the devimint e2e) must override these with the deployed
+/// contract addresses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsdtGenParams {
     pub usdt_contract: EvmAddress,
     pub chain_id: u64,
     pub confirmation_depth: u64,
+    /// The deployed ERC-4337 v0.7 `EntryPoint` contract address (Phase 7).
+    /// Placeholder; real deployments/tests must override.
+    pub entry_point: EvmAddress,
+    /// The deployed `SimpleAccountFactory` contract address (Phase 7).
+    /// Placeholder; real deployments/tests must override.
+    pub account_factory: EvmAddress,
+    /// The deployed `SimpleAccount` implementation contract address (Phase
+    /// 7). Placeholder; real deployments/tests must override.
+    pub simple_account_impl: EvmAddress,
     pub check_ttl_blocks: u64,
 }
 
@@ -317,6 +327,9 @@ impl Default for UsdtGenParams {
             usdt_contract: EvmAddress([0u8; 20]),
             chain_id: 31337,
             confirmation_depth: 1,
+            entry_point: EvmAddress([0u8; 20]),
+            account_factory: EvmAddress([0u8; 20]),
+            simple_account_impl: EvmAddress([0u8; 20]),
             check_ttl_blocks: 10_000,
         }
     }

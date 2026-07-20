@@ -30,6 +30,20 @@ pub struct UsdtClientConfig {
     /// The number of block confirmations a deposit must accumulate before
     /// guardians consider it final.
     pub confirmation_depth: u64,
+    /// The deployed ERC-4337 v0.7 `EntryPoint` contract address this
+    /// federation's `UserOps` are submitted through (Phase 7). Placeholder;
+    /// real deployments/tests must override.
+    pub entry_point: EvmAddress,
+    /// The deployed `SimpleAccountFactory` contract address used to
+    /// counterfactually derive (and, on first sweep, deploy) deposit
+    /// accounts (Phase 7, Task 2's CREATE2 derivation). Placeholder; real
+    /// deployments/tests must override.
+    pub account_factory: EvmAddress,
+    /// The deployed `SimpleAccount` implementation contract address the
+    /// `account_factory` proxies deposit accounts to (Phase 7, Task 2's
+    /// CREATE2 `initCodeHash`). Placeholder; real deployments/tests must
+    /// override.
+    pub simple_account_impl: EvmAddress,
 }
 
 impl std::fmt::Display for UsdtClientConfig {

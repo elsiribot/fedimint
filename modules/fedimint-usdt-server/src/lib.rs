@@ -321,6 +321,9 @@ impl ServerModuleInit for UsdtInit {
                         usdt_contract: params.usdt_contract,
                         chain_id: params.chain_id,
                         confirmation_depth: params.confirmation_depth,
+                        entry_point: params.entry_point,
+                        account_factory: params.account_factory,
+                        simple_account_impl: params.simple_account_impl,
                         check_ttl_blocks: params.check_ttl_blocks,
                     },
                 };
@@ -353,6 +356,9 @@ impl ServerModuleInit for UsdtInit {
             usdt_contract: config.usdt_contract,
             chain_id: config.chain_id,
             confirmation_depth: config.confirmation_depth,
+            entry_point: config.entry_point,
+            account_factory: config.account_factory,
+            simple_account_impl: config.simple_account_impl,
         })
     }
 
@@ -1936,6 +1942,9 @@ mod tests {
             usdt_contract: fedimint_usdt_common::EvmAddress([0xab; 20]),
             chain_id: 1,
             confirmation_depth: 6,
+            entry_point: fedimint_usdt_common::EvmAddress([0xcd; 20]),
+            account_factory: fedimint_usdt_common::EvmAddress([0xce; 20]),
+            simple_account_impl: fedimint_usdt_common::EvmAddress([0xcf; 20]),
             check_ttl_blocks: 500,
         };
 
@@ -1946,6 +1955,12 @@ mod tests {
             .unwrap();
         assert_eq!(cfg0.consensus.usdt_contract, params.usdt_contract);
         assert_eq!(cfg0.consensus.confirmation_depth, 6);
+        assert_eq!(cfg0.consensus.entry_point, params.entry_point);
+        assert_eq!(cfg0.consensus.account_factory, params.account_factory);
+        assert_eq!(
+            cfg0.consensus.simple_account_impl,
+            params.simple_account_impl
+        );
         assert_eq!(cfg0.consensus.check_ttl_blocks, 500);
 
         let client_cfg = UsdtInit::default()
@@ -1954,6 +1969,9 @@ mod tests {
         assert_eq!(client_cfg.usdt_contract, params.usdt_contract);
         assert_eq!(client_cfg.confirmation_depth, 6);
         assert_eq!(client_cfg.chain_id, 1);
+        assert_eq!(client_cfg.entry_point, params.entry_point);
+        assert_eq!(client_cfg.account_factory, params.account_factory);
+        assert_eq!(client_cfg.simple_account_impl, params.simple_account_impl);
     }
 
     /// A mostly-no-op [`IServerEvmRpc`] sufficient for constructing a
