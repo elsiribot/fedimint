@@ -42,13 +42,46 @@ for i in 1 2 3; do
 done
 echo "SMOKE: all guardians approved via dashboard"
 
+ready=0
 for _ in $(seq 90); do
   if curl -sf -b "$(cookies 0)" "http://127.0.0.1:$(port 0)/" | grep -q "Ready for activation"; then
     echo "SMOKE: DKG completed, generation ready for activation"
-    exit 0
+    ready=1
+    break
   fi
   sleep 2
 done
+
+if [ "$ready" = 1 ]; then
+  # Hot activation: the module goes live without a daemon restart. The
+  # dashboard is respawned in-process for a moment, so tolerate brief
+  # unreachability but fail if it stays down (a real restart gap).
+  curl -s -o /dev/null -b "$(cookies 0)" -X POST -d "generation_id=0" \
+    "http://127.0.0.1:$(port 0)/config-gen/activate"
+  echo "SMOKE: activation requested via dashboard"
+
+  consecutive_failures=0
+  for _ in $(seq 120); do
+    page=$(curl -s -m 2 -b "$(cookies 0)" "http://127.0.0.1:$(port 0)/") || true
+    if [ -z "$page" ]; then
+      consecutive_failures=$((consecutive_failures + 1))
+      if [ "$consecutive_failures" -gt 5 ]; then
+        echo "SMOKE: dashboard unreachable for >5s during activation, daemon restarted?"
+        exit 1
+      fi
+    else
+      consecutive_failures=0
+      if echo "$page" | grep -q 'text-bg-success">Active'; then
+        echo "SMOKE: module hot activated, dashboard stayed up throughout"
+        exit 0
+      fi
+    fi
+    sleep 1
+  done
+
+  echo "SMOKE: TIMEOUT waiting for hot activation"
+  exit 1
+fi
 
 echo "SMOKE: TIMEOUT waiting for generation to complete"
 for i in 0 1 2 3; do

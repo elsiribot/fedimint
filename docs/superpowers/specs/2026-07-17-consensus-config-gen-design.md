@@ -66,7 +66,7 @@ Once a generation is unanimously approved, each server starts a generation worke
 
 When generation completes, each guardian commits its `Result`. Activation (`Ready`) occurs only after all guardians agree on the consensus-config hash and report successful local decryption, validation, and module preparation, and schedules `active_from_session`. Module consensus items and transactions referencing the new instance are rejected deterministically before that session. Instance IDs come from a monotonic allocator in consensus state and are never reused.
 
-**Milestone 1 activates via coordinated restart**, riding the existing scheduled-shutdown-at-session mechanism used for upgrades: `Ready` schedules shutdown, and on restart the server loads DB-resident module configs alongside genesis ones. Hot activation is a follow-up that makes the static components dynamic: grow-only decoder registries (replay/recovery must install decoders at the correct session offsets), module API dispatch, the cached client config endpoint, and module proposal tasks.
+**Activation is hot (no restart)**: the consensus engine initializes the module at the start of its activation session (migrations, module init, decoder extension, CI proposal submitter) and publishes the extended module set on a watch channel; an api refresher respawns the websocket api server and dashboard with the extended endpoint set and swaps the iroh api handlers in place. The startup path still initializes active modules from the generation log and serves as the crash/offline-guardian catch-up path — both paths share `DynModuleActivator` and must produce identical state. (Milestone 1 used a coordinated restart via the scheduled-shutdown-at-session mechanism; superseded.)
 
 ### Config storage and identity
 
