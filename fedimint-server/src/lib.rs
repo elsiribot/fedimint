@@ -77,7 +77,7 @@ pub mod net;
 pub mod config;
 
 /// A function/closure type for handling dashboard UI
-pub type DashboardUiRouter = Box<dyn Fn(DynDashboardApi) -> axum::Router + Send>;
+pub type DashboardUiRouter = Box<dyn Fn(DynDashboardApi) -> axum::Router + Send + Sync>;
 
 /// A function/closure type for handling setup UI
 pub type SetupUiRouter = Box<dyn Fn(DynSetupApi) -> axum::Router + Send>;

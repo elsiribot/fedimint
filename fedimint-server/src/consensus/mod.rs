@@ -250,32 +250,6 @@ pub async fn run(
         modules: module_registry.clone(),
         db: db.clone(),
     });
-    let _ = &api_snapshot_receiver;
-
-    // The client config and advertised api versions cover dynamic modules
-    // as well, so clients pick them up via their additive config refresh
-    let mut client_cfg = cfg.consensus.to_client_config(&module_init_registry)?;
-
-    let mut all_module_configs = cfg.consensus.modules.clone();
-
-    for dynamic_module in &dynamic_modules {
-        let module_init = module_init_registry
-            .get(&dynamic_module.consensus_config.kind)
-            .expect("Checked during dynamic module initialization");
-
-        client_cfg.modules.insert(
-            dynamic_module.instance_id,
-            module_init
-                .get_client_config(dynamic_module.instance_id, &dynamic_module.consensus_config)?,
-        );
-
-        all_module_configs.insert(
-            dynamic_module.instance_id,
-            dynamic_module.consensus_config.clone(),
-        );
-    }
-
-    let client_cfg = client_cfg;
 
     let (shutdown_sender, shutdown_receiver) = watch::channel(None);
     let (ord_latency_sender, ord_latency_receiver) = watch::channel(None);
@@ -306,32 +280,32 @@ pub async fn run(
         ci_status_receivers.insert(peer, ci_receiver);
     }
 
-    let consensus_api = ConsensusApi {
+    let api_ctx = ApiSurfaceContext {
         cfg: cfg.clone(),
-        db: db.clone(),
-        modules: module_registry.clone(),
-        module_inits: module_init_registry.clone(),
-        client_cfg: client_cfg.clone(),
+        module_init_registry: module_init_registry.clone(),
         submission_sender: submission_sender.clone(),
         shutdown_sender,
         shutdown_receiver: shutdown_receiver.clone(),
-        supported_api_versions: ServerConfig::supported_api_versions_summary(
-            &all_module_configs,
-            &module_init_registry,
-        ),
         auth_ui,
         auth_api,
         p2p_status_receivers,
         ci_status_receivers,
         ord_latency_receiver,
         bitcoin_rpc_connection: bitcoin_rpc_connection.clone(),
-        force_api_secret: force_api_secrets.get_active(),
+        force_api_secrets: force_api_secrets.clone(),
         code_version_str,
         code_version_hash,
         task_group: task_group.clone(),
+        api_bind,
+        ui_bind,
+        dashboard_ui_router,
     };
 
     info!(target: LOG_CONSENSUS, "Starting Consensus Api...");
+
+    let initial_snapshot = api_snapshot_receiver.borrow().clone();
+
+    let consensus_api = api_ctx.build_consensus_api(&initial_snapshot).await?;
 
     let api_handler = start_consensus_api(
         &cfg.local,
@@ -341,13 +315,16 @@ pub async fn run(
     )
     .await;
 
+    let (iroh_handlers_sender, iroh_handlers_receiver) =
+        watch::channel(IrohApiHandlers::new(consensus_api.clone()));
+
     if let Some(iroh_api_sk) = cfg.private.iroh_api_sk.clone()
         && let Err(e) = Box::pin(start_iroh_api(
             iroh_api_sk,
             api_bind,
             iroh_dns,
             iroh_relays,
-            consensus_api.clone(),
+            iroh_handlers_receiver,
             task_group,
             iroh_api_limits,
         ))
@@ -372,20 +349,21 @@ pub async fn run(
         );
     }
 
-    let ui_service = dashboard_ui_router(consensus_api.clone().into_dyn()).into_make_service();
-
-    let ui_listener = TcpListener::bind(ui_bind)
-        .await
-        .expect("Failed to bind dashboard UI");
-
-    task_group.spawn("dashboard-ui", move |handle| async move {
-        axum::serve(ui_listener, ui_service)
-            .with_graceful_shutdown(handle.make_shutdown_rx())
-            .await
-            .expect("Failed to serve dashboard UI");
-    });
+    let dashboard_handle = api_ctx.spawn_dashboard_ui(&consensus_api).await?;
 
     info!(target: LOG_CONSENSUS, "Dashboard UI running at http://{ui_bind} 🚀");
+
+    // Rebuilds the api surface whenever the engine hot activates a module
+    task_group.spawn_cancellable(
+        "api-refresher",
+        run_api_refresher(
+            api_ctx,
+            api_snapshot_receiver,
+            api_handler,
+            dashboard_handle,
+            iroh_handlers_sender,
+        ),
+    );
 
     loop {
         match bitcoin_rpc_connection.status() {
@@ -440,13 +418,219 @@ pub async fn run(
     .run()
     .await?;
 
-    api_handler
-        .stop()
-        .expect("Consensus api should still be running");
-
-    api_handler.stopped().await;
+    // Dropping the engine closes the snapshot channel, which makes the api
+    // refresher stop the api servers it owns.
 
     Ok(())
+}
+
+/// Everything needed to build the api surface for a module set snapshot,
+/// both at startup and after a hot activation extended the module set.
+struct ApiSurfaceContext {
+    cfg: ServerConfig,
+    module_init_registry: ServerModuleInitRegistry,
+    submission_sender: Sender<ConsensusItem>,
+    shutdown_sender: watch::Sender<Option<u64>>,
+    shutdown_receiver: watch::Receiver<Option<u64>>,
+    auth_ui: Option<ApiAuth>,
+    auth_api: Option<ApiAuth>,
+    p2p_status_receivers: P2PStatusReceivers,
+    ci_status_receivers: BTreeMap<fedimint_core::PeerId, watch::Receiver<Option<u64>>>,
+    ord_latency_receiver: watch::Receiver<Option<Duration>>,
+    bitcoin_rpc_connection: ServerBitcoinRpcMonitor,
+    force_api_secrets: ApiSecrets,
+    code_version_str: String,
+    code_version_hash: String,
+    task_group: TaskGroup,
+    api_bind: SocketAddr,
+    ui_bind: SocketAddr,
+    dashboard_ui_router: DashboardUiRouter,
+}
+
+impl ApiSurfaceContext {
+    /// Builds the consensus api for a module set snapshot. The client config
+    /// and advertised api versions cover dynamic modules as well, so clients
+    /// pick them up via their additive config refresh.
+    async fn build_consensus_api(
+        &self,
+        snapshot: &ModuleSetSnapshot,
+    ) -> anyhow::Result<ConsensusApi> {
+        let dynamic_modules = snapshot
+            .db
+            .begin_transaction_nc()
+            .await
+            .get_value(&crate::db::ConfigGenerationLogKey)
+            .await
+            .unwrap_or_default()
+            .active_modules();
+
+        let mut client_cfg = self
+            .cfg
+            .consensus
+            .to_client_config(&self.module_init_registry)?;
+
+        let mut all_module_configs = self.cfg.consensus.modules.clone();
+
+        for dynamic_module in &dynamic_modules {
+            let module_init = self
+                .module_init_registry
+                .get(&dynamic_module.consensus_config.kind)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Active dynamic module of unsupported kind {}",
+                        dynamic_module.consensus_config.kind
+                    )
+                })?;
+
+            client_cfg.modules.insert(
+                dynamic_module.instance_id,
+                module_init.get_client_config(
+                    dynamic_module.instance_id,
+                    &dynamic_module.consensus_config,
+                )?,
+            );
+
+            all_module_configs.insert(
+                dynamic_module.instance_id,
+                dynamic_module.consensus_config.clone(),
+            );
+        }
+
+        Ok(ConsensusApi {
+            cfg: self.cfg.clone(),
+            db: snapshot.db.clone(),
+            modules: snapshot.modules.clone(),
+            module_inits: self.module_init_registry.clone(),
+            client_cfg,
+            submission_sender: self.submission_sender.clone(),
+            shutdown_sender: self.shutdown_sender.clone(),
+            shutdown_receiver: self.shutdown_receiver.clone(),
+            supported_api_versions: ServerConfig::supported_api_versions_summary(
+                &all_module_configs,
+                &self.module_init_registry,
+            ),
+            auth_ui: self.auth_ui.clone(),
+            auth_api: self.auth_api.clone(),
+            p2p_status_receivers: self.p2p_status_receivers.clone(),
+            ci_status_receivers: self.ci_status_receivers.clone(),
+            ord_latency_receiver: self.ord_latency_receiver.clone(),
+            bitcoin_rpc_connection: self.bitcoin_rpc_connection.clone(),
+            force_api_secret: self.force_api_secrets.get_active(),
+            code_version_str: self.code_version_str.clone(),
+            code_version_hash: self.code_version_hash.clone(),
+            task_group: self.task_group.clone(),
+        })
+    }
+
+    async fn spawn_dashboard_ui(
+        &self,
+        consensus_api: &ConsensusApi,
+    ) -> anyhow::Result<DashboardUiHandle> {
+        let ui_service =
+            (self.dashboard_ui_router)(consensus_api.clone().into_dyn()).into_make_service();
+
+        let ui_listener = TcpListener::bind(self.ui_bind).await?;
+
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+
+        let join_handle = fedimint_core::runtime::spawn("dashboard-ui", async move {
+            axum::serve(ui_listener, ui_service)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+                .expect("Failed to serve dashboard UI");
+        });
+
+        Ok(DashboardUiHandle {
+            shutdown_sender,
+            join_handle,
+        })
+    }
+}
+
+/// Handle to a running dashboard ui server; dropping the shutdown sender
+/// stops the server gracefully.
+struct DashboardUiHandle {
+    shutdown_sender: tokio::sync::oneshot::Sender<()>,
+    join_handle: fedimint_core::runtime::JoinHandle<()>,
+}
+
+impl DashboardUiHandle {
+    async fn stop(self) {
+        drop(self.shutdown_sender);
+        let _ = self.join_handle.await;
+    }
+}
+
+/// Rebuilds the api surface from the module set snapshot published by the
+/// consensus engine whenever a module is hot activated: the websocket api
+/// server is respawned with the extended endpoint set, the iroh api handlers
+/// are swapped in place and the dashboard ui is respawned. Stops the api
+/// servers once the engine drops the snapshot channel on shutdown.
+async fn run_api_refresher(
+    ctx: ApiSurfaceContext,
+    mut snapshot_receiver: watch::Receiver<ModuleSetSnapshot>,
+    mut api_handler: ServerHandle,
+    mut dashboard_handle: DashboardUiHandle,
+    iroh_handlers_sender: watch::Sender<Arc<IrohApiHandlers>>,
+) {
+    while snapshot_receiver.changed().await.is_ok() {
+        let snapshot = snapshot_receiver.borrow_and_update().clone();
+
+        let consensus_api = match ctx.build_consensus_api(&snapshot).await {
+            Ok(consensus_api) => consensus_api,
+            Err(err) => {
+                warn!(
+                    target: LOG_CONSENSUS,
+                    err = %err.fmt_compact_anyhow(),
+                    "Failed to rebuild consensus api for extended module set"
+                );
+                continue;
+            }
+        };
+
+        if api_handler.stop().is_ok() {
+            api_handler.stopped().await;
+        }
+
+        api_handler = start_consensus_api(
+            &ctx.cfg.local,
+            consensus_api.clone(),
+            ctx.force_api_secrets.clone(),
+            ctx.api_bind,
+        )
+        .await;
+
+        iroh_handlers_sender.send_replace(IrohApiHandlers::new(consensus_api.clone()));
+
+        dashboard_handle.stop().await;
+
+        dashboard_handle = loop {
+            match ctx.spawn_dashboard_ui(&consensus_api).await {
+                Ok(handle) => break handle,
+                Err(err) => {
+                    warn!(
+                        target: LOG_CONSENSUS,
+                        err = %err.fmt_compact_anyhow(),
+                        "Failed to respawn dashboard ui, retrying..."
+                    );
+                    sleep(Duration::from_millis(500)).await;
+                }
+            }
+        };
+
+        info!(
+            target: LOG_CONSENSUS,
+            "Rebuilt api surface for hot activated modules"
+        );
+    }
+
+    if api_handler.stop().is_ok() {
+        api_handler.stopped().await;
+    }
+
+    dashboard_handle.stop().await;
 }
 
 async fn start_consensus_api(
@@ -539,12 +723,50 @@ pub(crate) fn submit_module_ci_proposals(
     );
 }
 
+/// Api handlers the iroh api dispatches requests to. Swapped out as a whole
+/// whenever a hot activation extends the module set, so requests always see
+/// the current module set without interrupting the iroh endpoint.
+struct IrohApiHandlers {
+    consensus_api: ConsensusApi,
+    core_api: BTreeMap<String, ApiEndpoint<ConsensusApi>>,
+    module_api: BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>,
+}
+
+impl IrohApiHandlers {
+    fn new(consensus_api: ConsensusApi) -> Arc<Self> {
+        let core_api = server_endpoints()
+            .into_iter()
+            .map(|endpoint| (endpoint.path.to_string(), endpoint))
+            .collect::<BTreeMap<String, ApiEndpoint<ConsensusApi>>>();
+
+        let module_api = consensus_api
+            .modules
+            .iter_modules()
+            .map(|(id, _, module)| {
+                let api_endpoints = module
+                    .api_endpoints()
+                    .into_iter()
+                    .map(|endpoint| (endpoint.path.to_string(), endpoint))
+                    .collect::<BTreeMap<String, ApiEndpoint<DynServerModule>>>();
+
+                (id, api_endpoints)
+            })
+            .collect();
+
+        Arc::new(IrohApiHandlers {
+            consensus_api,
+            core_api,
+            module_api,
+        })
+    }
+}
+
 async fn start_iroh_api(
     secret_key: iroh::SecretKey,
     api_bind: SocketAddr,
     iroh_dns: Option<SafeUrl>,
     iroh_relays: Vec<SafeUrl>,
-    consensus_api: ConsensusApi,
+    handlers: watch::Receiver<Arc<IrohApiHandlers>>,
     task_group: &TaskGroup,
     iroh_api_limits: ConnectionLimits,
 ) -> anyhow::Result<()> {
@@ -558,40 +780,18 @@ async fn start_iroh_api(
     .await?;
     task_group.spawn_cancellable(
         "iroh-api",
-        run_iroh_api(consensus_api, endpoint, task_group.clone(), iroh_api_limits),
+        run_iroh_api(handlers, endpoint, task_group.clone(), iroh_api_limits),
     );
 
     Ok(())
 }
 
 async fn run_iroh_api(
-    consensus_api: ConsensusApi,
+    handlers: watch::Receiver<Arc<IrohApiHandlers>>,
     endpoint: Endpoint,
     task_group: TaskGroup,
     iroh_api_limits: ConnectionLimits,
 ) {
-    let core_api = server_endpoints()
-        .into_iter()
-        .map(|endpoint| (endpoint.path.to_string(), endpoint))
-        .collect::<BTreeMap<String, ApiEndpoint<ConsensusApi>>>();
-
-    let module_api = consensus_api
-        .modules
-        .iter_modules()
-        .map(|(id, _, module)| {
-            let api_endpoints = module
-                .api_endpoints()
-                .into_iter()
-                .map(|endpoint| (endpoint.path.to_string(), endpoint))
-                .collect::<BTreeMap<String, ApiEndpoint<DynServerModule>>>();
-
-            (id, api_endpoints)
-        })
-        .collect::<BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>>();
-
-    let consensus_api = Arc::new(consensus_api);
-    let core_api = Arc::new(core_api);
-    let module_api = Arc::new(module_api);
     let parallel_connections_limit = Arc::new(Semaphore::new(iroh_api_limits.max_connections));
 
     loop {
@@ -612,9 +812,7 @@ async fn run_iroh_api(
                 task_group.spawn_cancellable_silent(
                     "handle-iroh-connection",
                     handle_incoming(
-                        consensus_api.clone(),
-                        core_api.clone(),
-                        module_api.clone(),
+                        handlers.clone(),
                         task_group.clone(),
                         incoming,
                         permit,
@@ -633,9 +831,7 @@ async fn run_iroh_api(
 }
 
 async fn handle_incoming(
-    consensus_api: Arc<ConsensusApi>,
-    core_api: Arc<BTreeMap<String, ApiEndpoint<ConsensusApi>>>,
-    module_api: Arc<BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>>,
+    handlers: watch::Receiver<Arc<IrohApiHandlers>>,
     task_group: TaskGroup,
     incoming: Incoming,
     _connection_permit: tokio::sync::OwnedSemaphorePermit,
@@ -696,9 +892,7 @@ async fn handle_incoming(
         task_group.spawn_cancellable_silent(
             "handle-iroh-request",
             handle_request(
-                consensus_api.clone(),
-                core_api.clone(),
-                module_api.clone(),
+                handlers.borrow().clone(),
                 send_stream,
                 recv_stream,
                 permit,
@@ -713,9 +907,7 @@ async fn handle_incoming(
 }
 
 async fn handle_request(
-    consensus_api: Arc<ConsensusApi>,
-    core_api: Arc<BTreeMap<String, ApiEndpoint<ConsensusApi>>>,
-    module_api: Arc<BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>>,
+    handlers: Arc<IrohApiHandlers>,
     mut send_stream: SendStream,
     mut recv_stream: RecvStream,
     _request_permit: tokio::sync::OwnedSemaphorePermit,
@@ -729,7 +921,7 @@ async fn handle_request(
         .with_label_values(&[&method])
         .start_timer();
 
-    let response = await_response(consensus_api, core_api, module_api, request).await;
+    let response = await_response(&handlers, request).await;
 
     timer.observe_duration();
 
@@ -750,27 +942,30 @@ async fn handle_request(
 }
 
 async fn await_response(
-    consensus_api: Arc<ConsensusApi>,
-    core_api: Arc<BTreeMap<String, ApiEndpoint<ConsensusApi>>>,
-    module_api: Arc<BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>>,
+    handlers: &IrohApiHandlers,
     request: IrohApiRequest,
 ) -> Result<Value, ApiError> {
     match request.method {
         ApiMethod::Core(method) => {
-            let endpoint = core_api.get(&method).ok_or(ApiError::not_found(method))?;
+            let endpoint = handlers
+                .core_api
+                .get(&method)
+                .ok_or(ApiError::not_found(method))?;
 
-            let (state, context) = consensus_api.context(&request.request, None).await;
+            let (state, context) = handlers.consensus_api.context(&request.request, None).await;
 
             (endpoint.handler)(state, context, request.request).await
         }
         ApiMethod::Module(module_id, method) => {
-            let endpoint = module_api
+            let endpoint = handlers
+                .module_api
                 .get(&module_id)
                 .ok_or(ApiError::not_found(module_id.to_string()))?
                 .get(&method)
                 .ok_or(ApiError::not_found(method))?;
 
-            let (state, context) = consensus_api
+            let (state, context) = handlers
+                .consensus_api
                 .context(&request.request, Some(module_id))
                 .await;
 
