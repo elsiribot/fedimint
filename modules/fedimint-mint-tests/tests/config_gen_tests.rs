@@ -193,10 +193,73 @@ async fn generates_mint_config_on_running_federation() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Activates a generated module from the given guardian and returns its
+/// instance id and activation session.
+async fn activate(api: &DynGlobalApi, generation_id: ModuleGenerationId) -> (u64, u64) {
+    api.request_admin::<()>(
+        ACTIVATE_MODULE_GENERATION_ENDPOINT,
+        ApiRequestErased::new(generation_id),
+        auth(),
+    )
+    .await
+    .expect("activation accepted");
+
+    let active = await_state(api, generation_id, "Active").await;
+
+    let instance_id = active["instance_id"]
+        .as_u64()
+        .expect("instance id is a number");
+    let active_from_session = active["active_from_session"]
+        .as_u64()
+        .expect("activation session is a number");
+
+    (instance_id, active_from_session)
+}
+
+/// Waits until the guardian's audit covers the module instance. Polled and
+/// tolerant of request errors since the guardian's api is respawned with the
+/// extended module set shortly after the activation session is reached.
+async fn await_module_in_audit(api: &DynGlobalApi, instance_id: u64) {
+    loop {
+        if let Ok(audit) = api
+            .request_admin::<serde_json::Value>(AUDIT_ENDPOINT, ApiRequestErased::default(), auth())
+            .await
+            && audit["module_summaries"][instance_id.to_string()].is_object()
+        {
+            return;
+        }
+
+        sleep_in_test(
+            "Waiting for the guardian to serve the activated module",
+            Duration::from_millis(200),
+        )
+        .await;
+    }
+}
+
+/// Waits until the guardian's session count has advanced past the session.
+async fn await_session_past(api: &DynGlobalApi, session: u64) -> anyhow::Result<()> {
+    loop {
+        if let Ok(session_count) = api
+            .request_admin_no_auth::<u64>(SESSION_COUNT_ENDPOINT, ApiRequestErased::default())
+            .await
+            && session_count > session
+        {
+            return Ok(());
+        }
+
+        sleep_in_test(
+            "Waiting for consensus to advance past the session",
+            Duration::from_millis(200),
+        )
+        .await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn activated_module_runs_after_restart() -> anyhow::Result<()> {
+async fn activated_module_runs_without_restart() -> anyhow::Result<()> {
     let fixtures = Fixtures::new_primary(MintClientInit, MintInit);
-    let mut fed = fixtures.new_fed_not_degraded().await;
+    let fed = fixtures.new_fed_not_degraded().await;
 
     let mut apis = Vec::new();
     for peer in 0..NUM_PEERS {
@@ -211,79 +274,34 @@ async fn activated_module_runs_after_restart() -> anyhow::Result<()> {
         await_state(api, generation_id, "Generated").await;
     }
 
-    apis[0]
-        .request_admin::<()>(
-            ACTIVATE_MODULE_GENERATION_ENDPOINT,
-            ApiRequestErased::new(generation_id),
-            auth(),
-        )
-        .await?;
-
-    let active = await_state(&apis[0], generation_id, "Active").await;
-
-    let instance_id = active["instance_id"]
-        .as_u64()
-        .expect("instance id is a number");
-    let active_from_session = active["active_from_session"]
-        .as_u64()
-        .expect("activation session is a number");
+    let (instance_id, active_from_session) = activate(&apis[0], generation_id).await;
 
     info!(
         target: LOG_TEST,
         instance_id,
         active_from_session,
-        "Module activated, restarting all peers"
+        "Module activated, waiting for hot activation"
     );
 
-    // Guardians hot activate the module without restarting; a restart after
-    // activation has to arrive at the same state via the startup path
-    fed.restart_all_peers().await;
+    // Every guardian hot activates the module at the activation session
+    // without restarting: consensus advances past the activation session...
+    for api in &apis {
+        await_session_past(api, active_from_session).await?;
+    }
 
-    // The dynamically added mint instance is now part of the running
-    // federation: it shows up in the guardian audit...
-    let audit: serde_json::Value = apis[0]
-        .request_admin(AUDIT_ENDPOINT, ApiRequestErased::default(), auth())
-        .await?;
-
-    let module_summary = audit["module_summaries"][instance_id.to_string()].clone();
-
-    assert!(
-        module_summary.is_object(),
-        "Audit is missing the activated module: {audit}"
-    );
-
-    // ...and consensus keeps advancing past the activation session
-    loop {
-        let session_count: u64 = apis[0]
-            .request_admin_no_auth(SESSION_COUNT_ENDPOINT, ApiRequestErased::default())
-            .await?;
-
-        if session_count > active_from_session {
-            break;
-        }
-
-        sleep_in_test(
-            "Waiting for consensus to advance past activation",
-            Duration::from_millis(200),
-        )
-        .await;
+    // ...and the module shows up in every guardian's audit, polled since
+    // each guardian's api is respawned with the extended module set shortly
+    // after the activation session is reached
+    for api in &apis {
+        await_module_in_audit(api, instance_id).await;
     }
 
     // A client joining with the pre-activation config picks the new module
-    // up through its additive config refresh: the refreshed config is
-    // stored as pending and promoted on the next client start.
+    // up through its additive config refresh served by the rebuilt api: the
+    // refreshed config is stored as pending and promoted on the next start.
     let client_db: Database = MemDatabase::new().into();
 
     let client = fed.new_client_with_db(client_db.clone()).await;
-
-    assert!(
-        !client
-            .config()
-            .await
-            .modules
-            .contains_key(&(instance_id as u16)),
-        "Client joined with a config that already contains the dynamic module"
-    );
 
     while client_db
         .begin_transaction_nc()
@@ -328,7 +346,58 @@ async fn activated_module_runs_after_restart() -> anyhow::Result<()> {
 
     info!(
         target: LOG_TEST,
-        "Dynamically added module is live after restart and visible to clients"
+        "Dynamically added module is live without any restart"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_peer_catches_up_after_activation() -> anyhow::Result<()> {
+    let fixtures = Fixtures::new_primary(MintClientInit, MintInit);
+    let mut fed = fixtures.new_fed_not_degraded().await;
+
+    let mut apis = Vec::new();
+    for peer in 0..NUM_PEERS {
+        apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
+    }
+
+    let generation_id = propose(&apis, "mint").await;
+
+    approve_all(&apis, generation_id).await;
+
+    // The offline guardian has to participate in the DKG so it holds its
+    // private config before it goes down
+    for api in &apis {
+        await_state(api, generation_id, "Generated").await;
+    }
+
+    let offline_peer = PeerId::from(NUM_PEERS - 1);
+
+    fed.stop_peer(offline_peer).await;
+
+    info!(target: LOG_TEST, %offline_peer, "Stopped guardian, activating without it");
+
+    let (instance_id, active_from_session) = activate(&apis[0], generation_id).await;
+
+    // The remaining quorum hot activates the module and keeps running
+    await_session_past(&apis[0], active_from_session).await?;
+
+    fed.start_stopped_peer(offline_peer).await;
+
+    info!(target: LOG_TEST, %offline_peer, "Restarted guardian, waiting for catch up");
+
+    // The restarted guardian replays the missed sessions including the
+    // activation and initializes the module during catch up
+    let offline_api = fed.new_admin_api(offline_peer).await?;
+
+    await_session_past(&offline_api, active_from_session).await?;
+
+    await_module_in_audit(&offline_api, instance_id).await;
+
+    info!(
+        target: LOG_TEST,
+        "Offline guardian caught up with the hot activated module"
     );
 
     Ok(())

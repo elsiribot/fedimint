@@ -40,7 +40,7 @@ pub struct FederationTest {
     databases: BTreeMap<PeerId, Database>,
     server_init: ServerModuleInitRegistry,
     client_init: ClientModuleInitRegistry,
-    task: TaskGroup,
+    tasks: BTreeMap<PeerId, TaskGroup>,
     num_peers: u16,
     num_offline: u16,
     base_port: u16,
@@ -122,37 +122,54 @@ impl FederationTest {
     }
 
     /// Stops all peers and starts them again with their existing databases
-    /// and configs, e.g. to activate a dynamically generated module.
+    /// and configs.
     pub async fn restart_all_peers(&mut self) {
         info!(target: LOG_TEST, "Restarting all federation peers");
 
-        self.task
-            .clone()
+        let online: Vec<PeerId> = self.online_peer_ids().collect();
+
+        for peer_id in &online {
+            self.stop_peer(*peer_id).await;
+        }
+
+        for peer_id in &online {
+            self.start_stopped_peer(*peer_id).await;
+        }
+
+        self.await_apis_online().await;
+    }
+
+    /// Stops a single peer, e.g. to simulate a guardian being offline while
+    /// the rest of the federation hot activates a module.
+    pub async fn stop_peer(&mut self, peer_id: PeerId) {
+        info!(target: LOG_TEST, %peer_id, "Stopping federation peer");
+
+        self.tasks
+            .remove(&peer_id)
+            .expect("Peer is running")
             .shutdown_join_all(Duration::from_secs(60))
             .await
-            .expect("Could not shut down federation cleanly");
+            .expect("Could not shut down peer cleanly");
+    }
+
+    /// Starts a previously stopped peer again with its existing database
+    /// and config.
+    pub async fn start_stopped_peer(&mut self, peer_id: PeerId) {
+        info!(target: LOG_TEST, %peer_id, "Starting federation peer");
 
         let task_group = TaskGroup::new();
 
-        for (peer_id, cfg) in self.configs.clone() {
-            if u16::from(peer_id) >= self.num_peers - self.num_offline {
-                continue;
-            }
+        start_peer(
+            self.configs[&peer_id].clone(),
+            self.databases[&peer_id].clone(),
+            self.server_init.clone(),
+            self.base_port,
+            &task_group,
+            self.bitcoin_rpc.clone(),
+        )
+        .await;
 
-            start_peer(
-                cfg,
-                self.databases[&peer_id].clone(),
-                self.server_init.clone(),
-                self.base_port,
-                &task_group,
-                self.bitcoin_rpc.clone(),
-            )
-            .await;
-        }
-
-        self.task = task_group;
-
-        self.await_apis_online().await;
+        self.tasks.insert(peer_id, task_group);
     }
 
     /// Create a new admin api for the given PeerId
@@ -406,7 +423,7 @@ impl FederationTestBuilder {
         let configs =
             ServerConfig::trusted_dealer_gen(&params, &self.server_init, &self.version_hash);
 
-        let task_group = TaskGroup::new();
+        let mut tasks = BTreeMap::new();
         let mut databases = BTreeMap::new();
         for (peer_id, cfg) in configs.clone() {
             if u16::from(peer_id) >= self.num_peers - self.num_offline {
@@ -418,6 +435,8 @@ impl FederationTestBuilder {
             let db = Database::new(MemDatabase::new(), decoders);
             databases.insert(peer_id, db.clone());
 
+            let task_group = TaskGroup::new();
+
             start_peer(
                 cfg,
                 db,
@@ -427,6 +446,8 @@ impl FederationTestBuilder {
                 self.bitcoin_rpc_connection.clone(),
             )
             .await;
+
+            tasks.insert(peer_id, task_group);
         }
 
         let fed = FederationTest {
@@ -434,7 +455,7 @@ impl FederationTestBuilder {
             databases,
             server_init: self.server_init,
             client_init: self.client_init,
-            task: task_group,
+            tasks,
             num_peers: self.num_peers,
             num_offline: self.num_offline,
             base_port: self.base_port,
