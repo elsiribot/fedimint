@@ -23,12 +23,11 @@ pub const DEPOSIT_STATUS_ENDPOINT: &str = "deposit_status";
 /// creation from pending sign-request records and removes this endpoint.
 pub const DEBUG_START_SIGNING_ENDPOINT: &str = "debug_start_signing";
 
-/// Reports THIS guardian's in-memory view of a threshold-ECDSA signing
-/// session's outcome: `Some(compact 64-byte signature)` on a signer guardian
-/// once its off-thread state machine has finished, `None` on non-signer
-/// guardians and on signers that have not finished yet. Deliberately NOT
-/// read from the consensus `SigningSession.state` (Phase 6a never writes the
-/// signature there — see `Usdt::completed_signatures`'s doc comment), so
-/// callers must poll this endpoint across guardians rather than treating any
-/// single guardian's response as authoritative.
+/// Reports the federation-agreed outcome of a threshold-ECDSA signing
+/// session: `Some(compact 64-byte signature)` once a guardian's
+/// `UsdtConsensusItem::MpcSignature` proposal has been verified and written
+/// to the consensus `SigningSession.state` as `Completed` (Phase 6b), `None`
+/// while the session is still in progress. Read from the consensus DB, so
+/// ANY guardian — not just a signer — can answer, and every honest
+/// guardian's answer is identical once the session has completed.
 pub const SIGNING_SESSION_STATUS_ENDPOINT: &str = "signing_session_status";

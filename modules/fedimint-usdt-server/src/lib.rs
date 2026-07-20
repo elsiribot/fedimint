@@ -439,6 +439,14 @@ pub struct Usdt {
     /// `UsdtConsensusItem::StartSigning`'s doc comment for why this must go
     /// through consensus rather than being called per-guardian directly).
     pending_signing_starts: Arc<Mutex<Vec<[u8; 32]>>>,
+    /// Signatures this guardian's off-thread signers have assembled and are
+    /// awaiting federation-wide agreement (Phase 6b): pushed by
+    /// [`Usdt::advance_local_signer`] alongside (not instead of) its
+    /// `completed_signatures` write, drained into
+    /// `UsdtConsensusItem::MpcSignature` proposals in `consensus_proposal`.
+    /// Mirrors `pending_signing_starts`'s drain pattern.
+    #[allow(clippy::type_complexity)]
+    pending_signature_proposals: Arc<Mutex<Vec<(SigningSessionId, Vec<u8>)>>>,
 }
 
 /// Grouped handles/config for [`Usdt::spawn_deposit_checker`], bundling its
@@ -585,6 +593,33 @@ impl ServerModule for Usdt {
             items.push(UsdtConsensusItem::StartSigning { digest });
         }
 
+        // Drain signatures this guardian's off-thread signers have
+        // assembled (see `advance_local_signer`), proposing an
+        // `MpcSignature` for each whose session is not already `Completed`
+        // in this dbtx snapshot -- a cheap dedup; `process_consensus_item`'s
+        // redundancy guard is what actually enforces exactly-once agreement.
+        let pending_signatures = std::mem::take(
+            &mut *self
+                .pending_signature_proposals
+                .lock()
+                .expect("not poisoned"),
+        );
+        for (session_id, signature) in pending_signatures {
+            let already_completed = matches!(
+                dbtx.get_value(&SigningSessionKey(session_id)).await,
+                Some(SigningSession {
+                    state: SessionState::Completed(_),
+                    ..
+                })
+            );
+            if !already_completed {
+                items.push(UsdtConsensusItem::MpcSignature {
+                    session_id,
+                    signature,
+                });
+            }
+        }
+
         items
     }
 
@@ -656,6 +691,13 @@ impl ServerModule for Usdt {
                     .await;
 
                 Ok(())
+            }
+            UsdtConsensusItem::MpcSignature {
+                session_id,
+                signature,
+            } => {
+                self.process_mpc_signature(dbtx, session_id, signature)
+                    .await
             }
             UsdtConsensusItem::Default { .. } => {
                 bail!("The usdt module does not support this consensus item yet")
@@ -810,16 +852,19 @@ impl ServerModule for Usdt {
             api_endpoint! {
                 SIGNING_SESSION_STATUS_ENDPOINT,
                 ApiVersion::new(0, 0),
-                async |module: &Usdt, _context, session_id: SigningSessionId| -> Option<Vec<u8>> {
-                    // Read-only, guardian-LOCAL: see
-                    // `SIGNING_SESSION_STATUS_ENDPOINT`'s doc comment for why
-                    // this is never read from the consensus DB.
-                    Ok(module
-                        .completed_signatures
-                        .lock()
-                        .expect("not poisoned")
-                        .get(&session_id)
-                        .cloned())
+                async |_module: &Usdt, context, session_id: SigningSessionId| -> Option<Vec<u8>> {
+                    // Read-only: reads the federation-agreed consensus state
+                    // (Phase 6b), so any guardian -- not just a signer -- can
+                    // answer authoritatively (see
+                    // `SIGNING_SESSION_STATUS_ENDPOINT`'s doc comment).
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+                    let session = dbtx.get_value(&SigningSessionKey(session_id)).await;
+
+                    Ok(match session.map(|s| s.state) {
+                        Some(SessionState::Completed(sig)) => Some(sig),
+                        _ => None,
+                    })
                 }
             },
         ]
@@ -868,6 +913,7 @@ impl Usdt {
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
             pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
+            pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -894,6 +940,7 @@ impl Usdt {
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
             pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
+            pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1278,6 +1325,55 @@ impl Usdt {
         Ok(())
     }
 
+    /// Processes one `MpcSignature` consensus item (the body of
+    /// `process_consensus_item`'s `MpcSignature` arm): verifies a signer's
+    /// proposed signature against the DKG group key and, if valid, writes it
+    /// to the consensus `SigningSession` as the federation-agreed record.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of the item, prior consensus-DB state
+    /// (`SigningSession`), and config (`group_public_key`) -- byte-identical
+    /// on every guardian, signer or not, and independent of `our_peer_id`.
+    /// The ONLY consensus-DB write is `SigningSessionKey`'s `state ->
+    /// Completed(signature)`. Verifying the signature against the group key
+    /// BEFORE writing it (rather than trusting the proposer) is a Byzantine
+    /// guard: a malformed or forged proposal must never enter the agreed
+    /// record, no matter which peer proposed it.
+    async fn process_mpc_signature(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        session_id: SigningSessionId,
+        signature: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let session = dbtx
+            .get_value(&SigningSessionKey(session_id))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("MpcSignature for unknown signing session"))?;
+
+        ensure!(
+            !matches!(session.state, SessionState::Completed(_)),
+            "redundant MpcSignature"
+        );
+
+        let sig = secp256k1::ecdsa::Signature::from_compact(&signature)
+            .map_err(|_| anyhow::anyhow!("malformed signature"))?;
+        secp256k1::Secp256k1::verification_only()
+            .verify_ecdsa(
+                &secp256k1::Message::from_digest(session.digest),
+                &sig,
+                &self.cfg.consensus.group_public_key,
+            )
+            .map_err(|_| anyhow::anyhow!("MpcSignature does not verify against the group key"))?;
+
+        let mut completed = session;
+        completed.state = SessionState::Completed(signature);
+        dbtx.insert_entry(&SigningSessionKey(session_id), &completed)
+            .await;
+
+        Ok(())
+    }
+
     /// Starts (idempotently) a threshold-ECDSA signing session over `digest`.
     ///
     /// Writes the consensus [`SigningSession`] — signer subset = the lowest-`t`
@@ -1403,10 +1499,18 @@ impl Usdt {
         match slot.handle.into_output().await {
             Ok(sig) => match convert_signature(sig) {
                 Ok(sig) => {
+                    let sig_bytes = sig.serialize_compact().to_vec();
                     self.completed_signatures
                         .lock()
                         .expect("not poisoned")
-                        .insert(session_id, sig.serialize_compact().to_vec());
+                        .insert(session_id, sig_bytes.clone());
+                    // Still guardian-local/in-memory here: proposing this as
+                    // the federation-agreed record is the deterministic
+                    // consensus step in `consensus_proposal` below.
+                    self.pending_signature_proposals
+                        .lock()
+                        .expect("not poisoned")
+                        .push((session_id, sig_bytes));
                 }
                 Err(err) => warn!(
                     target: "usdt",
@@ -2679,6 +2783,200 @@ mod tests {
         assert!(
             final_rounds[0] >= 1,
             "the session must have advanced at least one round"
+        );
+    }
+
+    /// Task 1 (Phase 6b): once a signer's off-thread state machine finishes,
+    /// `advance_local_signer` queues the assembled signature onto
+    /// `pending_signature_proposals`, which `consensus_proposal` drains into
+    /// an `UsdtConsensusItem::MpcSignature`. Processing that item must
+    /// deterministically verify the signature against the group key and
+    /// write `SessionState::Completed(sig)` to the consensus `SigningSession`
+    /// on EVERY guardian -- including the non-signer peer 3, which cannot
+    /// compute the signature itself but must still end up holding the
+    /// federation-agreed record once a signer proposes it. Also asserts a
+    /// second, identical `MpcSignature` proposal is rejected as redundant.
+    ///
+    /// Slow: drives real cggmp21 signing to completion first (see
+    /// `mpc_round_consensus_drives_signing_to_completion`).
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn mpc_signature_consensus_item_completes_session_on_every_guardian() {
+        use sha2::{Digest as _, Sha256};
+
+        const N: u16 = 4;
+        let peers: Vec<PeerId> = (0..N).map(PeerId::from).collect();
+        let num_peers = peers.to_num_peers();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(
+            &peers,
+            &args,
+            &fedimint_usdt_common::UsdtGenParams::default(),
+        );
+
+        let mut modules: BTreeMap<PeerId, Usdt> = BTreeMap::new();
+        for &peer in &peers {
+            let cfg = server_cfgs[&peer]
+                .clone()
+                .to_typed::<UsdtConfig>()
+                .expect("config was just generated by the same configgen");
+            let db = fedimint_core::db::Database::new(
+                fedimint_core::db::mem_impl::MemDatabase::new(),
+                fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+            );
+            modules.insert(
+                peer,
+                Usdt::new_for_test(cfg, MockEvmRpc::default().into_dyn(), db, peer, num_peers),
+            );
+        }
+
+        let digest: [u8; 32] = Sha256::digest(b"usdt mpc-signature consensus item test").into();
+        let session_id = fedimint_usdt_common::signing_session_id(&digest, 0);
+        let purpose = SigningPurpose::Test(digest);
+
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Drive the `MpcRound` consensus loop to completion (mirrors
+        // `mpc_round_consensus_drives_signing_to_completion`). A finished
+        // signer's `consensus_proposal` call ALSO drains its
+        // `pending_signature_proposals` in the very same call that stops
+        // producing `MpcRound` items -- so the resulting `MpcSignature` item
+        // must be captured inline, here, or it is drained and lost before a
+        // later call could see it again.
+        let mut consensus_rounds = 0u32;
+        let mut captured_mpc_signature: Option<(PeerId, UsdtConsensusItem)> = None;
+        loop {
+            let mut proposed: Vec<(PeerId, MpcRoundItem)> = Vec::new();
+            for (&peer, module) in &modules {
+                let mut dbtx = module.db_for_test().begin_transaction().await;
+                let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+                dbtx.commit_tx().await;
+                for item in items {
+                    match item {
+                        UsdtConsensusItem::MpcRound(mpc) => proposed.push((peer, mpc)),
+                        UsdtConsensusItem::MpcSignature {
+                            session_id: sid, ..
+                        } if sid == session_id && captured_mpc_signature.is_none() => {
+                            captured_mpc_signature = Some((peer, item));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if proposed.is_empty() {
+                break;
+            }
+
+            proposed.sort_by(|(a, ia), (b, ib)| {
+                (a, ia.session_id.0, ia.round, ia.chunk).cmp(&(
+                    b,
+                    ib.session_id.0,
+                    ib.round,
+                    ib.chunk,
+                ))
+            });
+
+            for (proposer, item) in &proposed {
+                for module in modules.values() {
+                    let mut dbtx = module.db_for_test().begin_transaction().await;
+                    module
+                        .process_consensus_item(
+                            &mut dbtx.to_ref_nc(),
+                            UsdtConsensusItem::MpcRound(item.clone()),
+                            *proposer,
+                        )
+                        .await
+                        .expect("every proposed MpcRound item must process cleanly");
+                    dbtx.commit_tx().await;
+                }
+            }
+
+            consensus_rounds += 1;
+            assert!(consensus_rounds < 1_000, "signing failed to converge");
+        }
+        assert!(
+            consensus_rounds >= 1,
+            "signing must have taken at least one consensus round"
+        );
+
+        // A finished signer's `consensus_proposal` call must have drained
+        // its `pending_signature_proposals` into an `MpcSignature` item
+        // during the round loop above (captured inline).
+        let (proposer_peer, mpc_signature_item) =
+            captured_mpc_signature.expect("a finished signer must propose an MpcSignature item");
+        let signature_bytes = match &mpc_signature_item {
+            UsdtConsensusItem::MpcSignature { signature, .. } => signature.clone(),
+            other => panic!("expected MpcSignature, got {other:?}"),
+        };
+        assert_eq!(signature_bytes.len(), 64, "compact signature is 64 bytes");
+
+        // Shuttle the SAME `MpcSignature` item to every guardian's
+        // `process_consensus_item`, as ordered consensus would.
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    mpc_signature_item.clone(),
+                    proposer_peer,
+                )
+                .await
+                .expect("MpcSignature must process cleanly on every guardian");
+            dbtx.commit_tx().await;
+        }
+
+        // The agreed signature verifies against the group key.
+        let group_pk = server_cfgs[&peers[0]]
+            .clone()
+            .to_typed::<UsdtConfig>()
+            .expect("valid config")
+            .consensus
+            .group_public_key;
+        let msg = secp256k1::Message::from_digest(digest);
+        let verifier = secp256k1::Secp256k1::verification_only();
+        let sig = secp256k1::ecdsa::Signature::from_compact(&signature_bytes)
+            .expect("proposed signature bytes are a valid compact signature");
+        verifier
+            .verify_ecdsa(&msg, &sig, &group_pk)
+            .expect("agreed signature must verify against the group key");
+
+        // EVERY guardian -- including non-signer peer 3 -- now holds the
+        // identical `Completed(sig)` consensus record.
+        for &peer in &peers {
+            let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
+            let session = dbtx
+                .get_value(&SigningSessionKey(session_id))
+                .await
+                .expect("SigningSession present on every guardian");
+            assert_eq!(
+                session.state,
+                SessionState::Completed(signature_bytes.clone()),
+                "guardian {peer} must hold the federation-agreed signature"
+            );
+        }
+
+        // A second, identical `MpcSignature` proposal is redundant.
+        let mut dbtx = modules[&proposer_peer]
+            .db_for_test()
+            .begin_transaction()
+            .await;
+        let result = modules[&proposer_peer]
+            .process_consensus_item(&mut dbtx.to_ref_nc(), mpc_signature_item, proposer_peer)
+            .await;
+        dbtx.commit_tx().await;
+        assert!(
+            result.is_err(),
+            "a second identical MpcSignature must be rejected as redundant"
         );
     }
 }

@@ -344,6 +344,21 @@ pub enum UsdtConsensusItem {
     /// (see `Usdt::start_session`), so every guardian — signer or not —
     /// performs the identical `SigningSession` write.
     StartSigning { digest: [u8; 32] },
+    /// A signer's federation-agreed signature for a signing session (Phase
+    /// 6b). Proposed by a signer once its off-thread cggmp21 state machine
+    /// finishes (see `Usdt::advance_local_signer`'s
+    /// `pending_signature_proposals` queue in `fedimint-usdt-server`); every
+    /// guardian — signer or not — verifies `signature` against the DKG group
+    /// key and the session's digest before writing
+    /// `SessionState::Completed(signature)` to the consensus `SigningSession`
+    /// (see `Usdt::process_mpc_signature`). This is what makes the finished
+    /// signature a federation-wide agreed record instead of guardian-local,
+    /// signer-only state. `signature` is the compact 64-byte secp256k1
+    /// signature.
+    MpcSignature {
+        session_id: SigningSessionId,
+        signature: Vec<u8>,
+    },
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -611,6 +626,20 @@ mod tests {
         let decoded =
             UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
                 .expect("UsdtConsensusItem::MpcRound should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn test_usdt_consensus_item_mpc_signature_round_trips_through_consensus_encoding() {
+        let item = UsdtConsensusItem::MpcSignature {
+            session_id: SigningSessionId([8; 32]),
+            signature: vec![1; 64],
+        };
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("UsdtConsensusItem::MpcSignature should decode what it just encoded");
 
         assert_eq!(item, decoded);
     }

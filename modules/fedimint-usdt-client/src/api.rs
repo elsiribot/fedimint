@@ -41,11 +41,12 @@ pub trait UsdtFederationApi {
     /// needs to be called.
     async fn debug_start_signing(&self, peer: PeerId, digest: [u8; 32]) -> FederationResult<()>;
 
-    /// Queries `peer`'s in-memory view of a signing session's outcome. Only
-    /// a signer guardian that has finished the session returns `Some`; every
-    /// other guardian (non-signers, or signers still in progress) returns
-    /// `None` -- callers must poll this across guardians (see
-    /// `SIGNING_SESSION_STATUS_ENDPOINT`'s doc comment).
+    /// Queries `peer`'s consensus view of a signing session's outcome:
+    /// `Some(compact signature)` once the federation has agreed on an
+    /// `MpcSignature` for the session, `None` while still in progress. Any
+    /// guardian can answer authoritatively (see
+    /// `SIGNING_SESSION_STATUS_ENDPOINT`'s doc comment); this method is kept
+    /// per-peer for callers that want to target a specific guardian.
     async fn signing_session_status(
         &self,
         peer: PeerId,
