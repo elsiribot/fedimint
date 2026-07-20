@@ -225,6 +225,22 @@ impl UsdtClientModule {
             .await?)
     }
 
+    /// Test-only (Phase 6b Task 4 degraded-federation acceptance harness):
+    /// toggles `peer`'s local suppression of `MpcRound` proposals for
+    /// attempt-0 signing sessions (thin wrapper around
+    /// [`UsdtFederationApi::debug_suppress_attempt0_round`]; see that trait
+    /// method's doc comment).
+    pub async fn debug_suppress_attempt0_round(
+        &self,
+        peer: PeerId,
+        suppress: bool,
+    ) -> anyhow::Result<()> {
+        Ok(self
+            .module_api
+            .debug_suppress_attempt0_round(peer, suppress)
+            .await?)
+    }
+
     /// Looks up the claim keypair persisted by [`Self::allocate_deposit`] for
     /// `claim_pk`'s derived deposit account.
     async fn load_claim_keypair(

@@ -3,7 +3,7 @@
 #![allow(clippy::must_use_candidate)]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,8 +39,8 @@ use fedimint_threshold_ecdsa::{convert_signature, group_public_key};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
-    CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEPOSIT_STATUS_ENDPOINT,
-    GROUP_PUBLIC_KEY_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT,
+    CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
+    DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositObservation, DepositStatusRequest,
@@ -447,6 +447,16 @@ pub struct Usdt {
     /// Mirrors `pending_signing_starts`'s drain pattern.
     #[allow(clippy::type_complexity)]
     pending_signature_proposals: Arc<Mutex<Vec<(SigningSessionId, Vec<u8>)>>>,
+    /// Test-only (Phase 6b Task 4 harness): when set, this guardian skips
+    /// proposing `MpcRound` items for attempt-0 signing sessions in
+    /// `consensus_proposal`, letting a test force attempt 0 to stall (and
+    /// eventually time out) without a real killed guardian. Toggled by the
+    /// `debug_suppress_attempt0_round` API endpoint; see
+    /// `DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT`'s doc comment for why the
+    /// `fedimint-testing` degraded-federation fixture can't be used here
+    /// instead. Purely guardian-local — never read by `process_consensus_item`
+    /// or folded into any consensus-DB write or `Ok`/`Err` decision.
+    suppress_attempt0_round: Arc<AtomicBool>,
 }
 
 /// Grouped handles/config for [`Usdt::spawn_deposit_checker`], bundling its
@@ -530,6 +540,16 @@ impl ServerModule for Usdt {
 
         for (session_id, session) in sessions {
             if !session.signers.contains(&self.our_peer_id) {
+                continue;
+            }
+
+            // Test-only (Phase 6b Task 4 harness): a guardian with
+            // suppression toggled on never proposes `MpcRound` items for
+            // attempt-0 sessions, so the round can never reach 3-of-3 and
+            // the session stalls until it times out. Scoped to attempt 0
+            // only, so a rotated later attempt is unaffected. See
+            // `suppress_attempt0_round`'s doc comment.
+            if session.attempt == 0 && self.suppress_attempt0_round.load(Ordering::Relaxed) {
                 continue;
             }
 
@@ -876,6 +896,20 @@ impl ServerModule for Usdt {
                     })
                 }
             },
+            api_endpoint! {
+                DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, _context, suppress: bool| -> () {
+                    // Test-only (Phase 6b Task 4 harness); see
+                    // `DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT`'s doc comment.
+                    // Purely guardian-local: never touches the consensus DB.
+                    module
+                        .suppress_attempt0_round
+                        .store(suppress, Ordering::Relaxed);
+
+                    Ok(())
+                }
+            },
         ]
     }
 }
@@ -923,6 +957,7 @@ impl Usdt {
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
             pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
+            suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -950,6 +985,7 @@ impl Usdt {
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
             pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
+            suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
         }
     }
 

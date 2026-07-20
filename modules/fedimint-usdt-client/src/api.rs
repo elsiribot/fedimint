@@ -5,8 +5,8 @@ use fedimint_core::module::ApiRequestErased;
 use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::{PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
-    CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEPOSIT_STATUS_ENDPOINT,
-    GROUP_PUBLIC_KEY_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT,
+    CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
+    DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositStatusRequest, DepositStatusResponse,
@@ -52,6 +52,16 @@ pub trait UsdtFederationApi {
         peer: PeerId,
         session_id: SigningSessionId,
     ) -> FederationResult<Option<Vec<u8>>>;
+
+    /// Test-only (Phase 6b Task 4 degraded-federation acceptance harness):
+    /// toggles `peer`'s LOCAL suppression of `MpcRound` proposals for
+    /// attempt-0 signing sessions. See
+    /// `DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT`'s doc comment.
+    async fn debug_suppress_attempt0_round(
+        &self,
+        peer: PeerId,
+        suppress: bool,
+    ) -> FederationResult<()>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -112,6 +122,22 @@ where
         .await
         .map_err(|e| {
             FederationError::new_one_peer(peer, SIGNING_SESSION_STATUS_ENDPOINT, session_id, e)
+        })
+    }
+
+    async fn debug_suppress_attempt0_round(
+        &self,
+        peer: PeerId,
+        suppress: bool,
+    ) -> FederationResult<()> {
+        self.request_single_peer(
+            DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT.to_string(),
+            ApiRequestErased::new(suppress),
+            peer,
+        )
+        .await
+        .map_err(|e| {
+            FederationError::new_one_peer(peer, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT, suppress, e)
         })
     }
 }

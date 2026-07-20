@@ -136,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
 
         info!("Polling deposit-status until the guardians credit the deposit...");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        let deadline = fedimint_core::time::now() + Duration::from_secs(180);
         loop {
             let status = cmd!(client, "module", "usdt", "deposit-status", &claim_pk)
                 .out_json()
@@ -148,10 +148,10 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             ensure!(
-                tokio::time::Instant::now() < deadline,
+                fedimint_core::time::now() < deadline,
                 "deposit never became claimable before the deadline"
             );
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            fedimint_core::runtime::sleep(Duration::from_secs(2)).await;
         }
 
         info!("Claiming...");

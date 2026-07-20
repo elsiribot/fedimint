@@ -31,3 +31,17 @@ pub const DEBUG_START_SIGNING_ENDPOINT: &str = "debug_start_signing";
 /// ANY guardian — not just a signer — can answer, and every honest
 /// guardian's answer is identical once the session has completed.
 pub const SIGNING_SESSION_STATUS_ENDPOINT: &str = "signing_session_status";
+
+/// Test-only (Phase 6b Task 4 degraded-federation acceptance harness):
+/// toggles this guardian's LOCAL suppression of `MpcRound` proposals for
+/// attempt-0 signing sessions. `fedimint-testing`'s degraded-federation
+/// fixture always brings down the highest-numbered peer(s), which can never
+/// be a member of the FIXED lowest-`t` attempt-0 signer subset, so it cannot
+/// be used to make attempt 0 stall; this endpoint gives a test a way to force
+/// exactly that (one signer in attempt 0's subset never contributes its
+/// round payload, so the round can never reach 3-of-3 and the session times
+/// out) without touching any production consensus-decision logic. Purely
+/// guardian-local (an in-memory flag, never consensus state) and scoped to
+/// attempt 0 only, so a rotated later attempt is unaffected. Not
+/// access-gated, for the same reason as `DEBUG_START_SIGNING_ENDPOINT`.
+pub const DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT: &str = "debug_suppress_attempt0_round";
