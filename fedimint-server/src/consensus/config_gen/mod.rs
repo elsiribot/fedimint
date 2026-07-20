@@ -8,6 +8,7 @@
 //! every peer alike, so all acceptance rules in this module must be
 //! evaluatable from the log and the item alone.
 
+pub mod activation;
 pub mod manager;
 pub mod secrets;
 pub mod transport;

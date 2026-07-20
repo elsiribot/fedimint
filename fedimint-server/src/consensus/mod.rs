@@ -52,6 +52,7 @@ use tracing::{info, warn};
 use crate::config::{ServerConfig, ServerConfigLocal};
 use crate::connection_limits::ConnectionLimits;
 use crate::consensus::api::{ConsensusApi, server_endpoints};
+use crate::consensus::config_gen::activation::DynModuleActivator;
 use crate::consensus::config_gen::manager::GenerationManager;
 use crate::consensus::engine::ConsensusEngine;
 use crate::db::verify_server_db_integrity_dbtx;
@@ -217,65 +218,21 @@ pub async fn run(
         )
     };
 
+    let (submission_sender, submission_receiver) = async_channel::bounded(TRANSACTION_BUFFER);
+
+    let module_activator = DynModuleActivator::new(
+        cfg.clone(),
+        module_init_registry.clone(),
+        task_group.clone(),
+        submission_sender.clone(),
+        global_api.clone(),
+        bitcoin_rpc_connection.clone(),
+    );
+
     let mut dynamic_module_activation = BTreeMap::new();
 
     for dynamic_module in &dynamic_modules {
-        let kind = dynamic_module.consensus_config.kind.clone();
-
-        let module_init = module_init_registry.get(&kind).ok_or_else(|| {
-            anyhow::anyhow!("Activated dynamic module of unsupported kind {kind}")
-        })?;
-
-        let outcome = db
-            .begin_transaction_nc()
-            .await
-            .get_value(&crate::db::LocalGenerationOutcomeKey(
-                dynamic_module.generation_id,
-            ))
-            .await
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Missing local outcome for activated {}",
-                    dynamic_module.generation_id
-                )
-            })?;
-
-        info!(
-            target: LOG_CORE,
-            instance_id = dynamic_module.instance_id,
-            %kind,
-            active_from_session = dynamic_module.active_from_session,
-            "Initialise dynamic module..."
-        );
-
-        let mut dbtx = db.begin_transaction().await;
-        apply_migrations_dbtx(
-            &mut dbtx.to_ref_nc(),
-            Arc::new(ServerDbMigrationContext) as Arc<_>,
-            module_init.module_kind().to_string(),
-            module_init.get_database_migrations(),
-            Some(dynamic_module.instance_id),
-            None,
-        )
-        .await?;
-        dbtx.commit_tx_result().await?;
-
-        let module_cfg = fedimint_core::config::ServerModuleConfig::from(
-            serde_json::from_str(&outcome.private_json)?,
-            dynamic_module.consensus_config.clone(),
-        );
-
-        let module = module_init
-            .init(
-                NumPeers::from(cfg.consensus.api_endpoints().len()),
-                module_cfg,
-                db.with_prefix_module_id(dynamic_module.instance_id).0,
-                task_group,
-                cfg.local.identity,
-                global_api.with_module(dynamic_module.instance_id),
-                bitcoin_rpc_connection.clone(),
-            )
-            .await?;
+        let (kind, module) = module_activator.init_module(&db, dynamic_module).await?;
 
         modules.insert(dynamic_module.instance_id, (kind, module));
 
@@ -312,7 +269,6 @@ pub async fn run(
 
     let client_cfg = client_cfg;
 
-    let (submission_sender, submission_receiver) = async_channel::bounded(TRANSACTION_BUFFER);
     let (shutdown_sender, shutdown_receiver) = watch::channel(None);
     let shutdown_sender_engine = shutdown_sender.clone();
     let (ord_latency_sender, ord_latency_receiver) = watch::channel(None);
@@ -511,7 +467,7 @@ async fn start_consensus_api(
 
 const CONSENSUS_PROPOSAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn submit_module_ci_proposals(
+pub(crate) fn submit_module_ci_proposals(
     task_group: &TaskGroup,
     db: Database,
     module_id: ModuleInstanceId,
