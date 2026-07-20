@@ -46,6 +46,13 @@ impl DkgG1 {
         self.polynomial.iter().map(g1).collect()
     }
 
+    /// A single guardian completes the protocol without any peer messages.
+    fn solo_result(&self) -> (Vec<G1Projective>, Scalar) {
+        let sks = eval_poly_scalar(&self.polynomial, &scalar(&self.identity));
+
+        (self.commitment(), sks)
+    }
+
     fn initial_message(&self) -> DkgMessageG1 {
         DkgMessageG1::Hash(self.commitment().consensus_hash_sha256())
     }
@@ -152,6 +159,12 @@ pub async fn run_dkg_g1(
 ) -> anyhow::Result<(Vec<G1Projective>, Scalar)> {
     let mut dkg = DkgG1::new(num_peers, identity);
 
+    // Without the early return a single guardian would busy loop below since
+    // there are no peers to receive from, never yielding to the runtime.
+    if num_peers.total() == 1 {
+        return Ok(dkg.solo_result());
+    }
+
     connections.send(
         Recipient::Everyone,
         P2PMessage::DkgG1(dkg.initial_message()),
@@ -210,6 +223,18 @@ mod tests {
     use group::Curve;
 
     use super::{DkgG1, DkgStepG1};
+
+    #[test_log::test]
+    fn test_dkg_g1_solo() {
+        let peer = PeerId::from(0);
+
+        let dkg = DkgG1::new(vec![peer].to_num_peers(), peer);
+
+        let (poly_g1, sks) = dkg.solo_result();
+
+        assert_eq!(poly_g1.len(), 1);
+        assert_eq!(eval_poly_g1(&poly_g1, &peer), g1(&sks).to_affine());
+    }
 
     #[test_log::test]
     fn test_dkg_g1() {
