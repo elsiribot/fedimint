@@ -1,12 +1,16 @@
-use fedimint_api_client::api::{FederationApiExt, FederationResult, IModuleFederationApi};
+use fedimint_api_client::api::{
+    FederationApiExt, FederationError, FederationResult, IModuleFederationApi,
+};
 use fedimint_core::module::ApiRequestErased;
 use fedimint_core::task::{MaybeSend, MaybeSync};
-use fedimint_core::{apply, async_trait_maybe_send, secp256k1};
+use fedimint_core::{PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
-    CHECK_DEPOSIT_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
+    CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEPOSIT_STATUS_ENDPOINT,
+    GROUP_PUBLIC_KEY_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositStatusRequest, DepositStatusResponse,
+    SigningSessionId,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -29,6 +33,24 @@ pub trait UsdtFederationApi {
         &self,
         claim_pk: secp256k1::PublicKey,
     ) -> FederationResult<DepositStatusResponse>;
+
+    /// Test-only (Phase 6a acceptance): asks `peer` to queue `digest` into
+    /// its `pending_signing_starts`, triggering a `StartSigning` consensus
+    /// item that starts the session on every guardian. See
+    /// `DEBUG_START_SIGNING_ENDPOINT`'s doc comment for why only one peer
+    /// needs to be called.
+    async fn debug_start_signing(&self, peer: PeerId, digest: [u8; 32]) -> FederationResult<()>;
+
+    /// Queries `peer`'s in-memory view of a signing session's outcome. Only
+    /// a signer guardian that has finished the session returns `Some`; every
+    /// other guardian (non-signers, or signers still in progress) returns
+    /// `None` -- callers must poll this across guardians (see
+    /// `SIGNING_SESSION_STATUS_ENDPOINT`'s doc comment).
+    async fn signing_session_status(
+        &self,
+        peer: PeerId,
+        session_id: SigningSessionId,
+    ) -> FederationResult<Option<Vec<u8>>>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -64,5 +86,31 @@ where
             ApiRequestErased::new(DepositStatusRequest { claim_pk }),
         )
         .await
+    }
+
+    async fn debug_start_signing(&self, peer: PeerId, digest: [u8; 32]) -> FederationResult<()> {
+        self.request_single_peer(
+            DEBUG_START_SIGNING_ENDPOINT.to_string(),
+            ApiRequestErased::new(digest),
+            peer,
+        )
+        .await
+        .map_err(|e| FederationError::new_one_peer(peer, DEBUG_START_SIGNING_ENDPOINT, digest, e))
+    }
+
+    async fn signing_session_status(
+        &self,
+        peer: PeerId,
+        session_id: SigningSessionId,
+    ) -> FederationResult<Option<Vec<u8>>> {
+        self.request_single_peer(
+            SIGNING_SESSION_STATUS_ENDPOINT.to_string(),
+            ApiRequestErased::new(session_id),
+            peer,
+        )
+        .await
+        .map_err(|e| {
+            FederationError::new_one_peer(peer, SIGNING_SESSION_STATUS_ENDPOINT, session_id, e)
+        })
     }
 }

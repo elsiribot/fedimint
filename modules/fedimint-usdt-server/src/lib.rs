@@ -39,13 +39,15 @@ use fedimint_threshold_ecdsa::{convert_signature, group_public_key};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
-    CHECK_DEPOSIT_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
+    CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEPOSIT_STATUS_ENDPOINT,
+    GROUP_PUBLIC_KEY_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositObservation, DepositStatusRequest,
-    DepositStatusResponse, MODULE_CONSENSUS_VERSION, MpcRoundItem, SigningSessionId, USDT_UNIT,
-    UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtInput, UsdtInputError, UsdtModuleTypes,
-    UsdtOutput, UsdtOutputError, UsdtOutputOutcome, derive_deposit_account, signing_session_id,
+    DepositStatusResponse, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem,
+    SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtInput,
+    UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
+    derive_deposit_account, signing_session_id,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -56,9 +58,9 @@ use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfig
 use crate::db::{
     BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, DepositObservationVoteAccountPrefix,
     DepositObservationVoteKey, DepositObservationVotePrefix, DepositRecord, DepositRecordKey,
-    DepositRecordPrefix, MpcRoundSeenKey, MpcRoundSeenPrefix, MpcRoundSeenSessionRoundPrefix,
-    PendingCheck, PendingCheckKey, PendingCheckPrefix, SessionState, SigningPurpose,
-    SigningSession, SigningSessionKey, SigningSessionPrefix,
+    DepositRecordPrefix, MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix,
+    MpcRoundChunkSessionRoundPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
+    SessionState, SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -159,14 +161,14 @@ impl ModuleInit for UsdtInit {
                         "Signing Sessions"
                     );
                 }
-                DbKeyPrefix::MpcRoundSeen => {
+                DbKeyPrefix::MpcRoundChunk => {
                     push_db_pair_items!(
                         dbtx,
-                        MpcRoundSeenPrefix,
-                        crate::db::MpcRoundSeenKey,
-                        Vec<u8>,
+                        MpcRoundChunkPrefix,
+                        crate::db::MpcRoundChunkKey,
+                        MpcRoundChunk,
                         items,
-                        "MPC Round Seen"
+                        "MPC Round Chunks"
                     );
                 }
             }
@@ -427,6 +429,15 @@ pub struct Usdt {
     /// (so non-signers hold it too) is a Phase 6b concern. Read by Task 4's
     /// status endpoint.
     completed_signatures: Arc<Mutex<BTreeMap<SigningSessionId, Vec<u8>>>>,
+    /// Digests queued by the test-only `debug_start_signing` API endpoint
+    /// (gated by `is_running_in_test_env`), drained into
+    /// `UsdtConsensusItem::StartSigning` proposals in `consensus_proposal`.
+    /// Mirrors `deposit_proposals`'s drain pattern. A test needs only to
+    /// call `debug_start_signing` on ONE guardian: the resulting consensus
+    /// item starts the session identically on every guardian (see
+    /// `UsdtConsensusItem::StartSigning`'s doc comment for why this must go
+    /// through consensus rather than being called per-guardian directly).
+    pending_signing_starts: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 
 /// Grouped handles/config for [`Usdt::spawn_deposit_checker`], bundling its
@@ -506,45 +517,71 @@ impl ServerModule for Usdt {
             if !session.signers.contains(&self.our_peer_id) {
                 continue;
             }
-            if dbtx
-                .get_value(&MpcRoundSeenKey(
-                    session_id,
-                    session.round,
-                    self.our_peer_id,
-                ))
-                .await
-                .is_some()
-            {
-                continue;
-            }
 
-            // Take the slot out of the store, pump it on the owned value (so no
-            // `std::sync::MutexGuard` is alive across the `.await`), then put it
-            // back. `consensus_proposal`/`process_consensus_item` run
-            // sequentially on a module, so nothing else can touch the slot in
-            // the gap.
-            let slot = self
-                .signing_sessions
-                .lock()
-                .expect("not poisoned")
-                .remove(&session_id);
-            let Some(mut slot) = slot else {
+            // Only READ the current round's pending payload — never remove or
+            // pump the slot here. Fedimint runs `consensus_proposal` in a
+            // separate task (`submit_module_ci_proposals`, a ~100ms timer)
+            // CONCURRENTLY with `process_consensus_item`; if this drain took
+            // the slot out to pump it, it could win the race against
+            // `advance_local_signer`'s `remove`, which would then find no slot
+            // and skip `submit_round` — permanently stalling the signing
+            // session. The pump is therefore driven exclusively by the slot's
+            // owner: `start_session` (round 0) and `advance_local_signer`
+            // (subsequent rounds), both of which pre-fill `pending_outgoing`
+            // before the next round needs proposing. A brief `None` here (the
+            // window while `advance_local_signer` owns the slot mid-`.await`)
+            // just skips this tick; the next 100ms tick proposes it.
+            let payload = {
+                let store = self.signing_sessions.lock().expect("not poisoned");
+                store
+                    .get(&session_id)
+                    .and_then(|s| s.pending_outgoing.clone())
+            };
+            let Some(payload) = payload else {
                 continue;
             };
-            pump_slot_outgoing(&mut slot).await;
-            let payload = slot.pending_outgoing.clone();
-            self.signing_sessions
-                .lock()
-                .expect("not poisoned")
-                .insert(session_id, slot);
 
-            if let Some(payload) = payload {
+            // Split the round's payload into `MPC_ROUND_CHUNK_SIZE`-byte
+            // chunks (a single oversized `MpcRound` item would exceed the
+            // `AlephBFT` unit byte limit and never be ordered). Propose every
+            // chunk not already recorded for this (session, round, peer); the
+            // redundancy guard in `process_consensus_item` drops any repeats
+            // that race in before they land in the DB.
+            let chunks = chunk_payload(&payload);
+            let chunk_count = u16::try_from(chunks.len())
+                .expect("a signing round payload never splits into more than u16::MAX chunks");
+            for (chunk_index, chunk_bytes) in chunks.into_iter().enumerate() {
+                let chunk = u16::try_from(chunk_index).expect("chunk index fits in u16");
+                if dbtx
+                    .get_value(&MpcRoundChunkKey(
+                        session_id,
+                        session.round,
+                        self.our_peer_id,
+                        chunk,
+                    ))
+                    .await
+                    .is_some()
+                {
+                    continue;
+                }
                 items.push(UsdtConsensusItem::MpcRound(MpcRoundItem {
                     session_id,
                     round: session.round,
-                    payload,
+                    chunk,
+                    chunk_count,
+                    payload: chunk_bytes,
                 }));
             }
+        }
+
+        // Drain digests queued by the test-only `debug_start_signing` API
+        // endpoint, proposing a `StartSigning` consensus item for each so
+        // every guardian starts the session atomically in consensus order
+        // (see `UsdtConsensusItem::StartSigning`'s doc comment).
+        let pending_starts =
+            std::mem::take(&mut *self.pending_signing_starts.lock().expect("not poisoned"));
+        for digest in pending_starts {
+            items.push(UsdtConsensusItem::StartSigning { digest });
         }
 
         items
@@ -593,87 +630,29 @@ impl ServerModule for Usdt {
                 }
                 Ok(())
             }
-            UsdtConsensusItem::MpcRound(item) => {
-                let MpcRoundItem {
-                    session_id,
-                    round,
-                    payload,
-                } = item;
-
-                // DETERMINISM (Phase-5-CRITICAL): everything below that writes
-                // the consensus DB or decides `Ok`/`Err` is a pure function of
-                // the ordered item, prior consensus-DB state
-                // (`SigningSession`/`MpcRoundSeenKey`), and config
-                // (`signers`) — byte-identical on every guardian, signer or
-                // not. The ONLY consensus-DB writes in this arm are the
-                // `MpcRoundSeenKey` insert and the `session.round += 1` bump.
-                // The off-thread state-machine interactions
-                // (`submit_round`/`into_output`) and the `completed_signatures`
-                // write are guardian-LOCAL and MUST NOT feed either.
-                let session = dbtx
-                    .get_value(&SigningSessionKey(session_id))
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("MpcRound for unknown signing session"))?;
-
-                ensure!(
-                    session.signers.contains(&peer_id),
-                    "MpcRound from a peer outside the session's signer subset"
-                );
-                ensure!(
-                    round == session.round,
-                    "MpcRound for a stale or future round"
-                );
-
-                // Redundancy guard (unbounded-history rule): a repeat payload
-                // for the same (session, round, peer) changes no consensus
-                // state, so it must be rejected.
+            UsdtConsensusItem::MpcRound(item) => self.process_mpc_round(dbtx, item, peer_id).await,
+            UsdtConsensusItem::StartSigning { digest } => {
+                // DETERMINISTIC (mirrors the `MpcRound` arm's discipline): a
+                // pure function of the item, prior consensus-DB state, and
+                // config. `start_session` is idempotent (it no-ops if the
+                // session already exists), so the redundancy guard here must
+                // check FIRST and reject a repeat proposal rather than
+                // silently no-op-`Ok`ing it (the unbounded-history rule).
+                // `our_peer_id` never influences this `Ok`/`Err` or the
+                // consensus-DB write below -- only whether `start_session`
+                // additionally spawns this guardian's in-memory off-thread
+                // state machine, a guardian-local side effect.
+                let session_id = signing_session_id(&digest, 0);
                 if dbtx
-                    .insert_entry(&MpcRoundSeenKey(session_id, round, peer_id), &payload)
+                    .get_value(&SigningSessionKey(session_id))
                     .await
                     .is_some()
                 {
-                    bail!("redundant MpcRound");
+                    bail!("redundant StartSigning");
                 }
 
-                // Ordered by ascending subset position (the sorted signer
-                // list), so every signer submits the round's payloads to its
-                // state machine in the identical party order.
-                let mut signers = session.signers.clone();
-                signers.sort_unstable();
-
-                let seen: Vec<PeerId> = dbtx
-                    .find_by_prefix(&MpcRoundSeenSessionRoundPrefix(session_id, round))
-                    .await
-                    .map(|(MpcRoundSeenKey(_, _, peer), _)| peer)
-                    .collect()
+                self.start_session(dbtx, SigningPurpose::Test(digest), digest)
                     .await;
-
-                if signers.iter().all(|peer| seen.contains(peer)) {
-                    // Every signer's payload for this round is in — advance the
-                    // consensus round counter. DETERMINISTIC: every guardian
-                    // (signer or not) performs exactly this write.
-                    let mut advanced = session.clone();
-                    advanced.round += 1;
-                    dbtx.insert_entry(&SigningSessionKey(session_id), &advanced)
-                        .await;
-
-                    // Guardian-LOCAL, signer-only: feed the round's payloads to
-                    // this guardian's off-thread state machine and, if it then
-                    // finishes, stash the assembled signature. Never touches the
-                    // consensus DB or the `Ok`/`Err` decision below.
-                    if session.signers.contains(&self.our_peer_id) {
-                        let mut payloads = Vec::with_capacity(signers.len());
-                        for peer in &signers {
-                            payloads.push(
-                                dbtx.get_value(&MpcRoundSeenKey(session_id, round, *peer))
-                                    .await
-                                    .expect("every signer's payload was just confirmed present"),
-                            );
-                        }
-                        self.advance_local_signer(session_id, advanced.round, payloads)
-                            .await;
-                    }
-                }
 
                 Ok(())
             }
@@ -802,6 +781,46 @@ impl ServerModule for Usdt {
                         .await)
                 }
             },
+            api_endpoint! {
+                DEBUG_START_SIGNING_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, _context, digest: [u8; 32]| -> () {
+                    // Phase-6a debug/scaffolding trigger: queues `digest` so
+                    // this guardian proposes a `StartSigning` consensus item,
+                    // which deterministically starts the session on every
+                    // guardian (see `DEBUG_START_SIGNING_ENDPOINT`'s doc
+                    // comment for why session start must go through consensus).
+                    // Phase 7 replaces this with deterministic session creation
+                    // from pending sign-request records and removes this
+                    // endpoint. It is intentionally not access-gated here: the
+                    // usdt module is experimental and opt-in
+                    // (`FM_ENABLE_MODULE_USDT`), so the endpoint only exists on
+                    // federations that deliberately enabled it, and in Phase 6a
+                    // a triggered signing session has no on-chain effect.
+                    module
+                        .pending_signing_starts
+                        .lock()
+                        .expect("not poisoned")
+                        .push(digest);
+
+                    Ok(())
+                }
+            },
+            api_endpoint! {
+                SIGNING_SESSION_STATUS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, _context, session_id: SigningSessionId| -> Option<Vec<u8>> {
+                    // Read-only, guardian-LOCAL: see
+                    // `SIGNING_SESSION_STATUS_ENDPOINT`'s doc comment for why
+                    // this is never read from the consensus DB.
+                    Ok(module
+                        .completed_signatures
+                        .lock()
+                        .expect("not poisoned")
+                        .get(&session_id)
+                        .cloned())
+                }
+            },
         ]
     }
 }
@@ -847,6 +866,7 @@ impl Usdt {
             deposit_proposals,
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -872,6 +892,7 @@ impl Usdt {
             deposit_proposals: Arc::new(Mutex::new(Vec::new())),
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1118,6 +1139,144 @@ impl Usdt {
         }
     }
 
+    /// Processes one `MpcRound` chunk consensus item (the body of
+    /// `process_consensus_item`'s `MpcRound` arm, extracted so that method
+    /// stays under the line limit).
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// Everything here that writes the consensus DB or decides `Ok`/`Err` is a
+    /// pure function of the ordered `item`, prior consensus-DB state
+    /// (`SigningSession`/`MpcRoundChunkKey`), and config (`signers`) —
+    /// byte-identical on every guardian, signer or not. The ONLY consensus-DB
+    /// writes are the `MpcRoundChunkKey` insert and the `session.round += 1`
+    /// bump. The off-thread state-machine interactions
+    /// (`submit_round`/`into_output`) and the `completed_signatures` write are
+    /// guardian-LOCAL and MUST NOT feed either. Reassembly (concatenating a
+    /// peer's chunks `0..C` in ascending index) is likewise a pure function of
+    /// the consensus DB, so every signer reassembles identical payloads.
+    async fn process_mpc_round(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        item: MpcRoundItem,
+        peer_id: PeerId,
+    ) -> anyhow::Result<()> {
+        let MpcRoundItem {
+            session_id,
+            round,
+            chunk,
+            chunk_count,
+            payload,
+        } = item;
+
+        let session = dbtx
+            .get_value(&SigningSessionKey(session_id))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("MpcRound for unknown signing session"))?;
+
+        ensure!(
+            session.signers.contains(&peer_id),
+            "MpcRound from a peer outside the session's signer subset"
+        );
+        ensure!(
+            round == session.round,
+            "MpcRound for a stale or future round"
+        );
+        ensure!(
+            chunk_count >= 1 && chunk < chunk_count,
+            "MpcRound with an out-of-range chunk index or a zero chunk count"
+        );
+
+        // Redundancy guard (unbounded-history rule): a repeat chunk for the
+        // same (session, round, peer, chunk) changes no consensus state, so it
+        // must be rejected.
+        if dbtx
+            .insert_entry(
+                &MpcRoundChunkKey(session_id, round, peer_id, chunk),
+                &MpcRoundChunk {
+                    count: chunk_count,
+                    bytes: payload,
+                },
+            )
+            .await
+            .is_some()
+        {
+            bail!("redundant MpcRound chunk");
+        }
+
+        // Ordered by ascending subset position (the sorted signer list), so
+        // every signer reassembles and submits the round's payloads to its
+        // state machine in the identical party order.
+        let mut signers = session.signers.clone();
+        signers.sort_unstable();
+
+        // Every peer's chunks for this round, grouped by peer. Reading the
+        // whole (session, round) prefix once and grouping is a pure function
+        // of the consensus DB.
+        let mut chunks_by_peer: BTreeMap<PeerId, BTreeMap<u16, MpcRoundChunk>> = BTreeMap::new();
+        let round_chunks: Vec<(MpcRoundChunkKey, MpcRoundChunk)> = dbtx
+            .find_by_prefix(&MpcRoundChunkSessionRoundPrefix(session_id, round))
+            .await
+            .collect()
+            .await;
+        for (MpcRoundChunkKey(_, _, peer, idx), value) in round_chunks {
+            chunks_by_peer.entry(peer).or_default().insert(idx, value);
+        }
+
+        // A peer is complete when, among its chunks, it has some `count = C`
+        // and exactly chunks `0..C` all present. Derive each peer's `C` from
+        // its own chunks (do not assume a shared count).
+        let peer_complete = |peer: &PeerId| -> bool {
+            let Some(peer_chunks) = chunks_by_peer.get(peer) else {
+                return false;
+            };
+            let Some((_, first)) = peer_chunks.iter().next() else {
+                return false;
+            };
+            let count = first.count;
+            usize::from(count) == peer_chunks.len()
+                && (0..count).all(|i| peer_chunks.contains_key(&i))
+        };
+
+        if signers.iter().all(peer_complete) {
+            // Every signer's full payload for this round is in — advance the
+            // consensus round counter. DETERMINISTIC: every guardian (signer or
+            // not) performs exactly this write.
+            let mut advanced = session.clone();
+            advanced.round += 1;
+            dbtx.insert_entry(&SigningSessionKey(session_id), &advanced)
+                .await;
+
+            // Guardian-LOCAL, signer-only: reassemble each signer's full
+            // payload and feed it to this guardian's off-thread state machine;
+            // if it then finishes, stash the assembled signature. Never touches
+            // the consensus DB or the `Ok`/`Err` decision.
+            if session.signers.contains(&self.our_peer_id) {
+                let mut payloads = Vec::with_capacity(signers.len());
+                for peer in &signers {
+                    let peer_chunks = chunks_by_peer
+                        .get(peer)
+                        .expect("every signer was just confirmed complete");
+                    let mut reassembled = Vec::new();
+                    for idx in 0..u16::try_from(peer_chunks.len()).expect("chunk count fits in u16")
+                    {
+                        reassembled.extend_from_slice(
+                            &peer_chunks
+                                .get(&idx)
+                                .expect("chunks 0..len were just confirmed present")
+                                .bytes,
+                        );
+                    }
+                    payloads.push(reassembled);
+                }
+                self.advance_local_signer(session_id, advanced.round, payloads)
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Starts (idempotently) a threshold-ECDSA signing session over `digest`.
     ///
     /// Writes the consensus [`SigningSession`] — signer subset = the lowest-`t`
@@ -1261,6 +1420,25 @@ impl Usdt {
             ),
         }
     }
+}
+
+/// Splits a signing round's full per-peer payload into
+/// [`MPC_ROUND_CHUNK_SIZE`]-byte chunks, so each chunk fits under Fedimint's
+/// `AlephBFT` unit byte limit when carried as its own `MpcRound` consensus
+/// item.
+///
+/// A zero-length payload yields a single empty chunk, so the returned length
+/// (the `chunk_count` carried on every chunk) is always `>= 1`. Pure and
+/// deterministic: every guardian splits an identical payload into identical
+/// chunks, and concatenating the result back reproduces `payload` exactly.
+fn chunk_payload(payload: &[u8]) -> Vec<Vec<u8>> {
+    if payload.is_empty() {
+        return vec![Vec::new()];
+    }
+    payload
+        .chunks(MPC_ROUND_CHUNK_SIZE)
+        .map(<[u8]>::to_vec)
+        .collect()
 }
 
 /// Free-function core of [`Usdt::consensus_block_count`], taking `num_peers`
@@ -2407,8 +2585,18 @@ mod tests {
                 break;
             }
 
+            // Each guardian now proposes MULTIPLE `MpcRound` chunk items per
+            // round for the large rounds (round 2's ≈63 KB payload splits into
+            // several `MPC_ROUND_CHUNK_SIZE` chunks); order them totally,
+            // chunk index included, as the in-test analogue of consensus
+            // ordering.
             proposed.sort_by(|(a, ia), (b, ib)| {
-                (a, ia.session_id.0, ia.round).cmp(&(b, ib.session_id.0, ib.round))
+                (a, ia.session_id.0, ia.round, ia.chunk).cmp(&(
+                    b,
+                    ib.session_id.0,
+                    ib.round,
+                    ib.chunk,
+                ))
             });
 
             for (proposer, item) in &proposed {

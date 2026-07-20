@@ -27,9 +27,12 @@ pub enum DbKeyPrefix {
     /// Consensus-agreed state of a threshold-ECDSA signing session (Phase
     /// 6a).
     SigningSession = 0x06,
-    /// Per-(session, round, peer) record of an `MpcRound` consensus item
-    /// this guardian has already processed (Phase 6a).
-    MpcRoundSeen = 0x07,
+    /// Per-(session, round, peer, chunk) record of one `MpcRound` consensus
+    /// item chunk this guardian has already processed (Phase 6a). A round's
+    /// full per-peer payload is split into
+    /// [`fedimint_usdt_common::MPC_ROUND_CHUNK_SIZE`]-byte chunks (each its
+    /// own consensus item) to stay under the `AlephBFT` unit byte limit.
+    MpcRoundChunk = 0x07,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -170,29 +173,49 @@ impl_db_record!(
 );
 impl_db_lookup!(key = SigningSessionKey, query_prefix = SigningSessionPrefix);
 
-/// One peer's payload for a single round of a signing session, keyed
-/// `(session, round, peer)` so that [`MpcRoundSeenSessionRoundPrefix`] can
-/// look up every peer's payload for one session's round (mirroring
-/// [`DepositObservationVoteKey`]'s dual-prefix pattern, with a leading
-/// `(session, round)` pair instead of a leading `account`).
+/// One chunk of one peer's payload for a single round of a signing session.
+///
+/// A round's full per-peer payload can exceed the `AlephBFT` unit byte limit,
+/// so it is split into [`fedimint_usdt_common::MPC_ROUND_CHUNK_SIZE`]-byte
+/// chunks, each stored under its own key. `count` is the total number of
+/// chunks that make up this peer's full payload for this round (so a reader
+/// knows when it has seen all of `0..count`).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash, Serialize)]
+pub struct MpcRoundChunk {
+    pub count: u16,
+    pub bytes: Vec<u8>,
+}
+
+/// One chunk of one peer's payload for a single round of a signing session,
+/// keyed `(session, round, peer, chunk)`. The field order makes all three of
+/// [`MpcRoundChunkPrefix`], [`MpcRoundChunkSessionRoundPrefix`], and
+/// [`MpcRoundChunkSessionRoundPeerPrefix`] valid byte-prefixes (mirroring
+/// [`DepositObservationVoteKey`]'s dual-prefix pattern, extended to a
+/// three-level prefix hierarchy).
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash)]
-pub struct MpcRoundSeenKey(pub SigningSessionId, pub u16, pub PeerId);
+pub struct MpcRoundChunkKey(pub SigningSessionId, pub u16, pub PeerId, pub u16);
 
 #[derive(Debug, Clone, Encodable, Decodable)]
-pub struct MpcRoundSeenPrefix;
+pub struct MpcRoundChunkPrefix;
 
+/// Every peer's every chunk for one session's round.
 #[derive(Debug, Clone, Encodable, Decodable)]
-pub struct MpcRoundSeenSessionRoundPrefix(pub SigningSessionId, pub u16);
+pub struct MpcRoundChunkSessionRoundPrefix(pub SigningSessionId, pub u16);
+
+/// One peer's chunks for one session's round.
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct MpcRoundChunkSessionRoundPeerPrefix(pub SigningSessionId, pub u16, pub PeerId);
 
 impl_db_record!(
-    key = MpcRoundSeenKey,
-    value = Vec<u8>,
-    db_prefix = DbKeyPrefix::MpcRoundSeen,
+    key = MpcRoundChunkKey,
+    value = MpcRoundChunk,
+    db_prefix = DbKeyPrefix::MpcRoundChunk,
 );
 impl_db_lookup!(
-    key = MpcRoundSeenKey,
-    query_prefix = MpcRoundSeenPrefix,
-    query_prefix = MpcRoundSeenSessionRoundPrefix,
+    key = MpcRoundChunkKey,
+    query_prefix = MpcRoundChunkPrefix,
+    query_prefix = MpcRoundChunkSessionRoundPrefix,
+    query_prefix = MpcRoundChunkSessionRoundPeerPrefix,
 );
 
 #[cfg(test)]
@@ -331,32 +354,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mpc_round_seen_round_trips_and_filters_by_session_round_prefix() {
+    async fn mpc_round_chunk_round_trips_and_filters_by_session_round_and_peer_prefixes() {
         let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
         let id = signing_session_id(&[3; 32], 0);
 
+        let chunk = |count: u16, bytes: Vec<u8>| MpcRoundChunk { count, bytes };
+
         let mut dbtx = db.begin_transaction().await;
-        dbtx.insert_new_entry(&MpcRoundSeenKey(id, 2, PeerId::from(0)), &vec![1u8, 2, 3])
-            .await;
-        dbtx.insert_new_entry(&MpcRoundSeenKey(id, 2, PeerId::from(1)), &vec![4u8, 5, 6])
-            .await;
-        dbtx.insert_new_entry(&MpcRoundSeenKey(id, 3, PeerId::from(0)), &vec![9u8])
-            .await;
+        // Round 2: peer 0 has two chunks, peer 1 has one chunk.
+        dbtx.insert_new_entry(
+            &MpcRoundChunkKey(id, 2, PeerId::from(0), 0),
+            &chunk(2, vec![1, 2]),
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &MpcRoundChunkKey(id, 2, PeerId::from(0), 1),
+            &chunk(2, vec![3, 4]),
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &MpcRoundChunkKey(id, 2, PeerId::from(1), 0),
+            &chunk(1, vec![5, 6]),
+        )
+        .await;
+        // A different round must not leak into the round-2 prefix queries.
+        dbtx.insert_new_entry(
+            &MpcRoundChunkKey(id, 3, PeerId::from(0), 0),
+            &chunk(1, vec![9]),
+        )
+        .await;
         dbtx.commit_tx().await;
 
         let mut dbtx = db.begin_transaction_nc().await;
         assert_eq!(
-            dbtx.get_value(&MpcRoundSeenKey(id, 2, PeerId::from(0)))
+            dbtx.get_value(&MpcRoundChunkKey(id, 2, PeerId::from(0), 1))
                 .await,
-            Some(vec![1u8, 2, 3])
+            Some(chunk(2, vec![3, 4]))
         );
 
+        // All peers' chunks for (session, round 2): 2 (peer 0) + 1 (peer 1).
         let round_2: Vec<_> = dbtx
-            .find_by_prefix(&MpcRoundSeenSessionRoundPrefix(id, 2))
+            .find_by_prefix(&MpcRoundChunkSessionRoundPrefix(id, 2))
             .await
             .collect()
             .await;
-        assert_eq!(round_2.len(), 2);
+        assert_eq!(round_2.len(), 3);
         assert!(round_2.iter().all(|(key, _)| key.0 == id && key.1 == 2));
+
+        // One peer's chunks for (session, round 2, peer 0): both of peer 0's.
+        let peer0_round_2: Vec<_> = dbtx
+            .find_by_prefix(&MpcRoundChunkSessionRoundPeerPrefix(id, 2, PeerId::from(0)))
+            .await
+            .collect()
+            .await;
+        assert_eq!(peer0_round_2.len(), 2);
+        assert!(
+            peer0_round_2
+                .iter()
+                .all(|(key, _)| key.0 == id && key.1 == 2 && key.2 == PeerId::from(0))
+        );
     }
 }

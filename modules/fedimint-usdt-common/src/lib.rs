@@ -200,14 +200,38 @@ pub fn signing_session_id(digest: &[u8; 32], attempt: u32) -> SigningSessionId {
     SigningSessionId(hasher.finalize().into())
 }
 
-/// One guardian's message for a single round of a signing session's cggmp21
-/// state machine. `payload` is an opaque, round-specific encoding of that
-/// guardian's protocol message; this module's consensus logic (added in a
-/// later phase) is the only thing that interprets it.
+/// Maximum size, in bytes, of a single [`MpcRoundItem`] chunk's `payload`.
+///
+/// A cggmp21 signing round's full per-peer message can be tens of kilobytes
+/// (round 2 is ≈63 KB), but Fedimint's `AlephBFT` unit byte limit
+/// (`ALEPH_BFT_UNIT_BYTE_LIMIT = 50_000`) silently refuses to pack any
+/// consensus item that does not fit under it into an ordered unit — so a
+/// single oversized `MpcRound` item would never be ordered and the signing
+/// session would stall forever. Each round's payload is therefore split into
+/// chunks of at most this many bytes, each carried as its own `MpcRound`
+/// consensus item and reassembled deterministically before being fed to the
+/// signer. 30 KB leaves ample room under the 50 KB limit for the consensus
+/// item envelope and encoding overhead.
+pub const MPC_ROUND_CHUNK_SIZE: usize = 30_000;
+
+/// One chunk of one guardian's message for a single round of a signing
+/// session's cggmp21 state machine. A round's full per-peer payload can
+/// exceed Fedimint's `AlephBFT` unit byte limit, so it is split into
+/// [`MPC_ROUND_CHUNK_SIZE`]-byte chunks, each carried as its own `MpcRound`
+/// consensus item and reassembled (by concatenating chunks `0..chunk_count`
+/// in ascending index) before being interpreted. `payload` is THIS chunk's
+/// opaque bytes; this module's consensus logic is the only thing that
+/// interprets the reassembled whole.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct MpcRoundItem {
     pub session_id: SigningSessionId,
     pub round: u16,
+    /// This chunk's index in `0..chunk_count`.
+    pub chunk: u16,
+    /// Total number of chunks for this `(round, peer)`'s full payload (always
+    /// `>= 1`; a zero-length payload is a single empty chunk).
+    pub chunk_count: u16,
+    /// THIS chunk's bytes (not the whole round payload).
     pub payload: Vec<u8>,
 }
 
@@ -309,6 +333,17 @@ pub enum UsdtConsensusItem {
     /// One guardian's message for a single round of a signing session's
     /// cggmp21 state machine (Phase 6a).
     MpcRound(MpcRoundItem),
+    /// Starts a threshold-ECDSA signing session over `digest` on every
+    /// guardian, atomically, in consensus order (Phase 6a). Deliberately a
+    /// consensus item rather than a per-guardian API call: if guardians
+    /// started sessions independently, a signer could propose round 0 of its
+    /// `MpcRound` before another guardian had started the session, and that
+    /// guardian's `process_consensus_item` would reject it as belonging to
+    /// an unknown session, stalling the round. Processing this item is a
+    /// pure function of the digest, prior consensus DB state, and config
+    /// (see `Usdt::start_session`), so every guardian — signer or not —
+    /// performs the identical `SigningSession` write.
+    StartSigning { digest: [u8; 32] },
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -568,6 +603,8 @@ mod tests {
         let item = UsdtConsensusItem::MpcRound(MpcRoundItem {
             session_id: SigningSessionId([7; 32]),
             round: 3,
+            chunk: 1,
+            chunk_count: 2,
             payload: vec![1, 2, 3],
         });
         let bytes = item.consensus_encode_to_vec();

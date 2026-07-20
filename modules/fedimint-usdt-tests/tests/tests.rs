@@ -3,9 +3,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::bail;
 use common::MockEvmRpc;
 use fedimint_client::ClientHandleArc;
-use fedimint_core::runtime::sleep;
+use fedimint_core::runtime::{Instant, sleep};
 use fedimint_core::{Amount, secp256k1};
 use fedimint_mint_client::{MintClientInit, MintClientModule};
 use fedimint_mint_server::MintInit;
@@ -16,7 +17,7 @@ use fedimint_mintv2_server::MintInit as Mintv2Init;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_usdt_client::api::UsdtFederationApi;
 use fedimint_usdt_client::{UsdtClientInit, UsdtClientModule};
-use fedimint_usdt_common::{EvmAddress, USDT_UNIT, UsdtAmount};
+use fedimint_usdt_common::{EvmAddress, SigningSessionId, USDT_UNIT, UsdtAmount};
 use fedimint_usdt_server::UsdtInit;
 
 fn fixtures() -> Fixtures {
@@ -204,6 +205,72 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
         Amount::from_msats(2_560_000),
         "a rejected replay must not change the USDT-denominated balance"
     );
+
+    Ok(())
+}
+
+/// Polls `signing_session_status` across every guardian in `usdt`'s
+/// federation until one of them (necessarily a signer -- non-signers and
+/// signers still in progress return `None`, see
+/// `fedimint_usdt_common::endpoint_constants::SIGNING_SESSION_STATUS_
+/// ENDPOINT`'s doc comment) returns `Some(signature)`, or `deadline` elapses.
+async fn poll_across_peers_until_some(
+    usdt: &UsdtClientModule,
+    session_id: SigningSessionId,
+    deadline: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let deadline_at = Instant::now() + deadline;
+    loop {
+        for peer in usdt.all_peers() {
+            if let Ok(Some(sig)) = usdt.signing_session_status(peer, session_id).await {
+                return Ok(sig);
+            }
+        }
+
+        if Instant::now() >= deadline_at {
+            bail!("no guardian produced a signature for {session_id:?} before the deadline");
+        }
+
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// **Phase 6a gating acceptance test.** Drives a real threshold-ECDSA
+/// signing session end to end over a hermetic 4-guardian federation: the
+/// test triggers `UsdtConsensusItem::StartSigning` via the test-only
+/// `debug_start_signing` API endpoint on a single guardian (starting a
+/// session directly per-guardian would race the guardians' independent
+/// consensus loops -- see `UsdtConsensusItem::StartSigning`'s doc comment),
+/// then polls every guardian's guardian-LOCAL `signing_session_status` until
+/// one of the 3 signers finishes, and verifies the resulting compact
+/// signature against the federation's DKG group public key.
+#[tokio::test(flavor = "multi_thread")]
+async fn federation_signs_a_digest_via_mpc() -> anyhow::Result<()> {
+    let fed = fixtures().new_fed_not_degraded().await;
+    let client: ClientHandleArc = fed.new_client().await;
+    let usdt = client.get_first_module::<UsdtClientModule>()?;
+
+    let digest = [0x11u8; 32];
+
+    // 1. Kick off signing via the debug endpoint on ONE guardian; the resulting
+    //    `StartSigning` consensus item starts the session on all four.
+    usdt.debug_start_signing(digest).await?;
+    let session_id = fedimint_usdt_common::signing_session_id(&digest, 0);
+
+    // 2. Poll `signing_session_status` across guardians until a signer returns
+    //    `Some(sig)`. Real MPC over a real, real-timer-driven federation is slow --
+    //    a generous multi-minute deadline.
+    let sig_compact =
+        poll_across_peers_until_some(&usdt, session_id, Duration::from_secs(600)).await?;
+
+    // 3. Verify against the federation's group public key.
+    let group_pk = client.api().with_module(usdt.id).group_public_key().await?;
+    let msg = secp256k1::Message::from_digest(digest);
+    let mut sig = secp256k1::ecdsa::Signature::from_compact(&sig_compact)?;
+    sig.normalize_s();
+    secp256k1::Secp256k1::verification_only()
+        .verify_ecdsa(&msg, &sig, &group_pk)
+        .expect("federation MPC signature verifies against the group key");
 
     Ok(())
 }

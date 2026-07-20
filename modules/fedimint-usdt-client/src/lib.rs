@@ -3,7 +3,7 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "cli")]
 use std::ffi;
 use std::time::Duration;
@@ -28,12 +28,12 @@ use fedimint_core::module::{
 use fedimint_core::runtime::{Instant, sleep};
 use fedimint_core::secp256k1::rand::thread_rng;
 use fedimint_core::secp256k1::{self, Keypair};
-use fedimint_core::{Amount, apply, async_trait_maybe_send, push_db_pair_items};
+use fedimint_core::{Amount, PeerId, apply, async_trait_maybe_send, push_db_pair_items};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
-    CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND, USDT_UNIT, UsdtAmount,
-    UsdtCommonInit, UsdtInput, UsdtInputV0, UsdtModuleTypes,
+    CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND, SigningSessionId, USDT_UNIT,
+    UsdtAmount, UsdtCommonInit, UsdtInput, UsdtInputV0, UsdtModuleTypes,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -184,6 +184,45 @@ impl UsdtClientModule {
         claim_pk: secp256k1::PublicKey,
     ) -> anyhow::Result<DepositStatusResponse> {
         Ok(self.module_api.deposit_status(claim_pk).await?)
+    }
+
+    /// This federation's peer ids, for callers (e.g. `signing_session_status`
+    /// pollers) that need to iterate over every guardian individually rather
+    /// than going through a threshold-agreed `request_current_consensus`
+    /// call.
+    #[must_use]
+    pub fn all_peers(&self) -> BTreeSet<PeerId> {
+        self.module_api.all_peers().clone()
+    }
+
+    /// Test-only (Phase 6a acceptance): triggers a threshold-ECDSA signing
+    /// session for `digest` over the whole federation by queueing it on a
+    /// single, arbitrary guardian (thin wrapper around
+    /// [`UsdtFederationApi::debug_start_signing`]; see that trait method's
+    /// doc comment for why calling just one guardian is enough).
+    pub async fn debug_start_signing(&self, digest: [u8; 32]) -> anyhow::Result<()> {
+        let peer = *self
+            .module_api
+            .all_peers()
+            .iter()
+            .next()
+            .context("federation has no peers")?;
+        Ok(self.module_api.debug_start_signing(peer, digest).await?)
+    }
+
+    /// Queries `peer`'s in-memory view of `session_id`'s outcome (thin
+    /// wrapper around [`UsdtFederationApi::signing_session_status`]; see
+    /// that trait method's doc comment for why the caller must poll across
+    /// peers rather than trusting a single response).
+    pub async fn signing_session_status(
+        &self,
+        peer: PeerId,
+        session_id: SigningSessionId,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self
+            .module_api
+            .signing_session_status(peer, session_id)
+            .await?)
     }
 
     /// Looks up the claim keypair persisted by [`Self::allocate_deposit`] for

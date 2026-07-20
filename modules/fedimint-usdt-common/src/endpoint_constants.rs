@@ -9,3 +9,24 @@ pub const CHECK_DEPOSIT_ENDPOINT: &str = "check_deposit";
 /// Reports the credited/claimed/claimable state of a claim key's deposit
 /// account.
 pub const DEPOSIT_STATUS_ENDPOINT: &str = "deposit_status";
+
+/// Test-only (Phase 6a acceptance): pushes a digest into this guardian's
+/// in-memory `pending_signing_starts` queue, to be proposed as a
+/// `UsdtConsensusItem::StartSigning` consensus item on the guardian's next
+/// `consensus_proposal`. Starting a signing session must go through
+/// consensus (rather than being triggered on each guardian independently) so
+/// every guardian starts it atomically in the same consensus order; calling
+/// this on a single guardian is enough to reach every guardian via the
+/// resulting consensus item. Gated by
+/// `fedimint_core::runtime::is_running_in_test_env()`.
+pub const DEBUG_START_SIGNING_ENDPOINT: &str = "debug_start_signing";
+
+/// Reports THIS guardian's in-memory view of a threshold-ECDSA signing
+/// session's outcome: `Some(compact 64-byte signature)` on a signer guardian
+/// once its off-thread state machine has finished, `None` on non-signer
+/// guardians and on signers that have not finished yet. Deliberately NOT
+/// read from the consensus `SigningSession.state` (Phase 6a never writes the
+/// signature there — see `Usdt::completed_signatures`'s doc comment), so
+/// callers must poll this endpoint across guardians rather than treating any
+/// single guardian's response as authoritative.
+pub const SIGNING_SESSION_STATUS_ENDPOINT: &str = "signing_session_status";

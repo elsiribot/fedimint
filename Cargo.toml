@@ -410,6 +410,20 @@ aleph-bft-types = { opt-level = 3 }
 bitcoin_hashes = { opt-level = 3 }
 bls12_381 = { opt-level = 3 }
 byteorder = { opt-level = 3 }
+# cggmp21 threshold-ECDSA ecosystem: Paillier/bignum/curve math is extremely
+# heavy at opt-level 1, making the runtime MPC signing tests (usdt module,
+# threshold-ecdsa) take many minutes in dev. Optimize them like the other
+# crypto deps above so those tests are tractable.
+cggmp21 = { opt-level = 3 }
+cggmp21-keygen = { opt-level = 3 }
+generic-ec = { opt-level = 3 }
+generic-ec-core = { opt-level = 3 }
+generic-ec-curves = { opt-level = 3 }
+generic-ec-zkp = { opt-level = 3 }
+gmp-mpfr-sys = { opt-level = 3 }
+hd-wallet = { opt-level = 3 }
+paillier-zk = { opt-level = 3 }
+rug = { opt-level = 3 }
 fedimint-threshold-crypto = { opt-level = 3 }
 ff = { opt-level = 3 }
 group = { opt-level = 3 }
