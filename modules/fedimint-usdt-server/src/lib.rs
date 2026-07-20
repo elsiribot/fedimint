@@ -522,6 +522,12 @@ impl ServerModule for Usdt {
             .map(|(SigningSessionKey(id), session)| (id, session))
             .collect()
             .await;
+
+        // Propose a rotation for any signing session that has stalled past the
+        // timeout (see `propose_timed_out_rotations`). Read-only; no
+        // consensus-DB write.
+        items.extend(self.propose_timed_out_rotations(dbtx, &sessions).await);
+
         for (session_id, session) in sessions {
             if !session.signers.contains(&self.our_peer_id) {
                 continue;
@@ -687,10 +693,13 @@ impl ServerModule for Usdt {
                     bail!("redundant StartSigning");
                 }
 
-                self.start_session(dbtx, SigningPurpose::Test(digest), digest)
+                self.start_session(dbtx, SigningPurpose::Test(digest), digest, 0)
                     .await;
 
                 Ok(())
+            }
+            UsdtConsensusItem::RotateSigning { session_id } => {
+                self.process_rotate_signing(dbtx, session_id).await
             }
             UsdtConsensusItem::MpcSignature {
                 session_id,
@@ -1072,11 +1081,10 @@ impl Usdt {
     /// session had timed out, which would diverge any decision built on top
     /// of it.
     ///
-    /// Not yet called from production code (Task 3 wires the retry-on-timeout
-    /// flow into `consensus_proposal`/`process_consensus_item`); this task
-    /// only lands the deterministic detection primitive itself, exercised
-    /// directly by its unit test below.
-    #[allow(dead_code)]
+    /// Drives the retry-on-timeout flow: `consensus_proposal` proposes a
+    /// `RotateSigning` for every session this reports timed out, and the
+    /// `RotateSigning` arm of `process_consensus_item` re-checks it as a
+    /// deterministic gate before failing the attempt and starting the next.
     async fn timed_out(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -1084,7 +1092,7 @@ impl Usdt {
     ) -> bool {
         matches!(session.state, SessionState::InProgress)
             && self.consensus_block_count(dbtx).await
-                > session.last_progress_block + timeout_blocks()
+                > session.last_progress_block.saturating_add(timeout_blocks())
     }
 
     /// Credits a deposit observation that has reached threshold agreement:
@@ -1362,6 +1370,57 @@ impl Usdt {
         Ok(())
     }
 
+    /// Processes one `RotateSigning` consensus item (the body of
+    /// `process_consensus_item`'s `RotateSigning` arm): fails a stalled,
+    /// timed-out signing attempt and deterministically starts the next one
+    /// under a rotated signer subset.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of the item, prior consensus-DB state
+    /// (`SigningSession`/`BlockCountVoteKey`), and config — byte-identical on
+    /// every guardian, signer or not, and independent of `our_peer_id`. Both
+    /// `ensure!` gates read only consensus state: `timed_out` folds in
+    /// `consensus_block_count` (the median of `BlockCountVoteKey` votes,
+    /// identical everywhere), so a premature or stale rotate is rejected
+    /// identically on every guardian. The consensus-DB writes (old attempt ->
+    /// `Failed`, new `SigningSession`) are identical everywhere; the only
+    /// `our_peer_id`-conditional part is the in-memory signer spawn INSIDE
+    /// `start_session`, a guardian-local side effect. Rejecting a
+    /// non-`InProgress` session upholds the unbounded-history rule and dedups a
+    /// repeat rotate of the same attempt.
+    async fn process_rotate_signing(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        session_id: SigningSessionId,
+    ) -> anyhow::Result<()> {
+        let session = dbtx
+            .get_value(&SigningSessionKey(session_id))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("RotateSigning for unknown signing session"))?;
+
+        ensure!(
+            matches!(session.state, SessionState::InProgress),
+            "RotateSigning for a non-in-progress session"
+        );
+        ensure!(
+            self.timed_out(dbtx, &session).await,
+            "RotateSigning for a session that has not timed out"
+        );
+
+        // Fail the timed-out attempt, then deterministically start the next
+        // one (fresh id, rotated subset, `attempt + 1`).
+        let mut failed = session.clone();
+        failed.state = SessionState::Failed;
+        dbtx.insert_entry(&SigningSessionKey(session_id), &failed)
+            .await;
+
+        self.start_session(dbtx, session.purpose, session.digest, session.attempt + 1)
+            .await;
+
+        Ok(())
+    }
+
     /// Processes one `MpcSignature` consensus item (the body of
     /// `process_consensus_item`'s `MpcSignature` arm): verifies a signer's
     /// proposed signature against the DKG group key and, if valid, writes it
@@ -1411,19 +1470,76 @@ impl Usdt {
         Ok(())
     }
 
-    /// Starts (idempotently) a threshold-ECDSA signing session over `digest`.
+    /// The deterministic signer subset for a session's `attempt`: a rotated
+    /// window of size `t = threshold` over the sorted peer ring of size `n`,
+    /// starting at offset `attempt % n` and wrapping. Returned in the same
+    /// canonical sorted order [`spawn_signing_session`]/[`process_mpc_round`]
+    /// use everywhere else, so every guardian independently agrees on both the
+    /// membership and the party ordering of each attempt's subset.
     ///
-    /// Writes the consensus [`SigningSession`] — signer subset = the lowest-`t`
-    /// peer ids, `round: 0`, [`SessionState::InProgress`] — and no-ops if a
-    /// session for this digest already exists. If this guardian is in the
-    /// subset it also spawns the off-thread signing state machine into
+    /// A pure function of `num_peers` and `attempt`: peer ids are exactly
+    /// `0..n` and [`NumPeers::peer_ids`] yields them in order, so attempt 0 is
+    /// the lowest-`t` subset and each subsequent attempt rotates the window
+    /// one peer forward. Rotating on retry keeps a single persistently-faulty
+    /// signer from stalling every attempt.
+    fn signer_subset(&self, attempt: u32) -> Vec<PeerId> {
+        let ids: Vec<PeerId> = self.num_peers.peer_ids().collect();
+        let n = ids.len();
+        let t = self.num_peers.threshold();
+        let offset = (attempt as usize) % n;
+        let mut subset: Vec<PeerId> = (0..t).map(|i| ids[(offset + i) % n]).collect();
+        subset.sort_unstable();
+        subset
+    }
+
+    /// Proposes a [`UsdtConsensusItem::RotateSigning`] for every `session` in
+    /// `sessions` that has stalled past the timeout, so
+    /// `process_consensus_item` fails that attempt and starts the next under a
+    /// rotated signer subset. Detection is deterministic (via
+    /// `consensus_block_count`, never wall-clock). Already-`Failed` sessions
+    /// are skipped as a cheap dedup; `timed_out` also rejects them (only
+    /// `InProgress` can time out), and the `RotateSigning` arm's guards are
+    /// what actually enforce exactly-once rotation. Proposed by every guardian,
+    /// signer or not, so rotation does not depend on the previous subset
+    /// staying live. Read-only: makes no consensus-DB write.
+    async fn propose_timed_out_rotations(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        sessions: &[(SigningSessionId, SigningSession)],
+    ) -> Vec<UsdtConsensusItem> {
+        let mut items = Vec::new();
+        for (session_id, session) in sessions {
+            if matches!(session.state, SessionState::Failed) {
+                continue;
+            }
+            if self.timed_out(dbtx, session).await {
+                items.push(UsdtConsensusItem::RotateSigning {
+                    session_id: *session_id,
+                });
+            }
+        }
+        items
+    }
+
+    /// Starts (idempotently) a threshold-ECDSA signing session over `digest`
+    /// on its `attempt`'th try.
+    ///
+    /// Writes the consensus [`SigningSession`] — id
+    /// [`signing_session_id(&digest, attempt)`][signing_session_id], signer
+    /// subset [`signer_subset(attempt)`][Self::signer_subset], `round: 0`,
+    /// [`SessionState::InProgress`] — and no-ops if a session for this
+    /// `(digest, attempt)` already exists. If this guardian is in the subset
+    /// it also spawns the off-thread signing state machine into
     /// `signing_sessions` and pre-pumps round 0's payload, so the next
     /// `consensus_proposal` can propose it immediately.
     ///
-    /// The signer subset is a pure function of `num_peers`: peer ids are
-    /// exactly `0..n` and [`NumPeers::peer_ids`] yields them in order, so
-    /// `take(t)` is the lowest-`t` subset every guardian independently agrees
-    /// on.
+    /// # Determinism
+    ///
+    /// The consensus-DB write is a pure function of `(purpose, digest,
+    /// attempt)`, prior consensus DB state, and `num_peers` — byte-identical
+    /// on every guardian. The ONLY `our_peer_id`-conditional part is the
+    /// in-memory off-thread signer spawn, a guardian-local side effect that
+    /// never touches the consensus DB.
     ///
     /// # Panics
     ///
@@ -1435,8 +1551,9 @@ impl Usdt {
         dbtx: &mut DatabaseTransaction<'_>,
         purpose: SigningPurpose,
         digest: [u8; 32],
+        attempt: u32,
     ) {
-        let session_id = signing_session_id(&digest, 0);
+        let session_id = signing_session_id(&digest, attempt);
         if dbtx
             .get_value(&SigningSessionKey(session_id))
             .await
@@ -1445,8 +1562,7 @@ impl Usdt {
             return;
         }
 
-        let threshold = self.num_peers.threshold();
-        let signers: Vec<PeerId> = self.num_peers.peer_ids().take(threshold).collect();
+        let signers = self.signer_subset(attempt);
         // The block count at creation is this session's initial "progress"
         // baseline for `timed_out` — a session that never sees a round
         // advance still gets `timeout_blocks()` consensus blocks before it
@@ -1461,7 +1577,7 @@ impl Usdt {
                 signers: signers.clone(),
                 round: 0,
                 state: SessionState::InProgress,
-                attempt: 0,
+                attempt,
                 last_progress_block,
             },
         )
@@ -2322,6 +2438,181 @@ mod tests {
         }
     }
 
+    /// `signer_subset` is a deterministic rotated window of size `t` over the
+    /// sorted peer ring, offset by `attempt % n` and wrapping — the same
+    /// canonical sorted order every guardian independently agrees on. For
+    /// n=4, t=3: attempt 0 → {0,1,2}; attempt 1 → {1,2,3}; attempt 2 wraps to
+    /// sorted {0,2,3}; attempt 3 wraps to sorted {0,1,3}; attempt 4 wraps back
+    /// to attempt 0's subset.
+    #[tokio::test]
+    async fn signer_subset_rotates_and_wraps_deterministically() {
+        let module = test_module_with_block_count(4, 0).await;
+        let p = |i: u16| PeerId::from(i);
+
+        assert_eq!(module.signer_subset(0), vec![p(0), p(1), p(2)]);
+        assert_eq!(module.signer_subset(1), vec![p(1), p(2), p(3)]);
+        assert_eq!(module.signer_subset(2), vec![p(0), p(2), p(3)]);
+        assert_eq!(module.signer_subset(3), vec![p(0), p(1), p(3)]);
+        // Wraps: attempt 4 == attempt 0 (offset 4 % 4 == 0).
+        assert_eq!(module.signer_subset(4), module.signer_subset(0));
+    }
+
+    /// A stalled (`InProgress`, timed-out) signing session is deterministically
+    /// retried under a ROTATED signer subset: `consensus_proposal` proposes a
+    /// `RotateSigning` for the timed-out attempt, and processing it on EVERY
+    /// guardian (signer and non-signer alike) fails the old attempt and starts
+    /// the next one (`attempt + 1`, rotated subset, fresh id) with identical
+    /// consensus-DB writes.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn rotate_signing_fails_timed_out_attempt_and_retries_rotated_subset() {
+        use sha2::{Digest as _, Sha256};
+
+        const N: u16 = 4;
+        let peers: Vec<PeerId> = (0..N).map(PeerId::from).collect();
+        let num_peers = peers.to_num_peers();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(
+            &peers,
+            &args,
+            &fedimint_usdt_common::UsdtGenParams::default(),
+        );
+
+        // One module per guardian, each with its own in-memory DB.
+        let mut modules: BTreeMap<PeerId, Usdt> = BTreeMap::new();
+        for &peer in &peers {
+            let cfg = server_cfgs[&peer]
+                .clone()
+                .to_typed::<UsdtConfig>()
+                .expect("config was just generated by the same configgen");
+            let db = fedimint_core::db::Database::new(
+                fedimint_core::db::mem_impl::MemDatabase::new(),
+                fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+            );
+            modules.insert(
+                peer,
+                Usdt::new_for_test(cfg, MockEvmRpc::default().into_dyn(), db, peer, num_peers),
+            );
+        }
+
+        let digest: [u8; 32] = Sha256::digest(b"usdt rotate-signing timeout test").into();
+        let attempt0_id = fedimint_usdt_common::signing_session_id(&digest, 0);
+        let attempt1_id = fedimint_usdt_common::signing_session_id(&digest, 1);
+        let purpose = SigningPurpose::Test(digest);
+
+        // Attempt 0: every guardian starts the identical session over the
+        // lowest-`t` subset {0,1,2}. `consensus_block_count` is 0 here (no
+        // votes yet), so each session's `last_progress_block` is 0.
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest, 0)
+                .await;
+            dbtx.commit_tx().await;
+        }
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction_nc().await;
+            let session = dbtx
+                .get_value(&SigningSessionKey(attempt0_id))
+                .await
+                .expect("attempt-0 session present");
+            assert_eq!(
+                session.signers,
+                vec![PeerId::from(0), PeerId::from(1), PeerId::from(2)]
+            );
+            assert_eq!(session.attempt, 0);
+        }
+
+        // Advance the consensus block count strictly past the timeout WITHOUT
+        // completing any round — the session stalls.
+        for module in modules.values() {
+            seed_block_count_votes(module.db_for_test(), N, timeout_blocks() + 1).await;
+        }
+
+        // One guardian proposes `RotateSigning` for the timed-out attempt.
+        let proposal = {
+            let module = &modules[&PeerId::from(0)];
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+            dbtx.commit_tx().await;
+            items
+        };
+        assert!(
+            proposal.contains(&UsdtConsensusItem::RotateSigning {
+                session_id: attempt0_id,
+            }),
+            "consensus_proposal must propose RotateSigning for the timed-out attempt: {proposal:?}"
+        );
+
+        // Feed the RotateSigning item to EVERY guardian (proposer identity is
+        // irrelevant to this item's processing).
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::RotateSigning {
+                        session_id: attempt0_id,
+                    },
+                    PeerId::from(0),
+                )
+                .await
+                .expect("RotateSigning for a timed-out in-progress session must process cleanly");
+            dbtx.commit_tx().await;
+        }
+
+        // Every guardian's consensus DB is identical: attempt-0 Failed, a new
+        // attempt-1 session InProgress at round 0 under the rotated subset
+        // {1,2,3}.
+        for &peer in &peers {
+            let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
+
+            let failed = dbtx
+                .get_value(&SigningSessionKey(attempt0_id))
+                .await
+                .expect("attempt-0 session still present");
+            assert_eq!(
+                failed.state,
+                SessionState::Failed,
+                "peer {peer} must mark the timed-out attempt Failed"
+            );
+
+            let retry = dbtx
+                .get_value(&SigningSessionKey(attempt1_id))
+                .await
+                .expect("attempt-1 session created");
+            assert_eq!(retry.attempt, 1);
+            assert_eq!(retry.round, 0);
+            assert_eq!(retry.state, SessionState::InProgress);
+            assert_eq!(
+                retry.signers,
+                vec![PeerId::from(1), PeerId::from(2), PeerId::from(3)],
+                "the retry must run under the rotated (offset-1) signer subset"
+            );
+        }
+
+        // A second, identical RotateSigning is now rejected: the attempt-0
+        // session is already Failed, not InProgress.
+        {
+            let module = &modules[&PeerId::from(0)];
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            let err = module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::RotateSigning {
+                        session_id: attempt0_id,
+                    },
+                    PeerId::from(0),
+                )
+                .await
+                .expect_err("re-rotating an already-Failed attempt must Err");
+            assert!(err.to_string().contains("non-in-progress"));
+        }
+    }
+
     #[tokio::test]
     async fn scan_pending_deposits_finds_confirmed_balance_above_credited() {
         let num_peers = 4u16;
@@ -2775,7 +3066,7 @@ mod tests {
         for module in modules.values() {
             let mut dbtx = module.db_for_test().begin_transaction().await;
             module
-                .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest)
+                .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest, 0)
                 .await;
             dbtx.commit_tx().await;
         }
@@ -2953,7 +3244,7 @@ mod tests {
         for module in modules.values() {
             let mut dbtx = module.db_for_test().begin_transaction().await;
             module
-                .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest)
+                .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest, 0)
                 .await;
             dbtx.commit_tx().await;
         }

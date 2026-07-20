@@ -359,6 +359,18 @@ pub enum UsdtConsensusItem {
         session_id: SigningSessionId,
         signature: Vec<u8>,
     },
+    /// Fails a stalled signing session and retries the same digest under a
+    /// rotated signer subset (Phase 6b, Task 3). `session_id` is the
+    /// TIMED-OUT attempt's id. Proposed by `consensus_proposal` for any
+    /// `InProgress` session whose `last_progress_block` has fallen more than
+    /// the timeout behind the consensus block count (a deterministic,
+    /// consensus-DB-only judgement — never wall-clock — so every guardian
+    /// agrees). Processing it is a pure function of the item, prior consensus
+    /// DB state, and config: every guardian — signer or not — marks the
+    /// timed-out `SigningSession` `Failed` and starts the next attempt
+    /// (`attempt + 1`) under a rotated subset (see `Usdt::signer_subset` /
+    /// `Usdt::start_session`), performing the identical consensus-DB writes.
+    RotateSigning { session_id: SigningSessionId },
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -640,6 +652,19 @@ mod tests {
         let decoded =
             UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
                 .expect("UsdtConsensusItem::MpcSignature should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn test_usdt_consensus_item_rotate_signing_round_trips_through_consensus_encoding() {
+        let item = UsdtConsensusItem::RotateSigning {
+            session_id: SigningSessionId([5; 32]),
+        };
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("UsdtConsensusItem::RotateSigning should decode what it just encoded");
 
         assert_eq!(item, decoded);
     }
