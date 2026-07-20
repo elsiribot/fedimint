@@ -728,18 +728,18 @@ pub(crate) fn submit_module_ci_proposals(
 /// the current module set without interrupting the iroh endpoint.
 struct IrohApiHandlers {
     consensus_api: ConsensusApi,
-    core_api: BTreeMap<String, ApiEndpoint<ConsensusApi>>,
-    module_api: BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>,
+    core_endpoints: BTreeMap<String, ApiEndpoint<ConsensusApi>>,
+    module_endpoints: BTreeMap<ModuleInstanceId, BTreeMap<String, ApiEndpoint<DynServerModule>>>,
 }
 
 impl IrohApiHandlers {
     fn new(consensus_api: ConsensusApi) -> Arc<Self> {
-        let core_api = server_endpoints()
+        let core_endpoints = server_endpoints()
             .into_iter()
             .map(|endpoint| (endpoint.path.to_string(), endpoint))
             .collect::<BTreeMap<String, ApiEndpoint<ConsensusApi>>>();
 
-        let module_api = consensus_api
+        let module_endpoints = consensus_api
             .modules
             .iter_modules()
             .map(|(id, _, module)| {
@@ -755,8 +755,8 @@ impl IrohApiHandlers {
 
         Arc::new(IrohApiHandlers {
             consensus_api,
-            core_api,
-            module_api,
+            core_endpoints,
+            module_endpoints,
         })
     }
 }
@@ -948,7 +948,7 @@ async fn await_response(
     match request.method {
         ApiMethod::Core(method) => {
             let endpoint = handlers
-                .core_api
+                .core_endpoints
                 .get(&method)
                 .ok_or(ApiError::not_found(method))?;
 
@@ -958,7 +958,7 @@ async fn await_response(
         }
         ApiMethod::Module(module_id, method) => {
             let endpoint = handlers
-                .module_api
+                .module_endpoints
                 .get(&module_id)
                 .ok_or(ApiError::not_found(module_id.to_string()))?
                 .get(&method)
