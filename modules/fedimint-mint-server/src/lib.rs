@@ -49,7 +49,8 @@ use fedimint_server_core::migration::{
     ServerModuleDbMigrationFnContextExt as _,
 };
 use fedimint_server_core::{
-    ConfigGenModuleArgs, EnvVarDoc, ServerModule, ServerModuleInit, ServerModuleInitArgs,
+    ConfigGenModuleArgs, ConfigGenParamDoc, ConfigGenParamType, EnvVarDoc, ServerModule,
+    ServerModuleInit, ServerModuleInitArgs,
 };
 use futures::{FutureExt as _, StreamExt};
 use itertools::Itertools;
@@ -211,6 +212,15 @@ impl ServerModuleInit for MintInit {
         vec![EnvVarDoc {
             name: FM_ENABLE_MODULE_MINT_ENV,
             description: "Set to 0/false to disable the mint (e-cash) module. Enabled by default.",
+        }]
+    }
+
+    fn config_gen_param_docs(&self) -> Vec<ConfigGenParamDoc> {
+        vec![ConfigGenParamDoc {
+            name: CONFIG_PARAM_AMOUNT_UNIT,
+            description: "Asset issued by this mint instance (default: bitcoin)",
+            param_type: ConfigGenParamType::Asset,
+            required: false,
         }]
     }
 
