@@ -451,10 +451,12 @@ impl ISetupApi for SetupApi {
             "A restore is already in progress"
         );
 
+        // The ui password may be preconfigured via env var, in which case
+        // this endpoint is reachable before local params have been set
         let local_params = state
             .local_params
             .clone()
-            .expect("The endpoint is authenticated.");
+            .context("Cannot proceed before the local parameters are set")?;
 
         ensure!(
             info != local_params.setup_code(),
@@ -536,10 +538,12 @@ impl ISetupApi for SetupApi {
             "A restore is already in progress"
         );
 
+        // The ui password may be preconfigured via env var, in which case
+        // this endpoint is reachable before local params have been set
         let local_params = state
             .local_params
             .clone()
-            .expect("The endpoint is authenticated.");
+            .context("Cannot proceed before the local parameters are set")?;
 
         let our_setup_code = local_params.setup_code();
 
@@ -860,6 +864,37 @@ mod tests {
         api.set_local_parameters(name.to_string(), None, None, None, None)
             .await
             .expect("setting local parameters should succeed")
+    }
+
+    /// The ui password can be preconfigured via environment variable, in
+    /// which case the endpoint is reachable before local params are set;
+    /// calling it early has to error instead of crashing the daemon.
+    #[tokio::test]
+    async fn start_dkg_without_local_params_errors() {
+        let api = setup_api(Network::Regtest);
+
+        let err = api
+            .start_dkg()
+            .await
+            .expect_err("start_dkg without local params should error");
+
+        assert!(
+            err.to_string().contains("local parameters"),
+            "Unexpected error: {err}"
+        );
+
+        let peer_api = setup_api(Network::Regtest);
+        let peer_code = setup_code(&peer_api, "peer").await;
+
+        let err = api
+            .add_peer_setup_code(peer_code)
+            .await
+            .expect_err("add_peer_setup_code without local params should error");
+
+        assert!(
+            err.to_string().contains("local parameters"),
+            "Unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
