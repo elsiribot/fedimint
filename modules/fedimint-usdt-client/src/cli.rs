@@ -40,6 +40,13 @@ enum Opts {
     /// queued withdrawal, identified by the `OutPoint` (`txid`, `out_idx`)
     /// of the `withdraw` output that enqueued it.
     WithdrawalStatus { txid: TransactionId, out_idx: u64 },
+    /// Report a guardian's consensus view of the pool `SimpleAccount`'s
+    /// derived address (`account`) and swept-in USDT balance (`balance`, the
+    /// smallest on-chain USDT unit). Queried from the lowest-id peer;
+    /// `account` is config-derived so every guardian agrees on it even before
+    /// the first sweep, and `balance` converges to the swept-in total once a
+    /// sweep's `UserOpConfirmed` reaches threshold agreement.
+    PoolState,
     /// Rescan the federation from the seed alone to rediscover deposits whose
     /// client-DB state was lost, re-storing each rediscovered claim key (so
     /// `claim` can then be run per account) and printing a summary. Scans
@@ -87,6 +94,23 @@ pub(crate) async fn handle_cli_command(
         Opts::WithdrawalStatus { txid, out_idx } => {
             let out_point = OutPoint { txid, out_idx };
             json(usdt.withdrawal_status(out_point).await?)
+        }
+        Opts::PoolState => {
+            // Any guardian answers identically (config-derived account +
+            // threshold-agreed balance); query the lowest-id peer. Emit
+            // `account` as a hex string (mirroring `DepositAddress`) rather
+            // than `PoolStateResponse`'s derived `Serialize`, whose
+            // `EvmAddress` newtype serializes as a raw 20-number array.
+            let peer = usdt
+                .all_peers()
+                .into_iter()
+                .next()
+                .expect("a joined federation always has at least one peer");
+            let pool = usdt.pool_state(peer).await?;
+            json(serde_json::json!({
+                "account": pool.account.to_string(),
+                "balance": pool.balance.0,
+            }))
         }
         Opts::Recover { gap_limit } => json(usdt.recover_deposits(gap_limit).await?),
     };
@@ -163,6 +187,14 @@ mod tests {
                 amount: 2_000_000,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn parses_pool_state() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "pool-state"]).expect("parses"),
+            Opts::PoolState
         ));
     }
 
