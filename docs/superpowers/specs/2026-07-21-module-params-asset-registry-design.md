@@ -70,7 +70,10 @@ The propose endpoint validates submitted params against the descriptors
 (unknown keys rejected, required keys present, values parse per type,
 `Asset` values resolve against the registry) before submitting the
 consensus item. DKG-time failures still fall back to the existing abort
-flow as a defensive layer.
+flow, but note this layer is narrower than endpoint validation: e.g. the
+mint accepts any numeric `amount_unit`, so a Byzantine proposer can
+reference an unregistered id — approving guardians see the raw
+unresolved id in the UI and are expected to decline.
 
 ### 3. Asset registry
 
@@ -93,9 +96,11 @@ processing time (item ignored with a log line) and pre-checked at the
 endpoint for immediate feedback. Names are capped at 64 bytes and
 tickers at 12 bytes to bound registry state.
 
-Admin api: `register_asset` (auth), `list_assets` (auth). Dashboard: an
-"Assets" section with the registered table (id, name, ticker,
-registered-by) and an add form.
+Admin api: `register_asset` (auth); the registry is read through the
+existing `module_generations` endpoint, which returns the serialized
+generation log including `assets` (no dedicated list endpoint).
+Dashboard: an "Assets" section with the registered table (id, name,
+ticker) and an add form.
 
 ### 4. Dashboard propose flow
 
