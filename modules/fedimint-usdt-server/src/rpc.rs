@@ -354,9 +354,32 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .map(|op| to_rpc_packed_user_op(&op.pack()))
             .collect();
 
+        // Fetch the broadcaster's *pending* nonce fresh from chain state and
+        // set it explicitly on the transaction, instead of leaving it to the
+        // provider's default cached nonce manager. That manager reserves and
+        // locally increments a nonce inside `.send()` BEFORE gas estimation,
+        // and does NOT roll it back when estimation then reverts -- which
+        // happens routinely here: a guardian re-submitting a `UserOp` that
+        // another guardian (or an earlier tick) already included reverts with
+        // `AA10 sender already constructed` during estimation. Each such
+        // failed send would leak a nonce, so the cached value drifts ahead of
+        // the account's real on-chain nonce; a later `handleOps` transaction
+        // then carries a future (gapped) nonce, sits un-mined in the mempool,
+        // and the `get_receipt()` below blocks forever -- permanently wedging
+        // every subsequent submission (e.g. a withdrawal batch submitted after
+        // a sweep's `AA10` retries have leaked several nonces). Deriving the
+        // nonce from chain state each call keeps a reverted send from
+        // stranding future ones.
+        let nonce = broadcaster
+            .get_transaction_count(beneficiary)
+            .pending()
+            .await
+            .context("failed to fetch broadcaster nonce")?;
+
         let entry_point = IEntryPoint::new(Address::from(entry_point.0), broadcaster);
         let receipt = entry_point
             .handleOps(packed_ops, beneficiary)
+            .nonce(nonce)
             .send()
             .await
             .context("failed to send handleOps transaction")?
