@@ -45,3 +45,13 @@ pub const SIGNING_SESSION_STATUS_ENDPOINT: &str = "signing_session_status";
 /// attempt 0 only, so a rotated later attempt is unaffected. Not
 /// access-gated, for the same reason as `DEBUG_START_SIGNING_ENDPOINT`.
 pub const DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT: &str = "debug_suppress_attempt0_round";
+
+/// Reports the consensus-agreed pool `SimpleAccount`'s derived address and
+/// swept-in USDT balance (Phase 7, Task 5's `PoolState`). Read from
+/// consensus DB, so any guardian answers identically.
+pub const POOL_STATE_ENDPOINT: &str = "pool_state";
+
+/// Reports the consensus-agreed lifecycle stage (`Pending`/`Submitted`/
+/// `Unknown`) of a `UserOp`, identified by its `user_op_hash` (Phase 7, Task
+/// 5). Read from consensus DB, so any guardian answers identically.
+pub const USEROP_STATUS_ENDPOINT: &str = "userop_status";

@@ -6,11 +6,12 @@ use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::{PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
-    DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT,
+    DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
+    SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositStatusRequest, DepositStatusResponse,
-    SigningSessionId,
+    PoolStateResponse, SigningSessionId, UserOpStatusRequest, UserOpStatusResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -62,6 +63,20 @@ pub trait UsdtFederationApi {
         peer: PeerId,
         suppress: bool,
     ) -> FederationResult<()>;
+
+    /// Reports `peer`'s consensus view of the pool `SimpleAccount`'s
+    /// derived address and swept-in USDT balance (Phase 7, Task 5). Any
+    /// guardian answers identically (read from consensus DB).
+    async fn pool_state(&self, peer: PeerId) -> FederationResult<PoolStateResponse>;
+
+    /// Reports `peer`'s consensus view of a `UserOp`'s lifecycle stage
+    /// (Phase 7, Task 5). Any guardian answers identically (read from
+    /// consensus DB).
+    async fn userop_status(
+        &self,
+        peer: PeerId,
+        op_hash: [u8; 32],
+    ) -> FederationResult<UserOpStatusResponse>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -139,5 +154,29 @@ where
         .map_err(|e| {
             FederationError::new_one_peer(peer, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT, suppress, e)
         })
+    }
+
+    async fn pool_state(&self, peer: PeerId) -> FederationResult<PoolStateResponse> {
+        self.request_single_peer(
+            POOL_STATE_ENDPOINT.to_string(),
+            ApiRequestErased::default(),
+            peer,
+        )
+        .await
+        .map_err(|e| FederationError::new_one_peer(peer, POOL_STATE_ENDPOINT, (), e))
+    }
+
+    async fn userop_status(
+        &self,
+        peer: PeerId,
+        op_hash: [u8; 32],
+    ) -> FederationResult<UserOpStatusResponse> {
+        self.request_single_peer(
+            USEROP_STATUS_ENDPOINT.to_string(),
+            ApiRequestErased::new(UserOpStatusRequest { op_hash }),
+            peer,
+        )
+        .await
+        .map_err(|e| FederationError::new_one_peer(peer, USEROP_STATUS_ENDPOINT, op_hash, e))
     }
 }

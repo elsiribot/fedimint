@@ -13,6 +13,7 @@
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::SolCall as _;
+use anyhow::Context as _;
 use fedimint_usdt_common::user_op::UnsignedUserOp;
 use fedimint_usdt_common::{EvmAddress, UsdtAmount, deposit_salt};
 
@@ -191,6 +192,35 @@ pub fn build_deploy_and_sweep_userop(params: DeployAndSweepParams) -> UnsignedUs
         max_fee_per_gas: params.gas_bounds.max_fee_per_gas,
         paymaster_and_data: params.paymaster_and_data,
     }
+}
+
+/// Decodes the ERC-20 `transfer(to, amount)` amount embedded in a
+/// deploy-and-sweep [`UnsignedUserOp`]'s `call_data` (a `SimpleAccount.
+/// execute(dest, value, func)` call wrapping an ERC-20 `transfer(to,
+/// amount)` -- see [`build_deploy_and_sweep_userop`]).
+///
+/// Used by the guardian-local `UserOp` confirmation task (Phase 7, Task 5)
+/// to derive the `swept` amount for a successful `UserOpConfirmed`
+/// observation directly from the already-federation-agreed `op` -- pure
+/// function, no RPC call needed for the amount itself (only `success`/
+/// `block` come from `IServerEvmRpc::get_user_op_receipt`), so every
+/// guardian proposing for the same op independently computes the identical
+/// `swept` value once they agree `success`.
+///
+/// # Errors
+///
+/// Returns an error if `op.call_data` is not a valid `execute()` call
+/// wrapping a valid `transfer()` call (e.g. a future `Withdraw`-purpose op
+/// shaped differently -- out of scope for this phase), or if the decoded
+/// amount overflows `u64`.
+pub fn decode_transfer_amount(op: &UnsignedUserOp) -> anyhow::Result<UsdtAmount> {
+    let execute = ISimpleAccount::executeCall::abi_decode(&op.call_data)
+        .context("call_data is not a valid execute() call")?;
+    let transfer = IERC20Transfer::transferCall::abi_decode(&execute.func)
+        .context("execute()'s func arg is not a valid transfer() call")?;
+    let amount = u64::try_from(transfer.amount).context("transfer() amount overflows u64")?;
+
+    Ok(UsdtAmount(amount))
 }
 
 /// Assembles a 65-byte Ethereum `r ‖ s ‖ v` signature from a compact,

@@ -6182,6 +6182,7 @@ dependencies = [
  "fedimint-usdt-client",
  "fedimint-usdt-common",
  "fedimint-usdt-server",
+ "futures",
  "hex",
  "serde_json",
  "tokio",

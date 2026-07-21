@@ -32,8 +32,9 @@ use fedimint_core::{Amount, PeerId, apply, async_trait_maybe_send, push_db_pair_
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
-    CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND, SigningSessionId, USDT_UNIT,
-    UsdtAmount, UsdtCommonInit, UsdtInput, UsdtInputV0, UsdtModuleTypes,
+    CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND, PoolStateResponse,
+    SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtInput, UsdtInputV0,
+    UsdtModuleTypes, UserOpStatusResponse,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -239,6 +240,24 @@ impl UsdtClientModule {
             .module_api
             .debug_suppress_attempt0_round(peer, suppress)
             .await?)
+    }
+
+    /// Reports `peer`'s consensus view of the pool `SimpleAccount`'s
+    /// derived address and swept-in USDT balance (thin wrapper around
+    /// [`UsdtFederationApi::pool_state`]; Phase 7, Task 5 diagnostic).
+    pub async fn pool_state(&self, peer: PeerId) -> anyhow::Result<PoolStateResponse> {
+        Ok(self.module_api.pool_state(peer).await?)
+    }
+
+    /// Reports `peer`'s consensus view of a `UserOp`'s lifecycle stage
+    /// (thin wrapper around [`UsdtFederationApi::userop_status`]; Phase 7,
+    /// Task 5 diagnostic).
+    pub async fn userop_status(
+        &self,
+        peer: PeerId,
+        op_hash: [u8; 32],
+    ) -> anyhow::Result<UserOpStatusResponse> {
+        Ok(self.module_api.userop_status(peer, op_hash).await?)
     }
 
     /// Looks up the claim keypair persisted by [`Self::allocate_deposit`] for

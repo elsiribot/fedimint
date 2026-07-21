@@ -1,6 +1,7 @@
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::secp256k1::PublicKey;
 use fedimint_core::{PeerId, impl_db_lookup, impl_db_record};
+use fedimint_usdt_common::user_op::{SignedUserOp, UnsignedUserOp};
 use fedimint_usdt_common::{DepositObservation, EvmAddress, SigningSessionId, UsdtAmount};
 use serde::Serialize;
 use strum_macros::EnumIter;
@@ -33,6 +34,21 @@ pub enum DbKeyPrefix {
     /// [`fedimint_usdt_common::MPC_ROUND_CHUNK_SIZE`]-byte chunks (each its
     /// own consensus item) to stay under the `AlephBFT` unit byte limit.
     MpcRoundChunk = 0x07,
+    /// A `UserOp` deterministically enqueued for MPC signing but not yet
+    /// federation-agreed-signed (Phase 7, Task 5).
+    PendingUserOp = 0x08,
+    /// A `UserOp` that has been federation-agreed-signed (its `SigningSession`
+    /// reached `Completed`) and is awaiting/undergoing guardian-local
+    /// on-chain submission and confirmation (Phase 7, Task 5).
+    SubmittedUserOp = 0x09,
+    /// The consensus-agreed pool `SimpleAccount`'s derived address and the
+    /// USDT balance swept into it so far (Phase 7, Task 5). A module-wide
+    /// singleton record (see [`PoolStateKey`]).
+    PoolState = 0x0A,
+    /// Per-peer votes on the observed on-chain outcome of a submitted
+    /// `UserOp` (Phase 7, Task 5), mirroring [`DepositObservationVoteKey`]'s
+    /// dual-prefix quorum shape.
+    UserOpConfirmedVote = 0x0B,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -58,12 +74,21 @@ impl_db_lookup!(key = BlockCountVoteKey, query_prefix = BlockCountVotePrefix);
 /// balance has been credited (i.e. a supermajority of guardians agree it was
 /// observed) vs. already claimed by the depositor, plus the last block
 /// height a deposit observation vote was processed for.
+///
+/// `swept` (Phase 7, Task 5) is how much of `credited` has been moved
+/// on-chain into the pool account by a confirmed `UserOp`
+/// (`Usdt::apply_user_op_confirmed`) -- tracked here specifically so
+/// `ServerModule::audit` can report each deposit's un-swept remainder
+/// (`credited - swept`) instead of double-counting USDT that has already
+/// become `PoolState.balance`. See `Usdt::audit`'s doc comment for the exact
+/// solvency formula.
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
 pub struct DepositRecord {
     pub claim_pk: PublicKey,
     pub credited: UsdtAmount,
     pub claimed: UsdtAmount,
     pub last_observed_block: u64,
+    pub swept: UsdtAmount,
 }
 
 #[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
@@ -126,11 +151,19 @@ impl_db_lookup!(key = PendingCheckKey, query_prefix = PendingCheckPrefix);
 
 /// What a signing session's digest is being signed for. Phase 6a only ever
 /// creates [`SigningPurpose::Test`] sessions (exercising the round-advance
-/// loop end to end); Phase 7 adds the real `DeployAndSweep`/`Withdraw`
-/// purposes that drive actual EVM transactions.
+/// loop end to end); Phase 7 adds [`SigningPurpose::UserOp`], deterministically
+/// created alongside a [`PendingUserOp`] (see `Usdt::maybe_trigger_sweep`) to
+/// drive the deploy-and-sweep flow. `Test` is kept (not removed) so the
+/// Phase-6a/6b `debug_start_signing` acceptance tests keep working
+/// unmodified (Phase 9 removes the debug endpoint and this variant together).
+/// A `Withdraw` purpose is deferred to Phase 8.
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
 pub enum SigningPurpose {
     Test([u8; 32]),
+    /// Signing session for the `userOpHash`-derived EIP-191 digest of the
+    /// [`PendingUserOp`] keyed by this `op_hash` (its `user_op_hash`, i.e.
+    /// the [`PendingUserOpKey`]/[`SubmittedUserOpKey`] of the same op).
+    UserOp([u8; 32]),
 }
 
 /// A threshold-ECDSA signing session's current progress: `InProgress` while
@@ -231,6 +264,137 @@ impl_db_lookup!(
     query_prefix = MpcRoundChunkSessionRoundPeerPrefix,
 );
 
+/// What a [`PendingUserOp`]/[`SubmittedUserOp`] is for. Phase 7 only ever
+/// creates `DeployAndSweep` (the counterfactual deposit account's first,
+/// nonce-0 sweep to the pool); a `Withdraw` purpose is deferred to Phase 8.
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub enum UserOpPurpose {
+    /// Deploys (if not already deployed) and sweeps `source`'s full credited
+    /// balance to the pool account.
+    DeployAndSweep { source: EvmAddress },
+}
+
+/// A `UserOp` deterministically built from consensus DB state and enqueued
+/// for MPC signing (Phase 7, Task 5), keyed by its own
+/// [`fedimint_usdt_common::user_op::user_op_hash`] (see [`PendingUserOpKey`]).
+/// Cleared (and replaced by a [`SubmittedUserOp`]) once the
+/// `SigningPurpose::UserOp(op_hash)` session it started reaches
+/// `SessionState::Completed` (`Usdt::process_mpc_signature`).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub struct PendingUserOp {
+    pub op: UnsignedUserOp,
+    pub purpose: UserOpPurpose,
+    /// The consensus block count (`Usdt::consensus_block_count`) as of this
+    /// op's enqueueing -- diagnostic bookkeeping only (no consensus decision
+    /// reads it today).
+    pub created_block: u64,
+}
+
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct PendingUserOpKey(pub [u8; 32]);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct PendingUserOpPrefix;
+
+impl_db_record!(
+    key = PendingUserOpKey,
+    value = PendingUserOp,
+    db_prefix = DbKeyPrefix::PendingUserOp,
+);
+impl_db_lookup!(key = PendingUserOpKey, query_prefix = PendingUserOpPrefix);
+
+/// A `UserOp` whose federation-agreed-signed [`SignedUserOp`] is ready for
+/// guardian-local on-chain submission (Phase 7, Task 5), keyed by the same
+/// `op_hash` its originating [`PendingUserOp`] was keyed by. Cleared once
+/// `UsdtConsensusItem::UserOpConfirmed` reaches threshold agreement
+/// (`Usdt::apply_user_op_confirmed`).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub struct SubmittedUserOp {
+    pub signed: SignedUserOp,
+    /// The consensus block count as of this op's federation-agreed
+    /// signature -- diagnostic bookkeeping only.
+    pub submitted_block: u64,
+}
+
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct SubmittedUserOpKey(pub [u8; 32]);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct SubmittedUserOpPrefix;
+
+impl_db_record!(
+    key = SubmittedUserOpKey,
+    value = SubmittedUserOp,
+    db_prefix = DbKeyPrefix::SubmittedUserOp,
+);
+impl_db_lookup!(
+    key = SubmittedUserOpKey,
+    query_prefix = SubmittedUserOpPrefix
+);
+
+/// The consensus-agreed pool `SimpleAccount`'s derived address and the USDT
+/// balance swept into it so far (Phase 7, Task 5). A module-wide singleton
+/// (queried directly via [`PoolStateKey`], mirroring e.g. `walletv2`'s
+/// `FederationWalletKey`) rather than per-account: there is only ever one
+/// pool account per federation.
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub struct PoolState {
+    pub account: EvmAddress,
+    pub balance: UsdtAmount,
+}
+
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct PoolStateKey;
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct PoolStatePrefix;
+
+impl_db_record!(
+    key = PoolStateKey,
+    value = PoolState,
+    db_prefix = DbKeyPrefix::PoolState,
+);
+impl_db_lookup!(key = PoolStateKey, query_prefix = PoolStatePrefix);
+
+/// One peer's vote on the observed on-chain outcome of a submitted `UserOp`
+/// (Phase 7, Task 5). Mirrors [`DepositObservation`]'s role in
+/// [`DepositObservationVoteKey`] exactly: `success`/`block`/`swept` are all
+/// carried in the vote itself (not re-derived from any guardian-local
+/// state), and this type's full-field `#[derive(PartialEq)]` is what lets
+/// `Usdt::process_consensus_item`'s `UserOpConfirmed` arm tally only
+/// EXACTLY-matching votes toward the threshold (divergent `block`/`swept`
+/// values from a byzantine or lagging guardian cannot inflate the count).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub struct UserOpConfirmedObservation {
+    pub success: bool,
+    pub block: u64,
+    pub swept: UsdtAmount,
+}
+
+/// A single peer's vote on `UserOp` `[u8; 32]`'s (its `op_hash`) on-chain
+/// outcome. The `[u8; 32]` field is ordered first so that
+/// [`UserOpConfirmedVoteOpPrefix`] can look up every peer's vote for one
+/// `op_hash`, mirroring [`DepositObservationVoteKey`]'s dual-prefix shape.
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct UserOpConfirmedVoteKey(pub [u8; 32], pub PeerId);
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct UserOpConfirmedVotePrefix;
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct UserOpConfirmedVoteOpPrefix(pub [u8; 32]);
+
+impl_db_record!(
+    key = UserOpConfirmedVoteKey,
+    value = UserOpConfirmedObservation,
+    db_prefix = DbKeyPrefix::UserOpConfirmedVote,
+);
+impl_db_lookup!(
+    key = UserOpConfirmedVoteKey,
+    query_prefix = UserOpConfirmedVotePrefix,
+    query_prefix = UserOpConfirmedVoteOpPrefix,
+);
+
 #[cfg(test)]
 mod tests {
     use fedimint_core::PeerId;
@@ -259,6 +423,7 @@ mod tests {
             credited: UsdtAmount(1_000_000),
             claimed: UsdtAmount(0),
             last_observed_block: 100,
+            swept: UsdtAmount(0),
         };
 
         let mut dbtx = db.begin_transaction().await;
@@ -428,5 +593,133 @@ mod tests {
                 .iter()
                 .all(|(key, _)| key.0 == id && key.1 == 2 && key.2 == PeerId::from(0))
         );
+    }
+
+    fn sample_unsigned_user_op() -> UnsignedUserOp {
+        UnsignedUserOp {
+            sender: EvmAddress([0x21; 20]),
+            nonce: alloy::primitives::U256::ZERO,
+            init_code: vec![0xde, 0xad],
+            call_data: vec![0xbe, 0xef],
+            verification_gas_limit: 500_000,
+            call_gas_limit: 200_000,
+            pre_verification_gas: alloy::primitives::U256::from(100_000u64),
+            max_priority_fee_per_gas: 1_500_000_000,
+            max_fee_per_gas: 30_000_000_000,
+            paymaster_and_data: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_user_op_round_trips() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let op_hash = [0x41; 32];
+        let source = EvmAddress([0x51; 20]);
+        let pending = PendingUserOp {
+            op: sample_unsigned_user_op(),
+            purpose: UserOpPurpose::DeployAndSweep { source },
+            created_block: 42,
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&PendingUserOpKey(op_hash), &pending)
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&PendingUserOpKey(op_hash)).await,
+            Some(pending)
+        );
+        assert_eq!(
+            dbtx.find_by_prefix(&PendingUserOpPrefix)
+                .await
+                .count()
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn submitted_user_op_round_trips() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let op_hash = [0x42; 32];
+        let submitted = SubmittedUserOp {
+            signed: SignedUserOp {
+                unsigned: sample_unsigned_user_op(),
+                signature: vec![0xaa; 65],
+            },
+            submitted_block: 43,
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&SubmittedUserOpKey(op_hash), &submitted)
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&SubmittedUserOpKey(op_hash)).await,
+            Some(submitted)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_state_round_trips_as_a_singleton() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let state = PoolState {
+            account: EvmAddress([0x61; 20]),
+            balance: UsdtAmount(9_000_000),
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        assert!(
+            dbtx.get_value(&PoolStateKey).await.is_none(),
+            "no PoolState until first written"
+        );
+        dbtx.insert_new_entry(&PoolStateKey, &state).await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(dbtx.get_value(&PoolStateKey).await, Some(state.clone()));
+        // Exactly one record under the singleton's own prefix.
+        assert_eq!(dbtx.find_by_prefix(&PoolStatePrefix).await.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn user_op_confirmed_vote_round_trips_and_filters_by_op_hash_prefix() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let op_a = [0x71; 32];
+        let op_b = [0x72; 32];
+
+        let vote = |block: u64| UserOpConfirmedObservation {
+            success: true,
+            block,
+            swept: UsdtAmount(2_000_000),
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&UserOpConfirmedVoteKey(op_a, PeerId::from(0)), &vote(10))
+            .await;
+        dbtx.insert_new_entry(&UserOpConfirmedVoteKey(op_a, PeerId::from(1)), &vote(10))
+            .await;
+        dbtx.insert_new_entry(&UserOpConfirmedVoteKey(op_b, PeerId::from(0)), &vote(11))
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&UserOpConfirmedVoteKey(op_a, PeerId::from(0)))
+                .await,
+            Some(vote(10))
+        );
+
+        let op_a_votes: Vec<_> = dbtx
+            .find_by_prefix(&UserOpConfirmedVoteOpPrefix(op_a))
+            .await
+            .collect()
+            .await;
+        assert_eq!(op_a_votes.len(), 2);
+        assert!(op_a_votes.iter().all(|(key, _)| key.0 == op_a));
     }
 }

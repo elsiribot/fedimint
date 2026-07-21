@@ -1,11 +1,14 @@
 mod common;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::bail;
 use common::MockEvmRpc;
 use fedimint_client::ClientHandleArc;
+use fedimint_core::core::ModuleInstanceId;
+use fedimint_core::db::{IDatabaseTransactionOpsCore, IDatabaseTransactionOpsCoreTyped};
 use fedimint_core::runtime::{Instant, sleep};
 use fedimint_core::{Amount, PeerId, secp256k1};
 use fedimint_mint_client::{MintClientInit, MintClientModule};
@@ -14,11 +17,15 @@ use fedimint_mintv2_client::MintClientInit as Mintv2ClientInit;
 use fedimint_mintv2_common::KIND as MINTV2_KIND;
 use fedimint_mintv2_common::config::MintGenParams;
 use fedimint_mintv2_server::MintInit as Mintv2Init;
+use fedimint_testing::federation::FederationTest;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_usdt_client::api::UsdtFederationApi;
 use fedimint_usdt_client::{UsdtClientInit, UsdtClientModule};
-use fedimint_usdt_common::{EvmAddress, SigningSessionId, USDT_UNIT, UsdtAmount};
+use fedimint_usdt_common::user_op::UserOpReceipt;
+use fedimint_usdt_common::{EvmAddress, SigningSessionId, USDT_UNIT, UsdtAmount, UserOpStatus};
 use fedimint_usdt_server::UsdtInit;
+use fedimint_usdt_server::db::{PendingUserOpKey, PendingUserOpPrefix};
+use futures::StreamExt as _;
 
 fn fixtures() -> Fixtures {
     Fixtures::new_primary(MintClientInit, MintInit).with_module(UsdtClientInit, UsdtInit::default())
@@ -400,6 +407,246 @@ async fn degraded_federation_recovers_signing_via_timeout_and_rotation() -> anyh
     assert_eq!(
         attempt0_status, None,
         "the suppressed attempt-0 session must never produce a signature"
+    );
+
+    Ok(())
+}
+
+/// Returns the single `op_hash` this guardian's `PendingUserOp` table
+/// currently holds (or `None` if it's empty / holds more than one -- this
+/// test only ever drives a single deposit through the pipeline at a time).
+async fn find_sole_pending_user_op_hash(
+    fed: &FederationTest,
+    peer: PeerId,
+    module_instance_id: ModuleInstanceId,
+) -> Option<[u8; 32]> {
+    let db = fed.server_db(peer);
+    let mut dbtx = db.begin_transaction_nc().await;
+    let (mut isolated, _) = dbtx.to_ref_with_prefix_module_id(module_instance_id);
+    let pending: Vec<(PendingUserOpKey, _)> = isolated
+        .find_by_prefix(&PendingUserOpPrefix)
+        .await
+        .collect()
+        .await;
+    match pending.as_slice() {
+        [(PendingUserOpKey(hash), _)] => Some(*hash),
+        _ => None,
+    }
+}
+
+/// Dumps EVERY raw key/value pair in `peer`'s usdt module instance
+/// (`module_instance_id`), for asserting byte-identical consensus state
+/// across guardians. Raw (undecoded) bytes, so this is a strict superset of
+/// any single table's content -- any consensus-DB divergence anywhere in the
+/// module, not just in the tables this task added, would show up here.
+async fn dump_usdt_module_db(
+    fed: &FederationTest,
+    peer: PeerId,
+    module_instance_id: ModuleInstanceId,
+) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let db = fed.server_db(peer);
+    let mut dbtx = db.begin_transaction_nc().await;
+    let (mut isolated, _) = dbtx.to_ref_with_prefix_module_id(module_instance_id);
+    isolated
+        .raw_find_by_prefix(&[])
+        .await
+        .expect("raw_find_by_prefix never fails against an in-memory test DB")
+        .collect::<Vec<(Vec<u8>, Vec<u8>)>>()
+        .await
+        .into_iter()
+        .collect()
+}
+
+/// **Phase 7 Task 5 gating acceptance test.** Drives the automatic,
+/// deterministic deposit -> sweep pipeline end to end over a hermetic
+/// 4-guardian federation (a shared [`MockEvmRpc`] stands in for the EVM
+/// chain, and guardian 3 never signs -- `signer_subset(0)` is the fixed
+/// lowest-`t` subset `{0,1,2}`):
+///
+/// 1. Allocate + fund a deposit; the federation credits it.
+/// 2. Assert a `DeployAndSweep` `PendingUserOp` and its `SigningPurpose::
+///    UserOp` session appear -- byte-identically -- on every guardian
+///    (deterministic trigger, Task 5 part 1).
+/// 3. The federation's real MPC signing loop (no manual pumping -- this runs
+///    the actual `fedimintd`-style consensus loop) signs it; every guardian's
+///    `MpcSignature` arm deterministically produces an identical
+///    `SubmittedUserOp` (Task 5 part 2).
+/// 4. Every guardian's guardian-local `usdt-user-op-submitter` task submits the
+///    op (recorded by the mock, Task 5 part 3) and polls for a receipt; once
+///    the test scripts a successful receipt, guardians threshold-vote
+///    `UserOpConfirmed` and `PoolState.balance` converges to the swept amount
+///    on every guardian (Task 5 part 4).
+/// 5. Asserts every guardian's ENTIRE usdt module database is byte-identical at
+///    the terminal state (signer and non-signer alike), and that letting the
+///    guardian-local tasks keep ticking afterward (replay) does not change
+///    anything.
+///
+/// Slow (real MPC over a real, real-timer-driven federation, ~1-3 min);
+/// intentionally run in the foreground.
+#[tokio::test(flavor = "multi_thread")]
+async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> anyhow::Result<()> {
+    let mock = Arc::new(MockEvmRpc::new());
+    // The usdt module's default `UsdtGenParams::usdt_contract` placeholder.
+    let usdt_contract = EvmAddress([0u8; 20]);
+    mock.set_chain_id(31337);
+    mock.set_block_number(100);
+
+    let fed = dual_mint_fixtures(mock.clone())
+        .new_fed_builder(0)
+        .disable_mint_fees()
+        .build()
+        .await;
+    let client: ClientHandleArc = fed.new_client().await;
+    let usdt = client.get_first_module::<UsdtClientModule>()?;
+    let module_instance_id = usdt.id;
+    let peers: Vec<PeerId> = usdt.all_peers().into_iter().collect();
+    assert_eq!(
+        peers.len(),
+        4,
+        "this test assumes the default 4-guardian fixture"
+    );
+    let non_signer = PeerId::from(3); // signer_subset(0) is the fixed {0,1,2}
+
+    // 1. Allocate + fund a deposit; wait for it to be credited.
+    let (claim_keypair, account) = usdt.allocate_deposit().await?;
+    let deposit_amount = UsdtAmount(2_500_000);
+    mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
+    usdt.check_deposit(claim_keypair.public_key()).await?;
+
+    let credited_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let status = usdt.deposit_status(claim_keypair.public_key()).await?;
+        if status.credited == deposit_amount {
+            break;
+        }
+        if Instant::now() >= credited_deadline {
+            bail!("deposit was never credited before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+
+    // 2. A DeployAndSweep PendingUserOp deterministically appears on every
+    //    guardian, with the identical op_hash.
+    let pending_deadline = Instant::now() + Duration::from_secs(30);
+    let op_hash = loop {
+        if let Some(hash) = find_sole_pending_user_op_hash(&fed, peers[0], module_instance_id).await
+        {
+            break hash;
+        }
+        if Instant::now() >= pending_deadline {
+            bail!("no PendingUserOp appeared on peer 0 before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    };
+    for &peer in &peers {
+        let status = usdt.userop_status(peer, op_hash).await?;
+        assert_eq!(
+            status.status,
+            UserOpStatus::Pending,
+            "guardian {peer} must deterministically hold the identical PendingUserOp"
+        );
+    }
+
+    // 3. The federation's real (background, timer-driven) MPC signing loop signs it
+    //    -> every guardian's MpcSignature arm deterministically produces a
+    //    SubmittedUserOp. Poll until the guardian-local submission task has
+    //    actually recorded a submission with the mock (proves the SubmittedUserOp
+    //    landed and the guardian-local task picked it up), then script a successful
+    //    receipt.
+    let submit_deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        if !mock.submitted_user_ops().is_empty() {
+            break;
+        }
+        if Instant::now() >= submit_deadline {
+            bail!("no UserOp submission was recorded by the mock before the deadline");
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    mock.set_user_op_receipt(
+        op_hash,
+        UserOpReceipt {
+            success: true,
+            block: 42,
+            actual_cost_usdt: UsdtAmount(0),
+        },
+    );
+
+    // Every guardian -- signer and non-signer alike -- deterministically
+    // reaches Submitted (or, if the confirmation vote already landed by the
+    // time we poll, Unknown -- both prove the deterministic
+    // Completed -> SubmittedUserOp step ran identically).
+    for &peer in &peers {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let status = usdt.userop_status(peer, op_hash).await?.status;
+            if matches!(status, UserOpStatus::Submitted | UserOpStatus::Unknown) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("guardian {peer} UserOp never reached Submitted (status={status:?})");
+            }
+            sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    // 4. Threshold-voted confirmation: PoolState.balance converges to the swept
+    //    amount on EVERY guardian, including the non-signer.
+    for &peer in &peers {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let pool = usdt.pool_state(peer).await?;
+            if pool.balance == deposit_amount {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "guardian {peer} PoolState.balance never converged to the swept amount \
+                     (last read {})",
+                    pool.balance
+                );
+            }
+            sleep(Duration::from_millis(300)).await;
+        }
+    }
+    // Explicitly confirm the non-signer specifically -- the whole point of
+    // this determinism test.
+    let non_signer_pool = usdt.pool_state(non_signer).await?;
+    assert_eq!(non_signer_pool.balance, deposit_amount);
+    assert!(
+        usdt.userop_status(non_signer, op_hash).await?.status != UserOpStatus::Pending,
+        "the non-signer must have finalized the UserOp deterministically too"
+    );
+
+    // 5. Every guardian's usdt module database is byte-identical at the terminal
+    //    state.
+    let mut reference: Option<BTreeMap<Vec<u8>, Vec<u8>>> = None;
+    for &peer in &peers {
+        let items = dump_usdt_module_db(&fed, peer, module_instance_id).await;
+        match &reference {
+            Some(reference) => assert_eq!(
+                &items, reference,
+                "guardian {peer}'s usdt module DB diverges from peer {}'s",
+                peers[0]
+            ),
+            None => reference = Some(items),
+        }
+    }
+    let reference = reference.expect("at least one peer");
+
+    // Replay-safety: let the guardian-local background tasks keep ticking
+    // (they will keep re-submitting/re-polling every ~1s in the test env)
+    // and confirm nothing changes -- no double-credit, no DB drift.
+    sleep(Duration::from_secs(3)).await;
+    let pool_after_replay_window = usdt.pool_state(peers[0]).await?;
+    assert_eq!(
+        pool_after_replay_window.balance, deposit_amount,
+        "letting the background tasks keep ticking must not double-credit the pool"
+    );
+    let items_after = dump_usdt_module_db(&fed, peers[0], module_instance_id).await;
+    assert_eq!(
+        items_after, reference,
+        "the usdt module DB must be unchanged after the replay window"
     );
 
     Ok(())

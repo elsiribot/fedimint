@@ -43,6 +43,13 @@ pub struct FederationTest {
     num_peers: u16,
     num_offline: u16,
     connectors: ConnectorRegistry,
+    /// Each online guardian's server-side [`Database`] (the same handle
+    /// `consensus::run` was spawned with in [`FederationTestBuilder::build`]),
+    /// so a test can inspect a guardian's raw consensus state directly (e.g.
+    /// to assert every guardian's module DB ended up byte-identical) rather
+    /// than only through the wire API. `Database` is a cheap `Arc`-backed
+    /// clone, so stashing one here does not duplicate any storage.
+    databases: BTreeMap<PeerId, Database>,
 }
 
 impl FederationTest {
@@ -243,6 +250,20 @@ impl FederationTest {
     pub fn is_degraded(&self) -> bool {
         self.num_offline > 0
     }
+
+    /// Returns `peer`'s server-side [`Database`] (the SAME handle its
+    /// `consensus::run` instance was spawned with), for tests that need to
+    /// inspect a guardian's raw consensus DB directly -- e.g. asserting that
+    /// every guardian's module state ended up byte-identical after some
+    /// consensus flow. Only online peers have an entry (see
+    /// [`Self::online_peer_ids`]); panics if `peer` is offline or unknown.
+    #[must_use]
+    pub fn server_db(&self, peer: PeerId) -> Database {
+        self.databases
+            .get(&peer)
+            .expect("server_db called for an offline or unknown peer")
+            .clone()
+    }
 }
 
 /// Builder struct for creating a `FederationTest`.
@@ -349,6 +370,7 @@ impl FederationTestBuilder {
             ServerConfig::trusted_dealer_gen(&params, &self.server_init, &self.version_hash);
 
         let task_group = TaskGroup::new();
+        let mut databases = BTreeMap::new();
         for (peer_id, cfg) in configs.clone() {
             let peer_port = self.base_port + u16::from(peer_id) * 3;
 
@@ -363,6 +385,7 @@ impl FederationTestBuilder {
             let instances = cfg.consensus.iter_module_instances();
             let decoders = self.server_init.available_decoders(instances).unwrap();
             let db = Database::new(MemDatabase::new(), decoders);
+            databases.insert(peer_id, db.clone());
             let module_init_registry = self.server_init.clone();
             let subgroup = task_group.make_subgroup();
             let checkpoint_dir = tempfile::Builder::new().tempdir().unwrap().keep();
@@ -468,6 +491,7 @@ impl FederationTestBuilder {
                 .bind()
                 .await
                 .expect("Failed to initialize endpoints for testing"),
+            databases,
         }
     }
 }

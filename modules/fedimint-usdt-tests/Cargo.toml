@@ -33,6 +33,7 @@ fedimint-testing = { workspace = true }
 fedimint-usdt-client = { workspace = true }
 fedimint-usdt-common = { workspace = true }
 fedimint-usdt-server = { workspace = true }
+futures = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

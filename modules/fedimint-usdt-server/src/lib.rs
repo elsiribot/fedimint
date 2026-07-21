@@ -40,14 +40,17 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
-    DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT,
+    DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
+    SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
 };
+use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositObservation, DepositStatusRequest,
     DepositStatusResponse, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem,
-    SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtInput,
-    UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
-    derive_deposit_account, signing_session_id,
+    PoolStateResponse, SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
+    UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
+    UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, derive_deposit_account,
+    derive_pool_account, evm_address, signing_session_id,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -60,10 +63,14 @@ use crate::db::{
     DepositObservationVoteKey, DepositObservationVotePrefix, DepositRecord, DepositRecordKey,
     DepositRecordPrefix, MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix,
     MpcRoundChunkSessionRoundPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
+    PendingUserOp, PendingUserOpKey, PendingUserOpPrefix, PoolState, PoolStateKey, PoolStatePrefix,
     SessionState, SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix,
+    SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix, UserOpConfirmedObservation,
+    UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix, UserOpConfirmedVotePrefix, UserOpPurpose,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
+use crate::user_op::{DeployAndSweepParams, GasBounds, assemble_eth_signature};
 
 mod dkg;
 
@@ -100,6 +107,7 @@ impl ModuleInit for UsdtInit {
     type Common = UsdtCommonInit;
 
     /// Dumps all database items for debugging
+    #[allow(clippy::too_many_lines)]
     async fn dump_database(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -170,6 +178,46 @@ impl ModuleInit for UsdtInit {
                         MpcRoundChunk,
                         items,
                         "MPC Round Chunks"
+                    );
+                }
+                DbKeyPrefix::PendingUserOp => {
+                    push_db_pair_items!(
+                        dbtx,
+                        PendingUserOpPrefix,
+                        PendingUserOpKey,
+                        PendingUserOp,
+                        items,
+                        "Pending UserOps"
+                    );
+                }
+                DbKeyPrefix::SubmittedUserOp => {
+                    push_db_pair_items!(
+                        dbtx,
+                        SubmittedUserOpPrefix,
+                        SubmittedUserOpKey,
+                        SubmittedUserOp,
+                        items,
+                        "Submitted UserOps"
+                    );
+                }
+                DbKeyPrefix::PoolState => {
+                    push_db_pair_items!(
+                        dbtx,
+                        PoolStatePrefix,
+                        PoolStateKey,
+                        PoolState,
+                        items,
+                        "Pool State"
+                    );
+                }
+                DbKeyPrefix::UserOpConfirmedVote => {
+                    push_db_pair_items!(
+                        dbtx,
+                        UserOpConfirmedVotePrefix,
+                        UserOpConfirmedVoteKey,
+                        UserOpConfirmedObservation,
+                        items,
+                        "UserOp Confirmed Votes"
                     );
                 }
             }
@@ -470,6 +518,27 @@ pub struct Usdt {
     /// instead. Purely guardian-local — never read by `process_consensus_item`
     /// or folded into any consensus-DB write or `Ok`/`Err` decision.
     suppress_attempt0_round: Arc<AtomicBool>,
+    /// `UserOp` on-chain outcomes gathered by the background
+    /// `usdt-user-op-submitter` task (spawned in [`Usdt::new`]; see
+    /// [`Usdt::spawn_user_op_submitter`]), drained into
+    /// `UsdtConsensusItem::UserOpConfirmed` proposals in
+    /// `consensus_proposal`. Mirrors `deposit_proposals`'s drain pattern
+    /// exactly (Phase 7, Task 5).
+    user_op_confirmed_proposals: Arc<Mutex<Vec<UserOpConfirmedProposal>>>,
+}
+
+/// One guardian-local observation of a submitted `UserOp`'s on-chain outcome
+/// (Phase 7, Task 5), gathered by [`Usdt::spawn_user_op_submitter`] and
+/// drained into `UsdtConsensusItem::UserOpConfirmed` proposals by
+/// `consensus_proposal`. Plain data -- mirrors
+/// [`fedimint_usdt_common::DepositObservation`]'s role for the deposit-side
+/// quorum.
+#[derive(Debug, Clone)]
+struct UserOpConfirmedProposal {
+    op_hash: [u8; 32],
+    success: bool,
+    block: u64,
+    swept: UsdtAmount,
 }
 
 /// Grouped handles/config for [`Usdt::spawn_deposit_checker`], bundling its
@@ -487,6 +556,14 @@ struct DepositCheckerHandles {
     num_peers: NumPeers,
 }
 
+/// Grouped handles for [`Usdt::spawn_user_op_submitter`], mirroring
+/// [`DepositCheckerHandles`]'s convention.
+struct UserOpSubmitterHandles {
+    db: Database,
+    evm_rpc: DynServerEvmRpc,
+    user_op_confirmed_proposals: Arc<Mutex<Vec<UserOpConfirmedProposal>>>,
+}
+
 /// Implementation of consensus for the server module
 #[async_trait]
 impl ServerModule for Usdt {
@@ -494,6 +571,7 @@ impl ServerModule for Usdt {
     type Common = UsdtModuleTypes;
     type Init = UsdtInit;
 
+    #[allow(clippy::too_many_lines)]
     async fn consensus_proposal(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -659,6 +737,37 @@ impl ServerModule for Usdt {
             }
         }
 
+        // Drain `UserOp` on-chain outcomes gathered by the background
+        // `usdt-user-op-submitter` task (see `spawn_user_op_submitter`),
+        // proposing only those that differ from what this peer has already
+        // voted for the op (avoiding redundant proposals that
+        // `process_consensus_item` would reject) -- mirrors the `Deposit`
+        // drain above exactly.
+        let pending_confirmations = std::mem::take(
+            &mut *self
+                .user_op_confirmed_proposals
+                .lock()
+                .expect("not poisoned"),
+        );
+        for proposal in pending_confirmations {
+            let obs = UserOpConfirmedObservation {
+                success: proposal.success,
+                block: proposal.block,
+                swept: proposal.swept,
+            };
+            let current_vote = dbtx
+                .get_value(&UserOpConfirmedVoteKey(proposal.op_hash, self.our_peer_id))
+                .await;
+            if current_vote != Some(obs) {
+                items.push(UsdtConsensusItem::UserOpConfirmed {
+                    op_hash: proposal.op_hash,
+                    success: proposal.success,
+                    block: proposal.block,
+                    swept: proposal.swept,
+                });
+            }
+        }
+
         items
     }
 
@@ -741,6 +850,40 @@ impl ServerModule for Usdt {
                 self.process_mpc_signature(dbtx, session_id, signature)
                     .await
             }
+            UsdtConsensusItem::UserOpConfirmed {
+                op_hash,
+                success,
+                block,
+                swept,
+            } => {
+                // DETERMINISTIC, mirrors the `Deposit` arm's exact
+                // observation-quorum shape: store this peer's vote
+                // (redundancy guard, unbounded-history rule), tally only
+                // EXACTLY-matching votes (full-field `PartialEq` on
+                // `UserOpConfirmedObservation`), and apply at threshold.
+                let obs = UserOpConfirmedObservation {
+                    success,
+                    block,
+                    swept,
+                };
+                let key = UserOpConfirmedVoteKey(op_hash, peer_id);
+                if dbtx.insert_entry(&key, &obs).await.as_ref() == Some(&obs) {
+                    bail!("UserOp confirmation vote is redundant");
+                }
+
+                let votes: Vec<UserOpConfirmedObservation> = dbtx
+                    .find_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
+                    .await
+                    .map(|(_, v)| v)
+                    .collect()
+                    .await;
+                let agreeing = votes.iter().filter(|v| **v == obs).count();
+
+                if agreeing >= self.num_peers.threshold() {
+                    self.apply_user_op_confirmed(dbtx, op_hash, &obs).await;
+                }
+                Ok(())
+            }
             UsdtConsensusItem::Default { .. } => {
                 bail!("The usdt module does not support this consensus item yet")
             }
@@ -807,25 +950,45 @@ impl ServerModule for Usdt {
         // an asset backing the USDT-`mintv2` instance's issued e-cash
         // liability. `claimed <= credited` always (`process_input` only ever
         // moves `claimed` up to `credited`), so reporting the full
-        // `credited` amount here -- not `credited - claimed` -- can only
-        // create a surplus (deposits credited but not yet claimed into
+        // `credited - swept` amount here -- not `credited - claimed` -- can
+        // only create a surplus (deposits credited but not yet claimed into
         // e-cash), never a deficit, keeping the federation's global balance
         // sheet (`fedimint_core::module::audit::Audit::net_assets`) solvent.
+        //
+        // NO-DOUBLE-COUNTING (Phase 7, Task 5, SOLVENCY-CRITICAL): once a
+        // deposit account's USDT has been swept to the pool
+        // (`Usdt::apply_user_op_confirmed`), it is represented by
+        // `PoolState.balance`, not by that deposit's `credited` amount
+        // anymore -- reporting BOTH would double-count the same on-chain
+        // USDT as two separate assets. `DepositRecord::swept` tracks exactly
+        // how much of `credited` has already moved into the pool (monotonic,
+        // capped at `credited`, bumped only in `apply_user_op_confirmed`),
+        // so this module's total asset is `sum(credited - swept)` (the
+        // not-yet-swept remainder of every deposit, counted once) PLUS
+        // `PoolState.balance` (the pooled remainder, counted once) below --
+        // together, every on-chain USDT the federation vouches for is
+        // counted EXACTLY once, whichever side of a sweep it currently sits
+        // on.
         //
         // PROVISIONAL (Phase 5, mirrors `deposit_address`'s doc comment):
         // the on-chain deposit account is derived from the group public key
         // (`derive_deposit_account`), so once the federation has reached
         // consensus that it holds `credited` USDT there, it is already
         // vouching for that balance the same way the wallet module vouches
-        // for UTXOs it controls, even though the withdrawal/sweep signing
-        // path is reconciled later.
+        // for UTXOs it controls.
         audit
             .add_items(dbtx, module_instance_id, &DepositRecordPrefix, |_k, v| {
-                i64::try_from(v.credited.0).unwrap_or(i64::MAX)
+                i64::try_from(v.credited.0.saturating_sub(v.swept.0)).unwrap_or(i64::MAX)
+            })
+            .await;
+        audit
+            .add_items(dbtx, module_instance_id, &PoolStatePrefix, |_k, v| {
+                i64::try_from(v.balance.0).unwrap_or(i64::MAX)
             })
             .await;
     }
 
+    #[allow(clippy::too_many_lines)]
     fn api_endpoints(&self) -> Vec<ApiEndpoint<Self>> {
         vec![
             api_endpoint! {
@@ -923,6 +1086,57 @@ impl ServerModule for Usdt {
                     Ok(())
                 }
             },
+            api_endpoint! {
+                POOL_STATE_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, _params: ()| -> PoolStateResponse {
+                    // Read-only diagnostic (Phase 7, Task 5): reads
+                    // consensus DB, so any guardian answers identically.
+                    // `PoolState` may not exist yet (no sweep has confirmed
+                    // yet), in which case report the deterministically
+                    // derived pool address with a zero balance, mirroring
+                    // `deposit_status`'s pre-credit-zeros shape.
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+                    let pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
+                        account: module.pool_account(),
+                        balance: UsdtAmount(0),
+                    });
+
+                    Ok(PoolStateResponse {
+                        account: pool.account,
+                        balance: pool.balance,
+                    })
+                }
+            },
+            api_endpoint! {
+                USEROP_STATUS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |_module: &Usdt, context, req: UserOpStatusRequest| -> UserOpStatusResponse {
+                    // Read-only diagnostic (Phase 7, Task 5): reads
+                    // consensus DB, so any guardian answers identically.
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+
+                    let status = if dbtx
+                        .get_value(&PendingUserOpKey(req.op_hash))
+                        .await
+                        .is_some()
+                    {
+                        UserOpStatus::Pending
+                    } else if dbtx
+                        .get_value(&SubmittedUserOpKey(req.op_hash))
+                        .await
+                        .is_some()
+                    {
+                        UserOpStatus::Submitted
+                    } else {
+                        UserOpStatus::Unknown
+                    };
+
+                    Ok(UserOpStatusResponse { status })
+                }
+            },
         ]
     }
 }
@@ -957,6 +1171,16 @@ impl Usdt {
             },
         );
 
+        let user_op_confirmed_proposals = Arc::new(Mutex::new(Vec::new()));
+        Self::spawn_user_op_submitter(
+            &task_group,
+            UserOpSubmitterHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.clone(),
+                user_op_confirmed_proposals: user_op_confirmed_proposals.clone(),
+            },
+        );
+
         Usdt {
             cfg,
             evm_rpc,
@@ -971,6 +1195,7 @@ impl Usdt {
             pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
             suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
+            user_op_confirmed_proposals,
         }
     }
 
@@ -999,6 +1224,7 @@ impl Usdt {
             pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
             suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
+            user_op_confirmed_proposals: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1089,6 +1315,97 @@ impl Usdt {
                     .lock()
                     .expect("not poisoned")
                     .extend(observations);
+
+                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
+                    1
+                } else {
+                    10
+                }))
+                .await;
+            }
+        });
+    }
+
+    /// Spawns a background task that submits every consensus-agreed
+    /// [`SubmittedUserOp`] via `evm_rpc.submit_user_ops` and polls
+    /// `evm_rpc.get_user_op_receipt` for its confirmation, gathering
+    /// confirmed outcomes into `user_op_confirmed_proposals` for
+    /// `consensus_proposal` to drain into `UsdtConsensusItem::UserOpConfirmed`
+    /// proposals (Phase 7, Task 5).
+    ///
+    /// Mirrors [`Usdt::spawn_deposit_checker`]'s discipline EXACTLY: reads
+    /// the module DB via `db.begin_transaction_nc()` (non-committable) and
+    /// NEVER commits a write to it -- submission is idempotent (the
+    /// `EntryPoint` dedups by `(sender, nonce)`, so a redundant or
+    /// multi-guardian submission of the same op is harmless) and purely
+    /// guardian-local; the only consensus-DB write this task's output can
+    /// ever cause is via the ordinary `UserOpConfirmed` consensus-item path
+    /// (`Usdt::apply_user_op_confirmed`), gated on federation-wide
+    /// threshold agreement, never on this task's own say-so. `swept` is
+    /// derived from the already-consensus-agreed `op`'s own transfer amount
+    /// (via [`crate::user_op::decode_transfer_amount`]), not from the RPC
+    /// response -- only `success`/`block` are guardian-local RPC reads;
+    /// `swept` is otherwise a pure function of consensus data, so every
+    /// guardian proposing for the same `op_hash` proposes an identical
+    /// `swept` value once they agree on `success`.
+    fn spawn_user_op_submitter(task_group: &TaskGroup, handles: UserOpSubmitterHandles) {
+        let UserOpSubmitterHandles {
+            db,
+            evm_rpc,
+            user_op_confirmed_proposals,
+        } = handles;
+
+        task_group.spawn_cancellable("usdt-user-op-submitter", async move {
+            loop {
+                let mut dbtx = db.begin_transaction_nc().await;
+                let submitted: Vec<(SubmittedUserOpKey, SubmittedUserOp)> = dbtx
+                    .find_by_prefix(&SubmittedUserOpPrefix)
+                    .await
+                    .collect()
+                    .await;
+                drop(dbtx);
+
+                for (SubmittedUserOpKey(op_hash), record) in submitted {
+                    // Idempotent, guardian-local: errors (including "already
+                    // included") are swallowed and simply retried next tick.
+                    if let Err(err) = evm_rpc.submit_user_ops(vec![record.signed.clone()]).await {
+                        debug!(
+                            target: "usdt",
+                            err = %err.fmt_compact_anyhow(),
+                            ?op_hash,
+                            "UserOp submission failed, retrying next tick"
+                        );
+                    }
+
+                    match evm_rpc.get_user_op_receipt(op_hash).await {
+                        Ok(Some(receipt)) => {
+                            let swept = if receipt.success {
+                                crate::user_op::decode_transfer_amount(&record.signed.unsigned)
+                                    .unwrap_or(UsdtAmount(0))
+                            } else {
+                                UsdtAmount(0)
+                            };
+                            user_op_confirmed_proposals
+                                .lock()
+                                .expect("not poisoned")
+                                .push(UserOpConfirmedProposal {
+                                    op_hash,
+                                    success: receipt.success,
+                                    block: receipt.block,
+                                    swept,
+                                });
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            debug!(
+                                target: "usdt",
+                                err = %err.fmt_compact_anyhow(),
+                                ?op_hash,
+                                "UserOp receipt poll failed, retrying next tick"
+                            );
+                        }
+                    }
+                }
 
                 fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
                     1
@@ -1198,6 +1515,7 @@ impl Usdt {
                 credited: UsdtAmount(0),
                 claimed: UsdtAmount(0),
                 last_observed_block: 0,
+                swept: UsdtAmount(0),
             });
         // Only credit forward; balance is monotonic between sweeps.
         if obs.balance.0 > record.credited.0 {
@@ -1213,7 +1531,190 @@ impl Usdt {
         dbtx.remove_by_prefix(&DepositObservationVoteAccountPrefix(obs.account))
             .await;
         dbtx.remove_entry(&PendingCheckKey(obs.account)).await;
+
+        // Deterministic trigger (Phase 7, Task 5): every guardian, right
+        // here, enqueues the deploy-and-sweep `UserOp` for this account and
+        // starts its MPC signing session -- a pure function of the just-
+        // written `DepositRecord` (consensus DB) and this module's config.
+        // See `maybe_trigger_sweep`'s own doc comment for the full
+        // determinism argument and the first-sweep-only scope of this phase.
+        self.maybe_trigger_sweep(dbtx, obs.account).await;
+
         Ok(())
+    }
+
+    /// Deterministically enqueues the deploy-and-sweep [`PendingUserOp`] for
+    /// `account` and starts its `SigningPurpose::UserOp` signing session, if
+    /// `account`'s [`DepositRecord`] has credit that has never been swept
+    /// (`record.swept.0 == 0`) -- i.e. this account has not yet completed
+    /// its (Phase-7-scoped, first-and-only) sweep. Called from
+    /// [`Usdt::credit_deposit`], right after the credit write, so it always
+    /// observes the freshest `DepositRecord`.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of `account`'s [`DepositRecord`] (consensus DB) and
+    /// this module's config (`account_factory`/`usdt_contract`/
+    /// `entry_point`/`chain_id`/`group_public_key`) --
+    /// [`build_deploy_and_sweep_userop`] and [`user_op_hash`] take no
+    /// RPC/wall-clock input, so every guardian builds the byte-identical
+    /// `op`/`op_hash`. The only conditional consensus-DB writes are the
+    /// `PendingUserOpKey`/`SigningSession` inserts, gated on a check of the
+    /// SAME consensus DB (`PendingUserOpKey`/`SubmittedUserOpKey` presence
+    /// for this exact `op_hash`) -- identical on every guardian.
+    /// `start_session`'s only `our_peer_id`-conditional part is the
+    /// in-memory off-thread signer spawn, a guardian-local side effect (see
+    /// its own doc comment).
+    ///
+    /// # Scope (Phase 7)
+    ///
+    /// `nonce` is always `0` and `needs_deploy` is always `true`: this phase
+    /// only handles a counterfactual account's FIRST sweep. The
+    /// `record.swept.0 == 0` guard prevents ever building a second,
+    /// nonce-colliding op for an account that has already completed one
+    /// (which would revert on-chain with an invalid-nonce error); a second
+    /// deposit arriving before the first sweep confirms instead
+    /// transparently supersedes the still-`Pending`/`Submitted` op with a
+    /// fresh, higher-`amount` one (same nonce 0, since the account is still
+    /// undeployed) -- the stale op's `PendingUserOp`/`SubmittedUserOp`
+    /// record, if any, is simply left orphaned in the DB (harmless: it can
+    /// never be confirmed for a different amount than what's actually on
+    /// the sender's balance, and Task 5's acceptance only exercises the
+    /// single-deposit case). Consolidating multiple sweeps into one
+    /// account's lifetime, or handling withdrawals, is Phase 8's `Withdraw`
+    /// `UserOpPurpose`.
+    async fn maybe_trigger_sweep(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        account: fedimint_usdt_common::EvmAddress,
+    ) {
+        let Some(record) = dbtx.get_value(&DepositRecordKey(account)).await else {
+            return;
+        };
+        if record.swept.0 != 0 || record.credited.0 == 0 {
+            return;
+        }
+
+        let owner = evm_address(&self.cfg.consensus.group_public_key);
+        let params = DeployAndSweepParams {
+            account_factory: self.cfg.consensus.account_factory,
+            usdt_contract: self.cfg.consensus.usdt_contract,
+            deposit_account: account,
+            owner,
+            claim_pk: record.claim_pk,
+            amount: record.credited,
+            pool: self.pool_account(),
+            nonce: alloy::primitives::U256::ZERO,
+            needs_deploy: true,
+            paymaster_and_data: Vec::new(),
+            gas_bounds: GasBounds::DEPLOY_AND_SWEEP_DEVNET,
+        };
+        let op = crate::user_op::build_deploy_and_sweep_userop(params);
+        let op_hash = user_op_hash(
+            &op,
+            self.cfg.consensus.entry_point,
+            self.cfg.consensus.chain_id,
+        );
+
+        // Idempotent: if this exact op is already pending or already
+        // submitted, don't re-enqueue (also protects against re-deriving an
+        // unchanged op on a repeat/late-arriving threshold-reaching vote for
+        // the same already-credited balance).
+        if dbtx.get_value(&PendingUserOpKey(op_hash)).await.is_some()
+            || dbtx.get_value(&SubmittedUserOpKey(op_hash)).await.is_some()
+        {
+            return;
+        }
+
+        let created_block = self.consensus_block_count(dbtx).await;
+        dbtx.insert_entry(
+            &PendingUserOpKey(op_hash),
+            &PendingUserOp {
+                op: op.clone(),
+                purpose: UserOpPurpose::DeployAndSweep { source: account },
+                created_block,
+            },
+        )
+        .await;
+
+        // Same consensus-ordered `start_session` path Phase 6a's
+        // `debug_start_signing` uses -- every guardian processes this
+        // identical `Deposit` item, so every guardian starts the identical
+        // session deterministically (no separate `StartSigning` consensus
+        // item needed: unlike the debug endpoint, which fans a single
+        // guardian's local trigger out through consensus, this trigger is
+        // ALREADY inside `process_consensus_item`, so it runs on every
+        // guardian directly).
+        let digest = eth_signed_message_hash(op_hash);
+        self.start_session(dbtx, SigningPurpose::UserOp(op_hash), digest, 0)
+            .await;
+    }
+
+    /// This federation's fixed pool `SimpleAccount` address (see
+    /// [`derive_pool_account`]) -- a pure function of config, computed fresh
+    /// on every call rather than cached, so it is trivially identical on
+    /// every guardian and never goes stale if config were ever inspected
+    /// before [`PoolState`] exists in the DB yet.
+    fn pool_account(&self) -> fedimint_usdt_common::EvmAddress {
+        derive_pool_account(
+            &self.cfg.consensus.group_public_key,
+            self.cfg.consensus.account_factory,
+            self.cfg.consensus.simple_account_impl,
+        )
+    }
+
+    /// Applies a threshold-agreed [`UserOpConfirmedObservation`] for
+    /// `op_hash`: if `success`, credits `PoolState.balance` by `obs.swept`
+    /// and marks the corresponding [`DepositRecord`] (recovered from the
+    /// [`SubmittedUserOp`]'s own `op.sender`, i.e. the swept deposit
+    /// account) as swept forward. Either way, clears the now-finalized
+    /// [`SubmittedUserOp`] and the op's vote prefix. Replay-safe: if
+    /// `SubmittedUserOpKey(op_hash)` is already absent (a prior
+    /// threshold-reaching duplicate vote already applied this `op_hash`), this
+    /// is a no-op.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of `op_hash`, `obs` (both from the ordered consensus
+    /// item), and prior consensus-DB state (`SubmittedUserOp`/`PoolState`/
+    /// `DepositRecord`) -- byte-identical on every guardian, signer or not.
+    /// `obs` itself is federation-agreed (only reached after >= threshold
+    /// IDENTICAL votes, verified by the caller's full-field `PartialEq`
+    /// tally), so using its `success`/`swept` fields here is not reading
+    /// any single guardian's local RPC result.
+    async fn apply_user_op_confirmed(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        op_hash: [u8; 32],
+        obs: &UserOpConfirmedObservation,
+    ) {
+        let Some(submitted) = dbtx.get_value(&SubmittedUserOpKey(op_hash)).await else {
+            // Already applied by an earlier threshold-reaching vote for this
+            // op_hash (e.g. a late peer's vote pushes `agreeing` past
+            // threshold again after a prior vote already applied it).
+            dbtx.remove_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
+                .await;
+            return;
+        };
+
+        if obs.success {
+            let mut pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
+                account: self.pool_account(),
+                balance: UsdtAmount(0),
+            });
+            pool.balance = UsdtAmount(pool.balance.0 + obs.swept.0);
+            dbtx.insert_entry(&PoolStateKey, &pool).await;
+
+            let source = submitted.signed.unsigned.sender;
+            if let Some(mut record) = dbtx.get_value(&DepositRecordKey(source)).await {
+                record.swept = UsdtAmount((record.swept.0 + obs.swept.0).min(record.credited.0));
+                dbtx.insert_entry(&DepositRecordKey(source), &record).await;
+            }
+        }
+
+        dbtx.remove_entry(&SubmittedUserOpKey(op_hash)).await;
+        dbtx.remove_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
+            .await;
     }
 
     /// Derives `claim_pk`'s deposit account and enqueues a guardian-local
@@ -1490,13 +1991,33 @@ impl Usdt {
     /// # Determinism (consensus-critical)
     ///
     /// A pure function of the item, prior consensus-DB state
-    /// (`SigningSession`), and config (`group_public_key`) -- byte-identical
-    /// on every guardian, signer or not, and independent of `our_peer_id`.
-    /// The ONLY consensus-DB write is `SigningSessionKey`'s `state ->
-    /// Completed(signature)`. Verifying the signature against the group key
-    /// BEFORE writing it (rather than trusting the proposer) is a Byzantine
-    /// guard: a malformed or forged proposal must never enter the agreed
-    /// record, no matter which peer proposed it.
+    /// (`SigningSession`, and -- for a `SigningPurpose::UserOp` session --
+    /// its `PendingUserOp`), and config (`group_public_key`) --
+    /// byte-identical on every guardian, signer or not, and independent of
+    /// `our_peer_id`. The consensus-DB writes are `SigningSessionKey`'s
+    /// `state -> Completed(signature)` and, for a `UserOp`-purpose session
+    /// only, the deterministic `SubmittedUserOp` insert / `PendingUserOp`
+    /// removal (Phase 7, Task 5) described below. Verifying the signature
+    /// against the group key BEFORE writing it (rather than trusting the
+    /// proposer) is a Byzantine guard: a malformed or forged proposal must
+    /// never enter the agreed record, no matter which peer proposed it.
+    ///
+    /// **`UserOp` finalization (Phase 7, Task 5).** If `session.purpose` is
+    /// `SigningPurpose::UserOp(op_hash)`, this ALSO assembles the 65-byte
+    /// Ethereum `SignedUserOp` from the now-verified compact `(r, s)` (via
+    /// [`assemble_eth_signature`], brute-forcing the recovery id against the
+    /// group-key owner -- deterministic, and, since `signature` already
+    /// verified against `group_public_key` over `session.digest` above,
+    /// mathematically guaranteed to succeed) and writes it as a
+    /// `SubmittedUserOp`, clearing the `PendingUserOp`. This is done in the
+    /// SAME arm (not a separate consensus item) because the agreed signature
+    /// is already fully determined by this item alone -- every guardian,
+    /// including non-signers, computes the identical `SignedUserOp` from it.
+    /// All fallible steps (signature parse/verify, signature assembly, the
+    /// `PendingUserOp` lookup) happen BEFORE any write in this function, so
+    /// either everything here commits or (only in the unreachable case
+    /// `assemble_eth_signature` fails, which the verified-signature
+    /// precondition rules out) nothing does.
     async fn process_mpc_signature(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -1523,10 +2044,53 @@ impl Usdt {
             )
             .map_err(|_| anyhow::anyhow!("MpcSignature does not verify against the group key"))?;
 
+        // Prepare the UserOp-finalization write (if any) BEFORE any write
+        // happens below -- see this method's doc comment.
+        let finalized_user_op = if let SigningPurpose::UserOp(op_hash) = session.purpose {
+            match dbtx.get_value(&PendingUserOpKey(op_hash)).await {
+                Some(pending) => {
+                    let compact: [u8; 64] = signature.as_slice().try_into().map_err(|_| {
+                        anyhow::anyhow!("MPC signature is not the expected 64-byte compact length")
+                    })?;
+                    let owner = evm_address(&self.cfg.consensus.group_public_key);
+                    let eth_sig =
+                        assemble_eth_signature(compact, session.digest, owner).map_err(|err| {
+                            anyhow::anyhow!(
+                                "failed to assemble the Ethereum signature for completed \
+                                 UserOp session {session_id:?} (op_hash {op_hash:?}): {err}"
+                            )
+                        })?;
+                    Some((op_hash, pending, eth_sig))
+                }
+                // Already finalized by a racing attempt of the same digest
+                // that reached `Completed` first; nothing left to do.
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let mut completed = session;
         completed.state = SessionState::Completed(signature);
         dbtx.insert_entry(&SigningSessionKey(session_id), &completed)
             .await;
+
+        if let Some((op_hash, pending, eth_sig)) = finalized_user_op {
+            let submitted_block = self.consensus_block_count(dbtx).await;
+            let signed = SignedUserOp {
+                unsigned: pending.op,
+                signature: eth_sig.to_vec(),
+            };
+            dbtx.insert_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed,
+                    submitted_block,
+                },
+            )
+            .await;
+            dbtx.remove_entry(&PendingUserOpKey(op_hash)).await;
+        }
 
         Ok(())
     }
@@ -2891,6 +3455,7 @@ mod tests {
                     credited: UsdtAmount(5_000_000),
                     claimed: UsdtAmount(0),
                     last_observed_block: 0,
+                    swept: UsdtAmount(0),
                 },
             )
             .await;
@@ -3136,6 +3701,7 @@ mod tests {
                     credited: UsdtAmount(5_000_000),
                     claimed: UsdtAmount(2_000_000),
                     last_observed_block: 42,
+                    swept: UsdtAmount(0),
                 },
             )
             .await;
@@ -3586,6 +4152,621 @@ mod tests {
                 .expect("infallible"),
             Some(receipt)
         );
+    }
+
+    /// **Phase 7 Task 5.** Drives the FULL deposit-credited -> deterministic
+    /// `PendingUserOp`+`SigningPurpose::UserOp` session trigger -> real
+    /// cggmp21 MPC signing -> deterministic `SubmittedUserOp` finalization
+    /// pipeline across 4 independently-simulated guardians, asserting every
+    /// consensus-DB write this task introduces is byte-identical across ALL
+    /// FOUR guardians -- including the non-signer peer 3, which cannot
+    /// itself compute a signature but must still end up holding the
+    /// identical federation-agreed `SubmittedUserOp`. Also verifies the
+    /// assembled 65-byte Ethereum signature actually recovers to the
+    /// group-key owner.
+    ///
+    /// Slow: drives real cggmp21 signing to completion (mirrors
+    /// `mpc_signature_consensus_item_completes_session_on_every_guardian`).
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn deposit_credit_deterministically_drives_pending_user_op_through_real_mpc_to_submitted()
+    {
+        const N: u16 = 4;
+        let peers: Vec<PeerId> = (0..N).map(PeerId::from).collect();
+        let num_peers = peers.to_num_peers();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(
+            &peers,
+            &args,
+            &fedimint_usdt_common::UsdtGenParams::default(),
+        );
+
+        let mut modules: BTreeMap<PeerId, Usdt> = BTreeMap::new();
+        for &peer in &peers {
+            let cfg = server_cfgs[&peer]
+                .clone()
+                .to_typed::<UsdtConfig>()
+                .expect("config was just generated by the same configgen");
+            let db = fedimint_core::db::Database::new(
+                fedimint_core::db::mem_impl::MemDatabase::new(),
+                fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+            );
+            modules.insert(
+                peer,
+                Usdt::new_for_test(cfg, MockEvmRpc::default().into_dyn(), db, peer, num_peers),
+            );
+        }
+
+        let claim_pk = test_pubkey(0x70);
+        let group_public_key = server_cfgs[&peers[0]]
+            .clone()
+            .to_typed::<UsdtConfig>()
+            .expect("valid config")
+            .consensus
+            .group_public_key;
+        let account_factory = modules[&peers[0]].cfg.consensus.account_factory;
+        let simple_account_impl = modules[&peers[0]].cfg.consensus.simple_account_impl;
+        let account = derive_deposit_account(
+            &group_public_key,
+            account_factory,
+            simple_account_impl,
+            &claim_pk,
+        );
+
+        let obs = DepositObservation {
+            account,
+            balance: UsdtAmount(4_500_000),
+            block: 5,
+            claim_pk,
+        };
+
+        // Every guardian independently processes the identical ordered
+        // Deposit votes (threshold 3-of-4), triggering `maybe_trigger_sweep`.
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            for &voter in &[PeerId::from(0), PeerId::from(1), PeerId::from(2)] {
+                module
+                    .process_consensus_item(
+                        &mut dbtx.to_ref_nc(),
+                        UsdtConsensusItem::Deposit(obs.clone()),
+                        voter,
+                    )
+                    .await
+                    .expect("Deposit item processes cleanly");
+            }
+            dbtx.commit_tx().await;
+        }
+
+        // Every guardian deterministically triggered the identical
+        // DeployAndSweep PendingUserOp.
+        let mut op_hash: Option<[u8; 32]> = None;
+        for &peer in &peers {
+            let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
+            let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+                .find_by_prefix(&PendingUserOpPrefix)
+                .await
+                .collect()
+                .await;
+            assert_eq!(
+                pending.len(),
+                1,
+                "guardian {peer} must have exactly one PendingUserOp"
+            );
+            let (PendingUserOpKey(hash), record) = &pending[0];
+            assert_eq!(
+                record.purpose,
+                UserOpPurpose::DeployAndSweep { source: account }
+            );
+            assert_eq!(record.op.sender, account);
+            if let Some(expected) = op_hash {
+                assert_eq!(
+                    *hash, expected,
+                    "op_hash must be identical across guardians"
+                );
+            } else {
+                op_hash = Some(*hash);
+            }
+        }
+        let op_hash = op_hash.expect("at least one guardian in the federation");
+        let digest = eth_signed_message_hash(op_hash);
+        let session_id = signing_session_id(&digest, 0);
+
+        // Every guardian also deterministically started the identical
+        // UserOp-purpose signing session.
+        for &peer in &peers {
+            let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
+            let session = dbtx
+                .get_value(&SigningSessionKey(session_id))
+                .await
+                .expect("SigningSession present on every guardian");
+            assert_eq!(session.purpose, SigningPurpose::UserOp(op_hash));
+            assert_eq!(session.digest, digest);
+            assert_eq!(session.state, SessionState::InProgress);
+        }
+
+        // Drive the `MpcRound` consensus loop to completion (mirrors
+        // `mpc_signature_consensus_item_completes_session_on_every_guardian`).
+        let mut consensus_rounds = 0u32;
+        let mut captured_mpc_signature: Option<(PeerId, UsdtConsensusItem)> = None;
+        loop {
+            let mut proposed: Vec<(PeerId, MpcRoundItem)> = Vec::new();
+            for (&peer, module) in &modules {
+                let mut dbtx = module.db_for_test().begin_transaction().await;
+                let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+                dbtx.commit_tx().await;
+                for item in items {
+                    match item {
+                        UsdtConsensusItem::MpcRound(mpc) if mpc.session_id == session_id => {
+                            proposed.push((peer, mpc));
+                        }
+                        UsdtConsensusItem::MpcSignature {
+                            session_id: sid, ..
+                        } if sid == session_id && captured_mpc_signature.is_none() => {
+                            captured_mpc_signature = Some((peer, item));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if proposed.is_empty() {
+                break;
+            }
+
+            proposed.sort_by(|(a, ia), (b, ib)| {
+                (a, ia.session_id.0, ia.round, ia.chunk).cmp(&(
+                    b,
+                    ib.session_id.0,
+                    ib.round,
+                    ib.chunk,
+                ))
+            });
+
+            for (proposer, item) in &proposed {
+                for module in modules.values() {
+                    let mut dbtx = module.db_for_test().begin_transaction().await;
+                    module
+                        .process_consensus_item(
+                            &mut dbtx.to_ref_nc(),
+                            UsdtConsensusItem::MpcRound(item.clone()),
+                            *proposer,
+                        )
+                        .await
+                        .expect("every proposed MpcRound item must process cleanly");
+                    dbtx.commit_tx().await;
+                }
+            }
+
+            consensus_rounds += 1;
+            assert!(consensus_rounds < 1_000, "signing failed to converge");
+        }
+
+        let (proposer_peer, mpc_signature_item) =
+            captured_mpc_signature.expect("a finished signer must propose an MpcSignature item");
+
+        // Shuttle the SAME `MpcSignature` item to every guardian.
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    mpc_signature_item.clone(),
+                    proposer_peer,
+                )
+                .await
+                .expect("MpcSignature must process cleanly on every guardian");
+            dbtx.commit_tx().await;
+        }
+
+        // Every guardian -- signer and non-signer alike -- now holds an
+        // identical `SubmittedUserOp`, and the `PendingUserOp` is cleared.
+        let mut expected_signed: Option<fedimint_usdt_common::user_op::SignedUserOp> = None;
+        for &peer in &peers {
+            let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
+            assert!(
+                dbtx.get_value(&PendingUserOpKey(op_hash)).await.is_none(),
+                "guardian {peer}'s PendingUserOp must be cleared"
+            );
+            let submitted = dbtx
+                .get_value(&SubmittedUserOpKey(op_hash))
+                .await
+                .unwrap_or_else(|| panic!("guardian {peer} must hold a SubmittedUserOp"));
+            if let Some(expected) = &expected_signed {
+                assert_eq!(
+                    &submitted.signed, expected,
+                    "guardian {peer}'s SignedUserOp must be byte-identical to every other \
+                     guardian's"
+                );
+            } else {
+                expected_signed = Some(submitted.signed.clone());
+            }
+        }
+
+        // The assembled Ethereum signature recovers to the group-key owner
+        // over the EIP-191-wrapped digest.
+        let signed = expected_signed.expect("at least one guardian in the federation");
+        assert_eq!(signed.signature.len(), 65);
+        let owner = evm_address(&group_public_key);
+        let recid = secp256k1::ecdsa::RecoveryId::from_i32(i32::from(signed.signature[64] - 27))
+            .expect("valid recovery id");
+        let recoverable =
+            secp256k1::ecdsa::RecoverableSignature::from_compact(&signed.signature[..64], recid)
+                .expect("valid compact sig");
+        let recovered_pk = recoverable
+            .recover(&secp256k1::Message::from_digest(digest))
+            .expect("recovery succeeds for the signature's own digest");
+        assert_eq!(
+            evm_address(&recovered_pk),
+            owner,
+            "assembled signature must recover to the group-key owner"
+        );
+    }
+
+    /// **Phase 7 Task 5.** `UserOpConfirmed` mirrors `Deposit`'s exact
+    /// observation-quorum shape: below threshold, no state change beyond the
+    /// per-peer vote; a DIFFERING vote does not count toward the same
+    /// tally; at threshold, `PoolState.balance` is credited and the swept
+    /// deposit's `DepositRecord.swept` advances, and the `SubmittedUserOp` +
+    /// vote prefix are cleared. Also verifies replay-safety: a vote
+    /// re-delivered after the vote prefix was cleared is processed as a
+    /// fresh (below-threshold) vote rather than erroring, and a direct
+    /// re-invocation of `apply_user_op_confirmed` itself (the stronger
+    /// property: idempotent even if `agreeing >= threshold` were somehow
+    /// reached a second time) does not double-credit `PoolState` or
+    /// `DepositRecord.swept`.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn user_op_confirmed_applies_at_threshold_and_is_replay_safe() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let op_hash = [0x81; 32];
+        let source = EvmAddress([0x82; 20]);
+        let claim_pk = test_pubkey(0x83);
+        let pool_account = module.pool_account();
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(source),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(4_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                },
+            )
+            .await;
+            let mut sample = sample_unsigned_user_op_for_test();
+            sample.sender = source;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: sample,
+                        signature: vec![0xaa; 65],
+                    },
+                    submitted_block: 3,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: true,
+            block: 20,
+            swept: UsdtAmount(4_000_000),
+        };
+        let mut dbtx = db.begin_transaction().await;
+
+        // Two identical votes: below threshold, no PoolState/DepositRecord
+        // change yet, but each vote itself is recorded (`Ok`).
+        for p in [0u16, 1] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                .await
+                .expect("below-threshold vote processes cleanly");
+        }
+        assert!(
+            dbtx.to_ref_nc().get_value(&PoolStateKey).await.is_none(),
+            "PoolState must not exist before threshold"
+        );
+
+        // A DIFFERING vote (different `swept`) from peer 2 does not count
+        // toward the same tally.
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::UserOpConfirmed {
+                    op_hash,
+                    success: true,
+                    block: 20,
+                    swept: UsdtAmount(1),
+                },
+                PeerId::from(2),
+            )
+            .await
+            .expect("differing vote processes cleanly");
+        assert!(dbtx.to_ref_nc().get_value(&PoolStateKey).await.is_none());
+
+        // Third IDENTICAL vote reaches threshold -> applied.
+        module
+            .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(3))
+            .await
+            .expect("threshold-reaching vote processes cleanly");
+
+        let pool = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState created at threshold");
+        assert_eq!(pool.account, pool_account);
+        assert_eq!(pool.balance, UsdtAmount(4_000_000));
+
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(source))
+            .await
+            .expect("DepositRecord still present");
+        assert_eq!(record.swept, UsdtAmount(4_000_000));
+
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(op_hash))
+                .await
+                .is_none(),
+            "SubmittedUserOp must be cleared once confirmed"
+        );
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .find_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
+                .await
+                .count()
+                .await,
+            0,
+            "vote prefix must be cleared once confirmed"
+        );
+
+        // `apply_user_op_confirmed` clears the ENTIRE vote prefix once
+        // threshold is reached (mirroring `credit_deposit`'s
+        // `DepositObservationVoteAccountPrefix` clear), so re-delivering a
+        // vote a peer already cast is no longer rejected as "redundant" --
+        // the stored entry is gone, so it is processed as a fresh vote
+        // towards a new round. It must NOT, on its own, re-trigger
+        // `apply_user_op_confirmed` (only 1 of the 3 needed votes is now
+        // present).
+        module
+            .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(0))
+            .await
+            .expect("a vote cast after the prefix was cleared is a fresh vote, not redundant");
+        let pool_still_single_credit = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState still present");
+        assert_eq!(
+            pool_still_single_credit.balance,
+            UsdtAmount(4_000_000),
+            "a single fresh vote below threshold must not re-credit the pool"
+        );
+
+        // Stronger replay-safety property, exercised directly:
+        // `apply_user_op_confirmed` itself is idempotent even if somehow
+        // invoked again after the `SubmittedUserOp` is already gone (e.g. a
+        // late peer's vote independently pushes `agreeing` past threshold a
+        // second time) -- it must not double-credit `PoolState` or
+        // `DepositRecord.swept`.
+        module
+            .apply_user_op_confirmed(
+                &mut dbtx.to_ref_nc(),
+                op_hash,
+                &UserOpConfirmedObservation {
+                    success: true,
+                    block: 20,
+                    swept: UsdtAmount(4_000_000),
+                },
+            )
+            .await;
+
+        let pool_after = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState still present");
+        assert_eq!(
+            pool_after.balance,
+            UsdtAmount(4_000_000),
+            "a replayed apply must not double-credit the pool"
+        );
+        let record_after = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(source))
+            .await
+            .expect("DepositRecord still present");
+        assert_eq!(
+            record_after.swept,
+            UsdtAmount(4_000_000),
+            "a replayed apply must not double-advance swept"
+        );
+    }
+
+    /// A failed `UserOp` (`success: false`) must NOT credit `PoolState` or
+    /// bump `DepositRecord.swept`, but must still clear the `SubmittedUserOp`
+    /// once threshold-agreed (Phase 7 scope: a failed sweep is not retried
+    /// within this phase -- see `maybe_trigger_sweep`'s doc comment).
+    #[tokio::test]
+    async fn user_op_confirmed_failure_clears_submitted_without_crediting_pool() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let op_hash = [0x91; 32];
+        let source = EvmAddress([0x92; 20]);
+        let claim_pk = test_pubkey(0x93);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(source),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(2_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                },
+            )
+            .await;
+            let mut sample = sample_unsigned_user_op_for_test();
+            sample.sender = source;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: sample,
+                        signature: vec![0xbb; 65],
+                    },
+                    submitted_block: 3,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: false,
+            block: 21,
+            swept: UsdtAmount(0),
+        };
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                .await
+                .expect("vote processes cleanly");
+        }
+
+        assert!(
+            dbtx.to_ref_nc().get_value(&PoolStateKey).await.is_none(),
+            "a failed sweep must never create/credit PoolState"
+        );
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(source))
+            .await
+            .expect("DepositRecord still present");
+        assert_eq!(
+            record.swept,
+            UsdtAmount(0),
+            "a failed sweep must not advance DepositRecord.swept"
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(op_hash))
+                .await
+                .is_none(),
+            "SubmittedUserOp must still be cleared once confirmed (even on failure)"
+        );
+    }
+
+    /// **Solvency-critical.** `audit` must report each on-chain USDT unit
+    /// EXACTLY once, whichever side of a sweep it currently sits on:
+    /// `PoolState.balance` (already-swept) PLUS `sum(credited - swept)`
+    /// (not-yet-swept remainder of every deposit) -- never `credited` and
+    /// `PoolState.balance` both counting the same swept USDT.
+    #[tokio::test]
+    async fn audit_reports_pool_balance_plus_unswept_credited_without_double_counting() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0xa0);
+
+        let fully_swept = EvmAddress([0xa1; 20]);
+        let partially_swept = EvmAddress([0xa2; 20]);
+        let never_swept = EvmAddress([0xa3; 20]);
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &DepositRecordKey(fully_swept),
+            &DepositRecord {
+                claim_pk,
+                credited: UsdtAmount(5_000_000),
+                claimed: UsdtAmount(0),
+                last_observed_block: 0,
+                swept: UsdtAmount(5_000_000),
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &DepositRecordKey(partially_swept),
+            &DepositRecord {
+                claim_pk,
+                credited: UsdtAmount(3_000_000),
+                claimed: UsdtAmount(0),
+                last_observed_block: 0,
+                swept: UsdtAmount(1_000_000),
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &DepositRecordKey(never_swept),
+            &DepositRecord {
+                claim_pk,
+                credited: UsdtAmount(2_000_000),
+                claimed: UsdtAmount(0),
+                last_observed_block: 0,
+                swept: UsdtAmount(0),
+            },
+        )
+        .await;
+        // PoolState.balance holds exactly what's been swept so far (5M +
+        // 1M = 6M), mirroring what `apply_user_op_confirmed` would have
+        // produced.
+        dbtx.insert_new_entry(
+            &PoolStateKey,
+            &PoolState {
+                account: module.pool_account(),
+                balance: UsdtAmount(6_000_000),
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        let mut audit = fedimint_core::module::audit::Audit::default();
+        module.audit(&mut dbtx.to_ref_nc(), &mut audit, 0).await;
+
+        let net = audit.net_assets().expect("no overflow").milli_sat;
+        // pool 6M + (5M-5M) + (3M-1M) + (2M-0) = 6M + 0 + 2M + 2M = 10M.
+        assert_eq!(
+            net, 10_000_000,
+            "every on-chain USDT unit must be counted exactly once"
+        );
+    }
+
+    /// Shared sample [`UnsignedUserOp`] for the `UserOpConfirmed` tests
+    /// above, whose `call_data` decodes to a `transfer(pool, 4_000_000)`
+    /// call via `crate::user_op::decode_transfer_amount` (exercised by
+    /// `spawn_user_op_submitter`, not directly by these consensus-level
+    /// tests, but kept realistic).
+    fn sample_unsigned_user_op_for_test() -> fedimint_usdt_common::user_op::UnsignedUserOp {
+        fedimint_usdt_common::user_op::UnsignedUserOp {
+            sender: EvmAddress([0; 20]),
+            nonce: alloy::primitives::U256::ZERO,
+            init_code: vec![],
+            call_data: vec![0xde, 0xad],
+            verification_gas_limit: 500_000,
+            call_gas_limit: 200_000,
+            pre_verification_gas: alloy::primitives::U256::from(100_000u64),
+            max_priority_fee_per_gas: 1_500_000_000,
+            max_fee_per_gas: 30_000_000_000,
+            paymaster_and_data: vec![],
+        }
     }
 }
 

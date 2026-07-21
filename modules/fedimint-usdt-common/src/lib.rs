@@ -111,6 +111,14 @@ impl fmt::Display for FeeVote {
 /// [`derive_deposit_account`]).
 pub const DEPOSIT_ADDRESS_DOMAIN: &[u8] = b"fedimint-usdt-deposit-v0";
 
+/// Domain-separation tag whose `keccak256` IS the pool account's CREATE2
+/// `salt` directly (see [`derive_pool_account`]) -- unlike
+/// [`DEPOSIT_ADDRESS_DOMAIN`], which is only ever mixed with a `claim_pk`
+/// (never used bare), the pool account is a single, fixed, well-known
+/// address per federation, so its salt has nothing else to be
+/// domain-separated against.
+pub const POOL_ACCOUNT_DOMAIN: &[u8] = b"fedimint-usdt-pool-v0";
+
 /// Domain-separation tag mixed into a signing session's id derivation (see
 /// [`signing_session_id`]).
 pub const SIGNING_SESSION_DOMAIN: &[u8] = b"fedimint-usdt-signing-v0";
@@ -263,10 +271,48 @@ pub fn derive_deposit_account(
     simple_account_impl: EvmAddress,
     claim_pk: &secp256k1::PublicKey,
 ) -> EvmAddress {
-    use alloy_sol_types::{SolCall as _, SolValue as _};
-
     let owner = evm_address(group_public_key);
     let salt = deposit_salt(claim_pk);
+    create2_simple_account(account_factory, simple_account_impl, owner, salt)
+}
+
+/// Derives the CREATE2 address of this federation's fixed pool `SimpleAccount`
+/// -- the swept-to destination of every deploy-and-sweep `UserOp` (Phase 7
+/// Task 5): `owner = evm_address(group_public_key)` (the same group key that
+/// owns every deposit account), `salt = keccak256(POOL_ACCOUNT_DOMAIN)` (a
+/// single fixed salt, not mixed with any claim key -- there is only ever one
+/// pool account per federation).
+///
+/// Pure function, no RPC -- every guardian (and, if a client ever needs it,
+/// the client too) calls this exact function so the pool address is
+/// bit-for-bit identical everywhere. Mirrors [`derive_deposit_account`]'s
+/// CREATE2 construction via the shared [`create2_simple_account`] helper.
+#[must_use]
+pub fn derive_pool_account(
+    group_public_key: &secp256k1::PublicKey,
+    account_factory: EvmAddress,
+    simple_account_impl: EvmAddress,
+) -> EvmAddress {
+    let owner = evm_address(group_public_key);
+    let salt: [u8; 32] = Keccak256::digest(POOL_ACCOUNT_DOMAIN).into();
+    create2_simple_account(account_factory, simple_account_impl, owner, salt)
+}
+
+/// Shared CREATE2 computation behind [`derive_deposit_account`] and
+/// [`derive_pool_account`]: `address = keccak256(0xff ‖ account_factory ‖
+/// salt ‖ keccak256(initCode))[12..]` (EIP-1014), where `initCode =
+/// ERC1967Proxy_creationCode ‖ abi.encode(simple_account_impl,
+/// SimpleAccount.initialize(owner))`, mirroring
+/// `SimpleAccountFactory.createAccount`'s `new ERC1967Proxy{salt}(
+/// address(accountImplementation), abi.encodeCall(SimpleAccount.initialize,
+/// (owner)))`. Pure function, no RPC.
+fn create2_simple_account(
+    account_factory: EvmAddress,
+    simple_account_impl: EvmAddress,
+    owner: EvmAddress,
+    salt: [u8; 32],
+) -> EvmAddress {
+    use alloy_sol_types::{SolCall as _, SolValue as _};
 
     let initialize_calldata = ISimpleAccountInit::initializeCall {
         anOwner: alloy_primitives::Address::from(owner.0),
@@ -421,6 +467,48 @@ pub struct DepositStatusResponse {
     pub claimable: UsdtAmount,
 }
 
+/// Response to the `pool_state` diagnostic endpoint (Phase 7, Task 5):
+/// the pool `SimpleAccount`'s derived address (see [`derive_pool_account`])
+/// and the consensus-agreed USDT balance swept into it so far. Read directly
+/// from consensus DB, so any guardian answers identically once
+/// `UsdtConsensusItem::UserOpConfirmed` has reached threshold agreement for
+/// a sweep; `balance` is `0` (with `account` still populated) before the
+/// first successful sweep, mirroring [`DepositStatusResponse`]'s
+/// pre-credit-zeros shape.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct PoolStateResponse {
+    pub account: EvmAddress,
+    pub balance: UsdtAmount,
+}
+
+/// Request for the [`UserOpStatus`] of a specific `UserOp`, identified by its
+/// [`user_op::user_op_hash`].
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct UserOpStatusRequest {
+    pub op_hash: [u8; 32],
+}
+
+/// The consensus-agreed lifecycle stage of a `UserOp` (Phase 7, Task 5):
+/// `Pending` while awaiting/undergoing MPC signing (a `PendingUserOp`
+/// consensus record exists), `Submitted` once federation-agreed-signed and
+/// awaiting/undergoing on-chain confirmation (a `SubmittedUserOp` consensus
+/// record exists), `Unknown` once confirmed (both records cleared -- see
+/// [`PoolStateResponse`] for the confirmed sweep's effect) or if `op_hash`
+/// was never seen at all. Read directly from consensus DB, so any guardian
+/// answers identically.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub enum UserOpStatus {
+    Pending,
+    Submitted,
+    Unknown,
+}
+
+/// Response to the `userop_status` diagnostic endpoint (Phase 7, Task 5).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct UserOpStatusResponse {
+    pub status: UserOpStatus,
+}
+
 /// Per-instance config-gen params for the USDT module (Phase 4.5 mechanism).
 ///
 /// `Default` targets a local `anvil` dev federation: chain id 31337 and a
@@ -508,6 +596,27 @@ pub enum UsdtConsensusItem {
     /// (`attempt + 1`) under a rotated subset (see `Usdt::signer_subset` /
     /// `Usdt::start_session`), performing the identical consensus-DB writes.
     RotateSigning { session_id: SigningSessionId },
+    /// One guardian's threshold-voted observation that `op_hash`'s
+    /// `UserOp` has landed on-chain (Phase 7, Task 5) -- mirrors
+    /// [`Self::Deposit`]'s observation-quorum shape exactly (dual-prefix
+    /// per-peer vote, full-field `PartialEq` tally, unbounded-history
+    /// `Err`-on-redundant). `success`/`block` come from the guardian-local
+    /// deposit-checker-style background task's read of
+    /// `IServerEvmRpc::get_user_op_receipt` (a guardian-local RPC result,
+    /// never itself a consensus write); `swept` is the amount actually
+    /// moved (self-contained in the vote so the applying guardian need not
+    /// re-derive it). Processing this item (`fedimint_usdt_server::Usdt::
+    /// process_consensus_item`'s `UserOpConfirmed` arm) is a pure function
+    /// of the item, prior consensus DB state (the per-peer vote tally and
+    /// the `SubmittedUserOp`/`PoolState`/`DepositRecord` records it updates
+    /// at threshold), and config -- byte-identical on every guardian,
+    /// signer or not.
+    UserOpConfirmed {
+        op_hash: [u8; 32],
+        success: bool,
+        block: u64,
+        swept: UsdtAmount,
+    },
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -813,6 +922,55 @@ mod tests {
                 .expect("UsdtConsensusItem::MpcSignature should decode what it just encoded");
 
         assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn test_usdt_consensus_item_user_op_confirmed_round_trips_through_consensus_encoding() {
+        let item = UsdtConsensusItem::UserOpConfirmed {
+            op_hash: [6; 32],
+            success: true,
+            block: 77,
+            swept: UsdtAmount(1_234_000),
+        };
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("UsdtConsensusItem::UserOpConfirmed should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn derive_pool_account_is_deterministic_and_distinct_from_deposit_accounts() {
+        let group = secp256k1::SecretKey::from_slice(&[7u8; 32])
+            .unwrap()
+            .public_key(secp256k1::SECP256K1);
+        let other_group = secp256k1::SecretKey::from_slice(&[8u8; 32])
+            .unwrap()
+            .public_key(secp256k1::SECP256K1);
+        let claim = secp256k1::SecretKey::from_slice(&[9u8; 32])
+            .unwrap()
+            .public_key(secp256k1::SECP256K1);
+        let factory = EvmAddress([0xfa; 20]);
+        let simple_account_impl = EvmAddress([0x1e; 20]);
+
+        // Deterministic.
+        assert_eq!(
+            derive_pool_account(&group, factory, simple_account_impl),
+            derive_pool_account(&group, factory, simple_account_impl)
+        );
+        // Distinct per group key (a different federation's pool never
+        // collides).
+        assert_ne!(
+            derive_pool_account(&group, factory, simple_account_impl),
+            derive_pool_account(&other_group, factory, simple_account_impl)
+        );
+        // Distinct from any deposit account derived under the same group key
+        // (the pool is never mistaken for a claimant's deposit address).
+        assert_ne!(
+            derive_pool_account(&group, factory, simple_account_impl),
+            derive_deposit_account(&group, factory, simple_account_impl, &claim)
+        );
     }
 
     #[test]
