@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
+use fedimint_usdt_common::user_op::{SignedUserOp, UserOpReceipt};
 use fedimint_usdt_common::{EvmAddress, FeeVote, UsdtAmount};
 use fedimint_usdt_server::rpc::IServerEvmRpc;
 
@@ -26,6 +27,11 @@ struct State {
     code_len: HashMap<EvmAddress, usize>,
     fee: FeeVote,
     sent_raw_transactions: Vec<Vec<u8>>,
+    /// Every `SignedUserOp` batch previously passed to `submit_user_ops`, in
+    /// call order (Phase 7 Task 4).
+    submitted_user_ops: Vec<Vec<SignedUserOp>>,
+    /// Scripted `get_user_op_receipt` responses, keyed by `user_op_hash`.
+    user_op_receipts: HashMap<[u8; 32], UserOpReceipt>,
 }
 
 impl Default for State {
@@ -40,6 +46,8 @@ impl Default for State {
                 usdt_per_eth_e6: 0,
             },
             sent_raw_transactions: Vec::new(),
+            submitted_user_ops: Vec::new(),
+            user_op_receipts: HashMap::new(),
         }
     }
 }
@@ -120,6 +128,19 @@ impl MockEvmRpc {
         self.lock().sent_raw_transactions.clone()
     }
 
+    /// Every `SignedUserOp` batch previously passed to
+    /// [`IServerEvmRpc::submit_user_ops`], in call order (Phase 7 Task 4).
+    #[must_use]
+    pub fn submitted_user_ops(&self) -> Vec<Vec<SignedUserOp>> {
+        self.lock().submitted_user_ops.clone()
+    }
+
+    /// Scripts the [`UserOpReceipt`]
+    /// [`IServerEvmRpc::get_user_op_receipt`] returns for `user_op_hash`.
+    pub fn set_user_op_receipt(&self, user_op_hash: [u8; 32], receipt: UserOpReceipt) {
+        self.lock().user_op_receipts.insert(user_op_hash, receipt);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -173,6 +194,18 @@ impl IServerEvmRpc for MockEvmRpc {
         state.sent_raw_transactions.push(signed_tx);
 
         Ok(hash)
+    }
+
+    async fn submit_user_ops(&self, ops: Vec<SignedUserOp>) -> anyhow::Result<()> {
+        self.lock().submitted_user_ops.push(ops);
+        Ok(())
+    }
+
+    async fn get_user_op_receipt(
+        &self,
+        user_op_hash: [u8; 32],
+    ) -> anyhow::Result<Option<UserOpReceipt>> {
+        Ok(self.lock().user_op_receipts.get(&user_op_hash).copied())
     }
 }
 
@@ -276,6 +309,56 @@ mod tests {
         assert_eq!(
             mock.sent_raw_transactions(),
             vec![vec![1, 2, 3], vec![4, 5, 6]]
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_user_ops_and_get_user_op_receipt_round_trip() {
+        use fedimint_usdt_common::user_op::UnsignedUserOp;
+
+        let mock = MockEvmRpc::new();
+
+        let unsigned = UnsignedUserOp {
+            sender: EvmAddress([0x11; 20]),
+            nonce: alloy::primitives::U256::ZERO,
+            init_code: vec![],
+            call_data: vec![0xde, 0xad],
+            verification_gas_limit: 1,
+            call_gas_limit: 1,
+            pre_verification_gas: alloy::primitives::U256::ZERO,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 1,
+            paymaster_and_data: vec![],
+        };
+        let signed = SignedUserOp {
+            unsigned,
+            signature: vec![0xaa; 65],
+        };
+
+        mock.submit_user_ops(vec![signed.clone()])
+            .await
+            .expect("infallible");
+        assert_eq!(mock.submitted_user_ops(), vec![vec![signed]]);
+
+        let user_op_hash = [0x22u8; 32];
+        assert_eq!(
+            mock.get_user_op_receipt(user_op_hash)
+                .await
+                .expect("infallible"),
+            None
+        );
+
+        let receipt = UserOpReceipt {
+            success: true,
+            block: 7,
+            actual_cost_usdt: UsdtAmount(500),
+        };
+        mock.set_user_op_receipt(user_op_hash, receipt);
+        assert_eq!(
+            mock.get_user_op_receipt(user_op_hash)
+                .await
+                .expect("infallible"),
+            Some(receipt)
         );
     }
 }

@@ -71,6 +71,7 @@ pub mod config;
 pub mod db;
 pub mod rpc;
 pub mod signing;
+pub mod user_op;
 
 /// Generates the module
 #[derive(Debug, Clone, Default)]
@@ -251,7 +252,12 @@ impl ServerModuleInit for UsdtInit {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| cfg.private.local.evm_rpc_url.clone());
-            AlloyEvmRpc::new(&evm_rpc_url)?.into_dyn()
+            let mut rpc =
+                AlloyEvmRpc::new(&evm_rpc_url)?.with_entry_point(cfg.consensus.entry_point);
+            if let Some(broadcaster_private_key) = &cfg.private.local.broadcaster_private_key {
+                rpc = rpc.with_broadcaster(broadcaster_private_key)?;
+            }
+            rpc.into_dyn()
         };
         Ok(Usdt::new(
             cfg,
@@ -311,6 +317,7 @@ impl ServerModuleInit for UsdtInit {
                         mpc_encryption_sk: mpc_encryption_keys[&peer].0,
                         local: UsdtConfigLocal {
                             evm_rpc_url: crate::config::default_evm_rpc_url(),
+                            broadcaster_private_key: None,
                         },
                     },
                     consensus: UsdtConfigConsensus {
@@ -2006,6 +2013,15 @@ mod tests {
                 BTreeMap<u64, fedimint_usdt_common::UsdtAmount>,
             >,
         >,
+        /// Every `SignedUserOp` batch passed to `submit_user_ops`, in call
+        /// order (Phase 7 Task 4), so tests can assert on what consensus
+        /// logic attempted to submit.
+        submitted_user_ops: Mutex<Vec<Vec<fedimint_usdt_common::user_op::SignedUserOp>>>,
+        /// Scripted `get_user_op_receipt` responses, keyed by `user_op_hash`.
+        /// Unset hashes read as `None` (op not yet included on-chain).
+        user_op_receipts: Mutex<
+            std::collections::HashMap<[u8; 32], fedimint_usdt_common::user_op::UserOpReceipt>,
+        >,
     }
 
     impl MockEvmRpc {
@@ -2026,6 +2042,29 @@ mod tests {
                 .entry((token, holder))
                 .or_default()
                 .insert(block, balance);
+        }
+
+        /// Scripts the [`fedimint_usdt_common::user_op::UserOpReceipt`]
+        /// `get_user_op_receipt(user_op_hash)` returns.
+        fn set_user_op_receipt(
+            &self,
+            user_op_hash: [u8; 32],
+            receipt: fedimint_usdt_common::user_op::UserOpReceipt,
+        ) {
+            self.user_op_receipts
+                .lock()
+                .expect("not poisoned")
+                .insert(user_op_hash, receipt);
+        }
+
+        /// Every `SignedUserOp` batch previously passed to
+        /// `submit_user_ops`, in call order.
+        #[allow(dead_code)]
+        fn submitted_user_ops(&self) -> Vec<Vec<fedimint_usdt_common::user_op::SignedUserOp>> {
+            self.submitted_user_ops
+                .lock()
+                .expect("not poisoned")
+                .clone()
         }
     }
 
@@ -2070,6 +2109,29 @@ mod tests {
 
         async fn send_raw_transaction(&self, _signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]> {
             Ok([0u8; 32])
+        }
+
+        async fn submit_user_ops(
+            &self,
+            ops: Vec<fedimint_usdt_common::user_op::SignedUserOp>,
+        ) -> anyhow::Result<()> {
+            self.submitted_user_ops
+                .lock()
+                .expect("not poisoned")
+                .push(ops);
+            Ok(())
+        }
+
+        async fn get_user_op_receipt(
+            &self,
+            user_op_hash: [u8; 32],
+        ) -> anyhow::Result<Option<fedimint_usdt_common::user_op::UserOpReceipt>> {
+            Ok(self
+                .user_op_receipts
+                .lock()
+                .expect("not poisoned")
+                .get(&user_op_hash)
+                .copied())
         }
     }
 
@@ -3468,6 +3530,61 @@ mod tests {
         assert!(
             result.is_err(),
             "a second identical MpcSignature must be rejected as redundant"
+        );
+    }
+
+    /// Phase 7 Task 4: `MockEvmRpc::submit_user_ops`/`get_user_op_receipt`
+    /// round-trip -- submitted batches are recorded in call order, and a
+    /// scripted receipt is returned for its hash while an unscripted hash
+    /// reads back `None`.
+    #[tokio::test]
+    async fn mock_evm_rpc_submit_and_receipt_round_trip() {
+        use fedimint_usdt_common::user_op::{SignedUserOp, UnsignedUserOp, UserOpReceipt};
+
+        let mock = MockEvmRpc::default();
+
+        let unsigned = UnsignedUserOp {
+            sender: fedimint_usdt_common::EvmAddress([0x11; 20]),
+            nonce: alloy::primitives::U256::ZERO,
+            init_code: vec![],
+            call_data: vec![0xde, 0xad],
+            verification_gas_limit: 1,
+            call_gas_limit: 1,
+            pre_verification_gas: alloy::primitives::U256::ZERO,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 1,
+            paymaster_and_data: vec![],
+        };
+        let signed = SignedUserOp {
+            unsigned,
+            signature: vec![0xaa; 65],
+        };
+
+        mock.submit_user_ops(vec![signed.clone()])
+            .await
+            .expect("MockEvmRpc::submit_user_ops never fails");
+        assert_eq!(mock.submitted_user_ops(), vec![vec![signed]]);
+
+        let user_op_hash = [0x22u8; 32];
+        assert_eq!(
+            mock.get_user_op_receipt(user_op_hash)
+                .await
+                .expect("infallible"),
+            None,
+            "an unscripted user_op_hash must read back as not-yet-included"
+        );
+
+        let receipt = UserOpReceipt {
+            success: true,
+            block: 42,
+            actual_cost_usdt: fedimint_usdt_common::UsdtAmount(1_000),
+        };
+        mock.set_user_op_receipt(user_op_hash, receipt);
+        assert_eq!(
+            mock.get_user_op_receipt(user_op_hash)
+                .await
+                .expect("infallible"),
+            Some(receipt)
         );
     }
 }

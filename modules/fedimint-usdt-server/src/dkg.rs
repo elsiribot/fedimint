@@ -302,6 +302,7 @@ pub(crate) async fn distributed_gen(
             // phases/ops override via config.
             local: UsdtConfigLocal {
                 evm_rpc_url: crate::config::default_evm_rpc_url(),
+                broadcaster_private_key: None,
             },
         },
         consensus: UsdtConfigConsensus {

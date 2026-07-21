@@ -21,7 +21,7 @@ use fedimint_core::encoding::{Decodable, DecodeError, Encodable};
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use serde::{Deserialize, Serialize};
 
-use crate::EvmAddress;
+use crate::{EvmAddress, UsdtAmount};
 
 alloy_sol_types::sol! {
     // Applies to every item in this macro invocation (must be the block's
@@ -290,6 +290,63 @@ pub fn user_op_hash(op: &UnsignedUserOp, entry_point: EvmAddress, chain_id: u64)
     keccak256(outer_preimage).0
 }
 
+/// EIP-191's `toEthSignedMessageHash`: `keccak256("\x19Ethereum Signed
+/// Message:\n32" ‖ user_op_hash)`.
+///
+/// This is the digest `SimpleAccount` v0.7's `_validateSignature` actually
+/// checks a `UserOp`'s `signature` against -- **not** the raw [`user_op_hash`]
+/// -- via `MessageHashUtils.toEthSignedMessageHash(userOpHash)` followed by
+/// `ECDSA.recover(hash, userOp.signature) == owner`
+/// (`@account-abstraction/contracts@0.7.0`'s `samples/SimpleAccount.sol`).
+/// So the Phase-6 MPC signing loop must sign *this* wrapped digest, not
+/// `user_op_hash` directly, and
+/// `fedimint_usdt_server::user_op::assemble_eth_signature` (Phase 7 Task 4)
+/// must recover against it too.
+///
+/// Pure function, no RPC -- wasm-safe, callable from both client and every
+/// guardian.
+#[must_use]
+pub fn eth_signed_message_hash(user_op_hash: [u8; 32]) -> [u8; 32] {
+    const EIP_191_PREFIX: &[u8] = b"\x19Ethereum Signed Message:\n32";
+
+    let mut preimage = Vec::with_capacity(EIP_191_PREFIX.len() + 32);
+    preimage.extend_from_slice(EIP_191_PREFIX);
+    preimage.extend_from_slice(&user_op_hash);
+
+    keccak256(preimage).0
+}
+
+/// The outcome of a submitted [`SignedUserOp`], read back from the
+/// `EntryPoint`'s `UserOperationEvent` log (Phase 7 Task 4,
+/// `IServerEvmRpc::get_user_op_receipt`).
+///
+/// Plain data (no RPC/provider surface) so it can live in this WASM-safe
+/// crate even though only the server ever constructs one.
+///
+/// `actual_cost_usdt` is, for now, `UserOperationEvent.actualGasCost`
+/// **verbatim, in wei** -- NOT actually USDT-denominated yet. This task's
+/// `AlloyEvmRpc::submit_user_ops` calls `handleOps` with an empty
+/// `paymasterAndData` (broadcaster-EOA-fronted ETH gas; see the Phase-7
+/// plan's paymaster-economics scope decision), so no USDT is charged for gas
+/// at all in this flow. The field is named/typed to match the master plan's
+/// eventual schema; Phase 8's token-paymaster wiring is expected to either
+/// populate a real USDT conversion here or replace this field once real
+/// paymaster economics land. Treat this as wei until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserOpReceipt {
+    /// Whether the `UserOp`'s `callData` execution succeeded (the
+    /// `UserOperationEvent.success` flag). `false` means the op was
+    /// validated and included on-chain (so it consumed its nonce) but its
+    /// `callData` call reverted -- distinct from the op never landing at
+    /// all, which is `IServerEvmRpc::get_user_op_receipt` returning `None`.
+    pub success: bool,
+    /// The block the `UserOperationEvent` was emitted in.
+    pub block: u64,
+    /// See this struct's doc comment: currently the raw
+    /// `actualGasCost` wei value, not a true USDT amount.
+    pub actual_cost_usdt: UsdtAmount,
+}
+
 #[cfg(test)]
 mod tests {
     use fedimint_core::encoding::{Decodable, Encodable};
@@ -511,5 +568,31 @@ mod tests {
             user_op_hash(&signed_a.unsigned, entry_point, 31337),
             user_op_hash(&signed_b.unsigned, entry_point, 31337)
         );
+    }
+
+    #[test]
+    fn eth_signed_message_hash_matches_eip_191_by_hand() {
+        let user_op_hash = [0x77u8; 32];
+
+        let mut expected_preimage = b"\x19Ethereum Signed Message:\n32".to_vec();
+        expected_preimage.extend_from_slice(&user_op_hash);
+        let expected = keccak256(expected_preimage).0;
+
+        assert_eq!(eth_signed_message_hash(user_op_hash), expected);
+    }
+
+    #[test]
+    fn eth_signed_message_hash_is_deterministic_and_input_sensitive() {
+        assert_eq!(
+            eth_signed_message_hash([0x11; 32]),
+            eth_signed_message_hash([0x11; 32])
+        );
+        assert_ne!(
+            eth_signed_message_hash([0x11; 32]),
+            eth_signed_message_hash([0x22; 32])
+        );
+        // The wrapped digest must differ from the raw input (i.e. the
+        // EIP-191 prefix must actually be mixed in, not a no-op).
+        assert_ne!(eth_signed_message_hash([0x33; 32]), [0x33; 32]);
     }
 }

@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
@@ -21,8 +21,10 @@ use fedimint_usdt_server::rpc::{AlloyEvmRpc, IServerEvmRpc};
 
 /// Private key of `anvil`'s first deterministic default account (derived
 /// from its well-known dev mnemonic), used as the deployer/miner-funded
-/// account for contract creation in [`deploy_test_erc20`].
-const ANVIL_ACCOUNT_0_PRIVATE_KEY: &str =
+/// account for contract creation in [`deploy_test_erc20`]/
+/// [`deploy_4337_stack`], and (Phase 7 Task 4) as the broadcaster EOA
+/// `tests/user_op_isolation.rs` fronts `handleOps` gas from.
+pub const ANVIL_ACCOUNT_0_PRIVATE_KEY: &str =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
 /// Private key of `anvil`'s second deterministic default account. Exposed so
@@ -270,9 +272,13 @@ pub async fn transfer_erc20_from_account_1(
 // harness.
 
 /// Canonical ERC-4337 v0.7 `EntryPoint` address, identical on every real
-/// chain (deployed there via a deterministic CREATE2 factory). `anvil` never
-/// had a real deployment transaction for it, so [`deploy_4337_stack`] fakes
-/// its presence at this exact address via `anvil_setCode` instead.
+/// chain (deployed there via a deterministic CREATE2 factory). Kept only as
+/// a documented historical reference now that [`deploy_4337_stack`]
+/// real-constructor-deploys its own `EntryPoint` instance (see that
+/// function's doc comment for why); no longer used by this harness. hermetic
+/// tests must read the address from the returned [`Deployed4337::entry_point`]
+/// instead of assuming this constant.
+#[allow(dead_code)]
 pub const ENTRY_POINT_V07_ADDRESS: EvmAddress = EvmAddress([
     0x00, 0x00, 0x00, 0x00, 0x71, 0x72, 0x7d, 0xe2, 0x2e, 0x5e, 0x9d, 0x8b, 0xaf, 0x0e, 0xda, 0xc6,
     0xf3, 0x7d, 0xa0, 0x32,
@@ -342,8 +348,13 @@ const PAYMASTER_UNSTAKE_DELAY_SECS: u32 = 86_400; // 1 day
 /// The full ERC-4337 v0.7 stack [`deploy_4337_stack`] brings up on `anvil`.
 #[derive(Debug, Clone, Copy)]
 pub struct Deployed4337 {
-    /// The canonical `EntryPoint` address ([`ENTRY_POINT_V07_ADDRESS`]),
-    /// faked into existence via `anvil_setCode`.
+    /// The freshly, real-constructor-deployed `EntryPoint` (see
+    /// [`deploy_4337_stack`]'s doc comment for why this is a real deploy
+    /// rather than `anvil_setCode` at the canonical address). Every other
+    /// deployed contract in this stack (`factory`, `paymaster`) is
+    /// constructed pointing at THIS address, and hermetic tests must read it
+    /// from here rather than assuming the canonical
+    /// [`ENTRY_POINT_V07_ADDRESS`].
     pub entry_point: EvmAddress,
     /// The freshly deployed `SimpleAccountFactory`.
     pub factory: EvmAddress,
@@ -365,11 +376,34 @@ pub struct Deployed4337 {
     pub usdt: EvmAddress,
 }
 
-/// Brings up a full ERC-4337 v0.7 stack on `anvil`: the canonical
-/// `EntryPoint` (faked via `anvil_setCode`, since `anvil` never ran its real
-/// deployment transaction), a freshly deployed `SimpleAccountFactory`, a
+/// Brings up a full ERC-4337 v0.7 stack on `anvil`: a real, constructor-
+/// deployed `EntryPoint`, a freshly deployed `SimpleAccountFactory`, a
 /// staked and deposit-funded paymaster, and the vendored `TestUsdt` ERC-20
 /// fixture minted to `usdt_holder`.
+///
+/// **EntryPoint: real deploy, not `anvil_setCode` at the canonical address.**
+/// An earlier version of this harness faked the `EntryPoint` into existence
+/// via `anvil_setCode` at [`ENTRY_POINT_V07_ADDRESS`] (never running its
+/// constructor). That is broken for anything touching account creation:
+/// `EntryPoint`'s constructor does `senderCreator = new SenderCreator();`
+/// and stores the result in an **immutable**. Immutables are baked directly
+/// into the `deployedBytecode` at the offsets the constructor's `CODECOPY`
+/// picks -- `anvil_setCode`-ing only the `deployedBytecode` (no constructor
+/// run) leaves that immutable's storage slot as whatever
+/// `deployedBytecode`'s static template encodes, which for a bytecode
+/// artifact fetched pre-deployment is zeroed. `EntryPoint.senderCreator()`
+/// then returns `address(0)`, so `_createSenderIfNeeded`'s
+/// `senderCreator().createSender(initCode)` call reverts for any UserOp
+/// with a non-empty `initCode` -- i.e. `handleOps` can never deploy a
+/// counterfactual account, which is the entire point of this module's
+/// deposit-account model. Real-deploying `EntryPoint`'s own creation
+/// `bytecode` from a funded EOA (mirroring how [`deploy_test_erc20`] and the
+/// factory/paymaster below are already deployed) runs the real constructor,
+/// so `senderCreator` is set correctly. The resulting address is not the
+/// canonical mainnet one (`anvil` has no CREATE2 factory pre-deployed at the
+/// canonical deployer nonce), but hermetic tests never need the canonical
+/// address -- they read [`Deployed4337::entry_point`] and every other
+/// contract in this stack is pointed at that same address.
 ///
 /// **Paymaster choice:** deploys `LegacyTokenPaymaster`, not the v0.7 sample
 /// `TokenPaymaster`. `TokenPaymaster`'s constructor requires a wrapped-native
@@ -397,35 +431,37 @@ pub async fn deploy_4337_stack(
 ) -> anyhow::Result<Deployed4337> {
     let provider = wallet_provider(anvil, ANVIL_ACCOUNT_0_PRIVATE_KEY)?;
 
-    // 1. Fake the canonical EntryPoint into existence at its real-world address via
-    //    the `anvil_setCode` cheatcode (a raw JSON-RPC call: the workspace's
-    //    `alloy` doesn't enable the `provider-anvil-api` feature, and pulling it in
-    //    just for this one call isn't worth the extra feature surface).
-    let entry_point_runtime_code =
-        artifact_hex_field(ENTRY_POINT_ARTIFACT_JSON, "deployedBytecode")
-            .context("failed to extract EntryPoint deployedBytecode")?;
-    provider
-        .raw_request::<_, ()>(
-            "anvil_setCode".into(),
-            (
-                Address::from(ENTRY_POINT_V07_ADDRESS.0),
-                Bytes::from(entry_point_runtime_code),
-            ),
-        )
+    // 1. Real-constructor-deploy the EntryPoint (see this function's doc comment
+    //    for why `anvil_setCode` at the canonical address is broken for
+    //    initCode-based account creation). No constructor args.
+    let entry_point_creation_bytecode = artifact_hex_field(ENTRY_POINT_ARTIFACT_JSON, "bytecode")
+        .context("failed to extract EntryPoint bytecode")?;
+    let entry_point_deploy_tx =
+        TransactionRequest::default().with_deploy_code(entry_point_creation_bytecode);
+    let entry_point_receipt = provider
+        .send_transaction(entry_point_deploy_tx)
         .await
-        .context("anvil_setCode(EntryPoint) failed")?;
+        .context("failed to send EntryPoint creation transaction")?
+        .get_receipt()
+        .await
+        .context("failed to confirm EntryPoint creation transaction")?;
+    let entry_point_address = entry_point_receipt
+        .contract_address
+        .context("EntryPoint creation receipt is missing a contract_address")?;
 
-    // 2. Deploy SimpleAccountFactory (constructor: `address _entryPoint`). Its own
-    //    constructor deploys the SimpleAccount implementation; capture that address
-    //    by reading it back via `accountImplementation()` rather than trying to
-    //    predict it, per the plan's guidance.
+    // 2. Deploy SimpleAccountFactory (constructor: `address _entryPoint`), pointed
+    //    at the EntryPoint just deployed above (every contract in this stack must
+    //    agree on the one EntryPoint address). Its own constructor deploys the
+    //    SimpleAccount implementation; capture that address by reading it back via
+    //    `accountImplementation()` rather than trying to predict it, per the plan's
+    //    guidance.
     let factory_creation_bytecode =
         artifact_hex_field(SIMPLE_ACCOUNT_FACTORY_ARTIFACT_JSON, "bytecode")
             .context("failed to extract SimpleAccountFactory bytecode")?;
     // Constructor arg encoding: a single static (32-byte) `address` param is
     // just its left-padded word -- `abi_encode_params` on a 1-tuple gives
     // exactly that, matching `abi.encode(entryPoint)`.
-    let factory_ctor_args = (Address::from(ENTRY_POINT_V07_ADDRESS.0),).abi_encode_params();
+    let factory_ctor_args = (entry_point_address,).abi_encode_params();
     let mut factory_deploy_code = factory_creation_bytecode;
     factory_deploy_code.extend_from_slice(&factory_ctor_args);
 
@@ -455,12 +491,8 @@ pub async fn deploy_4337_stack(
     let paymaster_creation_bytecode =
         artifact_hex_field(LEGACY_TOKEN_PAYMASTER_ARTIFACT_JSON, "bytecode")
             .context("failed to extract LegacyTokenPaymaster bytecode")?;
-    let paymaster_ctor_args = (
-        factory_address,
-        "USDT".to_string(),
-        Address::from(ENTRY_POINT_V07_ADDRESS.0),
-    )
-        .abi_encode_params();
+    let paymaster_ctor_args =
+        (factory_address, "USDT".to_string(), entry_point_address).abi_encode_params();
     let mut paymaster_deploy_code = paymaster_creation_bytecode;
     paymaster_deploy_code.extend_from_slice(&paymaster_ctor_args);
 
@@ -500,7 +532,7 @@ pub async fn deploy_4337_stack(
     let usdt = deploy_test_erc20(anvil, usdt_holder, usdt_amount).await?;
 
     Ok(Deployed4337 {
-        entry_point: ENTRY_POINT_V07_ADDRESS,
+        entry_point: EvmAddress(entry_point_address.into_array()),
         factory: EvmAddress(factory_address.into_array()),
         simple_account_impl: EvmAddress(simple_account_impl.into_array()),
         paymaster: EvmAddress(paymaster_address.into_array()),

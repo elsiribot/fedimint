@@ -72,6 +72,17 @@ impl std::fmt::Debug for UsdtConfigPrivate {
 #[derive(Clone, Debug, Serialize, Deserialize, Encodable, Decodable)]
 pub struct UsdtConfigLocal {
     pub evm_rpc_url: String,
+    /// This guardian's broadcaster EOA private key (hex, optionally
+    /// `0x`-prefixed), used to front gas for `EntryPoint.handleOps` calls
+    /// (`AlloyEvmRpc::submit_user_ops`, Phase 7 Task 4). `None` in the
+    /// trusted-dealer/DKG defaults below; a real deployment must configure
+    /// one (or share a single federation-wide broadcaster key across
+    /// guardians -- any guardian's broadcaster may submit a given `UserOp`,
+    /// since the `EntryPoint` dedups by `(sender, nonce)` on-chain) before
+    /// Phase 7 Task 5 wires guardian-local `UserOp` submission into
+    /// production. Never put on the wire or into consensus (see this
+    /// struct's own doc comment).
+    pub broadcaster_private_key: Option<String>,
 }
 
 /// Default EVM RPC URL used by [`crate::UsdtInit::trusted_dealer_gen`] and

@@ -218,6 +218,20 @@ const ERC1967_PROXY_CREATION_CODE: &[u8] = &alloy_primitives::hex!(
     "f7e56433218edcc12bbe415d64736f6c63430008170033"
 );
 
+/// The CREATE2 `salt` for `claim_pk`'s deposit account:
+/// `keccak256(DEPOSIT_ADDRESS_DOMAIN ‖ claim_pk.serialize())` (compressed,
+/// 33-byte). Extracted out of [`derive_deposit_account`] so
+/// `fedimint-usdt-server`'s Phase-7 Task 4 `UserOp` builder can compute the
+/// exact same salt for `SimpleAccountFactory.createAccount`'s `initCode`
+/// without duplicating (and risking drifting from) this formula.
+#[must_use]
+pub fn deposit_salt(claim_pk: &secp256k1::PublicKey) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(DEPOSIT_ADDRESS_DOMAIN);
+    hasher.update(claim_pk.serialize()); // 33-byte compressed
+    hasher.finalize().into()
+}
+
 /// Derives the counterfactual CREATE2 address of the per-`claim_pk`
 /// ERC-4337 v0.7 `SimpleAccount` deposit account (D3, Phase 7 Task 2's
 /// reconciliation of Phase 5's provisional additive-tweak EOA):
@@ -252,11 +266,7 @@ pub fn derive_deposit_account(
     use alloy_sol_types::{SolCall as _, SolValue as _};
 
     let owner = evm_address(group_public_key);
-
-    let mut hasher = Keccak256::new();
-    hasher.update(DEPOSIT_ADDRESS_DOMAIN);
-    hasher.update(claim_pk.serialize()); // 33-byte compressed
-    let salt: [u8; 32] = hasher.finalize().into();
+    let salt = deposit_salt(claim_pk);
 
     let initialize_calldata = ISimpleAccountInit::initializeCall {
         anOwner: alloy_primitives::Address::from(owner.0),

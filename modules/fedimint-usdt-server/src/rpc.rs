@@ -8,8 +8,12 @@ use std::sync::Arc;
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::types::Filter;
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
+use alloy::sol_types::SolEvent as _;
 use anyhow::Context as _;
+use fedimint_usdt_common::user_op::{PackedUserOperation, SignedUserOp, UserOpReceipt};
 use fedimint_usdt_common::{EvmAddress, FeeVote, UsdtAmount};
 
 /// Type-erased handle to a [`IServerEvmRpc`] implementation.
@@ -19,6 +23,70 @@ sol! {
     #[sol(rpc)]
     interface IERC20 {
         function balanceOf(address account) external view returns (uint256);
+    }
+}
+
+alloy::sol! {
+    // Mirrors `fedimint_usdt_common::user_op::PackedUserOperation`
+    // field-for-field: a distinct (this-module-local) Rust type from a
+    // separate `sol!` invocation, needed because `EntryPoint.handleOps`'s
+    // `#[sol(rpc)]` binding requires its own `SolCall`-implementing
+    // parameter type. Same underlying `alloy-primitives`/`alloy-sol-types`
+    // versions across the workspace (see the root `Cargo.toml`'s comment on
+    // `alloy-primitives`), so fields copy across directly with no
+    // conversion (see [`to_rpc_packed_user_op`]). Mirrors the identical
+    // pattern already used by
+    // `fedimint-usdt-tests/tests/user_op_hash.rs`.
+    struct PackedUserOperationRpc {
+        address sender;
+        uint256 nonce;
+        bytes initCode;
+        bytes callData;
+        bytes32 accountGasLimits;
+        uint256 preVerificationGas;
+        bytes32 gasFees;
+        bytes paymasterAndData;
+        bytes signature;
+    }
+
+    #[sol(rpc)]
+    interface IEntryPoint {
+        function handleOps(PackedUserOperationRpc[] calldata ops, address payable beneficiary) external;
+    }
+
+    /// `EntryPoint` v0.7's `UserOperationEvent`
+    /// (`@account-abstraction/contracts@0.7.0`'s `interfaces/IEntryPoint.sol`),
+    /// emitted once per `UserOp` processed by `handleOps` -- regardless of
+    /// whether the op's `callData` execution itself succeeded (`success`
+    /// tracks that; the event is always emitted for any op that passed
+    /// validation and was included). Field layout confirmed against the
+    /// vendored `EntryPoint.json` artifact's ABI.
+    event UserOperationEvent(
+        bytes32 indexed userOpHash,
+        address indexed sender,
+        address indexed paymaster,
+        uint256 nonce,
+        bool success,
+        uint256 actualGasCost,
+        uint256 actualGasUsed
+    );
+}
+
+/// Converts the `-common` crate's [`PackedUserOperation`] into this module's
+/// own `sol!`-generated [`PackedUserOperationRpc`], so it can be passed to
+/// the `#[sol(rpc)]`-generated `handleOps` binding. Mirrors
+/// `fedimint-usdt-tests/tests/user_op_hash.rs`'s `to_rpc_packed_user_op`.
+fn to_rpc_packed_user_op(p: &PackedUserOperation) -> PackedUserOperationRpc {
+    PackedUserOperationRpc {
+        sender: p.sender,
+        nonce: p.nonce,
+        initCode: p.initCode.clone(),
+        callData: p.callData.clone(),
+        accountGasLimits: p.accountGasLimits,
+        preVerificationGas: p.preVerificationGas,
+        gasFees: p.gasFees,
+        paymasterAndData: p.paymasterAndData.clone(),
+        signature: p.signature.clone(),
     }
 }
 
@@ -58,6 +126,28 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
     /// its transaction hash.
     async fn send_raw_transaction(&self, signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]>;
 
+    /// Submits `ops` to the configured `EntryPoint` via `handleOps`, fronting
+    /// gas from this guardian's (or the shared broadcaster's) EOA (Phase 7
+    /// Task 4: self-bundling, no separate bundler service). Any federation
+    /// guardian's broadcaster may submit a given op -- the `EntryPoint`
+    /// dedups by `(sender, nonce)` on-chain, so a redundant submission simply
+    /// reverts/no-ops rather than double-spending.
+    ///
+    /// This only confirms the `handleOps` transaction itself landed
+    /// (validation passed for every op in the batch); it does NOT report
+    /// whether each op's `callData` execution succeeded -- poll
+    /// [`Self::get_user_op_receipt`] for that.
+    async fn submit_user_ops(&self, ops: Vec<SignedUserOp>) -> anyhow::Result<()>;
+
+    /// Looks up the `EntryPoint`'s `UserOperationEvent` for `user_op_hash`
+    /// (via `eth_getLogs`, filtered on the event's indexed `userOpHash`
+    /// topic), returning `None` if the op has not (yet, or ever) been
+    /// included on-chain.
+    async fn get_user_op_receipt(
+        &self,
+        user_op_hash: [u8; 32],
+    ) -> anyhow::Result<Option<UserOpReceipt>>;
+
     /// Wraps `self` into a type-erased, cheaply-cloneable [`DynServerEvmRpc`]
     /// handle.
     fn into_dyn(self) -> DynServerEvmRpc
@@ -77,14 +167,33 @@ pub struct AlloyEvmRpc {
     /// Kept only for [`std::fmt::Debug`] (the `alloy` provider itself does
     /// not implement `Debug`).
     url: String,
+    /// A second, wallet-connected provider signing as this guardian's (or
+    /// the shared) broadcaster EOA, used only by
+    /// [`IServerEvmRpc::submit_user_ops`]. `None` until
+    /// [`Self::with_broadcaster`] is called -- read-only construction via
+    /// [`Self::new`] alone is still fully usable for every other
+    /// [`IServerEvmRpc`] method.
+    broadcaster: Option<DynProvider>,
+    /// The broadcaster EOA's own address, set alongside `broadcaster`; used
+    /// as `handleOps`'s `beneficiary` (self-bundling: whoever fronts the gas
+    /// also collects the unspent-gas refund).
+    broadcaster_address: Option<Address>,
+    /// The `EntryPoint` contract address [`IServerEvmRpc::submit_user_ops`]/
+    /// [`IServerEvmRpc::get_user_op_receipt`] target. `None` until
+    /// [`Self::with_entry_point`] is called.
+    entry_point: Option<EvmAddress>,
 }
 
 impl std::fmt::Debug for AlloyEvmRpc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The `alloy` provider is deliberately omitted (it does not implement
-        // `Debug`); only the endpoint URL is printed.
+        // `Debug`); only the endpoint URL and non-secret configuration are
+        // printed (never the broadcaster's private key -- this struct never
+        // even stores one past `with_broadcaster`'s own stack frame).
         f.debug_struct("AlloyEvmRpc")
             .field("url", &self.url)
+            .field("has_broadcaster", &self.broadcaster.is_some())
+            .field("entry_point", &self.entry_point)
             .finish_non_exhaustive()
     }
 }
@@ -94,6 +203,12 @@ impl AlloyEvmRpc {
     /// perform any network I/O: the underlying `alloy` HTTP provider is
     /// lazy, so construction succeeds even against an unreachable endpoint
     /// and only the first actual call can fail.
+    ///
+    /// No broadcaster or `EntryPoint` is configured yet -- every read-only
+    /// [`IServerEvmRpc`] method works immediately, but
+    /// [`IServerEvmRpc::submit_user_ops`]/
+    /// [`IServerEvmRpc::get_user_op_receipt`]
+    /// need [`Self::with_broadcaster`]/[`Self::with_entry_point`] first.
     ///
     /// # Errors
     ///
@@ -107,7 +222,56 @@ impl AlloyEvmRpc {
         Ok(Self {
             provider,
             url: rpc_url.to_string(),
+            broadcaster: None,
+            broadcaster_address: None,
+            entry_point: None,
         })
+    }
+
+    /// Configures the broadcaster EOA [`IServerEvmRpc::submit_user_ops`]
+    /// signs and sends `handleOps` transactions from, given its private key
+    /// (hex, optionally `0x`-prefixed). Any federation guardian's
+    /// broadcaster may submit a given `UserOp` (see
+    /// [`IServerEvmRpc::submit_user_ops`]'s doc comment on on-chain dedup),
+    /// so in production every guardian may configure the same shared key or
+    /// its own -- this task only wires the mechanism, not the policy of
+    /// which key(s) a deployment uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `broadcaster_private_key` is not a valid
+    /// secp256k1 scalar, or if this instance's own `rpc_url` (captured at
+    /// [`Self::new`]) fails to re-parse (which would indicate a bug, since
+    /// [`Self::new`] already validated it).
+    pub fn with_broadcaster(mut self, broadcaster_private_key: &str) -> anyhow::Result<Self> {
+        let key_hex = broadcaster_private_key
+            .strip_prefix("0x")
+            .unwrap_or(broadcaster_private_key);
+        let signer: PrivateKeySigner = key_hex
+            .parse()
+            .context("malformed broadcaster private key")?;
+        let address = signer.address();
+        let url = self
+            .url
+            .parse()
+            .with_context(|| format!("invalid EVM RPC URL: {}", self.url))?;
+        let provider = ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(url)
+            .erased();
+
+        self.broadcaster = Some(provider);
+        self.broadcaster_address = Some(address);
+        Ok(self)
+    }
+
+    /// Configures the `EntryPoint` contract address
+    /// [`IServerEvmRpc::submit_user_ops`]/
+    /// [`IServerEvmRpc::get_user_op_receipt`] target.
+    #[must_use]
+    pub fn with_entry_point(mut self, entry_point: EvmAddress) -> Self {
+        self.entry_point = Some(entry_point);
+        self
     }
 }
 
@@ -172,6 +336,87 @@ impl IServerEvmRpc for AlloyEvmRpc {
         let pending = self.provider.send_raw_transaction(&signed_tx).await?;
 
         Ok(pending.tx_hash().0)
+    }
+
+    async fn submit_user_ops(&self, ops: Vec<SignedUserOp>) -> anyhow::Result<()> {
+        let broadcaster = self.broadcaster.as_ref().context(
+            "AlloyEvmRpc::submit_user_ops requires a broadcaster (see Self::with_broadcaster)",
+        )?;
+        let entry_point = self.entry_point.context(
+            "AlloyEvmRpc::submit_user_ops requires an EntryPoint address (see Self::with_entry_point)",
+        )?;
+        let beneficiary = self
+            .broadcaster_address
+            .expect("set alongside `broadcaster` in with_broadcaster");
+
+        let packed_ops: Vec<PackedUserOperationRpc> = ops
+            .iter()
+            .map(|op| to_rpc_packed_user_op(&op.pack()))
+            .collect();
+
+        let entry_point = IEntryPoint::new(Address::from(entry_point.0), broadcaster);
+        let receipt = entry_point
+            .handleOps(packed_ops, beneficiary)
+            .send()
+            .await
+            .context("failed to send handleOps transaction")?
+            .get_receipt()
+            .await
+            .context("failed to confirm handleOps transaction")?;
+
+        anyhow::ensure!(
+            receipt.status(),
+            "handleOps transaction reverted (tx {:?})",
+            receipt.transaction_hash
+        );
+
+        Ok(())
+    }
+
+    async fn get_user_op_receipt(
+        &self,
+        user_op_hash: [u8; 32],
+    ) -> anyhow::Result<Option<UserOpReceipt>> {
+        let entry_point = self.entry_point.context(
+            "AlloyEvmRpc::get_user_op_receipt requires an EntryPoint address (see Self::with_entry_point)",
+        )?;
+
+        let filter = Filter::new()
+            .address(Address::from(entry_point.0))
+            .event_signature(UserOperationEvent::SIGNATURE_HASH)
+            .topic1(alloy::primitives::FixedBytes::<32>::from(user_op_hash))
+            .from_block(0u64);
+
+        let logs = self
+            .provider
+            .get_logs(&filter)
+            .await
+            .context("eth_getLogs(UserOperationEvent) failed")?;
+
+        let Some(log) = logs.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let block = log
+            .block_number
+            .context("UserOperationEvent log is missing a block_number")?;
+        let decoded = log
+            .log_decode::<UserOperationEvent>()
+            .context("failed to decode UserOperationEvent log")?;
+
+        let actual_gas_cost =
+            u64::try_from(decoded.inner.data.actualGasCost).with_context(|| {
+                format!(
+                    "UserOperationEvent.actualGasCost {} overflows u64",
+                    decoded.inner.data.actualGasCost
+                )
+            })?;
+
+        Ok(Some(UserOpReceipt {
+            success: decoded.inner.data.success,
+            block,
+            actual_cost_usdt: UsdtAmount(actual_gas_cost),
+        }))
     }
 }
 
