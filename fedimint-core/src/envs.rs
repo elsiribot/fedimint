@@ -46,6 +46,23 @@ pub const FM_USDT_EVM_RPC_URL_ENV: &str = "FM_USDT_EVM_RPC_URL";
 /// federation at the actual deployed contract without a code change.
 pub const FM_USDT_CONTRACT_ENV: &str = "FM_USDT_CONTRACT";
 
+/// Env vars to override the USDT module's ERC-4337 contract addresses at
+/// config-gen (each a `0x`-prefixed 20-byte hex EVM address).
+///
+/// Like [`FM_USDT_CONTRACT_ENV`], the module's compiled-in defaults are
+/// placeholders (`EvmAddress([0u8; 20])`): the canonical `EntryPoint` and a
+/// `SimpleAccountFactory`/`SimpleAccount` implementation are deployed per-chain
+/// and are not known at compile time. These let a config-gen leader (e.g.
+/// `devimint`, after deploying the 4337 stack to its `anvil` instance) point a
+/// real federation at the actual deployed addresses without a code change --
+/// required for the sweep/withdrawal (UserOp) paths, which the deposit-only
+/// [`FM_USDT_CONTRACT_ENV`] flow does not exercise.
+pub const FM_USDT_ENTRY_POINT_ENV: &str = "FM_USDT_ENTRY_POINT";
+/// See [`FM_USDT_ENTRY_POINT_ENV`].
+pub const FM_USDT_ACCOUNT_FACTORY_ENV: &str = "FM_USDT_ACCOUNT_FACTORY";
+/// See [`FM_USDT_ENTRY_POINT_ENV`].
+pub const FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV: &str = "FM_USDT_SIMPLE_ACCOUNT_IMPL";
+
 /// Env var to override the `mintv2` module's `amount_unit` config-gen param
 /// (a decimal [`crate::module::AmountUnit`] id, e.g. `1` for
 /// `fedimint_usdt_common::USDT_UNIT`).

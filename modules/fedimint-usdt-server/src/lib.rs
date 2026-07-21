@@ -18,8 +18,9 @@ use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::envs::{
-    FM_ENABLE_MODULE_USDT_ENV, FM_USDT_CONTRACT_ENV, FM_USDT_EVM_RPC_URL_ENV, is_env_var_set_opt,
-    is_running_in_test_env,
+    FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV, FM_USDT_CONTRACT_ENV,
+    FM_USDT_ENTRY_POINT_ENV, FM_USDT_EVM_RPC_URL_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
+    is_env_var_set_opt, is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -336,13 +337,29 @@ impl ServerModuleInit for UsdtInit {
 
         let mut params = fedimint_usdt_common::UsdtGenParams::default();
 
-        if let Ok(contract) = std::env::var(FM_USDT_CONTRACT_ENV)
-            && !contract.is_empty()
-        {
-            params.usdt_contract = contract.parse().unwrap_or_else(|err| {
-                panic!("{FM_USDT_CONTRACT_ENV} must be a valid EvmAddress: {err}")
-            });
-        }
+        // Each override is a `0x`-prefixed 20-byte hex EvmAddress; an
+        // unset/empty var leaves the compiled-in placeholder in place. A
+        // malformed value is a config-gen-leader misconfiguration, so panic
+        // (deterministically, before any consensus starts) rather than silently
+        // deploy against a wrong address.
+        let apply_address_override =
+            |env_name: &str, field: &mut fedimint_usdt_common::EvmAddress| {
+                if let Ok(value) = std::env::var(env_name)
+                    && !value.is_empty()
+                {
+                    *field = value.parse().unwrap_or_else(|err| {
+                        panic!("{env_name} must be a valid EvmAddress: {err}")
+                    });
+                }
+            };
+
+        apply_address_override(FM_USDT_CONTRACT_ENV, &mut params.usdt_contract);
+        apply_address_override(FM_USDT_ENTRY_POINT_ENV, &mut params.entry_point);
+        apply_address_override(FM_USDT_ACCOUNT_FACTORY_ENV, &mut params.account_factory);
+        apply_address_override(
+            FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
+            &mut params.simple_account_impl,
+        );
 
         params
     }
@@ -360,6 +377,18 @@ impl ServerModuleInit for UsdtInit {
             EnvVarDoc {
                 name: FM_USDT_CONTRACT_ENV,
                 description: "Overrides the default instance's `usdt_contract` config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.",
+            },
+            EnvVarDoc {
+                name: FM_USDT_ENTRY_POINT_ENV,
+                description: "Overrides the ERC-4337 `entry_point` config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader (e.g. devimint after deploying the 4337 stack).",
+            },
+            EnvVarDoc {
+                name: FM_USDT_ACCOUNT_FACTORY_ENV,
+                description: "Overrides the ERC-4337 `account_factory` config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.",
+            },
+            EnvVarDoc {
+                name: FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
+                description: "Overrides the ERC-4337 `simple_account_impl` config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.",
             },
         ]
     }
