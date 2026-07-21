@@ -38,7 +38,7 @@ use super::external::Bitcoind;
 use super::util::{Command, ProcessHandle, ProcessManager, cmd};
 use super::vars::utf8;
 use crate::envs::{FM_CLIENT_DIR_ENV, FM_DATA_DIR_ENV};
-use crate::util::{FedimintdCmd, poll, poll_simple, poll_with_timeout};
+use crate::util::{FedimintdCmd, poll, poll_with_timeout};
 use crate::version_constants::{VERSION_0_10_0_ALPHA, VERSION_0_11_0_ALPHA, VERSION_0_12_0_ALPHA};
 use crate::{poll_almost_equal, poll_eq, vars};
 
@@ -416,14 +416,30 @@ impl Federation {
             for peer_env_vars in peer_to_env_vars_map.values() {
                 let peer_data_dir = utf8(&peer_env_vars.FM_DATA_DIR);
 
-                let invite_code = poll_simple("awaiting-invite-code", || async {
-                    let path = format!("{peer_data_dir}/{invite_code_filename_original}");
-                    tokio::fs::read_to_string(&path)
-                        .await
-                        .with_context(|| format!("Awaiting invite code file: {path}"))
-                })
-                .await
-                .context("Awaiting invite code file")?;
+                // Config-gen (DKG) can run for well over the default 60s poll
+                // timeout for modules with heavy key ceremonies -- notably the
+                // usdt module, whose threshold-ECDSA distributed key generation
+                // does a per-guardian Paillier aux-gen (safe-prime search) that
+                // alone takes a minute or more. Let the invite-code wait be
+                // extended via `FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS` (default:
+                // the usual 60s), so such federations get enough time without
+                // changing the fast path for every other test (this poll
+                // returns the instant the invite code appears, so a larger
+                // timeout only raises the ceiling, never the happy-path wait).
+                let config_gen_timeout = std::env::var("FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map_or(Duration::from_secs(60), Duration::from_secs);
+                let invite_code =
+                    poll_with_timeout("awaiting-invite-code", config_gen_timeout, || async {
+                        let path = format!("{peer_data_dir}/{invite_code_filename_original}");
+                        tokio::fs::read_to_string(&path)
+                            .await
+                            .with_context(|| format!("Awaiting invite code file: {path}"))
+                            .map_err(std::ops::ControlFlow::Continue)
+                    })
+                    .await
+                    .context("Awaiting invite code file")?;
 
                 download_from_invite_code(&connectors, &InviteCode::from_str(&invite_code)?)
                     .await?;
