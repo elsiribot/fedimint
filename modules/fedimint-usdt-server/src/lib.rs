@@ -81,6 +81,7 @@ use crate::user_op::{
 };
 
 mod dkg;
+mod trusted_dealer_primes;
 
 pub mod config;
 pub mod db;
@@ -451,9 +452,21 @@ impl ServerModuleInit for UsdtInit {
         let threshold = u16::try_from(num_peers.threshold())
             .expect("federation sizes fit in u16 in every supported deployment");
 
-        let shares = cggmp21::trusted_dealer::builder::<fedimint_threshold_ecdsa::Curve, _>(n)
+        // Inject a fixed pool of pregenerated Paillier safe primes instead of
+        // searching for fresh ones at runtime, which turns config generation
+        // from minutes into milliseconds. This is sound ONLY because the
+        // trusted dealer is test/dev-only and already reconstructs the full
+        // secret centrally (see `trusted_dealer_primes` for the security
+        // scope). Production key generation runs `distributed_gen`, which keeps
+        // generating fresh primes and is untouched. If `n` exceeds the embedded
+        // pool we fall back to live generation.
+        let mut builder = cggmp21::trusted_dealer::builder::<fedimint_threshold_ecdsa::Curve, _>(n)
             .set_threshold(Some(threshold))
-            .hd_wallet(true)
+            .hd_wallet(true);
+        if let Some(primes) = trusted_dealer_primes::pregenerated_primes(n as usize) {
+            builder = builder.set_pregenerated_primes(primes);
+        }
+        let shares = builder
             .generate_shares(&mut OsRng)
             .expect("trusted dealer share generation failed");
 
