@@ -1993,6 +1993,7 @@ impl Usdt {
                 claimed: UsdtAmount(0),
                 last_observed_block: 0,
                 swept: UsdtAmount(0),
+                nonce: 0,
             });
         // Only credit forward; balance is monotonic between sweeps.
         if obs.balance.0 > record.credited.0 {
@@ -2022,11 +2023,22 @@ impl Usdt {
 
     /// Deterministically enqueues the deploy-and-sweep [`PendingUserOp`] for
     /// `account` and starts its `SigningPurpose::UserOp` signing session, if
-    /// `account`'s [`DepositRecord`] has credit that has never been swept
-    /// (`record.swept.0 == 0`) -- i.e. this account has not yet completed
-    /// its (Phase-7-scoped, first-and-only) sweep. Called from
-    /// [`Usdt::credit_deposit`], right after the credit write, so it always
-    /// observes the freshest `DepositRecord`.
+    /// `account`'s [`DepositRecord`] has an un-swept remainder
+    /// (`credited - swept > 0`) that is not already being swept by an
+    /// in-flight op. Called from [`Usdt::credit_deposit`] right after the
+    /// credit write, and re-called from [`Usdt::apply_user_op_confirmed`]
+    /// right after a successful sweep confirms, so it always observes the
+    /// freshest `DepositRecord`.
+    ///
+    /// # Re-sweeping a reused deposit address (issue #6)
+    ///
+    /// A deposit address can receive more than one on-chain transfer, so
+    /// `credited` may grow after an earlier, fixed-`amount` sweep already
+    /// moved less than the current `credited`. Each call sweeps exactly the
+    /// current `credited - swept` remainder at `record.nonce` -- the deposit
+    /// account's live `SimpleAccount` nonce -- so the leftover is pooled
+    /// rather than stranded on-chain. `needs_deploy` is `record.nonce == 0`
+    /// (only the first, account-creating sweep carries `initCode`).
     ///
     /// # Determinism (consensus-critical)
     ///
@@ -2043,23 +2055,28 @@ impl Usdt {
     /// in-memory off-thread signer spawn, a guardian-local side effect (see
     /// its own doc comment).
     ///
-    /// # Scope (Phase 7)
+    /// # Per-account serialization (nonce-collision avoidance)
     ///
-    /// `nonce` is always `0` and `needs_deploy` is always `true`: this phase
-    /// only handles a counterfactual account's FIRST sweep. The
-    /// `record.swept.0 == 0` guard prevents ever building a second,
-    /// nonce-colliding op for an account that has already completed one
-    /// (which would revert on-chain with an invalid-nonce error); a second
-    /// deposit arriving before the first sweep confirms instead
-    /// transparently supersedes the still-`Pending`/`Submitted` op with a
-    /// fresh, higher-`amount` one (same nonce 0, since the account is still
-    /// undeployed) -- the stale op's `PendingUserOp`/`SubmittedUserOp`
-    /// record, if any, is simply left orphaned in the DB (harmless: it can
-    /// never be confirmed for a different amount than what's actually on
-    /// the sender's balance, and Task 5's acceptance only exercises the
-    /// single-deposit case). Consolidating multiple sweeps into one
-    /// account's lifetime, or handling withdrawals, is Phase 8's `Withdraw`
-    /// `UserOpPurpose`.
+    /// At most one `DeployAndSweep` op for a given `account` may be in flight
+    /// at a time: if a `Pending` or `Submitted` `DeployAndSweep` op already
+    /// targets this `account`, this call returns without enqueuing a second.
+    /// Two concurrent sweeps of the same account would both be built at the
+    /// same on-chain `record.nonce` (which only advances on confirm) and the
+    /// second would revert with an `EntryPoint` invalid-nonce error (AA25).
+    /// Serializing them -- and re-triggering from
+    /// [`Usdt::apply_user_op_confirmed`] once the in-flight one confirms and
+    /// `record.nonce` has advanced -- lets `credited` grow safely mid-flight
+    /// while every remainder is eventually swept at its own correct nonce.
+    ///
+    /// # Scope / known limitation
+    ///
+    /// The credit rule (`Usdt::credit_deposit`) is intentionally raw-balance
+    /// (`balance > credited`), not `swept + balance`, to stay race-free
+    /// against an observation straddling a sweep. A brand-new deposit paid to
+    /// an address whose balance has already been fully swept back to `0`
+    /// therefore stays a documented limitation (it would not raise `credited`
+    /// above the already-swept total); this method only re-sweeps the
+    /// `credited - swept` remainder that the credit rule does record.
     async fn maybe_trigger_sweep(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -2068,7 +2085,21 @@ impl Usdt {
         let Some(record) = dbtx.get_value(&DepositRecordKey(account)).await else {
             return;
         };
-        if record.swept.0 != 0 || record.credited.0 == 0 {
+        // Sweep only the not-yet-pooled remainder. `saturating_sub` is belt-
+        // and-suspenders: `swept` is always clamped to `credited` on write.
+        let remainder = record.credited.0.saturating_sub(record.swept.0);
+        if remainder == 0 {
+            return;
+        }
+
+        // Per-account in-flight guard: never build a second `DeployAndSweep`
+        // op for `account` while one is still `Pending` or `Submitted`. Both
+        // would carry the same on-chain `record.nonce` (it only advances when
+        // a sweep confirms), so the later one would revert with an
+        // `EntryPoint` invalid-nonce error (AA25). The confirm path re-calls
+        // this method once the in-flight op finalizes and `record.nonce` has
+        // advanced, so a `credited` that grew mid-flight is still swept.
+        if self.deploy_and_sweep_in_flight(dbtx, account).await {
             return;
         }
 
@@ -2079,10 +2110,10 @@ impl Usdt {
             deposit_account: account,
             owner,
             claim_pk: record.claim_pk,
-            amount: record.credited,
+            amount: UsdtAmount(remainder),
             pool: self.pool_account(),
-            nonce: alloy::primitives::U256::ZERO,
-            needs_deploy: true,
+            nonce: alloy::primitives::U256::from(record.nonce),
+            needs_deploy: record.nonce == 0,
             paymaster_and_data: Vec::new(),
             gas_bounds: GasBounds::DEPLOY_AND_SWEEP_DEVNET,
         };
@@ -2161,6 +2192,46 @@ impl Usdt {
         submitted
             .iter()
             .any(|(_, s)| matches!(s.purpose, UserOpPurpose::Withdraw { .. }))
+    }
+
+    /// `true` if a `DeployAndSweep`-purpose `UserOp` for exactly this
+    /// `account` is currently `Pending` (awaiting/undergoing MPC signing) or
+    /// `Submitted` (signed, awaiting on-chain confirmation) -- i.e. a sweep
+    /// of this deposit account is already "in flight" and
+    /// [`Usdt::maybe_trigger_sweep`] must not start a second one at the same
+    /// on-chain nonce (which would collide, AA25). Unlike
+    /// [`Usdt::withdraw_batch_in_flight`], the scan is filtered to a SINGLE
+    /// `account` (`DeployAndSweep { source }` with `source == account`):
+    /// different accounts have independent nonces and may legitimately sweep
+    /// concurrently.
+    ///
+    /// A pure function of consensus-DB state (`PendingUserOp`/
+    /// `SubmittedUserOp` tables) and `account`, so identical on every
+    /// guardian.
+    async fn deploy_and_sweep_in_flight(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        account: fedimint_usdt_common::EvmAddress,
+    ) -> bool {
+        let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        if pending.iter().any(|(_, p)| {
+            matches!(p.purpose, UserOpPurpose::DeployAndSweep { source } if source == account)
+        }) {
+            return true;
+        }
+
+        let submitted: Vec<(SubmittedUserOpKey, SubmittedUserOp)> = dbtx
+            .find_by_prefix(&SubmittedUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        submitted.iter().any(|(_, s)| {
+            matches!(s.purpose, UserOpPurpose::DeployAndSweep { source } if source == account)
+        })
     }
 
     /// Deterministically batches every currently-`Queued` withdrawal into
@@ -2392,8 +2463,21 @@ impl Usdt {
             return;
         };
 
+        // Set to the swept deposit account only for a SUCCESSFUL
+        // `DeployAndSweep`, so that -- after this op is cleared from the
+        // in-flight tables below -- we can promptly re-sweep any remainder
+        // that `credited` grew into while this sweep was in flight. Deliberately
+        // left `None` on failure: a persistently-reverting sweep (e.g. a
+        // non-standard token whose `transfer` reverts) would otherwise
+        // tight-loop, re-enqueuing and burning gas every confirmation cycle.
+        // On failure the remainder simply stays `credited - swept` (solvent,
+        // still on-chain) and is retried by a later deposit observation.
+        let mut retrigger_source: Option<fedimint_usdt_common::EvmAddress> = None;
+
         match &submitted.purpose {
             UserOpPurpose::DeployAndSweep { .. } => {
+                let source = submitted.signed.unsigned.sender;
+
                 if obs.success {
                     let mut pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
                         account: self.pool_account(),
@@ -2410,8 +2494,25 @@ impl Usdt {
                     pool.balance = UsdtAmount(pool.balance.0.saturating_add(obs.swept.0));
                     dbtx.insert_entry(&PoolStateKey, &pool).await;
 
-                    let source = submitted.signed.unsigned.sender;
-                    if let Some(mut record) = dbtx.get_value(&DepositRecordKey(source)).await {
+                    retrigger_source = Some(source);
+                }
+
+                // Advance this deposit account's tracked `SimpleAccount` nonce
+                // UNCONDITIONALLY (success OR failure), mirroring the
+                // `Withdraw` path's unconditional `PoolState.nonce` bump (see
+                // `apply_withdraw_confirmed`'s doc comment): the `EntryPoint`
+                // validates and increments the on-chain nonce (and runs
+                // `initCode`) BEFORE the sweep `callData` executes, so the
+                // nonce is consumed whether or not the transfer reverted. If
+                // the guardian's tracked `record.nonce` did not mirror that,
+                // every later sweep of this account would be built at a stale
+                // (already-consumed) nonce and revert forever (AA25). On
+                // success we additionally advance `swept` (clamped to
+                // `credited`), which is what the pool credit above accounts
+                // for; on failure `swept` is left untouched. Written once.
+                if let Some(mut record) = dbtx.get_value(&DepositRecordKey(source)).await {
+                    record.nonce = record.nonce.saturating_add(1);
+                    if obs.success {
                         record.swept = UsdtAmount(
                             record
                                 .swept
@@ -2419,8 +2520,8 @@ impl Usdt {
                                 .saturating_add(obs.swept.0)
                                 .min(record.credited.0),
                         );
-                        dbtx.insert_entry(&DepositRecordKey(source), &record).await;
                     }
+                    dbtx.insert_entry(&DepositRecordKey(source), &record).await;
                 }
             }
             UserOpPurpose::Withdraw { outpoints } => {
@@ -2431,6 +2532,15 @@ impl Usdt {
         dbtx.remove_entry(&SubmittedUserOpKey(op_hash)).await;
         dbtx.remove_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
             .await;
+
+        // Re-trigger AFTER the op is cleared from the in-flight tables, so
+        // `maybe_trigger_sweep`'s per-account in-flight guard no longer sees
+        // THIS (now-finalized) op and can enqueue the next sweep at the
+        // freshly-advanced `record.nonce`. Only on success (see
+        // `retrigger_source`'s comment for why failure does not auto-retry).
+        if let Some(source) = retrigger_source {
+            self.maybe_trigger_sweep(dbtx, source).await;
+        }
     }
 
     /// Settles a confirmed `Withdraw`-purpose `UserOp`'s `outpoints` (Phase
@@ -4830,6 +4940,7 @@ mod tests {
                     claimed: UsdtAmount(0),
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
+                    nonce: 0,
                 },
             )
             .await;
@@ -5431,6 +5542,7 @@ mod tests {
                     claimed: UsdtAmount(2_000_000),
                     last_observed_block: 42,
                     swept: UsdtAmount(0),
+                    nonce: 0,
                 },
             )
             .await;
@@ -6225,6 +6337,7 @@ mod tests {
                     claimed: UsdtAmount(0),
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
+                    nonce: 0,
                 },
             )
             .await;
@@ -6407,6 +6520,7 @@ mod tests {
                     claimed: UsdtAmount(0),
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
+                    nonce: 0,
                 },
             )
             .await;
@@ -6464,6 +6578,445 @@ mod tests {
         );
     }
 
+    /// Every currently-`Pending` `DeployAndSweep` op whose `source` is
+    /// `account`, as `(op_hash, op)` pairs -- the re-sweep tests' lens onto
+    /// what `maybe_trigger_sweep` enqueued.
+    async fn pending_deploy_and_sweeps(
+        dbtx: &mut DatabaseTransaction<'_>,
+        account: EvmAddress,
+    ) -> Vec<([u8; 32], fedimint_usdt_common::user_op::UnsignedUserOp)> {
+        let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        pending
+            .into_iter()
+            .filter(|(_, p)| {
+                matches!(p.purpose, UserOpPurpose::DeployAndSweep { source } if source == account)
+            })
+            .map(|(PendingUserOpKey(hash), p)| (hash, p.op))
+            .collect()
+    }
+
+    /// Asserts exactly one pending `DeployAndSweep` for `account` and returns
+    /// its `(op_hash, op)`.
+    async fn single_pending_deploy_and_sweep(
+        dbtx: &mut DatabaseTransaction<'_>,
+        account: EvmAddress,
+    ) -> ([u8; 32], fedimint_usdt_common::user_op::UnsignedUserOp) {
+        let mut ops = pending_deploy_and_sweeps(dbtx, account).await;
+        assert_eq!(
+            ops.len(),
+            1,
+            "expected exactly one pending DeployAndSweep for the account"
+        );
+        ops.pop().expect("just checked len == 1")
+    }
+
+    /// Simulates the MPC-signing promotion `process_mpc_signature` performs:
+    /// moves `op_hash`'s `PendingUserOp` into a `SubmittedUserOp` (carrying
+    /// its `op` verbatim, so `sender`/`purpose` are preserved) and clears the
+    /// `PendingUserOp`, so `apply_user_op_confirmed` can then finalize it --
+    /// without standing up the real threshold signer.
+    async fn promote_pending_to_submitted(db: &Database, op_hash: [u8; 32]) {
+        let mut dbtx = db.begin_transaction().await;
+        let pending = dbtx
+            .to_ref_nc()
+            .get_value(&PendingUserOpKey(op_hash))
+            .await
+            .expect("pending op present to promote");
+        dbtx.to_ref_nc()
+            .insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: pending.op,
+                        signature: vec![0xaa; 65],
+                    },
+                    purpose: pending.purpose,
+                    submitted_block: 3,
+                },
+            )
+            .await;
+        dbtx.to_ref_nc()
+            .remove_entry(&PendingUserOpKey(op_hash))
+            .await;
+        dbtx.commit_tx().await;
+    }
+
+    /// **Issue #6 (solvency).** A reused deposit address whose `credited`
+    /// grows after an earlier, fixed-amount sweep must have the leftover
+    /// (`credited - swept`) re-swept -- at the deposit account's advanced
+    /// `SimpleAccount` nonce and without a second deploy -- rather than
+    /// stranding it on-chain. Drives the full loop: first sweep (nonce 0,
+    /// deploy, amount == full credited) → confirm → grow `credited` →
+    /// re-sweep (nonce 1, no deploy, amount == the new remainder) → confirm →
+    /// a further trigger is a no-op (remainder 0).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn re_sweep_moves_the_remainder_after_credited_grows() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([0xc1; 20]);
+        let claim_pk = test_pubkey(0xc2);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(10),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // First sweep: full credited (10), nonce 0, deploying (initCode set).
+        let op_hash_1 = {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+                .await;
+            let (hash, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+            assert_eq!(op.nonce, alloy::primitives::U256::ZERO);
+            assert_eq!(
+                crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
+                UsdtAmount(10)
+            );
+            assert!(
+                !op.init_code.is_empty(),
+                "first sweep must deploy the account"
+            );
+            dbtx.commit_tx().await;
+            hash
+        };
+
+        // Confirm the first sweep (swept 10).
+        promote_pending_to_submitted(db, op_hash_1).await;
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    op_hash_1,
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 20,
+                        swept: UsdtAmount(10),
+                    },
+                )
+                .await;
+            let record = dbtx
+                .to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .expect("record present");
+            assert_eq!(record.swept, UsdtAmount(10));
+            assert_eq!(record.nonce, 1, "nonce advances on the confirmed sweep");
+            let pool = dbtx
+                .to_ref_nc()
+                .get_value(&PoolStateKey)
+                .await
+                .expect("pool credited");
+            assert_eq!(pool.balance, UsdtAmount(10));
+            // Remainder is now 0, so the success auto-retrigger enqueued nothing.
+            assert!(
+                pending_deploy_and_sweeps(&mut dbtx.to_ref_nc(), account)
+                    .await
+                    .is_empty(),
+                "no re-sweep while credited == swept"
+            );
+            dbtx.commit_tx().await;
+        }
+
+        // A second deposit bumps credited to 20.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let mut record = dbtx
+                .to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .expect("record present");
+            record.credited = UsdtAmount(20);
+            dbtx.to_ref_nc()
+                .insert_entry(&DepositRecordKey(account), &record)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Re-sweep: only the remainder (10), at nonce 1, WITHOUT redeploying.
+        let op_hash_2 = {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+                .await;
+            let (hash, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+            assert_ne!(hash, op_hash_1, "the re-sweep is a fresh op");
+            assert_eq!(op.nonce, alloy::primitives::U256::from(1u64));
+            assert_eq!(
+                crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
+                UsdtAmount(10),
+                "re-sweep moves only the remainder, not the full credited"
+            );
+            assert!(
+                op.init_code.is_empty(),
+                "an already-deployed account must not redeploy"
+            );
+            dbtx.commit_tx().await;
+            hash
+        };
+
+        // Confirm the re-sweep (swept another 10).
+        promote_pending_to_submitted(db, op_hash_2).await;
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    op_hash_2,
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 30,
+                        swept: UsdtAmount(10),
+                    },
+                )
+                .await;
+            let record = dbtx
+                .to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .expect("record present");
+            assert_eq!(record.swept, UsdtAmount(20));
+            assert_eq!(record.nonce, 2);
+            let pool = dbtx
+                .to_ref_nc()
+                .get_value(&PoolStateKey)
+                .await
+                .expect("pool present");
+            assert_eq!(pool.balance, UsdtAmount(20));
+            dbtx.commit_tx().await;
+        }
+
+        // Nothing owed -> a further trigger is a no-op.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+                .await;
+            assert!(
+                pending_deploy_and_sweeps(&mut dbtx.to_ref_nc(), account)
+                    .await
+                    .is_empty(),
+                "fully-swept account must not enqueue another sweep"
+            );
+            dbtx.commit_tx().await;
+        }
+    }
+
+    /// **Nonce-collision safety.** At most one `DeployAndSweep` op per
+    /// account may be in flight: while sweep A is pending, a `credited` that
+    /// grows must NOT spawn a second op at the same (still-unconsumed) nonce
+    /// (which would revert AA25 on-chain). The remainder is instead swept by
+    /// the success auto-retrigger, once A confirms and the nonce advances --
+    /// so exactly one op is outstanding at a time, each at its own nonce.
+    #[tokio::test]
+    async fn concurrent_sweep_of_the_same_account_is_serialized() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([0xd1; 20]);
+        let claim_pk = test_pubkey(0xd2);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(10),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Sweep A enqueued (in-flight, nonce 0).
+        let op_a = {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+                .await;
+            let (hash, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+            assert_eq!(op.nonce, alloy::primitives::U256::ZERO);
+            dbtx.commit_tx().await;
+            hash
+        };
+
+        // credited grows to 20 while A is still in flight; re-triggering must
+        // NOT create a second op -- the per-account guard holds.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let mut record = dbtx
+                .to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .expect("record present");
+            record.credited = UsdtAmount(20);
+            dbtx.to_ref_nc()
+                .insert_entry(&DepositRecordKey(account), &record)
+                .await;
+            module
+                .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+                .await;
+            let (hash, _) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+            assert_eq!(
+                hash, op_a,
+                "the still-pending sweep A is the only in-flight op; no colliding second one"
+            );
+            dbtx.commit_tx().await;
+        }
+
+        // Confirm A (swept 10). The success auto-retrigger now sweeps the
+        // remainder as op B: nonce 1, amount 10 -- exactly one in flight.
+        promote_pending_to_submitted(db, op_a).await;
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    op_a,
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 25,
+                        swept: UsdtAmount(10),
+                    },
+                )
+                .await;
+            let (hash_b, op_b) =
+                single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+            assert_ne!(hash_b, op_a, "the auto-retrigger enqueued a fresh op");
+            assert_eq!(op_b.nonce, alloy::primitives::U256::from(1u64));
+            assert_eq!(
+                crate::user_op::decode_transfer_amount(&op_b).expect("decodes"),
+                UsdtAmount(10),
+                "op B sweeps exactly the remainder that grew while A was in flight"
+            );
+            dbtx.commit_tx().await;
+        }
+    }
+
+    /// **Nonce discipline on failure.** A reverted sweep still consumes its
+    /// on-chain nonce (the `EntryPoint` validates+increments it before the
+    /// `callData` runs), so `DepositRecord.nonce` must advance even on
+    /// failure -- but `swept`/`PoolState` must NOT move (nothing left the
+    /// account), and the failure must NOT auto-retrigger (a persistently
+    /// reverting sweep would otherwise tight-loop and burn gas). A later
+    /// manual trigger still builds the retry at the advanced nonce.
+    #[tokio::test]
+    async fn failed_sweep_advances_nonce_without_retrigger_or_double_credit() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([0xe1; 20]);
+        let claim_pk = test_pubkey(0xe2);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(10),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let op_hash = {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+                .await;
+            let (hash, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+            assert_eq!(op.nonce, alloy::primitives::U256::ZERO);
+            dbtx.commit_tx().await;
+            hash
+        };
+
+        // Confirm a FAILURE (success: false, swept 0).
+        promote_pending_to_submitted(db, op_hash).await;
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    op_hash,
+                    &UserOpConfirmedObservation {
+                        success: false,
+                        block: 21,
+                        swept: UsdtAmount(0),
+                    },
+                )
+                .await;
+            let record = dbtx
+                .to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .expect("record present");
+            assert_eq!(record.nonce, 1, "a reverted sweep still consumes its nonce");
+            assert_eq!(
+                record.swept,
+                UsdtAmount(0),
+                "failure must not advance swept"
+            );
+            assert!(
+                dbtx.to_ref_nc().get_value(&PoolStateKey).await.is_none(),
+                "failure must not credit the pool"
+            );
+            assert!(
+                pending_deploy_and_sweeps(&mut dbtx.to_ref_nc(), account)
+                    .await
+                    .is_empty(),
+                "failure must NOT auto-retrigger (no tight loop)"
+            );
+            dbtx.commit_tx().await;
+        }
+
+        // A later observation-driven trigger still retries -- at the advanced
+        // nonce, no redeploy.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+                .await;
+            let (_, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+            assert_eq!(op.nonce, alloy::primitives::U256::from(1u64));
+            assert!(
+                op.init_code.is_empty(),
+                "retry after the deploying attempt already consumed nonce 0 must not redeploy"
+            );
+            assert_eq!(
+                crate::user_op::decode_transfer_amount(&op).expect("decodes"),
+                UsdtAmount(10)
+            );
+            dbtx.commit_tx().await;
+        }
+    }
+
     /// **Solvency-critical.** `audit` must report each on-chain USDT unit
     /// EXACTLY once, whichever side of a sweep it currently sits on:
     /// `PoolState.balance` (already-swept) PLUS `sum(credited - swept)`
@@ -6488,6 +7041,7 @@ mod tests {
                 claimed: UsdtAmount(0),
                 last_observed_block: 0,
                 swept: UsdtAmount(5_000_000),
+                nonce: 0,
             },
         )
         .await;
@@ -6499,6 +7053,7 @@ mod tests {
                 claimed: UsdtAmount(0),
                 last_observed_block: 0,
                 swept: UsdtAmount(1_000_000),
+                nonce: 0,
             },
         )
         .await;
@@ -6510,6 +7065,7 @@ mod tests {
                 claimed: UsdtAmount(0),
                 last_observed_block: 0,
                 swept: UsdtAmount(0),
+                nonce: 0,
             },
         )
         .await;
@@ -7386,6 +7942,7 @@ mod tests {
                 claimed: UsdtAmount(0),
                 last_observed_block: 1,
                 swept: UsdtAmount(0),
+                nonce: 0,
             },
         )
         .await;

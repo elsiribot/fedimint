@@ -108,6 +108,16 @@ impl_db_lookup!(key = FeeVoteKey, query_prefix = FeeVotePrefix);
 /// (`credited - swept`) instead of double-counting USDT that has already
 /// become `PoolState.balance`. See `Usdt::audit`'s doc comment for the exact
 /// solvency formula.
+///
+/// `nonce` is this deposit account's `SimpleAccount` nonce -- the number of
+/// deploy-and-sweep `UserOp`s the `EntryPoint` has already consumed for it.
+/// It advances by one every time such an op is confirmed (whether it
+/// succeeded or reverted, mirroring the on-chain nonce, which the
+/// `EntryPoint` validates and increments before the sweep `callData` runs).
+/// `Usdt::maybe_trigger_sweep` builds each re-sweep of the `credited - swept`
+/// remainder at exactly this nonce (and only populates `initCode` while it is
+/// still `0`, i.e. before the account's first, deploying sweep), so a reused
+/// deposit address is fully swept instead of leaving an unpooled remainder.
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
 pub struct DepositRecord {
     pub claim_pk: PublicKey,
@@ -115,6 +125,7 @@ pub struct DepositRecord {
     pub claimed: UsdtAmount,
     pub last_observed_block: u64,
     pub swept: UsdtAmount,
+    pub nonce: u64,
 }
 
 #[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
@@ -565,6 +576,7 @@ mod tests {
             claimed: UsdtAmount(0),
             last_observed_block: 100,
             swept: UsdtAmount(0),
+            nonce: 0,
         };
 
         let mut dbtx = db.begin_transaction().await;
