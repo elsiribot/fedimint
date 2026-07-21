@@ -2127,6 +2127,16 @@ impl Usdt {
         // (and hence `call_data`/`op_hash`) are byte-identical everywhere.
         queued.sort_by_key(|(out_point, _)| *out_point);
 
+        // Cap the batch SIZE (not just the trigger threshold) so a burst of
+        // queued withdrawals can never build a single `executeBatch` too large
+        // to be bundled/included on-chain (which would never confirm and, on
+        // the next trigger, rebuild the identical oversized batch -- a
+        // permanent liveness wedge of ALL withdrawals). The `OutPoint` sort
+        // above makes "which `BATCH_MAX_ITEMS`" deterministic; the remainder
+        // stays `Queued` and is picked up by the next batch (the in-flight
+        // guard serializes batches, so nonces never collide).
+        queued.truncate(BATCH_MAX_ITEMS);
+
         let pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
             account: self.pool_account(),
             balance: UsdtAmount(0),
