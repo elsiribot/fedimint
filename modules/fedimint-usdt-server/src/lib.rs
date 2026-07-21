@@ -18,9 +18,9 @@ use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::envs::{
-    FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV, FM_USDT_CONTRACT_ENV,
-    FM_USDT_ENTRY_POINT_ENV, FM_USDT_EVM_RPC_URL_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
-    is_env_var_set_opt, is_running_in_test_env,
+    FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
+    FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV, FM_USDT_EVM_RPC_URL_ENV,
+    FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, is_env_var_set_opt, is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -390,6 +390,10 @@ impl ServerModuleInit for UsdtInit {
                 name: FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
                 description: "Overrides the ERC-4337 `simple_account_impl` config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.",
             },
+            EnvVarDoc {
+                name: FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
+                description: "Overrides this guardian's broadcaster EOA private key (hex) at runtime, taking priority over the configured `broadcaster_private_key`. Needed to front UserOp gas for sweeps/withdrawals.",
+            },
         ]
     }
 
@@ -448,7 +452,11 @@ impl ServerModuleInit for UsdtInit {
                 .unwrap_or_else(|| cfg.private.local.evm_rpc_url.clone());
             let mut rpc =
                 AlloyEvmRpc::new(&evm_rpc_url)?.with_entry_point(cfg.consensus.entry_point);
-            if let Some(broadcaster_private_key) = &cfg.private.local.broadcaster_private_key {
+            let broadcaster_private_key = std::env::var(FM_USDT_BROADCASTER_PRIVATE_KEY_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| cfg.private.local.broadcaster_private_key.clone());
+            if let Some(broadcaster_private_key) = &broadcaster_private_key {
                 rpc = rpc.with_broadcaster(broadcaster_private_key)?;
             }
             rpc.into_dyn()

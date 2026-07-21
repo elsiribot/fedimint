@@ -63,6 +63,17 @@ pub const FM_USDT_ACCOUNT_FACTORY_ENV: &str = "FM_USDT_ACCOUNT_FACTORY";
 /// See [`FM_USDT_ENTRY_POINT_ENV`].
 pub const FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV: &str = "FM_USDT_SIMPLE_ACCOUNT_IMPL";
 
+/// Env var to override this guardian's USDT broadcaster EOA private key at
+/// runtime (hex, optionally `0x`-prefixed).
+///
+/// Takes priority over the `broadcaster_private_key` in the encrypted private
+/// config (which is `None` by default -- config-gen does not assign one). Used
+/// e.g. by `devimint` to hand every guardian a funded `anvil` dev-account key
+/// so the sweep/withdrawal `UserOp` broadcasters can front gas, without baking
+/// a key into config-gen. Any guardian's broadcaster may submit a given op, so
+/// a shared key across guardians is fine.
+pub const FM_USDT_BROADCASTER_PRIVATE_KEY_ENV: &str = "FM_USDT_BROADCASTER_PRIVATE_KEY";
+
 /// Env var to override the `mintv2` module's `amount_unit` config-gen param
 /// (a decimal [`crate::module::AmountUnit`] id, e.g. `1` for
 /// `fedimint_usdt_common::USDT_UNIT`).
