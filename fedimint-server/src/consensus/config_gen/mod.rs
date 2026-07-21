@@ -24,6 +24,7 @@ use fedimint_core::config_gen::{
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::{NumPeers, PeerId};
+use fedimint_server_core::{ConfigGenParamDoc, ConfigGenParamType};
 use serde::Serialize;
 
 /// Sessions between accepting an activation and the module becoming
@@ -389,6 +390,52 @@ pub fn process_item(
                 },
             );
         }
+    }
+
+    Ok(())
+}
+
+/// Validates guardian-supplied proposal params against a module kind's
+/// param descriptors and the asset registry. Called at proposal time for
+/// immediate feedback; DKG-time parse failures still abort the generation
+/// as a defensive layer.
+pub fn validate_proposal_params(
+    docs: &[ConfigGenParamDoc],
+    params: &BTreeMap<String, String>,
+    assets: &BTreeMap<u64, AssetInfo>,
+) -> anyhow::Result<()> {
+    for (name, value) in params {
+        let doc = docs
+            .iter()
+            .find(|doc| doc.name == name)
+            .with_context(|| format!("Unknown param {name}"))?;
+
+        match doc.param_type {
+            ConfigGenParamType::Text => {}
+            ConfigGenParamType::U64 => {
+                value
+                    .parse::<u64>()
+                    .with_context(|| format!("Param {name} must be an unsigned integer"))?;
+            }
+            ConfigGenParamType::Asset => {
+                let id = value
+                    .parse::<u64>()
+                    .with_context(|| format!("Param {name} must be an asset id"))?;
+
+                anyhow::ensure!(
+                    id == 0 || assets.contains_key(&id),
+                    "Param {name}: no registered asset with id {id}"
+                );
+            }
+        }
+    }
+
+    for doc in docs {
+        anyhow::ensure!(
+            !doc.required || params.contains_key(doc.name),
+            "Missing required param {}",
+            doc.name
+        );
     }
 
     Ok(())
@@ -882,5 +929,59 @@ mod tests {
             log.generations()[&ModuleGenerationId(0)],
             GenerationState::Aborted { .. }
         ));
+    }
+
+    fn amount_unit_docs() -> Vec<ConfigGenParamDoc> {
+        vec![ConfigGenParamDoc {
+            name: "amount_unit",
+            description: "Asset issued by this instance",
+            param_type: ConfigGenParamType::Asset,
+            required: false,
+        }]
+    }
+
+    #[test]
+    fn validates_proposal_params() {
+        let docs = amount_unit_docs();
+        let assets = BTreeMap::from([(
+            1,
+            AssetInfo {
+                name: "US Dollar".to_string(),
+                ticker: "USD".to_string(),
+                registered_by: PeerId::from(0),
+            },
+        )]);
+        let params = |entries: &[(&str, &str)]| {
+            entries
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+
+        // optional param may be omitted
+        assert!(validate_proposal_params(&docs, &params(&[]), &assets).is_ok());
+        // bitcoin (0) and registered asset accepted
+        assert!(validate_proposal_params(&docs, &params(&[("amount_unit", "0")]), &assets).is_ok());
+        assert!(validate_proposal_params(&docs, &params(&[("amount_unit", "1")]), &assets).is_ok());
+        // unregistered asset, non-numeric value, unknown key rejected
+        assert!(
+            validate_proposal_params(&docs, &params(&[("amount_unit", "7")]), &assets).is_err()
+        );
+        assert!(
+            validate_proposal_params(&docs, &params(&[("amount_unit", "abc")]), &assets).is_err()
+        );
+        assert!(validate_proposal_params(&docs, &params(&[("nonsense", "1")]), &assets).is_err());
+    }
+
+    #[test]
+    fn required_param_must_be_present() {
+        let docs = vec![ConfigGenParamDoc {
+            name: "flavor",
+            description: "",
+            param_type: ConfigGenParamType::Text,
+            required: true,
+        }];
+
+        assert!(validate_proposal_params(&docs, &BTreeMap::new(), &BTreeMap::new()).is_err());
     }
 }

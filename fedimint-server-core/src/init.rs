@@ -20,6 +20,7 @@ use fedimint_core::module::{
 };
 use fedimint_core::task::TaskGroup;
 use fedimint_core::{NumPeers, PeerId, apply, async_trait_maybe_send, dyn_newtype_define};
+use serde::Serialize;
 
 use crate::bitcoin_rpc::ServerBitcoinRpcMonitor;
 use crate::config::PeerHandleOps;
@@ -39,6 +40,26 @@ pub struct EnvVarDoc {
     pub name: &'static str,
     /// A short human-readable description shown in `--help`.
     pub description: &'static str,
+}
+
+/// The kind of value a module config-gen param expects, driving how the
+/// dashboard renders the input and how proposal params are validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ConfigGenParamType {
+    Text,
+    U64,
+    /// A registered asset id (0 = bitcoin); rendered as a dropdown
+    Asset,
+}
+
+/// Documentation for a single param a guardian can set when proposing a
+/// generation of a module kind.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigGenParamDoc {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub param_type: ConfigGenParamType,
+    pub required: bool,
 }
 
 /// Arguments passed to modules during config generation
@@ -116,6 +137,11 @@ pub trait IServerModuleInit: IDynCommonModuleInit {
 
     /// Returns documentation for every environment variable this module reads.
     fn get_documented_env_vars(&self) -> Vec<EnvVarDoc>;
+
+    /// Params a guardian can set when proposing a generation of this
+    /// module kind; rendered as a form by the dashboard and validated at
+    /// proposal time.
+    fn config_gen_param_docs(&self) -> Vec<ConfigGenParamDoc>;
 }
 
 /// A type that can be used as module-shared value inside
@@ -260,6 +286,13 @@ pub trait ServerModuleInit: ModuleInit + Sized {
     fn get_documented_env_vars(&self) -> Vec<EnvVarDoc> {
         vec![]
     }
+
+    /// Params a guardian can set when proposing a generation of this
+    /// module kind; rendered as a form by the dashboard and validated at
+    /// proposal time.
+    fn config_gen_param_docs(&self) -> Vec<ConfigGenParamDoc> {
+        vec![]
+    }
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -361,6 +394,10 @@ where
 
     fn get_documented_env_vars(&self) -> Vec<EnvVarDoc> {
         <Self as ServerModuleInit>::get_documented_env_vars(self)
+    }
+
+    fn config_gen_param_docs(&self) -> Vec<ConfigGenParamDoc> {
+        <Self as ServerModuleInit>::config_gen_param_docs(self)
     }
 }
 

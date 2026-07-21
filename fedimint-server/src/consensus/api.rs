@@ -71,7 +71,8 @@ use fedimint_server_core::dashboard_ui::{
     ServerBitcoinRpcStatus,
 };
 use fedimint_server_core::{
-    DynServerModule, ServerModuleInitRegistry, ServerModuleRegistry, ServerModuleRegistryExt,
+    ConfigGenParamDoc, DynServerModule, ServerModuleInitRegistry, ServerModuleRegistry,
+    ServerModuleRegistryExt,
 };
 use futures::StreamExt;
 use tokio::sync::watch::{self, Receiver, Sender};
@@ -79,7 +80,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::io::{CONSENSUS_CONFIG, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG};
 use crate::config::{ServerConfig, legacy_consensus_config_hash};
-use crate::consensus::config_gen::{GenerationLog, GenerationState};
+use crate::consensus::config_gen::{GenerationLog, GenerationState, validate_proposal_params};
 use crate::consensus::db::{AcceptedItemPrefix, AcceptedTransactionKey, SignedSessionOutcomeKey};
 use crate::consensus::engine::get_finished_session_count_static;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
@@ -349,6 +350,17 @@ impl ConsensusApi {
         if let Some(pending) = log.pending_generation() {
             anyhow::bail!("Generation {pending} is still pending");
         }
+
+        let module_init = self
+            .module_inits
+            .get(&proposal.module_kind)
+            .with_context(|| format!("Unsupported module kind {}", proposal.module_kind))?;
+
+        validate_proposal_params(
+            &module_init.config_gen_param_docs(),
+            &proposal.params,
+            log.assets(),
+        )?;
 
         let generation_id = log.next_id();
 
@@ -1009,11 +1021,19 @@ impl IDashboardApi for ConsensusApi {
         self.try_register_asset(name, ticker).await
     }
 
-    async fn propose_module_generation(&self, kind: ModuleKind) -> anyhow::Result<()> {
+    async fn propose_module_generation(
+        &self,
+        kind: ModuleKind,
+        params: BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
         let module_init = self
             .module_inits
             .get(&kind)
             .with_context(|| format!("Unsupported module kind {kind}"))?;
+
+        let log = self.generation_log().await;
+
+        validate_proposal_params(&module_init.config_gen_param_docs(), &params, log.assets())?;
 
         let consensus_version = module_init.supported_api_versions().module_consensus;
 
@@ -1028,11 +1048,18 @@ impl IDashboardApi for ConsensusApi {
             consensus_version,
             network,
             disable_base_fees: false,
-            params: BTreeMap::new(),
+            params,
         })
         .await?;
 
         Ok(())
+    }
+
+    async fn module_param_docs(&self, kind: ModuleKind) -> Vec<ConfigGenParamDoc> {
+        self.module_inits
+            .get(&kind)
+            .map(|init| init.config_gen_param_docs())
+            .unwrap_or_default()
     }
 
     async fn approve_module_generation(&self, generation_id: u64) -> anyhow::Result<()> {

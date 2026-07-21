@@ -14,6 +14,7 @@ use fedimint_core::util::SafeUrl;
 use fedimint_core::{Feerate, PeerId};
 use serde::{Deserialize, Serialize};
 
+use crate::init::ConfigGenParamDoc;
 use crate::{DynServerModule, ServerModule};
 
 pub type DynDashboardApi = Arc<dyn IDashboardApi + Send + Sync + 'static>;
@@ -102,7 +103,15 @@ pub trait IDashboardApi {
 
     /// Propose generating a new module instance of the given kind, using
     /// the latest supported consensus version and the backend's network
-    async fn propose_module_generation(&self, kind: ModuleKind) -> anyhow::Result<()>;
+    async fn propose_module_generation(
+        &self,
+        kind: ModuleKind,
+        params: BTreeMap<String, String>,
+    ) -> anyhow::Result<()>;
+
+    /// Param descriptors a guardian can set when proposing a generation of
+    /// the given module kind
+    async fn module_param_docs(&self, kind: ModuleKind) -> Vec<ConfigGenParamDoc>;
 
     /// Approve the given pending module generation
     async fn approve_module_generation(&self, generation_id: u64) -> anyhow::Result<()>;

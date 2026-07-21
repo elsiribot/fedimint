@@ -4,6 +4,8 @@
 //! propose/approve/activate/abort actions backed by the consensus
 //! coordinated generation protocol.
 
+use std::collections::BTreeMap;
+
 use axum::extract::{Form, State};
 use axum::response::{IntoResponse, Redirect};
 use fedimint_core::util::FmtCompactAnyhow as _;
@@ -129,7 +131,10 @@ pub async fn post_propose(
 ) -> impl IntoResponse {
     if let Err(err) = state
         .api
-        .propose_module_generation(fedimint_core::core::ModuleKind::clone_from_str(&form.kind))
+        .propose_module_generation(
+            fedimint_core::core::ModuleKind::clone_from_str(&form.kind),
+            BTreeMap::new(),
+        )
         .await
     {
         warn!(target: LOG_UI, err = %err.fmt_compact_anyhow(), "Failed to propose module generation");
