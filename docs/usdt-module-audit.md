@@ -138,6 +138,8 @@ the guardian-local submitter re-submits UserOps that yield no receipt.
 | Factory misconfiguration → unspendable addresses | **mitigated** | Startup warns on placeholder factory; operator must configure a factory matching the vendored proxy init code (documented). |
 | Bootstrap fee median (few votes) / degenerate zero median | **mitigated / deferred** | `MIN_WITHDRAWAL_FEE` floor prevents free withdrawals; transient early-vote skew is deterministic and within the honest range. |
 | DB migrations | **n/a (greenfield)** | Unreleased module; a v1-migration pattern scaffold is documented. |
+| Non-BITCOIN primary-module e-cash await (client) | **maintainer decision (shared client)** | `Client::await_primary_bitcoin_module_output` (fedimint-client) is hardcoded to `AmountUnit::BITCOIN`. A USDT-denominated `mintv2` primary module's issued e-cash cannot be awaited/observed through the standard client path, so the real-chain devimint e2e asserts the claim only at the consensus level and leaves the CLI-observed e-cash balance as best-effort. Fix is a unit-aware await — a fedimint-client API change affecting all module clients. |
+| Withdrawal devimint e2e (real-chain) | **deferred (stretch)** | Deposit→claim runs green through real `fedimintd` + anvil. The withdrawal loop additionally needs a runtime broadcaster-key env override (none exists; `broadcaster_private_key` is config-only), a funded broadcaster on the devimint anvil, the 4337-stack deploy in the binary, and the new `FM_USDT_ENTRY_POINT`/`ACCOUNT_FACTORY`/`SIMPLE_ACCOUNT_IMPL` overrides wired in. |
 
 ## Test coverage (evidence)
 
