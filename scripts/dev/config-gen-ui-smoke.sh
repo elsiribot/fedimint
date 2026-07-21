@@ -19,7 +19,22 @@ done
 curl -sf -b "$(cookies 0)" "http://127.0.0.1:$(port 0)/" | grep -q "Module Generation"
 echo "SMOKE: dashboard renders module generation section"
 
-curl -sf -b "$(cookies 0)" -X POST -d "kind=mint" "http://127.0.0.1:$(port 0)/config-gen/propose" >/dev/null
+curl -sf -b "$(cookies 0)" -X POST -d "name=US Dollar&ticker=USD" \
+  "http://127.0.0.1:$(port 0)/assets/register" >/dev/null
+for _ in $(seq 30); do
+  if curl -sf -b "$(cookies 0)" "http://127.0.0.1:$(port 0)/" | grep -q ">USD<"; then
+    break
+  fi
+  sleep 2
+done
+curl -sf -b "$(cookies 0)" "http://127.0.0.1:$(port 0)/" | grep -q ">USD<"
+echo "SMOKE: asset registered and visible"
+
+curl -sf -b "$(cookies 0)" "http://127.0.0.1:$(port 0)/config-gen/propose-form?kind=mint" \
+  | grep -q "param_amount_unit"
+curl -sf -b "$(cookies 0)" -X POST -d "kind=mint&param_amount_unit=1" \
+  "http://127.0.0.1:$(port 0)/config-gen/propose" >/dev/null
+echo "SMOKE: proposed mint with amount_unit param"
 
 for _ in $(seq 30); do
   if curl -sf -b "$(cookies 0)" "http://127.0.0.1:$(port 0)/" | grep -q "Proposed</span>"; then

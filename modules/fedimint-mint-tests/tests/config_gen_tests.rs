@@ -6,6 +6,7 @@
 //! the actual mint DKGs over the runtime p2p transport and verify every
 //! peer reports an identical generated consensus config.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use fedimint_api_client::api::{DynGlobalApi, FederationApiExt};
@@ -14,7 +15,7 @@ use fedimint_client::{Client, RootSecret};
 use fedimint_client_module::secret::{PlainRootSecretStrategy, RootSecretStrategy};
 use fedimint_core::PeerId;
 use fedimint_core::config_gen::{
-    AbortModuleGenerationRequest, ModuleConfigProposal, ModuleGenerationId,
+    AbortModuleGenerationRequest, ModuleConfigProposal, ModuleGenerationId, RegisterAssetRequest,
 };
 use fedimint_core::core::ModuleKind;
 use fedimint_core::db::mem_impl::MemDatabase;
@@ -22,7 +23,7 @@ use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped};
 use fedimint_core::endpoint_constants::{
     ABORT_MODULE_GENERATION_ENDPOINT, ACTIVATE_MODULE_GENERATION_ENDPOINT,
     APPROVE_MODULE_GENERATION_ENDPOINT, AUDIT_ENDPOINT, MODULE_GENERATIONS_ENDPOINT,
-    PROPOSE_MODULE_GENERATION_ENDPOINT, SESSION_COUNT_ENDPOINT,
+    PROPOSE_MODULE_GENERATION_ENDPOINT, REGISTER_ASSET_ENDPOINT, SESSION_COUNT_ENDPOINT,
 };
 use fedimint_core::module::{ApiAuth, ApiRequestErased, ModuleConsensusVersion};
 use fedimint_core::task::sleep_in_test;
@@ -91,12 +92,23 @@ async fn propose(
     module_kind: &'static str,
     consensus_version: ModuleConsensusVersion,
 ) -> ModuleGenerationId {
+    propose_with_params(apis, module_kind, consensus_version, BTreeMap::new()).await
+}
+
+/// Proposes a generation from peer 0 with the given module params and
+/// returns its id.
+async fn propose_with_params(
+    apis: &[DynGlobalApi],
+    module_kind: &'static str,
+    consensus_version: ModuleConsensusVersion,
+    params: BTreeMap<String, String>,
+) -> ModuleGenerationId {
     let proposal = ModuleConfigProposal {
         module_kind: ModuleKind::from_static_str(module_kind),
         consensus_version,
         network: bitcoin::Network::Regtest,
         disable_base_fees: false,
-        params: std::collections::BTreeMap::new(),
+        params,
     };
 
     let generation_id: ModuleGenerationId = apis[0]
@@ -499,7 +511,7 @@ async fn aborted_generation_can_be_retried_under_fresh_id() -> anyhow::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unsupported_module_kind_is_aborted() -> anyhow::Result<()> {
+async fn unsupported_module_kind_is_rejected() -> anyhow::Result<()> {
     let fixtures = Fixtures::new_primary(MintClientInit, MintInit);
     let fed = fixtures.new_fed_not_degraded().await;
 
@@ -508,22 +520,142 @@ async fn unsupported_module_kind_is_aborted() -> anyhow::Result<()> {
         apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
     }
 
-    let generation_id = propose(&apis, "no-such-module", MODULE_CONSENSUS_VERSION).await;
+    // The propose endpoint validates the module kind upfront (see
+    // `try_propose_module_generation`) and rejects unsupported kinds
+    // synchronously, before ever submitting a consensus item -- so there is
+    // no pending generation to approve or await an abort for.
+    let proposal = ModuleConfigProposal {
+        module_kind: ModuleKind::from_static_str("no-such-module"),
+        consensus_version: MODULE_CONSENSUS_VERSION,
+        network: bitcoin::Network::Regtest,
+        disable_base_fees: false,
+        params: BTreeMap::new(),
+    };
+
+    let err = apis[0]
+        .request_admin::<ModuleGenerationId>(
+            PROPOSE_MODULE_GENERATION_ENDPOINT,
+            ApiRequestErased::new(&proposal),
+            auth(),
+        )
+        .await
+        .expect_err("proposal for an unsupported module kind is rejected");
+
+    assert!(
+        err.to_string().contains("Unsupported module kind"),
+        "Unexpected propose error: {err}"
+    );
+
+    Ok(())
+}
+
+/// Registers an asset and proposes a mint module parameterized by it: the
+/// activated instance's client config should carry the registered asset's
+/// custom `AmountUnit`.
+#[tokio::test(flavor = "multi_thread")]
+async fn mint_with_custom_asset_unit() -> anyhow::Result<()> {
+    let fixtures = Fixtures::new_primary(MintClientInit, MintInit);
+    let fed = fixtures.new_fed_not_degraded().await;
+
+    let mut apis = Vec::new();
+    for peer in 0..NUM_PEERS {
+        apis.push(fed.new_admin_api(PeerId::from(peer)).await?);
+    }
+
+    // Register an asset on peer 0; every peer sees it in its log
+    apis[0]
+        .request_admin::<()>(
+            REGISTER_ASSET_ENDPOINT,
+            ApiRequestErased::new(RegisterAssetRequest {
+                name: "US Dollar".to_string(),
+                ticker: "USD".to_string(),
+            }),
+            auth(),
+        )
+        .await?;
+
+    for api in &apis {
+        loop {
+            let log: serde_json::Value = api
+                .request_admin(
+                    MODULE_GENERATIONS_ENDPOINT,
+                    ApiRequestErased::default(),
+                    auth(),
+                )
+                .await?;
+            if log["assets"]["1"]["ticker"] == "USD" {
+                break;
+            }
+            sleep_in_test("Waiting for asset registration", Duration::from_millis(200)).await;
+        }
+    }
+
+    // Propose a mint denominated in the registered asset and activate it
+    let generation_id = propose_with_params(
+        &apis,
+        "mint",
+        MODULE_CONSENSUS_VERSION,
+        BTreeMap::from([("amount_unit".to_string(), "1".to_string())]),
+    )
+    .await;
 
     approve_all(&apis, generation_id).await;
 
-    // Every guardian's manager aborts since it cannot run the DKG
     for api in &apis {
-        let aborted = await_state(api, generation_id, "Aborted").await;
-
-        assert!(
-            aborted["reason"]
-                .as_str()
-                .expect("reason is a string")
-                .contains("not supported"),
-            "Unexpected abort reason: {aborted}"
-        );
+        await_state(api, generation_id, "Generated").await;
     }
+
+    let (instance_id, active_from_session) = activate(&apis[0], generation_id).await;
+
+    await_session_past(&apis[0], active_from_session).await?;
+    await_module_in_audit(&apis[0], instance_id).await;
+
+    // A client joining with the pre-activation config picks the new module up
+    // through its additive config refresh, promoted on reopen (same pattern
+    // as `activated_module_runs_without_restart`), and its client config
+    // should carry the registered asset's custom unit.
+    let client_db: Database = MemDatabase::new().into();
+
+    let client = fed.new_client_with_db(client_db.clone()).await;
+
+    while client_db
+        .begin_transaction_nc()
+        .await
+        .get_value(&PendingClientConfigKey)
+        .await
+        .is_none()
+    {
+        sleep_in_test(
+            "Waiting for client to fetch the refreshed config",
+            Duration::from_millis(200),
+        )
+        .await;
+    }
+
+    drop(client);
+
+    let client_secret = Client::load_or_generate_client_secret(&client_db).await?;
+
+    let client = fed
+        .open_client_with_db(
+            client_db,
+            RootSecret::StandardDoubleDerive(PlainRootSecretStrategy::to_root_secret(
+                &client_secret,
+            )),
+        )
+        .await;
+
+    let config = client.config().await;
+    let mint_config = config
+        .modules
+        .get(&(instance_id as u16))
+        .expect("dynamically added mint in client config")
+        .cast::<fedimint_mint_common::config::MintClientConfig>()?;
+
+    assert_eq!(
+        mint_config.amount_unit,
+        fedimint_core::module::AmountUnit::new_custom(1)
+    );
 
     Ok(())
 }

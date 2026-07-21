@@ -131,3 +131,5 @@ proposal.
 - Non-guardian (public) visibility of the registry.
 - Setup-time (day-0) module instances with params (`module_instances`
   in the setup code).
+
+Status (2026-07-21): implemented on branch experimint.
