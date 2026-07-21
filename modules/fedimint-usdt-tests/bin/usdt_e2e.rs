@@ -18,20 +18,19 @@
 //! `backend-test.sh`, unlike its fast sibling `mintv2-module-tests`, which
 //! this file is modeled on).
 //!
-//! KNOWN LIMITATION (documented rather than fixed by this test): the
-//! hermetic fixture in `tests/tests.rs` runs a *second* `mintv2` instance
-//! (USDT-denominated) alongside the default Bitcoin-denominated one, via
-//! `fedimint_testing::fixtures::Fixtures::with_extra_module_instance`.
-//! `devimint`'s real (non-hermetic) config-gen flow has no mechanism yet to
-//! add a second instance of the same module kind with distinct params to a
-//! live federation (tracked as a follow-up of the `instance-list`
-//! refactor -- see the `d4cd4a32b98` commit message). This e2e sidesteps
-//! that gap by overriding the federation's *single* `mintv2` instance to be
-//! USDT-denominated directly (`FM_MINTV2_AMOUNT_UNIT`, added alongside
-//! `FM_USDT_CONTRACT` in this same change), at the cost of the
-//! test-federation not also supporting Bitcoin-denominated e-cash. Wiring a
-//! true dual-mint devimint federation is left to whichever later phase picks
-//! up that instance-list follow-up.
+//! MINIMAL USDT-ONLY FEDERATION: this e2e deliberately mounts only the two
+//! modules the USDT deposit/claim path needs -- the `usdt` wallet and a
+//! single USDT-denominated `mintv2` (the primary module claimed e-cash is
+//! minted into) -- and disables everything Bitcoin/Lightning (no Bitcoin
+//! wallet, no Bitcoin-denominated mint, no lightning). A Fedimint federation
+//! runs fine with no Bitcoin wallet module, so this keeps the test focused on
+//! exactly the USDT flow. `devimint`'s real (non-hermetic) config-gen has no
+//! mechanism yet to add a *second* instance of the same module kind with
+//! distinct params to a live federation (tracked as a follow-up of the
+//! `instance-list` refactor -- see the `d4cd4a32b98` commit message), so the
+//! single `mintv2` instance is made USDT-denominated directly via
+//! `FM_MINTV2_AMOUNT_UNIT`; a true dual-mint (Bitcoin + USDT) devimint
+//! federation is left to whoever picks up that follow-up.
 
 use std::ffi;
 use std::time::Duration;
@@ -50,8 +49,10 @@ use devimint::external::{Anvil, Bitcoind};
 use devimint::federation::{Client, Federation};
 use devimint::tests::log_binary_versions;
 use fedimint_core::envs::{
+    FM_DISABLE_BASE_FEES_ENV, FM_ENABLE_MODULE_LNV1_ENV, FM_ENABLE_MODULE_LNV2_ENV,
     FM_ENABLE_MODULE_MINT_ENV, FM_ENABLE_MODULE_MINTV2_ENV, FM_ENABLE_MODULE_USDT_ENV,
-    FM_MINTV2_AMOUNT_UNIT_ENV, FM_USDT_CONTRACT_ENV,
+    FM_ENABLE_MODULE_WALLET_ENV, FM_ENABLE_MODULE_WALLETV2_ENV, FM_MINTV2_AMOUNT_UNIT_ENV,
+    FM_USDT_CONTRACT_ENV,
 };
 use fedimint_usdt_common::{EvmAddress, USDT_UNIT, UsdtAmount};
 use tracing::info;
@@ -89,15 +90,31 @@ async fn main() -> anyhow::Result<()> {
             // (invite-code) timeout; give it room (see the same var in
             // `devimint::federation`).
             std::env::set_var("FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS", "300");
+
+            // Minimal USDT-only federation: the ONLY modules are the usdt
+            // wallet and a single USDT-denominated `mintv2` (the primary module
+            // the usdt module mints claimed e-cash into). Everything Bitcoin/
+            // Lightning is disabled -- no Bitcoin wallet, no Bitcoin-denominated
+            // mint, no lightning -- so this e2e exercises exactly the usdt
+            // deposit->claim path and nothing else.
             std::env::set_var(FM_ENABLE_MODULE_USDT_ENV, "1");
             std::env::set_var(FM_ENABLE_MODULE_MINTV2_ENV, "1");
             std::env::set_var(FM_ENABLE_MODULE_MINT_ENV, "0");
+            std::env::set_var(FM_ENABLE_MODULE_WALLET_ENV, "0");
+            std::env::set_var(FM_ENABLE_MODULE_WALLETV2_ENV, "0");
+            std::env::set_var(FM_ENABLE_MODULE_LNV1_ENV, "0");
+            std::env::set_var(FM_ENABLE_MODULE_LNV2_ENV, "0");
             std::env::set_var(
                 FM_MINTV2_AMOUNT_UNIT_ENV,
                 serde_json::to_value(USDT_UNIT)
                     .expect("AmountUnit is serializable")
                     .to_string(),
             );
+            // Zero the mintv2 issuance fee so the claimed e-cash balance equals
+            // the deposit exactly (mirrors the hermetic fixture's
+            // `disable_mint_fees()`); this test asserts deposit/claim
+            // correctness, not fee accounting.
+            std::env::set_var(FM_DISABLE_BASE_FEES_ENV, "1");
             std::env::set_var(FM_USDT_CONTRACT_ENV, token.to_string());
         }
 
@@ -129,7 +146,12 @@ async fn main() -> anyhow::Result<()> {
             .parse()?;
 
         info!(%account, "Transferring USDT to the deposit address on-chain...");
-        let transfer_amount = UsdtAmount(2_000_000);
+        // Must be a multiple of the `mintv2` denomination granularity (512
+        // msats) so the whole claimed amount mints into e-cash notes with no
+        // sub-denomination dust remainder (2_048_000 = 4000 * 512); combined
+        // with `FM_DISABLE_BASE_FEES` above, the issued balance then equals the
+        // deposit exactly.
+        let transfer_amount = UsdtAmount(2_048_000);
         transfer_erc20_from_account_1(&anvil, token, account, transfer_amount).await?;
 
         info!("Mining past confirmation_depth...");
@@ -172,47 +194,32 @@ async fn main() -> anyhow::Result<()> {
             transfer_amount.0
         );
 
-        // Best-effort observation of the issued USDT e-cash balance.
-        //
-        // `claim` returns as soon as the fedimint transaction is submitted; the
-        // USDT-`mintv2` instance then issues the e-cash notes asynchronously (a
-        // blind-signature round-trip driven by the primary module's output
-        // state machine). Observing that issued balance through the CLI here is
-        // currently blocked by a shared fedimint-client limitation, NOT a usdt
-        // module issue: `Client::await_primary_bitcoin_module_output`
-        // (fedimint-client) is hardcoded to `AmountUnit::BITCOIN`, and the sole
-        // `mintv2` instance in this federation is USDT-denominated
-        // (`supports_being_primary` -> `[USDT_UNIT]`), so the standard
-        // primary-module await path does not drive/observe a non-BITCOIN
-        // primary module's output. Making that await unit-aware is a
-        // fedimint-client API change (a maintainer decision). Until then this
-        // e2e's authoritative assertions are the CONSENSUS-level ones above and
-        // below -- deposit credited, `claim` accepted with the correct amount,
-        // and a double-claim rejected -- all driven through real `fedimintd`
-        // processes; the balance is polled only opportunistically.
-        info!("Observing the USDT-denominated e-cash balance (best-effort; see code comment)...");
-        let balance_deadline = fedimint_core::time::now() + Duration::from_secs(15);
-        loop {
+        // The USDT client's `claim` awaits the USDT-denominated `mintv2`
+        // issuance before returning (it uses the unit-aware
+        // `await_primary_module_outputs_for_unit(USDT_UNIT)`), so by the time
+        // the CLI `claim` above returns, the e-cash notes are issued and
+        // persisted; the balance is therefore observable immediately. A short
+        // poll is kept only to absorb any per-process client-load latency.
+        info!("Verifying the USDT-denominated e-cash balance equals the transfer...");
+        let balance_deadline = fedimint_core::time::now() + Duration::from_secs(30);
+        let balance = loop {
             let balance = usdt_ecash_balance_msats(&client).await?;
             if balance == transfer_amount.0 {
-                info!(
-                    balance,
-                    "USDT e-cash balance settled to the transferred amount"
-                );
-                break;
+                break balance;
             }
-            if fedimint_core::time::now() >= balance_deadline {
-                tracing::warn!(
-                    balance,
-                    expected = transfer_amount.0,
-                    "USDT e-cash balance not observed via the CLI (known fedimint-client \
-                     non-BITCOIN primary-module await limitation; see the code comment). The \
-                     claim itself was accepted at the consensus level, asserted above."
-                );
-                break;
-            }
+            ensure!(
+                fedimint_core::time::now() < balance_deadline,
+                "USDT e-cash balance ({balance} msats) never reached the transferred amount \
+                 ({} msats) before the deadline",
+                transfer_amount.0
+            );
             fedimint_core::runtime::sleep(Duration::from_secs(1)).await;
-        }
+        };
+        ensure!(
+            balance == transfer_amount.0,
+            "USDT e-cash balance ({balance} msats) != transferred amount ({} msats)",
+            transfer_amount.0
+        );
 
         info!("Verifying a second claim of the same (already fully-claimed) deposit fails...");
         let second_claim = cmd!(client, "module", "usdt", "claim", &claim_pk)
