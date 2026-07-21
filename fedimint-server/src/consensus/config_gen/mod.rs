@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, bail, ensure};
 use fedimint_core::config::ServerModuleConsensusConfig;
 use fedimint_core::config_gen::{
-    ConfigGenAbortReason, ConfigGenItem, MAX_ENCRYPTED_PRIVATE_CONFIG_BYTES, ModuleConfigProposal,
-    ModuleGenerationId,
+    ConfigGenAbortReason, ConfigGenItem, MAX_ASSET_NAME_LEN, MAX_ASSET_TICKER_LEN,
+    MAX_ENCRYPTED_PRIVATE_CONFIG_BYTES, ModuleConfigProposal, ModuleGenerationId,
 };
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -93,10 +93,21 @@ impl GenerationState {
     }
 }
 
+/// A registered asset: human-readable metadata for a custom amount-unit id.
+#[derive(Debug, Clone, PartialEq, Eq, Encodable, Decodable, Serialize)]
+pub struct AssetInfo {
+    pub name: String,
+    pub ticker: String,
+    pub registered_by: PeerId,
+}
+
 /// All module config generations of this federation, in consensus order.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Encodable, Decodable, Serialize)]
 pub struct GenerationLog {
     generations: BTreeMap<ModuleGenerationId, GenerationState>,
+    /// Registered assets by custom amount-unit id. Id 0 is bitcoin,
+    /// implicit and never stored.
+    assets: BTreeMap<u64, AssetInfo>,
 }
 
 impl GenerationLog {
@@ -108,6 +119,10 @@ impl GenerationLog {
 
     pub fn generations(&self) -> &BTreeMap<ModuleGenerationId, GenerationState> {
         &self.generations
+    }
+
+    pub fn assets(&self) -> &BTreeMap<u64, AssetInfo> {
+        &self.assets
     }
 
     pub fn pending_generation(&self) -> Option<ModuleGenerationId> {
@@ -346,6 +361,33 @@ pub fn process_item(
             };
 
             *state = GenerationState::Aborted { proposal, reason };
+        }
+        ConfigGenItem::RegisterAsset { name, ticker } => {
+            anyhow::ensure!(
+                !name.is_empty() && name.len() <= MAX_ASSET_NAME_LEN,
+                "Asset name must be 1..={MAX_ASSET_NAME_LEN} bytes"
+            );
+            anyhow::ensure!(
+                !ticker.is_empty() && ticker.len() <= MAX_ASSET_TICKER_LEN,
+                "Asset ticker must be 1..={MAX_ASSET_TICKER_LEN} bytes"
+            );
+            anyhow::ensure!(
+                !log.assets
+                    .values()
+                    .any(|asset| asset.ticker.eq_ignore_ascii_case(&ticker)),
+                "Asset ticker {ticker} is already registered"
+            );
+
+            let id = 1 + log.assets.keys().next_back().copied().unwrap_or(0);
+
+            log.assets.insert(
+                id,
+                AssetInfo {
+                    name,
+                    ticker,
+                    registered_by: peer,
+                },
+            );
         }
     }
 
@@ -746,6 +788,82 @@ mod tests {
         };
 
         assert_eq!(stored.params, proposal.params);
+    }
+
+    #[test]
+    fn assets_get_monotonic_ids_starting_at_one() {
+        let mut log = GenerationLog::default();
+
+        for (i, (name, ticker)) in [("US Dollar", "USD"), ("Euro", "EUR")].iter().enumerate() {
+            process_item(
+                test_ctx(),
+                &mut log,
+                ConfigGenItem::RegisterAsset {
+                    name: (*name).to_string(),
+                    ticker: (*ticker).to_string(),
+                },
+                PeerId::from(0),
+            )
+            .expect("registration accepted");
+
+            let id = (i + 1) as u64;
+            assert_eq!(log.assets()[&id].ticker, *ticker);
+            assert_eq!(log.assets()[&id].registered_by, PeerId::from(0));
+        }
+    }
+
+    #[test]
+    fn duplicate_ticker_is_rejected_case_insensitively() {
+        let mut log = GenerationLog::default();
+
+        let register = |log: &mut GenerationLog, ticker: &str| {
+            process_item(
+                test_ctx(),
+                log,
+                ConfigGenItem::RegisterAsset {
+                    name: "Some Asset".to_string(),
+                    ticker: ticker.to_string(),
+                },
+                PeerId::from(0),
+            )
+        };
+
+        register(&mut log, "USD").expect("first registration accepted");
+        assert!(register(&mut log, "usd").is_err());
+        assert_eq!(log.assets().len(), 1);
+    }
+
+    #[test]
+    fn asset_name_and_ticker_are_length_capped() {
+        let mut log = GenerationLog::default();
+
+        assert!(
+            process_item(
+                test_ctx(),
+                &mut log,
+                ConfigGenItem::RegisterAsset {
+                    name: "x".repeat(MAX_ASSET_NAME_LEN + 1),
+                    ticker: "OK".to_string(),
+                },
+                PeerId::from(0),
+            )
+            .is_err()
+        );
+
+        assert!(
+            process_item(
+                test_ctx(),
+                &mut log,
+                ConfigGenItem::RegisterAsset {
+                    name: "Ok".to_string(),
+                    ticker: "x".repeat(MAX_ASSET_TICKER_LEN + 1),
+                },
+                PeerId::from(0),
+            )
+            .is_err()
+        );
+
+        assert!(log.assets().is_empty());
     }
 
     #[test]

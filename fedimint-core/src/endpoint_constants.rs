@@ -43,5 +43,6 @@ pub const APPROVE_MODULE_GENERATION_ENDPOINT: &str = "approve_module_generation"
 pub const ABORT_MODULE_GENERATION_ENDPOINT: &str = "abort_module_generation";
 pub const ACTIVATE_MODULE_GENERATION_ENDPOINT: &str = "activate_module_generation";
 pub const MODULE_GENERATIONS_ENDPOINT: &str = "module_generations";
+pub const REGISTER_ASSET_ENDPOINT: &str = "register_asset";
 pub const FEDIMINTD_VERSION_ENDPOINT: &str = "fedimintd_version";
 pub const CHAIN_ID_ENDPOINT: &str = "chain_id";

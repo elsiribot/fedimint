@@ -94,6 +94,12 @@ pub trait IDashboardApi {
     /// All module config generations of this federation
     async fn module_generations(&self) -> Vec<ModuleGenerationSummary>;
 
+    /// All registered assets, id ascending
+    async fn assets(&self) -> Vec<AssetSummary>;
+
+    /// Register an asset name/ticker for the next free unit id
+    async fn register_asset(&self, name: String, ticker: String) -> anyhow::Result<()>;
+
     /// Propose generating a new module instance of the given kind, using
     /// the latest supported consensus version and the backend's network
     async fn propose_module_generation(&self, kind: ModuleKind) -> anyhow::Result<()>;
@@ -153,6 +159,14 @@ pub struct ModuleGenerationSummary {
     pub can_activate: bool,
     /// The generation can be aborted
     pub can_abort: bool,
+}
+
+/// UI summary of one registered asset
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetSummary {
+    pub id: u64,
+    pub name: String,
+    pub ticker: String,
 }
 
 #[derive(Debug, Clone)]

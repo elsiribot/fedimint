@@ -16,8 +16,8 @@ use fedimint_core::backup::{
 };
 use fedimint_core::config::{ClientConfig, JsonClientConfig, META_FEDERATION_NAME_KEY};
 use fedimint_core::config_gen::{
-    AbortModuleGenerationRequest, ConfigGenAbortReason, ConfigGenItem, ModuleConfigProposal,
-    ModuleGenerationId,
+    AbortModuleGenerationRequest, ConfigGenAbortReason, ConfigGenItem, MAX_ASSET_NAME_LEN,
+    MAX_ASSET_TICKER_LEN, ModuleConfigProposal, ModuleGenerationId, RegisterAssetRequest,
 };
 use fedimint_core::core::backup::{BACKUP_REQUEST_MAX_PAYLOAD_SIZE_BYTES, SignedBackupRequest};
 use fedimint_core::core::{DynOutputOutcome, ModuleInstanceId, ModuleKind};
@@ -35,11 +35,12 @@ use fedimint_core::endpoint_constants::{
     CLIENT_CONFIG_JSON_ENDPOINT, CONSENSUS_ORD_LATENCY_ENDPOINT, FEDERATION_ID_ENDPOINT,
     FEDIMINTD_VERSION_ENDPOINT, GUARDIAN_CONFIG_BACKUP_ENDPOINT, GUARDIAN_METADATA_ENDPOINT,
     INVITE_CODE_ENDPOINT, MODULE_GENERATIONS_ENDPOINT, P2P_CONNECTION_STATUS_ENDPOINT,
-    PROPOSE_MODULE_GENERATION_ENDPOINT, RECOVER_ENDPOINT, SERVER_CONFIG_CONSENSUS_HASH_ENDPOINT,
-    SESSION_COUNT_ENDPOINT, SESSION_STATUS_ENDPOINT, SESSION_STATUS_V2_ENDPOINT,
-    SETUP_STATUS_ENDPOINT, SHUTDOWN_ENDPOINT, SIGN_API_ANNOUNCEMENT_ENDPOINT,
-    SIGN_GUARDIAN_METADATA_ENDPOINT, STATUS_ENDPOINT, SUBMIT_API_ANNOUNCEMENT_ENDPOINT,
-    SUBMIT_GUARDIAN_METADATA_ENDPOINT, SUBMIT_TRANSACTION_ENDPOINT, VERSION_ENDPOINT,
+    PROPOSE_MODULE_GENERATION_ENDPOINT, RECOVER_ENDPOINT, REGISTER_ASSET_ENDPOINT,
+    SERVER_CONFIG_CONSENSUS_HASH_ENDPOINT, SESSION_COUNT_ENDPOINT, SESSION_STATUS_ENDPOINT,
+    SESSION_STATUS_V2_ENDPOINT, SETUP_STATUS_ENDPOINT, SHUTDOWN_ENDPOINT,
+    SIGN_API_ANNOUNCEMENT_ENDPOINT, SIGN_GUARDIAN_METADATA_ENDPOINT, STATUS_ENDPOINT,
+    SUBMIT_API_ANNOUNCEMENT_ENDPOINT, SUBMIT_GUARDIAN_METADATA_ENDPOINT,
+    SUBMIT_TRANSACTION_ENDPOINT, VERSION_ENDPOINT,
 };
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::invite_code::InviteCode;
@@ -66,7 +67,8 @@ use fedimint_core::{ChainId, OutPoint, OutPointRange, PeerId, TransactionId, sec
 use fedimint_logging::LOG_NET_API;
 use fedimint_server_core::bitcoin_rpc::ServerBitcoinRpcMonitor;
 use fedimint_server_core::dashboard_ui::{
-    IDashboardApi, ModuleGenerationSummary, P2PConnectionStatus, ServerBitcoinRpcStatus,
+    AssetSummary, IDashboardApi, ModuleGenerationSummary, P2PConnectionStatus,
+    ServerBitcoinRpcStatus,
 };
 use fedimint_server_core::{
     DynServerModule, ServerModuleInitRegistry, ServerModuleRegistry, ServerModuleRegistryExt,
@@ -357,6 +359,31 @@ impl ConsensusApi {
         .await;
 
         Ok(generation_id)
+    }
+
+    async fn try_register_asset(&self, name: String, ticker: String) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !name.is_empty() && name.len() <= MAX_ASSET_NAME_LEN,
+            "Asset name must be 1..={MAX_ASSET_NAME_LEN} bytes"
+        );
+        anyhow::ensure!(
+            !ticker.is_empty() && ticker.len() <= MAX_ASSET_TICKER_LEN,
+            "Asset ticker must be 1..={MAX_ASSET_TICKER_LEN} bytes"
+        );
+
+        let log = self.generation_log().await;
+
+        anyhow::ensure!(
+            !log.assets()
+                .values()
+                .any(|asset| asset.ticker.eq_ignore_ascii_case(&ticker)),
+            "Asset ticker {ticker} is already registered"
+        );
+
+        self.submit_config_gen_item(ConfigGenItem::RegisterAsset { name, ticker })
+            .await;
+
+        Ok(())
     }
 
     async fn try_approve_module_generation(
@@ -965,6 +992,23 @@ impl IDashboardApi for ConsensusApi {
             .collect()
     }
 
+    async fn assets(&self) -> Vec<AssetSummary> {
+        self.generation_log()
+            .await
+            .assets()
+            .iter()
+            .map(|(id, asset)| AssetSummary {
+                id: *id,
+                name: asset.name.clone(),
+                ticker: asset.ticker.clone(),
+            })
+            .collect()
+    }
+
+    async fn register_asset(&self, name: String, ticker: String) -> anyhow::Result<()> {
+        self.try_register_asset(name, ticker).await
+    }
+
     async fn propose_module_generation(&self, kind: ModuleKind) -> anyhow::Result<()> {
         let module_init = self
             .module_inits
@@ -1327,6 +1371,17 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             async |fedimint: &ConsensusApi, context, _v: ()| -> GenerationLog {
                 check_auth(context)?;
                 Ok(fedimint.generation_log().await)
+            }
+        },
+        api_endpoint! {
+            REGISTER_ASSET_ENDPOINT,
+            ApiVersion::new(0, 10),
+            async |fedimint: &ConsensusApi, context, request: RegisterAssetRequest| -> () {
+                check_auth(context)?;
+                fedimint
+                    .try_register_asset(request.name, request.ticker)
+                    .await
+                    .map_err(|err| ApiError::bad_request(err.to_string()))
             }
         },
         api_endpoint! {

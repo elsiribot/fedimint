@@ -116,6 +116,22 @@ pub enum ConfigGenItem {
         generation_id: ModuleGenerationId,
         reason: ConfigGenAbortReason,
     },
+    /// Register a human-readable name/ticker for the next free custom
+    /// amount-unit id. Single-guardian: takes effect once processed, no
+    /// approval flow — the module proposal referencing the asset is the
+    /// unanimously approved step.
+    RegisterAsset { name: String, ticker: String },
+}
+
+/// Bounds on asset registry entries so registry state stays small.
+pub const MAX_ASSET_NAME_LEN: usize = 64;
+pub const MAX_ASSET_TICKER_LEN: usize = 12;
+
+/// Request body of the register-asset admin endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterAssetRequest {
+    pub name: String,
+    pub ticker: String,
 }
 
 #[cfg(test)]
