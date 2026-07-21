@@ -126,16 +126,40 @@ pub const WITHDRAWAL_GAS_UNITS: u128 = 150_000;
 /// `20` == 20%.
 pub const WITHDRAWAL_FEE_BUFFER_PERCENT: u128 = 20;
 
+/// Floor applied by [`withdrawal_fee_quote`] on top of the computed
+/// gas-cost-derived fee (Phase 9, Task 1 hardening; deferred from Phase 8).
+///
+/// Without a floor, a degenerate consensus [`FeeVote`] median -- e.g. every
+/// guardian voting `max_fee_per_gas_wei: 0` or `usdt_per_eth_e6: 0` (whether
+/// by misconfiguration, an EVM RPC that always reports a zero base fee such
+/// as an idle `anvil` devnet, or a byzantine minority trying to zero out the
+/// median) -- would make [`withdrawal_fee_quote`] return `Some(UsdtAmount(0))`,
+/// letting `process_output` accept a withdrawal with `max_fee: 0`: a
+/// completely free withdrawal that drains the pool with no fee revenue to
+/// cover the guardians' real on-chain gas cost.
+///
+/// `10_000` raw units == `0.01` USDT (see [`UsdtAmount`]'s `10^-6` USDT
+/// unit): large enough to guarantee the quote is never literally zero, but
+/// negligible next to any realistic gas-market-derived quote (tens of
+/// thousands to millions of raw units at normal EVM gas prices -- see
+/// `withdrawal_fee_quote_computes_expected_value`'s `16_200_000`-unit
+/// example), so it never distorts a real quote and only ever bites in the
+/// degenerate zero-median edge case this const exists to close.
+pub const MIN_WITHDRAWAL_FEE: UsdtAmount = UsdtAmount(10_000);
+
 /// Computes the minimum USDT fee (in [`UsdtAmount`]'s smallest on-chain
 /// unit) a withdrawal output must offer as `max_fee`, given the
 /// federation's current [`FeeVote`] median (see
 /// `fedimint_usdt_server::Usdt::fee_vote_median`).
 ///
-/// `= WITHDRAWAL_GAS_UNITS * median.max_fee_per_gas_wei (wei) *
-/// median.usdt_per_eth_e6 / 1e18 * (100 + WITHDRAWAL_FEE_BUFFER_PERCENT) /
-/// 100`, ceiling-rounded (`(numerator + denominator - 1) / denominator`) so
-/// the federation is never left undercharged by integer-division
-/// truncation.
+/// `= max(MIN_WITHDRAWAL_FEE, WITHDRAWAL_GAS_UNITS *
+/// median.max_fee_per_gas_wei (wei) * median.usdt_per_eth_e6 / 1e18 * (100 +
+/// WITHDRAWAL_FEE_BUFFER_PERCENT) / 100)`, ceiling-rounded (`(numerator +
+/// denominator - 1) / denominator`) so the federation is never left
+/// undercharged by integer-division truncation, and floored at
+/// [`MIN_WITHDRAWAL_FEE`] so a degenerate zero (or near-zero) `FeeVote`
+/// median can never yield a free (or near-free) withdrawal (see
+/// [`MIN_WITHDRAWAL_FEE`]'s doc comment).
 ///
 /// All arithmetic happens in `u128` via `checked_*` operations: two `u64`
 /// fee-vote fields multiplied together (`max_fee_per_gas_wei *
@@ -145,7 +169,8 @@ pub const WITHDRAWAL_FEE_BUFFER_PERCENT: u128 = 20;
 /// than panicking or silently wrapping in that case. A pure function of
 /// `median` alone (no RPC, no wall-clock, no `our_peer_id`), so every
 /// guardian computes byte-identical output from the same consensus-agreed
-/// median.
+/// median; [`MIN_WITHDRAWAL_FEE`] is a compile-time const, so the `max` with
+/// it stays just as deterministic.
 #[must_use]
 pub fn withdrawal_fee_quote(median: &FeeVote) -> Option<UsdtAmount> {
     const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
@@ -157,7 +182,8 @@ pub fn withdrawal_fee_quote(median: &FeeVote) -> Option<UsdtAmount> {
     let denominator = WEI_PER_ETH.checked_mul(100)?;
     let fee = numerator
         .checked_add(denominator - 1)?
-        .checked_div(denominator)?;
+        .checked_div(denominator)?
+        .max(u128::from(MIN_WITHDRAWAL_FEE.0));
 
     u64::try_from(fee).ok().map(UsdtAmount)
 }
@@ -1353,6 +1379,52 @@ mod tests {
             .expect("WithdrawalStatusResponse should deserialize what it just serialized");
 
         assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn withdrawal_fee_quote_zero_median_is_floored_not_free() {
+        // A degenerate all-zero `FeeVote` median (e.g. an idle `anvil`
+        // devnet reporting a zero base fee, or every guardian voting zeros)
+        // must never yield a zero (free) withdrawal quote: the
+        // `MIN_WITHDRAWAL_FEE` floor kicks in instead (Phase 9, Task 1
+        // hardening).
+        let median = FeeVote {
+            max_fee_per_gas_wei: 0,
+            usdt_per_eth_e6: 0,
+        };
+        let quote = withdrawal_fee_quote(&median).expect("zero median must not overflow");
+        assert_eq!(quote, MIN_WITHDRAWAL_FEE);
+        assert_ne!(
+            quote.0, 0,
+            "a degenerate zero median must never quote a free withdrawal"
+        );
+    }
+
+    #[test]
+    fn withdrawal_fee_quote_near_zero_median_is_also_floored() {
+        // A tiny but nonzero median whose computed fee would round to below
+        // the floor is still floored up to `MIN_WITHDRAWAL_FEE`, not left at
+        // its (near-)free computed value.
+        let median = FeeVote {
+            max_fee_per_gas_wei: 1,
+            usdt_per_eth_e6: 1,
+        };
+        let quote = withdrawal_fee_quote(&median).expect("tiny median must not overflow");
+        assert_eq!(quote, MIN_WITHDRAWAL_FEE);
+    }
+
+    #[test]
+    fn withdrawal_fee_quote_realistic_median_is_unaffected_by_the_floor() {
+        // A realistic gas-market median (same as
+        // `withdrawal_fee_quote_computes_expected_value`) computes well
+        // above `MIN_WITHDRAWAL_FEE`, so the floor must not perturb it.
+        let median = FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        let quote = withdrawal_fee_quote(&median).expect("must not overflow for realistic input");
+        assert_eq!(quote, UsdtAmount(16_200_000));
+        assert!(quote.0 > MIN_WITHDRAWAL_FEE.0);
     }
 
     #[test]

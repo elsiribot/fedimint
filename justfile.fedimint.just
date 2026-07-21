@@ -120,6 +120,7 @@ check-wasm *EXTRA_ARGS:
         --package fedimint-wasm-tests \
         --package fedimint-mintv2-client \
         --package fedimint-walletv2-client \
+        --package fedimint-usdt-client \
         {{EXTRA_ARGS}}
 
 # regenerate server db migration snapshots

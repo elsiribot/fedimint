@@ -366,6 +366,49 @@ impl ServerModuleInit for UsdtInit {
     /// Initialize the module
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
         let cfg: UsdtConfig = args.cfg().to_typed()?;
+
+        // Factory-config setup-validation guard (Phase 9, Task 1 hardening;
+        // deferred from Phase 7/9). We cannot RPC the configured
+        // `account_factory.getAddress` here to fully cross-check it against
+        // `derive_deposit_account` without complicating module startup
+        // (ordering a live EVM RPC call before the module -- which owns the
+        // RPC client -- is even constructed), so this is deliberately a
+        // pragmatic, LOCAL-only check: warn if `account_factory` or
+        // `simple_account_impl` is still the compiled-in all-zero
+        // placeholder (`EvmAddress([0u8; 20])`, see
+        // `fedimint_usdt_common::UsdtGenParams::default`).
+        //
+        // The real hazard this guards against: a real deployment's
+        // `account_factory`/`simple_account_impl` MUST point at a deployed
+        // `SimpleAccountFactory`/`SimpleAccount` whose on-chain CREATE2
+        // `initCodeHash` matches this build's vendored
+        // `ERC1967_PROXY_CREATION_CODE` (see
+        // `fedimint_usdt_common::derive_deposit_account`'s doc comment). If
+        // it doesn't -- e.g. a mis-compiled or wrong-version factory -- every
+        // off-chain-derived deposit address disagrees with the real
+        // on-chain `account_factory.getAddress`, and any USDT sent to the
+        // (wrong) derived address becomes UNSPENDABLE. A guardian operator
+        // MUST independently verify this off-chain before going live (see
+        // the ops runbook); this check can only catch the placeholder case.
+        //
+        // Deliberately non-fatal (`warn!`, never `Err`): hermetic tests
+        // routinely construct modules with the placeholder (no real EVM
+        // stack deployed), and erroring here would break them.
+        if cfg.consensus.account_factory.0 == [0u8; 20]
+            || cfg.consensus.simple_account_impl.0 == [0u8; 20]
+        {
+            warn!(
+                account_factory = %cfg.consensus.account_factory,
+                simple_account_impl = %cfg.consensus.simple_account_impl,
+                "USDT module configured with a placeholder account_factory/simple_account_impl \
+                 (all-zero address). Deposit-account derivation will not match any real \
+                 on-chain factory. This is expected for hermetic tests, but a real deployment \
+                 MUST configure both to a deployed SimpleAccountFactory/SimpleAccount whose \
+                 CREATE2 initCodeHash matches this build's vendored ERC1967_PROXY_CREATION_CODE, \
+                 or deposits sent to derived addresses will be unspendable."
+            );
+        }
+
         let evm_rpc = if let Some(evm_rpc) = &self.evm_rpc_override {
             evm_rpc.clone()
         } else {
@@ -508,7 +551,45 @@ impl ServerModuleInit for UsdtInit {
         Ok(())
     }
 
-    /// DB migrations to move from old to newer versions
+    /// DB migrations to move from old to newer versions.
+    ///
+    /// Empty today: the `usdt` module is greenfield/unreleased (this is its
+    /// first, still-`MODULE_CONSENSUS_VERSION`-0 shape), so there is no
+    /// prior on-disk layout to migrate FROM yet. This doc comment exists to
+    /// establish the pattern this module MUST follow the first time a DB
+    /// schema change actually ships (Phase 9, Task 1 hardening scaffold),
+    /// mirroring e.g. `fedimint-mint-server`'s
+    /// `ServerModuleInit::get_database_migrations`/
+    /// `fedimint-wallet-server`'s equivalent:
+    ///
+    /// 1. Bump [`MODULE_CONSENSUS_VERSION`]'s DB-relevant component and add a
+    ///    `migrate_db_v<N>(ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) ->
+    ///    anyhow::Result<()>` free function next to this `impl` that reads the
+    ///    OLD key/value shape and rewrites it into the NEW one (typically via
+    ///    `ctx.get_typed_module_history_stream()` + `dbtx.insert_entry`,
+    ///    removing/replacing stale keys as needed).
+    /// 2. Register it here: `migrations.insert(DatabaseVersion(N),
+    ///    Box::new(|ctx| migrate_db_v<N>(ctx).boxed()))`.
+    /// 3. Add a `fedimint_migration_tests` module in
+    ///    `fedimint-usdt-tests/tests/tests.rs` (mirroring
+    ///    `fedimint-mint-tests`' module of the same name) with:
+    ///    - `create_server_db_with_v<N-1>_data` -- builds a `Database`
+    ///      populated with the OLD shape's records (one of every affected
+    ///      `DbKeyPrefix`, matching this module's own `dump_database` coverage
+    ///      test).
+    ///    - `snapshot_server_db_migrations` -- calls
+    ///      `fedimint_testing::db::snapshot_db_migrations::<_, UsdtCommonInit>`
+    ///      to freeze that pre-migration DB as a checked-in snapshot
+    ///      (regenerated via `just snapshot-server-db-migrations
+    ///      fedimint-usdt-tests`).
+    ///    - `test_server_db_migrations` -- calls
+    ///      `fedimint_testing::db::validate_migrations_server`, runs
+    ///      `get_database_migrations` against the frozen snapshot, and asserts
+    ///      every `DbKeyPrefix` reads back in the NEW shape.
+    ///
+    /// See `fedimint-mint-server/src/lib.rs`'s `get_database_migrations` +
+    /// `fedimint-mint-tests/tests/tests.rs`'s `fedimint_migration_tests`
+    /// module for a complete worked example of this exact pattern.
     fn get_database_migrations(
         &self,
     ) -> BTreeMap<DatabaseVersion, ServerModuleDbMigrationFn<Usdt>> {
@@ -1035,7 +1116,15 @@ impl ServerModule for Usdt {
                 requested: input.amount,
             });
         }
-        record.claimed = UsdtAmount(record.claimed.0 + input.amount.0);
+        // `saturating_add` (Phase 9, Task 1 hardening, N1): `claimed` is
+        // already bounded above by `credited` (a real, finite on-chain
+        // balance) via the `available` check just above, so this can never
+        // actually saturate -- but a deterministic saturate is strictly
+        // safer than a deterministic panic on the (unreachable in practice)
+        // chance of a `u64` overflow, and saturation is exactly as
+        // reproducible across guardians as a raw `+` would be (still a pure
+        // function of the two operands).
+        record.claimed = UsdtAmount(record.claimed.0.saturating_add(input.amount.0));
         dbtx.insert_entry(&DepositRecordKey(input.account), &record)
             .await;
 
@@ -2274,13 +2363,25 @@ impl Usdt {
                         balance: UsdtAmount(0),
                         nonce: 0,
                     });
-                    pool.balance = UsdtAmount(pool.balance.0 + obs.swept.0);
+                    // `saturating_add` (Phase 9, Task 1 hardening, N1): both
+                    // adds below are bounded in practice (a pool balance /
+                    // deposit's `swept` amount tracking real, finite
+                    // on-chain USDT transfers), but a deterministic saturate
+                    // is strictly safer than a deterministic panic on the
+                    // (unreachable) chance of a `u64` overflow, and stays
+                    // just as reproducible across guardians as a raw `+`.
+                    pool.balance = UsdtAmount(pool.balance.0.saturating_add(obs.swept.0));
                     dbtx.insert_entry(&PoolStateKey, &pool).await;
 
                     let source = submitted.signed.unsigned.sender;
                     if let Some(mut record) = dbtx.get_value(&DepositRecordKey(source)).await {
-                        record.swept =
-                            UsdtAmount((record.swept.0 + obs.swept.0).min(record.credited.0));
+                        record.swept = UsdtAmount(
+                            record
+                                .swept
+                                .0
+                                .saturating_add(obs.swept.0)
+                                .min(record.credited.0),
+                        );
                         dbtx.insert_entry(&DepositRecordKey(source), &record).await;
                     }
                 }
@@ -6485,6 +6586,173 @@ mod tests {
             "confirming must not move net assets -- it only reconciles which record accounts \
              for the already-excluded amount"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one insert per DbKeyPrefix variant is inherently long
+    async fn dump_database_covers_every_key_prefix() {
+        // Phase 9, Task 1 hardening: `dump_database`'s match over
+        // `DbKeyPrefix` is exhaustive (no `_` arm), so the compiler already
+        // guarantees every variant has an arm -- but this additionally
+        // proves each arm actually surfaces real inserted data end to end
+        // (not just that it compiles), and pins the exact set of
+        // human-readable table labels `dump_database` reports, so an
+        // accidentally-dropped arm (which would need a matching enum
+        // variant removal to even compile) or a silently-empty/no-op arm
+        // gets caught by a regular `cargo test` run.
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+
+        let claim_pk = test_pubkey(0x21);
+        let account = EvmAddress([0x31; 20]);
+        let op_hash = [0x41; 32];
+        let out_point = test_out_point(9);
+        let session_id = signing_session_id(&[0x51; 32], 0);
+
+        let mut dbtx = db.begin_transaction().await;
+
+        dbtx.insert_new_entry(&BlockCountVoteKey(PeerId::from(0)), &42u64)
+            .await;
+        dbtx.insert_new_entry(&FeeVoteKey(PeerId::from(0)), &sample_fee_vote())
+            .await;
+        dbtx.insert_new_entry(
+            &DepositRecordKey(account),
+            &DepositRecord {
+                claim_pk,
+                credited: UsdtAmount(1_000_000),
+                claimed: UsdtAmount(0),
+                last_observed_block: 1,
+                swept: UsdtAmount(0),
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &DepositObservationVoteKey(account, PeerId::from(0)),
+            &DepositObservation {
+                account,
+                balance: UsdtAmount(1_000_000),
+                block: 1,
+                claim_pk,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &PendingCheckKey(account),
+            &PendingCheck {
+                claim_pk,
+                requested_at_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &SigningSessionKey(session_id),
+            &SigningSession {
+                purpose: SigningPurpose::Test([0x61; 32]),
+                digest: [0x61; 32],
+                signers: vec![PeerId::from(0)],
+                round: 0,
+                state: SessionState::InProgress,
+                attempt: 0,
+                last_progress_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &MpcRoundChunkKey(session_id, 0, PeerId::from(0), 0),
+            &MpcRoundChunk {
+                count: 1,
+                bytes: vec![0x01],
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &PendingUserOpKey(op_hash),
+            &PendingUserOp {
+                op: sample_unsigned_user_op_for_test(),
+                purpose: UserOpPurpose::DeployAndSweep { source: account },
+                created_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &SubmittedUserOpKey(op_hash),
+            &SubmittedUserOp {
+                signed: fedimint_usdt_common::user_op::SignedUserOp {
+                    unsigned: sample_unsigned_user_op_for_test(),
+                    signature: vec![0x71; 65],
+                },
+                purpose: UserOpPurpose::DeployAndSweep { source: account },
+                submitted_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &PoolStateKey,
+            &PoolState {
+                account,
+                balance: UsdtAmount(1_000_000),
+                nonce: 0,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &UserOpConfirmedVoteKey(op_hash, PeerId::from(0)),
+            &UserOpConfirmedObservation {
+                success: true,
+                block: 1,
+                swept: UsdtAmount(1_000_000),
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &UnclaimedWithdrawalKey(out_point),
+            &UsdtWithdrawalV0 {
+                recipient: account,
+                amount: UsdtAmount(1_000_000),
+                max_fee: UsdtAmount(20_000),
+                requested_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+            .await;
+
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let dumped: BTreeMap<String, Box<dyn erased_serde::Serialize + Send>> = UsdtInit::default()
+            .dump_database(&mut dbtx.to_ref_nc(), Vec::new())
+            .await
+            .collect();
+
+        let expected_labels = [
+            "Block Count Votes",
+            "Fee Votes",
+            "Deposit Records",
+            "Deposit Observation Votes",
+            "Pending Checks",
+            "Signing Sessions",
+            "MPC Round Chunks",
+            "Pending UserOps",
+            "Submitted UserOps",
+            "Pool State",
+            "UserOp Confirmed Votes",
+            "Unclaimed Withdrawals",
+            "Withdrawal States",
+        ];
+        assert_eq!(
+            dumped.len(),
+            expected_labels.len(),
+            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x0D)"
+        );
+        for label in expected_labels {
+            assert!(
+                dumped.contains_key(label),
+                "dump_database is missing the {label:?} table"
+            );
+        }
     }
 
     /// Shared sample [`UnsignedUserOp`] for the `UserOpConfirmed` tests
