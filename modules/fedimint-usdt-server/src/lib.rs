@@ -90,6 +90,19 @@ pub struct UsdtInit {
     /// guardian's module instance, so their reads agree (deposit consensus
     /// needs identical observations).
     evm_rpc_override: Option<crate::rpc::DynServerEvmRpc>,
+    /// Test-only override for [`ServerModuleInit::default_config_gen_params`]
+    /// (Phase 7, Task 6). `None` in production (and in every test that
+    /// hasn't called [`Self::with_gen_params`]), in which case
+    /// `default_config_gen_params` falls back to its usual compiled-in
+    /// [`fedimint_usdt_common::UsdtGenParams::default`] (plus the
+    /// `FM_USDT_CONTRACT_ENV` override). `Some` lets a hermetic test that has
+    /// already deployed a real ERC-4337 stack (`entry_point`/
+    /// `account_factory`/`simple_account_impl`/`usdt_contract`, e.g. via
+    /// `deploy_4337_stack`) inject those REAL addresses into config-gen
+    /// directly, rather than racing a process-global env var across
+    /// (potentially parallel) test binaries — mirrors
+    /// [`Self::evm_rpc_override`]'s injection pattern.
+    gen_params_override: Option<fedimint_usdt_common::UsdtGenParams>,
 }
 
 impl UsdtInit {
@@ -99,7 +112,21 @@ impl UsdtInit {
     pub fn with_evm_rpc(evm_rpc: crate::rpc::DynServerEvmRpc) -> Self {
         Self {
             evm_rpc_override: Some(evm_rpc),
+            gen_params_override: None,
         }
+    }
+
+    /// Overrides [`ServerModuleInit::default_config_gen_params`] to return
+    /// `gen_params` verbatim, for hermetic tests that need config-gen to
+    /// carry real deployed contract addresses (Phase 7, Task 6). Chainable
+    /// with [`Self::with_evm_rpc`] (e.g. `UsdtInit::with_evm_rpc(rpc).
+    /// with_gen_params(params)`), since a real-`anvil` test needs both: the
+    /// real addresses in config AND a real `AlloyEvmRpc` pointed at the same
+    /// stack.
+    #[must_use]
+    pub fn with_gen_params(mut self, gen_params: fedimint_usdt_common::UsdtGenParams) -> Self {
+        self.gen_params_override = Some(gen_params);
+        self
     }
 }
 
@@ -259,7 +286,15 @@ impl ServerModuleInit for UsdtInit {
     /// config-gen leader (e.g. `devimint`, after deploying a test ERC-20 to
     /// its `anvil` instance) point the default instance at the real deployed
     /// contract via [`FM_USDT_CONTRACT_ENV`], without a code change.
+    ///
+    /// [`Self::gen_params_override`] (set via [`Self::with_gen_params`])
+    /// takes priority over both the compiled-in default and the env var --
+    /// see that field's doc comment.
     fn default_config_gen_params(&self) -> Self::Params {
+        if let Some(gen_params) = &self.gen_params_override {
+            return gen_params.clone();
+        }
+
         let mut params = fedimint_usdt_common::UsdtGenParams::default();
 
         if let Ok(contract) = std::env::var(FM_USDT_CONTRACT_ENV)
