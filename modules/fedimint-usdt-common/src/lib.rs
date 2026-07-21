@@ -107,6 +107,61 @@ impl fmt::Display for FeeVote {
     }
 }
 
+/// Static, conservative gas-unit estimate for a single-transfer withdrawal
+/// `UserOp` executed from the pool `SimpleAccount` (already deployed by the
+/// first Phase-7 sweep, so -- unlike
+/// `fedimint_usdt_server::user_op::GasBounds::DEPLOY_AND_SWEEP_DEVNET`'s
+/// first-sweep case -- there is no `initCode`/CREATE2 deploy overhead to
+/// cover): just `validateUserOp`'s signature check plus one
+/// `execute`-wrapped ERC-20 `transfer`. Used only to QUOTE the withdrawal
+/// fee ([`withdrawal_fee_quote`]); Task 2 builds the actual batched
+/// withdrawal `UserOp`'s own gas bounds when it constructs it, independent
+/// of this constant.
+pub const WITHDRAWAL_GAS_UNITS: u128 = 150_000;
+
+/// Percentage buffer [`withdrawal_fee_quote`] applies on top of the raw
+/// gas-cost estimate, covering fee-market movement between the quote being
+/// given out and the withdrawal batch actually landing on-chain (Task 2's
+/// batching delay), as well as [`WITHDRAWAL_GAS_UNITS`]'s own imprecision.
+/// `20` == 20%.
+pub const WITHDRAWAL_FEE_BUFFER_PERCENT: u128 = 20;
+
+/// Computes the minimum USDT fee (in [`UsdtAmount`]'s smallest on-chain
+/// unit) a withdrawal output must offer as `max_fee`, given the
+/// federation's current [`FeeVote`] median (see
+/// `fedimint_usdt_server::Usdt::fee_vote_median`).
+///
+/// `= WITHDRAWAL_GAS_UNITS * median.max_fee_per_gas_wei (wei) *
+/// median.usdt_per_eth_e6 / 1e18 * (100 + WITHDRAWAL_FEE_BUFFER_PERCENT) /
+/// 100`, ceiling-rounded (`(numerator + denominator - 1) / denominator`) so
+/// the federation is never left undercharged by integer-division
+/// truncation.
+///
+/// All arithmetic happens in `u128` via `checked_*` operations: two `u64`
+/// fee-vote fields multiplied together (`max_fee_per_gas_wei *
+/// usdt_per_eth_e6`) can already approach `u128::MAX`, and multiplying that
+/// by [`WITHDRAWAL_GAS_UNITS`] and the buffer can overflow it outright for
+/// an extreme (e.g. byzantine-voted) `FeeVote` -- this returns `None` rather
+/// than panicking or silently wrapping in that case. A pure function of
+/// `median` alone (no RPC, no wall-clock, no `our_peer_id`), so every
+/// guardian computes byte-identical output from the same consensus-agreed
+/// median.
+#[must_use]
+pub fn withdrawal_fee_quote(median: &FeeVote) -> Option<UsdtAmount> {
+    const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
+
+    let gas_cost_wei = WITHDRAWAL_GAS_UNITS.checked_mul(u128::from(median.max_fee_per_gas_wei))?;
+    let numerator = gas_cost_wei
+        .checked_mul(u128::from(median.usdt_per_eth_e6))?
+        .checked_mul(100 + WITHDRAWAL_FEE_BUFFER_PERCENT)?;
+    let denominator = WEI_PER_ETH.checked_mul(100)?;
+    let fee = numerator
+        .checked_add(denominator - 1)?
+        .checked_div(denominator)?;
+
+    u64::try_from(fee).ok().map(UsdtAmount)
+}
+
 /// Domain-separation tag mixed into a deposit account's CREATE2 `salt` (see
 /// [`derive_deposit_account`]).
 pub const DEPOSIT_ADDRESS_DOMAIN: &[u8] = b"fedimint-usdt-deposit-v0";
@@ -509,6 +564,28 @@ pub struct UserOpStatusResponse {
     pub status: UserOpStatus,
 }
 
+/// Request for the current withdrawal fee quote (Phase 8, Task 1).
+/// `amount` is carried for forward-compatibility with a future
+/// amount-dependent fee model (e.g. a batching-size-aware quote); the
+/// current [`withdrawal_fee_quote`] formula does not use it.
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct WithdrawFeeQuoteRequest {
+    pub amount: UsdtAmount,
+}
+
+/// Response to the `withdraw_fee_quote` endpoint (Phase 8, Task 1):
+/// `max_fee` is the minimum fee a `UsdtOutput::V0` withdrawing `amount` must
+/// offer right now; `valid_blocks` is how many further guardian-observed EVM
+/// blocks the quote should be treated as valid for before re-querying
+/// (fee-vote-median-derived quotes can move as guardians' `FeeVote`s
+/// change), a fixed, non-consensus advisory hint rather than an enforced
+/// on-chain expiry.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct WithdrawFeeQuoteResponse {
+    pub max_fee: UsdtAmount,
+    pub valid_blocks: u64,
+}
+
 /// Per-instance config-gen params for the USDT module (Phase 4.5 mechanism).
 ///
 /// `Default` targets a local `anvil` dev federation: chain id 31337 and a
@@ -617,6 +694,22 @@ pub enum UsdtConsensusItem {
         block: u64,
         swept: UsdtAmount,
     },
+    /// One guardian's vote on the current EVM fee market and USDT/ETH
+    /// exchange rate (Phase 8, Task 1), mirroring [`Self::BlockCount`]'s
+    /// per-peer-vote shape exactly: `process_consensus_item` stores this
+    /// peer's vote (with a redundancy guard) and does not itself "apply"
+    /// anything at threshold -- the current fee quote is read on demand as
+    /// the per-field median over all stored votes (see
+    /// `fedimint_usdt_server::Usdt::fee_vote_median`), not derived from any
+    /// single peer's vote. Unlike `BlockCount`'s vote (which only ever
+    /// increases, so the redundancy guard is `vote > current_vote`), the EVM
+    /// fee market can move in either direction, so the guard here is
+    /// equality-based (reject only an EXACT repeat of this peer's current
+    /// vote). `vote` comes from this guardian's local, guardian-LOCAL
+    /// `IServerEvmRpc::get_fee_estimate` read (never itself a consensus
+    /// decision) -- the federation-wide fee decision is always the MEDIAN
+    /// read from consensus DB, never a single guardian's raw RPC value.
+    FeeVote(FeeVote),
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -639,11 +732,49 @@ pub struct UsdtInputV0 {
     pub amount: UsdtAmount,
 }
 
-/// Output for a fedimint transaction
+/// Output for a fedimint transaction (Phase 8, Task 1): a user burning USDT
+/// e-cash to enqueue an on-chain withdrawal.
+///
+/// Versioned like [`UsdtInput`] (a `V0` variant plus an
+/// `#[encodable_default]` catch-all), so a future gas/fee model change can
+/// add `UsdtOutput::V1` without breaking wire-compatibility with old
+/// transactions still referencing `V0`.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
-pub struct UsdtOutput;
+pub enum UsdtOutput {
+    V0(UsdtOutputV0),
+    #[encodable_default]
+    Default {
+        variant: u64,
+        bytes: Vec<u8>,
+    },
+}
 
-/// Information needed by a client to update output funds
+/// Data for a `UsdtOutput::V0`: withdraw `amount` of USDT to `recipient`,
+/// offering up to `max_fee` (in the same [`UsdtAmount`] unit) to cover the
+/// federation's on-chain gas cost of paying it out. The server's
+/// `process_output` rejects the output (`UsdtOutputError::FeeQuoteExceeded`)
+/// if `max_fee` is below the federation's current fee-vote-median-derived
+/// quote (see `fedimint_usdt_common::withdrawal_fee_quote`); `amount +
+/// max_fee` of `USDT_UNIT`-denominated e-cash is burned from the submitting
+/// transaction's funding.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+pub struct UsdtOutputV0 {
+    pub recipient: EvmAddress,
+    pub amount: UsdtAmount,
+    pub max_fee: UsdtAmount,
+}
+
+/// Information needed by a client to update output funds.
+///
+/// Deliberately minimal (a unit struct, like the pre-Phase-8 placeholder):
+/// `output_status` returns `Some(UsdtOutputOutcome)` once a withdrawal has
+/// been enqueued (i.e. `process_output` succeeded for this `OutPoint`) and
+/// `None` otherwise, just proving the output landed. The detailed
+/// [lifecycle state](crate) (`Queued`/`Signing`/`Submitted`/`Confirmed`/
+/// `Failed`) is server-only (`fedimint_usdt_server::db::WithdrawalState`)
+/// and tracked via a dedicated status endpoint (Task 4), not via this
+/// outcome type, so it can evolve (e.g. gain the signing `UserOp` hash)
+/// without a wire-breaking change here.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
 pub struct UsdtOutputOutcome;
 
@@ -662,8 +793,17 @@ pub enum UsdtInputError {
 /// Errors that might be returned by the server
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Error, Encodable, Decodable)]
 pub enum UsdtOutputError {
-    #[error("This module does not support outputs")]
-    NotSupported,
+    #[error("This module does not support this output variant")]
+    UnsupportedOutputVariant,
+    #[error("No federation fee-vote median is available yet; withdrawals cannot be queued")]
+    NoFeeQuoteAvailable,
+    #[error("Computing the withdrawal fee quote overflowed")]
+    FeeQuoteOverflow,
+    #[error("This output's max_fee {max_fee} is below the federation's fee quote {quote}")]
+    FeeQuoteExceeded {
+        quote: UsdtAmount,
+        max_fee: UsdtAmount,
+    },
 }
 
 /// Contains the types defined above
@@ -704,7 +844,7 @@ impl fmt::Display for UsdtInput {
 
 impl fmt::Display for UsdtOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UsdtOutput")
+        write!(f, "{self:?}")
     }
 }
 
@@ -1011,5 +1151,99 @@ mod tests {
             .expect("UsdtInput::V0 should decode what it just encoded");
 
         assert_eq!(input, decoded);
+    }
+
+    #[test]
+    fn test_usdt_output_v0_round_trips_through_consensus_encoding() {
+        let output = UsdtOutput::V0(UsdtOutputV0 {
+            recipient: EvmAddress([7; 20]),
+            amount: UsdtAmount(2_000_000),
+            max_fee: UsdtAmount(1_000),
+        });
+        let bytes = output.consensus_encode_to_vec();
+        let decoded = UsdtOutput::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+            .expect("UsdtOutput::V0 should decode what it just encoded");
+
+        assert_eq!(output, decoded);
+    }
+
+    #[test]
+    fn test_usdt_consensus_item_fee_vote_round_trips_through_consensus_encoding() {
+        let item = UsdtConsensusItem::FeeVote(FeeVote {
+            max_fee_per_gas_wei: 25_000_000_000,
+            usdt_per_eth_e6: 3_200_000_000,
+        });
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("UsdtConsensusItem::FeeVote should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn withdrawal_fee_quote_computes_expected_value() {
+        // 30 gwei max_fee_per_gas, 3000.000000 USDT/ETH.
+        let median = FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        // gas_cost_wei = 150_000 * 30e9 = 4.5e15
+        // numerator = 4.5e15 * 3_000_000_000 * 120 = 1.62e27
+        // denominator = 1e18 * 100 = 1e20
+        // fee = 1.62e27 / 1e20 = 16_200_000 (raw USDT units == 16.2 USDT,
+        // i.e. the unbuffered 13_500_000 scaled by the 20% buffer)
+        let quote = withdrawal_fee_quote(&median).expect("must not overflow for realistic input");
+        assert_eq!(quote, UsdtAmount(16_200_000));
+    }
+
+    #[test]
+    fn withdrawal_fee_quote_is_deterministic() {
+        let median = FeeVote {
+            max_fee_per_gas_wei: 87_654_321,
+            usdt_per_eth_e6: 3_456_789_012,
+        };
+        assert_eq!(withdrawal_fee_quote(&median), withdrawal_fee_quote(&median));
+    }
+
+    #[test]
+    fn withdrawal_fee_quote_scales_with_gas_price() {
+        let low = FeeVote {
+            max_fee_per_gas_wei: 10_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        let high = FeeVote {
+            max_fee_per_gas_wei: 100_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        let quote_low = withdrawal_fee_quote(&low).expect("must not overflow");
+        let quote_high = withdrawal_fee_quote(&high).expect("must not overflow");
+        assert!(quote_high.0 > quote_low.0);
+    }
+
+    #[test]
+    fn withdrawal_fee_quote_overflow_is_none_not_a_panic() {
+        // An extreme (e.g. byzantine-voted) FeeVote whose product overflows
+        // u128 part-way through the computation must return `None`, never
+        // panic (no unwrap/wrapping arithmetic).
+        let median = FeeVote {
+            max_fee_per_gas_wei: u64::MAX,
+            usdt_per_eth_e6: u64::MAX,
+        };
+        assert_eq!(withdrawal_fee_quote(&median), None);
+    }
+
+    #[test]
+    fn withdrawal_fee_quote_large_but_plausible_gas_price_does_not_overflow() {
+        // A large but plausible fee spike: 5000 gwei max_fee_per_gas (far
+        // above anything seen in practice, but nowhere near u64::MAX) and a
+        // high ETH price, exercising the u128 intermediate without
+        // overflowing.
+        let median = FeeVote {
+            max_fee_per_gas_wei: 5_000_000_000_000, // 5000 gwei
+            usdt_per_eth_e6: 10_000_000_000,        // 10,000.000000 USDT/ETH
+        };
+        let quote = withdrawal_fee_quote(&median).expect("plausible fee spike must not overflow");
+        assert!(quote.0 > 0);
     }
 }

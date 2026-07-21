@@ -17,7 +17,9 @@ use fedimint_client_module::module::init::{ClientModuleInit, ClientModuleInitArg
 use fedimint_client_module::module::recovery::NoModuleBackup;
 use fedimint_client_module::module::{ClientContext, ClientModule, IClientModule};
 use fedimint_client_module::sm::Context;
-use fedimint_client_module::transaction::{ClientInput, ClientInputBundle, TransactionBuilder};
+use fedimint_client_module::transaction::{
+    ClientInput, ClientInputBundle, ClientOutput, ClientOutputBundle, TransactionBuilder,
+};
 use fedimint_core::core::{Decoder, ModuleKind, OperationId};
 use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
@@ -28,13 +30,15 @@ use fedimint_core::module::{
 use fedimint_core::runtime::{Instant, sleep};
 use fedimint_core::secp256k1::rand::thread_rng;
 use fedimint_core::secp256k1::{self, Keypair};
-use fedimint_core::{Amount, PeerId, apply, async_trait_maybe_send, push_db_pair_items};
+use fedimint_core::{
+    Amount, OutPointRange, PeerId, apply, async_trait_maybe_send, push_db_pair_items,
+};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
     CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND, PoolStateResponse,
     SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtInput, UsdtInputV0,
-    UsdtModuleTypes, UserOpStatusResponse,
+    UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse, WithdrawFeeQuoteResponse,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -70,13 +74,22 @@ impl Context for UsdtClientContext {
     const KIND: Option<ModuleKind> = None;
 }
 
-/// Metadata recorded in the client's operation log for a deposit-claim
-/// transaction.
+/// Metadata recorded in the client's operation log for a deposit-claim or
+/// withdrawal transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UsdtOperationMeta {
     Claim {
         account: EvmAddress,
         amount: UsdtAmount,
+    },
+    /// Phase 8, Task 1: the DEBIT/QUEUE half of a withdrawal only -- no
+    /// state machine is attached (see [`UsdtClientModule::withdraw`]), so
+    /// this operation log entry is not currently advanced past submission.
+    /// Task 4 adds full state-machine-tracked lifecycle metadata.
+    Withdraw {
+        recipient: EvmAddress,
+        amount: UsdtAmount,
+        max_fee: UsdtAmount,
     },
 }
 
@@ -110,17 +123,31 @@ impl ClientModule for UsdtClientModule {
         Some(Amounts::ZERO)
     }
 
-    // This module never constructs a `UsdtOutput` client-side (the server's
-    // `process_output` unconditionally returns `UsdtOutputError::
-    // NotSupported`), so this is never called in practice; `unreachable!()`
-    // documents that invariant rather than guessing at a fee for a variant
-    // that can't occur.
+    // Phase 8, Task 1: `UsdtOutput::V0` (a withdrawal) now really is
+    // constructed client-side (see `Self::withdraw`); its fee is exactly
+    // its own `max_fee` field -- the transaction-balancing framework calls
+    // this for every output in a transaction being built
+    // (`Client::finalize_and_submit_transaction` sums `input_fee`/
+    // `output_fee` across all modules involved to compute the primary
+    // module's balancing input), and that sum must match what the server's
+    // `process_output` reports back as `TransactionItemAmounts` (`amounts:
+    // amount, fees: max_fee`) for the transaction to balance. Only `V0` is a
+    // variant this client (or any client on this consensus version) ever
+    // constructs or observes as its own; `None` for `Default` mirrors this
+    // trait method's documented contract ("only happens if a future version
+    // of Fedimint introduces a new output variant").
     fn output_fee(
         &self,
         _amount: &Amounts,
-        _output: &<Self::Common as ModuleCommon>::Output,
+        output: &<Self::Common as ModuleCommon>::Output,
     ) -> Option<Amounts> {
-        unreachable!()
+        match output {
+            UsdtOutput::V0(withdrawal) => Some(Amounts::new_custom(
+                USDT_UNIT,
+                Amount::from_msats(withdrawal.max_fee.0),
+            )),
+            UsdtOutput::Default { .. } => None,
+        }
     }
 
     // USDT-denominated e-cash balance lives in the USDT-`mintv2` instance (the
@@ -382,6 +409,77 @@ impl UsdtClientModule {
             .await?;
 
         Ok(())
+    }
+
+    /// Reports the federation's current withdrawal fee quote: the minimum
+    /// `max_fee` a `withdraw` of `amount` must offer right now (Phase 8,
+    /// Task 1). Thin wrapper around [`UsdtFederationApi::withdraw_fee_quote`]
+    /// (threshold-agreement -- every guardian answers identically, since the
+    /// quote is derived from consensus DB).
+    pub async fn withdraw_fee_quote(
+        &self,
+        amount: UsdtAmount,
+    ) -> anyhow::Result<WithdrawFeeQuoteResponse> {
+        Ok(self.module_api.withdraw_fee_quote(amount).await?)
+    }
+
+    /// Submits a withdrawal output transaction, burning `amount + max_fee`
+    /// of `USDT_UNIT`-denominated e-cash (auto-funded from the USDT-`mintv2`
+    /// primary module's existing notes, mirroring [`Self::submit_claim`]'s
+    /// implicit-funding pattern but on the output side) and enqueueing an
+    /// on-chain payout of `amount` to `recipient` (Phase 8, Task 1's
+    /// DEBIT/QUEUE half; Task 2 batches queued withdrawals into an
+    /// MPC-signed `UserOp`).
+    ///
+    /// Callers are responsible for choosing `max_fee` (typically from
+    /// [`Self::withdraw_fee_quote`]) -- the server's `process_output`
+    /// rejects the output if `max_fee` is below its own fresh fee-vote-
+    /// median-derived quote at the point the transaction is processed.
+    ///
+    /// No state machine is attached to the output
+    /// (`ClientOutputBundle::new_no_sm`): nothing here tracks the
+    /// withdrawal's lifecycle client-side past submission yet -- poll the
+    /// server's `output_status` endpoint (`Some` once queued) in the
+    /// meantime. Task 4 adds a full state-machine-tracked operation
+    /// (Queued -> Signing -> Submitted -> Confirmed/Failed), a
+    /// `withdraw_fee_quote`-driven default `max_fee`, and `fedimint-cli`
+    /// wiring; this is deliberately minimal scaffolding so Phase 8's
+    /// server-side debit/queue/fee-median logic (this task) can be
+    /// exercised end to end over a real transaction.
+    pub async fn withdraw(
+        &self,
+        recipient: EvmAddress,
+        amount: UsdtAmount,
+        max_fee: UsdtAmount,
+    ) -> anyhow::Result<OutPointRange> {
+        let output = ClientOutputBundle::new_no_sm(vec![ClientOutput {
+            output: UsdtOutput::V0(UsdtOutputV0 {
+                recipient,
+                amount,
+                max_fee,
+            }),
+            amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0)),
+        }]);
+        let output = self.client_ctx.make_client_outputs(output);
+
+        let operation_id = OperationId::new_random();
+        let tx = TransactionBuilder::new().with_outputs(output);
+
+        let range = self
+            .client_ctx
+            .finalize_and_submit_transaction(
+                operation_id,
+                KIND.as_str(),
+                move |_range| UsdtOperationMeta::Withdraw {
+                    recipient,
+                    amount,
+                    max_fee,
+                },
+                tx,
+            )
+            .await?;
+
+        Ok(range)
     }
 }
 

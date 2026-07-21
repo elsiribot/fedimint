@@ -1,15 +1,12 @@
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::secp256k1::PublicKey;
-use fedimint_core::{PeerId, impl_db_lookup, impl_db_record};
+use fedimint_core::{OutPoint, PeerId, impl_db_lookup, impl_db_record};
 use fedimint_usdt_common::user_op::{SignedUserOp, UnsignedUserOp};
-use fedimint_usdt_common::{DepositObservation, EvmAddress, SigningSessionId, UsdtAmount};
+use fedimint_usdt_common::{DepositObservation, EvmAddress, FeeVote, SigningSessionId, UsdtAmount};
 use serde::Serialize;
 use strum_macros::EnumIter;
 
 /// Namespaces DB keys for this module.
-///
-/// `0x02` is intentionally skipped: it is reserved for a later-phase
-/// `FeeVote` table and must not be reused.
 #[repr(u8)]
 #[derive(Clone, EnumIter, Debug)]
 pub enum DbKeyPrefix {
@@ -17,6 +14,13 @@ pub enum DbKeyPrefix {
     /// wallet module's `BlockCountVote`, but `u64`-valued since EVM block
     /// numbers do not fit the wallet's `u32` bitcoin block heights).
     BlockCountVote = 0x01,
+    /// Per-peer votes on the current EVM fee market and USDT/ETH exchange
+    /// rate (Phase 8, Task 1), mirroring [`Self::BlockCountVote`]'s
+    /// per-peer-vote shape. The federation's current fee quote is the
+    /// per-field MEDIAN over these votes (see
+    /// `fedimint_usdt_server::Usdt::fee_vote_median`), not any single
+    /// peer's vote.
+    FeeVote = 0x02,
     /// Consensus-agreed state for a tracked deposit account.
     DepositRecord = 0x03,
     /// Per-peer votes on the observed balance of a deposit account at a
@@ -49,6 +53,13 @@ pub enum DbKeyPrefix {
     /// `UserOp` (Phase 7, Task 5), mirroring [`DepositObservationVoteKey`]'s
     /// dual-prefix quorum shape.
     UserOpConfirmedVote = 0x0B,
+    /// A withdrawal output that has been accepted (its `max_fee` cleared
+    /// the fee-vote-median quote) and is queued for the next withdrawal
+    /// batch (Phase 8, Task 1; batched into an actual `UserOp` by Task 2).
+    UnclaimedWithdrawal = 0x0C,
+    /// The consensus-agreed lifecycle stage of a queued withdrawal (Phase 8,
+    /// Task 1).
+    WithdrawalState = 0x0D,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -69,6 +80,21 @@ impl_db_record!(
     db_prefix = DbKeyPrefix::BlockCountVote,
 );
 impl_db_lookup!(key = BlockCountVoteKey, query_prefix = BlockCountVotePrefix);
+
+/// One peer's vote on the current EVM fee market / USDT-per-ETH exchange
+/// rate (Phase 8, Task 1), mirroring [`BlockCountVoteKey`] exactly.
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct FeeVoteKey(pub PeerId);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct FeeVotePrefix;
+
+impl_db_record!(
+    key = FeeVoteKey,
+    value = FeeVote,
+    db_prefix = DbKeyPrefix::FeeVote,
+);
+impl_db_lookup!(key = FeeVoteKey, query_prefix = FeeVotePrefix);
 
 /// Consensus-agreed state for a deposit account: how much of the observed
 /// balance has been credited (i.e. a supermajority of guardians agree it was
@@ -393,6 +419,79 @@ impl_db_lookup!(
     key = UserOpConfirmedVoteKey,
     query_prefix = UserOpConfirmedVotePrefix,
     query_prefix = UserOpConfirmedVoteOpPrefix,
+);
+
+/// A withdrawal output's queued payout details (Phase 8, Task 1), keyed by
+/// the `OutPoint` of the `UsdtOutput::V0` that enqueued it (see
+/// [`UnclaimedWithdrawalKey`]). Written once, atomically, alongside
+/// [`WithdrawalStateKey`]`(out_point) = WithdrawalState::Queued` by
+/// `Usdt::process_output`; removed once Task 2's batching logic confirms the
+/// withdrawal (its `WithdrawalState` becomes terminal).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub struct UsdtWithdrawalV0 {
+    pub recipient: EvmAddress,
+    pub amount: UsdtAmount,
+    pub max_fee: UsdtAmount,
+    /// The consensus block count (`Usdt::consensus_block_count`) as of this
+    /// withdrawal's enqueueing -- diagnostic bookkeeping only (mirrors
+    /// [`PendingUserOp::created_block`](crate::db::PendingUserOp)), no
+    /// consensus decision reads it today.
+    pub requested_block: u64,
+}
+
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct UnclaimedWithdrawalKey(pub OutPoint);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct UnclaimedWithdrawalPrefix;
+
+impl_db_record!(
+    key = UnclaimedWithdrawalKey,
+    value = UsdtWithdrawalV0,
+    db_prefix = DbKeyPrefix::UnclaimedWithdrawal,
+);
+impl_db_lookup!(
+    key = UnclaimedWithdrawalKey,
+    query_prefix = UnclaimedWithdrawalPrefix
+);
+
+/// The consensus-agreed lifecycle stage of a queued withdrawal (Phase 8,
+/// Task 1's `Queued`; Task 2 adds the `UserOp`-signing/submission
+/// transitions).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub enum WithdrawalState {
+    /// Enqueued by `Usdt::process_output`, awaiting Task 2's batching logic
+    /// to include it in a withdrawal `UserOp`.
+    Queued,
+    /// Included in a withdrawal `UserOp` whose federation MPC signing
+    /// session (identified by its digest) is in progress (Task 2).
+    Signing([u8; 32]),
+    /// The withdrawal's `UserOp` has been federation-agreed-signed
+    /// (identified by its `op_hash`) and is awaiting/undergoing guardian-
+    /// local on-chain submission and confirmation (Task 2).
+    Submitted([u8; 32]),
+    /// The withdrawal's `UserOp` confirmed on-chain successfully at `block`
+    /// (Task 2); terminal.
+    Confirmed { block: u64 },
+    /// The withdrawal's `UserOp` failed on-chain, or could not be
+    /// completed, for `reason` (Task 2/3); terminal.
+    Failed { reason: String },
+}
+
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct WithdrawalStateKey(pub OutPoint);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct WithdrawalStatePrefix;
+
+impl_db_record!(
+    key = WithdrawalStateKey,
+    value = WithdrawalState,
+    db_prefix = DbKeyPrefix::WithdrawalState,
+);
+impl_db_lookup!(
+    key = WithdrawalStateKey,
+    query_prefix = WithdrawalStatePrefix
 );
 
 #[cfg(test)]
@@ -721,5 +820,96 @@ mod tests {
             .await;
         assert_eq!(op_a_votes.len(), 2);
         assert!(op_a_votes.iter().all(|(key, _)| key.0 == op_a));
+    }
+
+    #[tokio::test]
+    async fn fee_vote_round_trips() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let vote = fedimint_usdt_common::FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&FeeVoteKey(PeerId::from(1)), &vote)
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&FeeVoteKey(PeerId::from(1))).await,
+            Some(vote)
+        );
+        assert_eq!(dbtx.find_by_prefix(&FeeVotePrefix).await.count().await, 1);
+    }
+
+    fn test_out_point(idx: u64) -> OutPoint {
+        use fedimint_core::BitcoinHash as _;
+        OutPoint {
+            txid: fedimint_core::TransactionId::all_zeros(),
+            out_idx: idx,
+        }
+    }
+
+    #[tokio::test]
+    async fn unclaimed_withdrawal_round_trips() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let out_point = test_out_point(0);
+        let withdrawal = UsdtWithdrawalV0 {
+            recipient: EvmAddress([0x33; 20]),
+            amount: UsdtAmount(5_000_000),
+            max_fee: UsdtAmount(20_000),
+            requested_block: 12,
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_point), &withdrawal)
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&UnclaimedWithdrawalKey(out_point)).await,
+            Some(withdrawal)
+        );
+        assert_eq!(
+            dbtx.find_by_prefix(&UnclaimedWithdrawalPrefix)
+                .await
+                .count()
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawal_state_round_trips_every_variant() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+
+        let states = [
+            WithdrawalState::Queued,
+            WithdrawalState::Signing([1; 32]),
+            WithdrawalState::Submitted([2; 32]),
+            WithdrawalState::Confirmed { block: 99 },
+            WithdrawalState::Failed {
+                reason: "gas spike".to_string(),
+            },
+        ];
+
+        let mut dbtx = db.begin_transaction().await;
+        for (i, state) in states.iter().enumerate() {
+            dbtx.insert_new_entry(&WithdrawalStateKey(test_out_point(i as u64)), state)
+                .await;
+        }
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        for (i, state) in states.iter().enumerate() {
+            assert_eq!(
+                dbtx.get_value(&WithdrawalStateKey(test_out_point(i as u64)))
+                    .await
+                    .as_ref(),
+                Some(state)
+            );
+        }
     }
 }

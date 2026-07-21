@@ -55,3 +55,11 @@ pub const POOL_STATE_ENDPOINT: &str = "pool_state";
 /// `Unknown`) of a `UserOp`, identified by its `user_op_hash` (Phase 7, Task
 /// 5). Read from consensus DB, so any guardian answers identically.
 pub const USEROP_STATUS_ENDPOINT: &str = "userop_status";
+
+/// Reports the current withdrawal fee quote (Phase 8, Task 1): the minimum
+/// `max_fee` a `UsdtOutput::V0` must offer, derived from the federation's
+/// consensus-agreed `FeeVote` median (see
+/// `fedimint_usdt_common::withdrawal_fee_quote`). Read from consensus DB, so
+/// any guardian answers identically (threshold-agreement, not just a
+/// single-guardian estimate).
+pub const WITHDRAW_FEE_QUOTE_ENDPOINT: &str = "withdraw_fee_quote";

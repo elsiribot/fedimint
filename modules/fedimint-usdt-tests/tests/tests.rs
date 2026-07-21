@@ -22,9 +22,15 @@ use fedimint_testing::fixtures::Fixtures;
 use fedimint_usdt_client::api::UsdtFederationApi;
 use fedimint_usdt_client::{UsdtClientInit, UsdtClientModule};
 use fedimint_usdt_common::user_op::UserOpReceipt;
-use fedimint_usdt_common::{EvmAddress, SigningSessionId, USDT_UNIT, UsdtAmount, UserOpStatus};
+use fedimint_usdt_common::{
+    EvmAddress, FeeVote, SigningSessionId, USDT_UNIT, UsdtAmount, UserOpStatus,
+    withdrawal_fee_quote,
+};
 use fedimint_usdt_server::UsdtInit;
-use fedimint_usdt_server::db::{PendingUserOpKey, PendingUserOpPrefix};
+use fedimint_usdt_server::db::{
+    PendingUserOpKey, PendingUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix,
+    UsdtWithdrawalV0, WithdrawalState, WithdrawalStateKey,
+};
 use futures::StreamExt as _;
 
 fn fixtures() -> Fixtures {
@@ -648,6 +654,285 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
         items_after, reference,
         "the usdt module DB must be unchanged after the replay window"
     );
+
+    Ok(())
+}
+
+/// Returns the sole `(OutPoint, UsdtWithdrawal)` this guardian's
+/// `UnclaimedWithdrawal` table currently holds (or `None` if it's empty /
+/// holds more than one -- this test only ever drives a single withdrawal at
+/// a time), mirroring [`find_sole_pending_user_op_hash`].
+async fn find_sole_unclaimed_withdrawal(
+    fed: &FederationTest,
+    peer: PeerId,
+    module_instance_id: ModuleInstanceId,
+) -> Option<(fedimint_core::OutPoint, UsdtWithdrawalV0)> {
+    let db = fed.server_db(peer);
+    let mut dbtx = db.begin_transaction_nc().await;
+    let (mut isolated, _) = dbtx.to_ref_with_prefix_module_id(module_instance_id);
+    let queued: Vec<(UnclaimedWithdrawalKey, UsdtWithdrawalV0)> = isolated
+        .find_by_prefix(&UnclaimedWithdrawalPrefix)
+        .await
+        .collect()
+        .await;
+    match queued.as_slice() {
+        [(UnclaimedWithdrawalKey(out_point), withdrawal)] => Some((*out_point, withdrawal.clone())),
+        _ => None,
+    }
+}
+
+/// **Phase 8 Task 1 gating acceptance test.** Drives the withdrawal
+/// debit/queue + FeeVote-median path end to end over a hermetic 4-guardian
+/// federation (shared [`MockEvmRpc`], so every guardian's fee-estimate poller
+/// reads the identical scripted `get_fee_estimate`, votes the identical
+/// `FeeVote`, and thus computes the identical median):
+///
+/// 1. Every guardian proposes its `FeeVote` (from the scripted mock) on its 1s
+///    poller tick; the `withdraw_fee_quote` endpoint converges to the SAME
+///    quote on every guardian (fee-vote median is deterministic + identical).
+/// 2. A user first deposits + claims USDT e-cash (funding the withdrawal), then
+///    submits a `UsdtOutput::V0` withdrawal whose `max_fee` equals the quote;
+///    `process_output` debits `amount + max_fee` and enqueues an
+///    `UnclaimedWithdrawal` + `WithdrawalState::Queued` -- byte-identically on
+///    every guardian.
+/// 3. Asserts every guardian's ENTIRE usdt module DB is byte-identical at the
+///    terminal state (reusing the same `dump_usdt_module_db` raw byte-compare
+///    helper as the Phase-7 sweep test).
+///
+/// Slow (real DKG + a real, real-timer-driven federation); run in the
+/// foreground.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> anyhow::Result<()> {
+    let mock = Arc::new(MockEvmRpc::new());
+    let usdt_contract = EvmAddress([0u8; 20]);
+    mock.set_chain_id(31337);
+    mock.set_block_number(100);
+    // Every guardian reads THIS scripted fee estimate, so every guardian
+    // votes it and the per-field median trivially equals it -- identical on
+    // all guardians.
+    let scripted_fee = FeeVote {
+        max_fee_per_gas_wei: 20_000_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
+    let expected_quote =
+        withdrawal_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
+
+    let fed = dual_mint_fixtures(mock.clone())
+        .new_fed_builder(0)
+        .disable_mint_fees()
+        .build()
+        .await;
+    let client: ClientHandleArc = fed.new_client().await;
+    let usdt = client.get_first_module::<UsdtClientModule>()?;
+    let module_instance_id = usdt.id;
+    let peers: Vec<PeerId> = usdt.all_peers().into_iter().collect();
+    assert_eq!(peers.len(), 4, "this test assumes the 4-guardian fixture");
+
+    // 1. Wait for the fee-vote median to be populated (guardians vote on their 1s
+    //    poller ticks), then assert `withdraw_fee_quote` is identical across every
+    //    guardian and equals the pure-function quote.
+    let quote_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let quote = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await?;
+        if quote.max_fee == expected_quote {
+            break;
+        }
+        if Instant::now() >= quote_deadline {
+            bail!(
+                "withdraw_fee_quote never converged to {expected_quote} (last {})",
+                quote.max_fee
+            );
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+    // `withdraw_fee_quote` is a `request_current_consensus` call, so a
+    // response at all means a threshold of guardians agreed on it; assert the
+    // value equals the deterministic quote.
+    let quote = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await?;
+    assert_eq!(quote.max_fee, expected_quote);
+
+    // 2. Fund the withdrawal: deposit + claim USDT e-cash. `25_600_000` is a
+    //    multiple of 512 msat (no mintv2 denomination-rounding dust) and
+    //    comfortably covers `amount + max_fee`.
+    let deposit_amount = UsdtAmount(25_600_000);
+    let (claim_keypair, account) = usdt.allocate_deposit().await?;
+    mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
+    usdt.check_and_claim(&claim_keypair, Duration::from_secs(120))
+        .await?;
+    let fund_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if client.get_balance_for_unit(USDT_UNIT).await? == Amount::from_msats(deposit_amount.0) {
+            break;
+        }
+        if Instant::now() >= fund_deadline {
+            bail!("USDT e-cash was never minted before the deadline");
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // 2b. Crediting a deposit auto-triggers the Phase-7 deploy-and-sweep MPC
+    //     pipeline (`Usdt::maybe_trigger_sweep`). That pipeline mutates the
+    //     consensus DB (signing sessions, round chunks) asynchronously and
+    //     is transiently divergent across guardians mid-signing, so drive it
+    //     to its quiescent terminal state (pool balance == deposit) BEFORE
+    //     the byte-identical whole-DB compare below, exactly as the Phase-7
+    //     sweep acceptance test does.
+    let submit_deadline = Instant::now() + Duration::from_secs(600);
+    // Capture the sweep op_hash from the `PendingUserOp` table BEFORE waiting
+    // for the submission: the sweep lifecycle clears `PendingUserOp` ->
+    // `SubmittedUserOp` when the signing session completes, which happens
+    // before the guardian-local submitter ever records a submission. Reading
+    // the submission first would leave nothing in `PendingUserOp` to capture
+    // (mirrors the Phase-7 `deposit_sweep_pipeline` ordering).
+    let sweep_op_hash = loop {
+        if let Some(hash) = find_sole_pending_user_op_hash(&fed, peers[0], module_instance_id).await
+        {
+            break hash;
+        }
+        if Instant::now() >= submit_deadline {
+            bail!("no sweep PendingUserOp appeared before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    };
+    loop {
+        if !mock.submitted_user_ops().is_empty() {
+            break;
+        }
+        if Instant::now() >= submit_deadline {
+            bail!("no sweep UserOp submission was recorded before the deadline");
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    mock.set_user_op_receipt(
+        sweep_op_hash,
+        UserOpReceipt {
+            success: true,
+            block: 42,
+            actual_cost_usdt: UsdtAmount(0),
+        },
+    );
+    for &peer in &peers {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if usdt.pool_state(peer).await?.balance == deposit_amount {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("guardian {peer} pool balance never converged before the deadline");
+            }
+            sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    // 3. Submit the withdrawal output (max_fee == quote).
+    let recipient = EvmAddress([0x99; 20]);
+    let amount = UsdtAmount(2_000_000);
+    usdt.withdraw(recipient, amount, expected_quote).await?;
+
+    // 4. An UnclaimedWithdrawal + WithdrawalState::Queued deterministically appears
+    //    on every guardian, with identical contents.
+    let queued_deadline = Instant::now() + Duration::from_secs(30);
+    let out_point = loop {
+        if let Some((out_point, _)) =
+            find_sole_unclaimed_withdrawal(&fed, peers[0], module_instance_id).await
+        {
+            break out_point;
+        }
+        if Instant::now() >= queued_deadline {
+            bail!("no UnclaimedWithdrawal appeared on peer 0 before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    };
+    for &peer in &peers {
+        // Guardians apply the ordered output at slightly different wall-clock
+        // moments, so poll each one to convergence rather than reading it
+        // eagerly (the write itself is a deterministic pure function of the
+        // ordered output + config, identical on every guardian).
+        let peer_deadline = Instant::now() + Duration::from_secs(30);
+        let withdrawal = loop {
+            if let Some((_, w)) =
+                find_sole_unclaimed_withdrawal(&fed, peer, module_instance_id).await
+            {
+                break w;
+            }
+            if Instant::now() >= peer_deadline {
+                panic!("guardian {peer} must hold the identical UnclaimedWithdrawal");
+            }
+            sleep(Duration::from_millis(300)).await;
+        };
+        assert_eq!(withdrawal.recipient, recipient);
+        assert_eq!(withdrawal.amount, amount);
+        assert_eq!(withdrawal.max_fee, expected_quote);
+
+        let state = loop {
+            let state = {
+                let db = fed.server_db(peer);
+                let mut dbtx = db.begin_transaction_nc().await;
+                let (mut isolated, _) = dbtx.to_ref_with_prefix_module_id(module_instance_id);
+                isolated.get_value(&WithdrawalStateKey(out_point)).await
+            };
+            if let Some(state) = state {
+                break state;
+            }
+            if Instant::now() >= peer_deadline {
+                panic!("guardian {peer} must hold the WithdrawalState");
+            }
+            sleep(Duration::from_millis(300)).await;
+        };
+        assert_eq!(state, WithdrawalState::Queued);
+    }
+
+    // 5. The claimed USDT e-cash was debited by exactly `amount + max_fee`. The
+    //    mint spend's change is reissued asynchronously (a mint output state
+    //    machine fetches the blind signatures after the tx is accepted), so poll
+    //    until the balance settles rather than reading it eagerly -- exactly like
+    //    the deposit-claim balance poll above. If this were a real over-charge (not
+    //    change-settlement timing) the balance would never reach the expected value
+    //    and this still fails at the deadline.
+    let expected_balance = Amount::from_msats(25_600_000 - amount.0 - expected_quote.0);
+    let burn_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let balance_after = client.get_balance_for_unit(USDT_UNIT).await?;
+        if balance_after == expected_balance {
+            break;
+        }
+        if Instant::now() >= burn_deadline {
+            assert_eq!(
+                balance_after, expected_balance,
+                "the withdrawal must burn exactly amount + max_fee of USDT e-cash"
+            );
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+
+    // 6. Every guardian's ENTIRE usdt module DB converges to byte-identical at the
+    //    terminal state. Guardians apply the final ordered items at slightly
+    //    different wall-clock moments, so poll to convergence rather than comparing
+    //    eagerly; the federation is quiescent here (static block count + static fee
+    //    -> the pollers are redundancy-guarded and propose nothing new), so a fixed
+    //    point is reached. A REAL divergence never converges and still fails at the
+    //    deadline with the diverging peer.
+    let converge_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut dumps: Vec<BTreeMap<Vec<u8>, Vec<u8>>> = Vec::with_capacity(peers.len());
+        for &peer in &peers {
+            dumps.push(dump_usdt_module_db(&fed, peer, module_instance_id).await);
+        }
+        if dumps.iter().all(|d| d == &dumps[0]) {
+            break;
+        }
+        if Instant::now() >= converge_deadline {
+            for (i, &peer) in peers.iter().enumerate() {
+                assert_eq!(
+                    &dumps[i], &dumps[0],
+                    "guardian {peer}'s usdt module DB diverges from peer {}'s",
+                    peers[0]
+                );
+            }
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
 
     Ok(())
 }

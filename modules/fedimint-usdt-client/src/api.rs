@@ -7,11 +7,12 @@ use fedimint_core::{PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
     DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
-    SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
+    SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositStatusRequest, DepositStatusResponse,
-    PoolStateResponse, SigningSessionId, UserOpStatusRequest, UserOpStatusResponse,
+    PoolStateResponse, SigningSessionId, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse,
+    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -77,6 +78,16 @@ pub trait UsdtFederationApi {
         peer: PeerId,
         op_hash: [u8; 32],
     ) -> FederationResult<UserOpStatusResponse>;
+
+    /// Reports the federation's current withdrawal fee quote for `amount`
+    /// (Phase 8, Task 1). Threshold-agreement (`request_current_consensus`,
+    /// mirroring `deposit_status`): the quote is derived entirely from the
+    /// consensus-agreed `FeeVote` median, so any guardian answers
+    /// identically.
+    async fn withdraw_fee_quote(
+        &self,
+        amount: UsdtAmount,
+    ) -> FederationResult<WithdrawFeeQuoteResponse>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -178,5 +189,16 @@ where
         )
         .await
         .map_err(|e| FederationError::new_one_peer(peer, USEROP_STATUS_ENDPOINT, op_hash, e))
+    }
+
+    async fn withdraw_fee_quote(
+        &self,
+        amount: UsdtAmount,
+    ) -> FederationResult<WithdrawFeeQuoteResponse> {
+        self.request_current_consensus(
+            WITHDRAW_FEE_QUOTE_ENDPOINT.to_string(),
+            ApiRequestErased::new(WithdrawFeeQuoteRequest { amount }),
+        )
+        .await
     }
 }

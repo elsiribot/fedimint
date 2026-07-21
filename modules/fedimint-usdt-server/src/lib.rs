@@ -41,16 +41,17 @@ use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
     DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
-    SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
+    SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositObservation, DepositStatusRequest,
-    DepositStatusResponse, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem,
+    DepositStatusResponse, FeeVote, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem,
     PoolStateResponse, SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
     UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
-    UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, derive_deposit_account,
-    derive_pool_account, evm_address, signing_session_id,
+    UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
+    WithdrawFeeQuoteResponse, derive_deposit_account, derive_pool_account, evm_address,
+    signing_session_id, withdrawal_fee_quote,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -61,12 +62,15 @@ use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfig
 use crate::db::{
     BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, DepositObservationVoteAccountPrefix,
     DepositObservationVoteKey, DepositObservationVotePrefix, DepositRecord, DepositRecordKey,
-    DepositRecordPrefix, MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix,
-    MpcRoundChunkSessionRoundPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
-    PendingUserOp, PendingUserOpKey, PendingUserOpPrefix, PoolState, PoolStateKey, PoolStatePrefix,
-    SessionState, SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix,
-    SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix, UserOpConfirmedObservation,
-    UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix, UserOpConfirmedVotePrefix, UserOpPurpose,
+    DepositRecordPrefix, FeeVoteKey, FeeVotePrefix, MpcRoundChunk, MpcRoundChunkKey,
+    MpcRoundChunkPrefix, MpcRoundChunkSessionRoundPrefix, PendingCheck, PendingCheckKey,
+    PendingCheckPrefix, PendingUserOp, PendingUserOpKey, PendingUserOpPrefix, PoolState,
+    PoolStateKey, PoolStatePrefix, SessionState, SigningPurpose, SigningSession, SigningSessionKey,
+    SigningSessionPrefix, SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix,
+    UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
+    UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
+    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalState, WithdrawalStateKey,
+    WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -157,6 +161,16 @@ impl ModuleInit for UsdtInit {
                         "Block Count Votes"
                     );
                 }
+                DbKeyPrefix::FeeVote => {
+                    push_db_pair_items!(
+                        dbtx,
+                        FeeVotePrefix,
+                        crate::db::FeeVoteKey,
+                        fedimint_usdt_common::FeeVote,
+                        items,
+                        "Fee Votes"
+                    );
+                }
                 DbKeyPrefix::DepositRecord => {
                     push_db_pair_items!(
                         dbtx,
@@ -245,6 +259,26 @@ impl ModuleInit for UsdtInit {
                         UserOpConfirmedObservation,
                         items,
                         "UserOp Confirmed Votes"
+                    );
+                }
+                DbKeyPrefix::UnclaimedWithdrawal => {
+                    push_db_pair_items!(
+                        dbtx,
+                        UnclaimedWithdrawalPrefix,
+                        UnclaimedWithdrawalKey,
+                        UsdtWithdrawalV0,
+                        items,
+                        "Unclaimed Withdrawals"
+                    );
+                }
+                DbKeyPrefix::WithdrawalState => {
+                    push_db_pair_items!(
+                        dbtx,
+                        WithdrawalStatePrefix,
+                        WithdrawalStateKey,
+                        WithdrawalState,
+                        items,
+                        "Withdrawal States"
                     );
                 }
             }
@@ -560,6 +594,16 @@ pub struct Usdt {
     /// `consensus_proposal`. Mirrors `deposit_proposals`'s drain pattern
     /// exactly (Phase 7, Task 5).
     user_op_confirmed_proposals: Arc<Mutex<Vec<UserOpConfirmedProposal>>>,
+    /// This guardian's most recently polled [`FeeVote`] (current EVM fee
+    /// market / USDT-per-ETH exchange rate), refreshed in the background by
+    /// [`Usdt::spawn_fee_estimate_poller`] (Phase 8, Task 1) -- mirrors
+    /// `block_count`'s push-updated cache pattern exactly, except `Option`
+    /// (rather than an `AtomicU64` defaulting to `0`) since a `FeeVote` of
+    /// all-zero fields would be a meaningfully wrong value to ever propose,
+    /// unlike block count `0`, which is a legitimate (if unlikely)
+    /// "chain not observed yet" state already handled elsewhere. `None`
+    /// until the poller's first successful read.
+    fee_estimate: Arc<Mutex<Option<FeeVote>>>,
 }
 
 /// One guardian-local observation of a submitted `UserOp`'s on-chain outcome
@@ -630,6 +674,19 @@ impl ServerModule for Usdt {
 
         if vote > current_vote {
             items.push(UsdtConsensusItem::BlockCount(vote));
+        }
+
+        // Propose this guardian's most recently polled `FeeVote` (see
+        // `spawn_fee_estimate_poller`), mirroring the `BlockCount` proposal
+        // above but with equality-based (not `>`) dedup: the EVM fee market
+        // moves in both directions, so "changed" (not "increased") is the
+        // right redundancy test (Phase 8, Task 1).
+        let fee_vote = *self.fee_estimate.lock().expect("not poisoned");
+        if let Some(vote) = fee_vote {
+            let current_vote = dbtx.get_value(&FeeVoteKey(self.our_peer_id)).await;
+            if current_vote != Some(vote) {
+                items.push(UsdtConsensusItem::FeeVote(vote));
+            }
         }
 
         // Drain observations gathered by the background deposit-checker task
@@ -919,6 +976,25 @@ impl ServerModule for Usdt {
                 }
                 Ok(())
             }
+            UsdtConsensusItem::FeeVote(vote) => {
+                // DETERMINISTIC, mirrors the `BlockCount` arm's discipline:
+                // store this peer's vote with a redundancy guard. Unlike
+                // `BlockCount` (monotonic, so the guard is `vote >
+                // current_vote`), the EVM fee market moves in both
+                // directions, so the guard here is equality-based (reject
+                // only an EXACT repeat). No threshold-triggered "apply"
+                // step: the federation's fee quote is always read on
+                // demand as the median over whatever votes are currently
+                // stored (see `Usdt::fee_vote_median`), never derived from
+                // any single peer's vote or written to a separate
+                // consensus-agreed record here.
+                let current_vote = dbtx.get_value(&FeeVoteKey(peer_id)).await;
+                ensure!(current_vote != Some(vote), "FeeVote is redundant");
+
+                dbtx.insert_entry(&FeeVoteKey(peer_id), &vote).await;
+
+                Ok(())
+            }
             UsdtConsensusItem::Default { .. } => {
                 bail!("The usdt module does not support this consensus item yet")
             }
@@ -958,21 +1034,82 @@ impl ServerModule for Usdt {
         })
     }
 
+    /// Debits `output.amount + output.max_fee` (in [`USDT_UNIT`]) from the
+    /// submitting transaction's funding and enqueues an on-chain withdrawal
+    /// (Phase 8, Task 1). `output.max_fee` must clear the federation's
+    /// current fee-vote-median-derived quote
+    /// ([`fedimint_usdt_common::withdrawal_fee_quote`]); the excess over the
+    /// actual on-chain gas cost accrues to the federation (Task 3).
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of `(output, prior consensus DB state, config)`:
+    /// reads only the fee-vote median (`Usdt::fee_vote_median`, itself a
+    /// pure read over the consensus `FeeVote` table) and
+    /// `Usdt::consensus_block_count` (also consensus-DB-derived,
+    /// diagnostic-only bookkeeping for `requested_block`, mirroring
+    /// `PendingUserOp::created_block`) -- no RPC, no wall-clock, no
+    /// `our_peer_id`. Every guardian processing the same ordered output
+    /// against the same prior DB state computes the identical
+    /// `Ok`/`Err` and the identical `UnclaimedWithdrawalKey`/
+    /// `WithdrawalStateKey` writes.
     async fn process_output<'a, 'b>(
         &'a self,
-        _dbtx: &mut DatabaseTransaction<'b>,
-        _output: &'a UsdtOutput,
-        _out_point: OutPoint,
+        dbtx: &mut DatabaseTransaction<'b>,
+        output: &'a UsdtOutput,
+        out_point: OutPoint,
     ) -> Result<TransactionItemAmounts, UsdtOutputError> {
-        Err(UsdtOutputError::NotSupported)
+        let UsdtOutput::V0(withdrawal) = output else {
+            return Err(UsdtOutputError::UnsupportedOutputVariant); // unknown/default variant
+        };
+
+        let median = self
+            .fee_vote_median(dbtx)
+            .await
+            .ok_or(UsdtOutputError::NoFeeQuoteAvailable)?;
+        let quote = withdrawal_fee_quote(&median).ok_or(UsdtOutputError::FeeQuoteOverflow)?;
+
+        if withdrawal.max_fee.0 < quote.0 {
+            return Err(UsdtOutputError::FeeQuoteExceeded {
+                quote,
+                max_fee: withdrawal.max_fee,
+            });
+        }
+
+        let requested_block = self.consensus_block_count(dbtx).await;
+        dbtx.insert_new_entry(
+            &UnclaimedWithdrawalKey(out_point),
+            &UsdtWithdrawalV0 {
+                recipient: withdrawal.recipient,
+                amount: withdrawal.amount,
+                max_fee: withdrawal.max_fee,
+                requested_block,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+            .await;
+
+        Ok(TransactionItemAmounts {
+            amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(withdrawal.amount.0)),
+            fees: Amounts::new_custom(USDT_UNIT, Amount::from_msats(withdrawal.max_fee.0)),
+        })
     }
 
+    /// `Some(UsdtOutputOutcome)` once `out_point`'s withdrawal has been
+    /// enqueued (a `WithdrawalStateKey` record exists for it -- i.e.
+    /// `process_output` succeeded), `None` otherwise. Read directly from
+    /// consensus DB, so any guardian answers identically; see
+    /// [`UsdtOutputOutcome`]'s doc comment for why the detailed lifecycle
+    /// state itself is not carried here.
     async fn output_status(
         &self,
-        _dbtx: &mut DatabaseTransaction<'_>,
-        _out_point: OutPoint,
+        dbtx: &mut DatabaseTransaction<'_>,
+        out_point: OutPoint,
     ) -> Option<UsdtOutputOutcome> {
-        None
+        dbtx.get_value(&WithdrawalStateKey(out_point))
+            .await
+            .map(|_state| UsdtOutputOutcome)
     }
 
     async fn audit(
@@ -1172,9 +1309,49 @@ impl ServerModule for Usdt {
                     Ok(UserOpStatusResponse { status })
                 }
             },
+            api_endpoint! {
+                WITHDRAW_FEE_QUOTE_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, _req: WithdrawFeeQuoteRequest| -> WithdrawFeeQuoteResponse {
+                    // Read-only (Phase 8, Task 1): the quote is derived
+                    // entirely from the consensus-agreed `FeeVote` median,
+                    // so any guardian answers identically
+                    // (threshold-agreement via `request_current_consensus`,
+                    // mirroring `deposit_status`). Before any `FeeVote` has
+                    // landed, `max_fee` reports `0` (a sentinel meaning "no
+                    // quote yet", mirroring `deposit_status`'s
+                    // pre-credit-zeros shape) rather than erroring --
+                    // `process_output` is what actually enforces
+                    // `NoFeeQuoteAvailable`; a `0` quote here can never be
+                    // used to withdraw for free, since any `max_fee` (even
+                    // `0`) still needs `process_output`'s own median lookup
+                    // to succeed at the point the transaction lands.
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+
+                    let median = module.fee_vote_median(&mut dbtx.to_ref_nc()).await;
+                    let max_fee = median
+                        .and_then(|median| withdrawal_fee_quote(&median))
+                        .unwrap_or(UsdtAmount(0));
+
+                    Ok(WithdrawFeeQuoteResponse {
+                        max_fee,
+                        valid_blocks: WITHDRAW_QUOTE_VALID_BLOCKS,
+                    })
+                }
+            },
         ]
     }
 }
+
+/// Advisory (non-enforced) number of further guardian-observed EVM blocks a
+/// `withdraw_fee_quote` response should be treated as valid for before
+/// re-querying, since the fee-vote-median-derived quote can move as
+/// guardians' individual `FeeVote`s change. Not read by any consensus
+/// decision -- `process_output` always re-derives the quote fresh from the
+/// median at the block it processes the output, regardless of how stale a
+/// client's cached quote is.
+const WITHDRAW_QUOTE_VALID_BLOCKS: u64 = 50;
 
 impl Usdt {
     /// Create new module instance, spawning the background block-count
@@ -1216,6 +1393,9 @@ impl Usdt {
             },
         );
 
+        let fee_estimate = Arc::new(Mutex::new(None));
+        Self::spawn_fee_estimate_poller(&task_group, evm_rpc.clone(), fee_estimate.clone());
+
         Usdt {
             cfg,
             evm_rpc,
@@ -1231,6 +1411,7 @@ impl Usdt {
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
             suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
             user_op_confirmed_proposals,
+            fee_estimate,
         }
     }
 
@@ -1260,6 +1441,7 @@ impl Usdt {
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
             suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
             user_op_confirmed_proposals: Arc::new(Mutex::new(Vec::new())),
+            fee_estimate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1292,6 +1474,46 @@ impl Usdt {
                             target: "usdt",
                             err = %err.fmt_compact_anyhow(),
                             "block count poll failed"
+                        );
+                    }
+                }
+
+                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
+                    1
+                } else {
+                    10
+                }))
+                .await;
+            }
+        });
+    }
+
+    /// Spawns a background task that polls `evm_rpc.get_fee_estimate()` into
+    /// `fee_estimate` on a fixed interval (Phase 8, Task 1), mirroring
+    /// [`Usdt::spawn_block_count_poller`] exactly: `consensus_proposal`
+    /// reads a cheap, cached view of this guardian's current fee-market
+    /// observation instead of making a synchronous RPC call on every
+    /// consensus round. The cached value is this guardian's own
+    /// guardian-LOCAL observation, never itself a consensus decision -- it
+    /// only becomes one once proposed as a `UsdtConsensusItem::FeeVote` and
+    /// aggregated (by median, over every peer's vote) into the federation's
+    /// actual fee quote (see [`Usdt::fee_vote_median`]).
+    fn spawn_fee_estimate_poller(
+        task_group: &TaskGroup,
+        evm_rpc: DynServerEvmRpc,
+        fee_estimate: Arc<Mutex<Option<FeeVote>>>,
+    ) {
+        task_group.spawn_cancellable("usdt-fee-estimate-poller", async move {
+            loop {
+                match evm_rpc.get_fee_estimate().await {
+                    Ok(vote) => {
+                        *fee_estimate.lock().expect("not poisoned") = Some(vote);
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "usdt",
+                            err = %err.fmt_compact_anyhow(),
+                            "fee estimate poll failed"
                         );
                     }
                 }
@@ -1463,6 +1685,35 @@ impl Usdt {
     /// value without duplicating the median logic.
     pub async fn consensus_block_count(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
         consensus_block_count(dbtx, self.num_peers).await
+    }
+
+    /// The federation's current withdrawal fee quote: the per-field MEDIAN
+    /// (over every peer's stored [`FeeVote`]) of `max_fee_per_gas_wei` and
+    /// `usdt_per_eth_e6` independently, `None` if not a single peer has
+    /// voted yet (Phase 8, Task 1).
+    ///
+    /// Delegates to the free [`fee_vote_median`] function, mirroring
+    /// [`Self::consensus_block_count`]'s delegation to the free
+    /// [`consensus_block_count`] -- kept as a free function so any future
+    /// `'static`-spawned background task could compute the same value
+    /// without a `&Usdt` (today, nothing needs to; `process_output` and the
+    /// `withdraw_fee_quote` endpoint both hold `&self`).
+    ///
+    /// Deliberately does NOT zero-pad missing votes out to `num_peers` the
+    /// way [`consensus_block_count`] does: block count is monotonic (a
+    /// missing/lagging peer's vote is always "behind", so padding with `0`
+    /// is a safe, conservative default), but the EVM fee market moves in
+    /// both directions, so padding an absent guardian's vote with `0` would
+    /// let a Byzantine guardian bias the fee quote DOWN merely by
+    /// withholding a vote (undercharging users, at the federation's
+    /// expense) — the opposite of what padding protects against for block
+    /// count. The median is instead taken over whatever votes are actually
+    /// present, which — combined with `process_consensus_item`'s
+    /// per-vote redundancy guard — still bounds any single Byzantine
+    /// guardian's influence on the result to one vote out of however many
+    /// have been cast.
+    pub async fn fee_vote_median(&self, dbtx: &mut DatabaseTransaction<'_>) -> Option<FeeVote> {
+        fee_vote_median(dbtx).await
     }
 
     /// Whether `session` has gone `timeout_blocks()` consensus blocks
@@ -2400,6 +2651,33 @@ async fn consensus_block_count(dbtx: &mut DatabaseTransaction<'_>, num_peers: Nu
     counts.sort_unstable();
 
     counts[peer_count / 2]
+}
+
+/// Free-function core of [`Usdt::fee_vote_median`]; see that method's doc
+/// comment for the full rationale (in particular why, unlike
+/// [`consensus_block_count`], this does NOT zero-pad missing votes out to a
+/// peer count).
+async fn fee_vote_median(dbtx: &mut DatabaseTransaction<'_>) -> Option<FeeVote> {
+    let votes: Vec<FeeVote> = dbtx
+        .find_by_prefix(&FeeVotePrefix)
+        .await
+        .map(|entry| entry.1)
+        .collect()
+        .await;
+
+    if votes.is_empty() {
+        return None;
+    }
+
+    let mut max_fee_per_gas_wei: Vec<u64> = votes.iter().map(|v| v.max_fee_per_gas_wei).collect();
+    let mut usdt_per_eth_e6: Vec<u64> = votes.iter().map(|v| v.usdt_per_eth_e6).collect();
+    max_fee_per_gas_wei.sort_unstable();
+    usdt_per_eth_e6.sort_unstable();
+
+    Some(FeeVote {
+        max_fee_per_gas_wei: max_fee_per_gas_wei[max_fee_per_gas_wei.len() / 2],
+        usdt_per_eth_e6: usdt_per_eth_e6[usdt_per_eth_e6.len() / 2],
+    })
 }
 
 /// Scans every guardian-local [`PendingCheck`] and returns the
@@ -3618,6 +3896,361 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, UsdtInputError::UnknownDepositAccount);
+    }
+
+    fn test_out_point(idx: u64) -> OutPoint {
+        OutPoint {
+            txid: TransactionId::all_zeros(),
+            out_idx: idx,
+        }
+    }
+
+    fn sample_fee_vote() -> fedimint_usdt_common::FeeVote {
+        fedimint_usdt_common::FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn fee_vote_median_none_until_first_vote_and_is_per_field() {
+        let module = test_module_with_block_count(4, 0).await;
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        // No votes yet -> None.
+        assert_eq!(module.fee_vote_median(&mut dbtx.to_ref_nc()).await, None);
+
+        // Three peers vote with distinct field combinations; each field's
+        // median is computed independently.
+        let votes = [
+            FeeVote {
+                max_fee_per_gas_wei: 10,
+                usdt_per_eth_e6: 3_000_000_000,
+            },
+            FeeVote {
+                max_fee_per_gas_wei: 20,
+                usdt_per_eth_e6: 1_000_000_000,
+            },
+            FeeVote {
+                max_fee_per_gas_wei: 30,
+                usdt_per_eth_e6: 5_000_000_000,
+            },
+        ];
+        for (i, vote) in votes.iter().enumerate() {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::FeeVote(*vote),
+                    PeerId::from(u16::try_from(i).expect("small")),
+                )
+                .await
+                .expect("first vote from each peer must succeed");
+        }
+
+        // max_fee_per_gas_wei median of [10, 20, 30] = 20 (index 1).
+        // usdt_per_eth_e6 median of [1e9, 3e9, 5e9] = 3e9 (index 1).
+        assert_eq!(
+            module.fee_vote_median(&mut dbtx.to_ref_nc()).await,
+            Some(FeeVote {
+                max_fee_per_gas_wei: 20,
+                usdt_per_eth_e6: 3_000_000_000,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fee_vote_redundancy_guard_rejects_exact_repeat_but_allows_a_change() {
+        let module = test_module_with_block_count(4, 0).await;
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+        let vote = sample_fee_vote();
+
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(vote),
+                PeerId::from(0),
+            )
+            .await
+            .expect("first vote succeeds");
+
+        // Exact repeat is rejected (unbounded-history rule).
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(vote),
+                PeerId::from(0),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("redundant"));
+
+        // A genuinely different vote (fee market moved DOWN, unlike
+        // BlockCount which only ever moves up) from the same peer succeeds.
+        let lower_vote = FeeVote {
+            max_fee_per_gas_wei: vote.max_fee_per_gas_wei - 1,
+            usdt_per_eth_e6: vote.usdt_per_eth_e6,
+        };
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(lower_vote),
+                PeerId::from(0),
+            )
+            .await
+            .expect("a changed vote (even a lower one) must succeed");
+    }
+
+    #[tokio::test]
+    async fn consensus_proposal_drains_fee_estimate_only_when_changed() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        // No cached fee estimate yet -> no FeeVote item proposed.
+        let mut dbtx = db.begin_transaction().await;
+        let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, UsdtConsensusItem::FeeVote(_)))
+        );
+        dbtx.commit_tx().await;
+
+        // Poller "reads" a vote -> proposed once.
+        let vote = sample_fee_vote();
+        *module.fee_estimate.lock().expect("not poisoned") = Some(vote);
+        let mut dbtx = db.begin_transaction().await;
+        let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert!(items.contains(&UsdtConsensusItem::FeeVote(vote)));
+
+        // Simulate the item having been ordered and applied.
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(vote),
+                module.our_peer_id,
+            )
+            .await
+            .expect("apply this guardian's own proposed vote");
+        dbtx.commit_tx().await;
+
+        // Same reading again -> not re-proposed (dedup against stored vote).
+        let mut dbtx = db.begin_transaction().await;
+        let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, UsdtConsensusItem::FeeVote(_)))
+        );
+    }
+
+    /// Seeds every peer's `FeeVoteKey` with `vote`, so
+    /// `Usdt::fee_vote_median` resolves to exactly `vote` (all fields
+    /// identical across peers -> trivially their own median).
+    async fn seed_fee_votes(db: &fedimint_core::db::Database, num_peers: u16, vote: FeeVote) {
+        let mut dbtx = db.begin_transaction().await;
+        for p in 0..num_peers {
+            dbtx.insert_new_entry(&FeeVoteKey(PeerId::from(p)), &vote)
+                .await;
+        }
+        dbtx.commit_tx().await;
+    }
+
+    #[tokio::test]
+    async fn process_output_rejects_when_no_fee_median_exists() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_output(
+                &mut dbtx.to_ref_nc(),
+                &UsdtOutput::V0(fedimint_usdt_common::UsdtOutputV0 {
+                    recipient: EvmAddress([0x22; 20]),
+                    amount: UsdtAmount(1_000_000),
+                    max_fee: UsdtAmount(u64::MAX),
+                }),
+                test_out_point(0),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, UsdtOutputError::NoFeeQuoteAvailable);
+    }
+
+    #[tokio::test]
+    async fn process_output_rejects_max_fee_below_quote() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        let quote = withdrawal_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_output(
+                &mut dbtx.to_ref_nc(),
+                &UsdtOutput::V0(fedimint_usdt_common::UsdtOutputV0 {
+                    recipient: EvmAddress([0x22; 20]),
+                    amount: UsdtAmount(1_000_000),
+                    max_fee: UsdtAmount(quote.0 - 1),
+                }),
+                test_out_point(0),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UsdtOutputError::FeeQuoteExceeded {
+                quote,
+                max_fee: UsdtAmount(quote.0 - 1),
+            }
+        );
+
+        // The rejected output must not have written anything.
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert!(
+            dbtx.get_value(&UnclaimedWithdrawalKey(test_out_point(0)))
+                .await
+                .is_none()
+        );
+        assert!(
+            dbtx.get_value(&WithdrawalStateKey(test_out_point(0)))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_output_debits_and_enqueues_withdrawal() {
+        let module = test_module_with_block_count(4, 100).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        // Advance the consensus block count so `requested_block` is
+        // observably non-zero.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for p in 0..4u16 {
+                module
+                    .process_consensus_item(
+                        &mut dbtx.to_ref_nc(),
+                        UsdtConsensusItem::BlockCount(50),
+                        PeerId::from(p),
+                    )
+                    .await
+                    .expect("block count vote succeeds");
+            }
+            dbtx.commit_tx().await;
+        }
+
+        let quote = withdrawal_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
+        let recipient = EvmAddress([0x77; 20]);
+        let amount = UsdtAmount(4_200_000);
+        let out_point = test_out_point(7);
+
+        let mut dbtx = db.begin_transaction().await;
+        let meta = module
+            .process_output(
+                &mut dbtx.to_ref_nc(),
+                &UsdtOutput::V0(fedimint_usdt_common::UsdtOutputV0 {
+                    recipient,
+                    amount,
+                    max_fee: quote,
+                }),
+                out_point,
+            )
+            .await
+            .expect("max_fee == quote must clear the FeeQuoteExceeded check");
+        dbtx.commit_tx().await;
+
+        assert_eq!(
+            meta.amounts,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0))
+        );
+        assert_eq!(
+            meta.fees,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(quote.0))
+        );
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let withdrawal = dbtx
+            .get_value(&UnclaimedWithdrawalKey(out_point))
+            .await
+            .expect("UnclaimedWithdrawal must be written");
+        assert_eq!(withdrawal.recipient, recipient);
+        assert_eq!(withdrawal.amount, amount);
+        assert_eq!(withdrawal.max_fee, quote);
+        assert_eq!(withdrawal.requested_block, 50);
+
+        let state = dbtx
+            .get_value(&WithdrawalStateKey(out_point))
+            .await
+            .expect("WithdrawalState must be written");
+        assert_eq!(state, WithdrawalState::Queued);
+    }
+
+    #[tokio::test]
+    async fn process_output_default_variant_errors() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_output(
+                &mut dbtx.to_ref_nc(),
+                &UsdtOutput::Default {
+                    variant: 99,
+                    bytes: Vec::new(),
+                },
+                test_out_point(0),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, UsdtOutputError::UnsupportedOutputVariant);
+    }
+
+    // `ServerModule::output_status` is deprecated upstream (modules are
+    // steered toward dedicated status endpoints instead -- see its trait
+    // doc comment); this module still implements it minimally per this
+    // task's spec (`UsdtOutputOutcome`'s doc comment explains why it stays
+    // minimal), so this test intentionally exercises the deprecated method
+    // directly.
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn output_status_reflects_withdrawal_state_presence() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let out_point = test_out_point(0);
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            module.output_status(&mut dbtx.to_ref_nc(), out_point).await,
+            None,
+            "no outcome before the output is processed"
+        );
+        drop(dbtx);
+
+        let quote = withdrawal_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .process_output(
+                &mut dbtx.to_ref_nc(),
+                &UsdtOutput::V0(fedimint_usdt_common::UsdtOutputV0 {
+                    recipient: EvmAddress([0x44; 20]),
+                    amount: UsdtAmount(1_000_000),
+                    max_fee: quote,
+                }),
+                out_point,
+            )
+            .await
+            .expect("must succeed with a valid quote");
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            module.output_status(&mut dbtx.to_ref_nc(), out_point).await,
+            Some(UsdtOutputOutcome),
+            "an outcome exists once the withdrawal is queued"
+        );
     }
 
     #[tokio::test]
