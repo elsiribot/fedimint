@@ -106,7 +106,8 @@ impl fmt::Display for FeeVote {
     }
 }
 
-/// Domain-separation tag mixed into the provisional deposit-address tweak.
+/// Domain-separation tag mixed into a deposit account's CREATE2 `salt` (see
+/// [`derive_deposit_account`]).
 pub const DEPOSIT_ADDRESS_DOMAIN: &[u8] = b"fedimint-usdt-deposit-v0";
 
 /// Domain-separation tag mixed into a signing session's id derivation (see
@@ -128,41 +129,153 @@ pub fn evm_address(pk: &secp256k1::PublicKey) -> EvmAddress {
     EvmAddress(address)
 }
 
-/// Derives the per-user deposit EOA from the federation group key and the
-/// user's claim key via an additive tweak: `group_pk ⊕ t·G` where
-/// `t = keccak256(DOMAIN ‖ group_pk ‖ claim_pk)`.
+alloy_sol_types::sol! {
+    /// Only the ABI signature is needed here (to produce `initialize`'s
+    /// calldata for [`derive_deposit_account`]'s `initCode`); mirrors
+    /// `SimpleAccount.initialize(address)` from the vendored
+    /// `fedimint-usdt-tests/tests/fixtures/erc4337/SimpleAccount.json`
+    /// (Phase 7 Task 1, `@account-abstraction/contracts@0.7.0`).
+    interface ISimpleAccountInit {
+        function initialize(address anOwner) external;
+    }
+}
+
+/// The `ERC1967Proxy` creation (constructor) bytecode that
+/// `SimpleAccountFactory.createAccount`/`getAddress` embed in the `initCode`
+/// they `CREATE2` a counterfactual `SimpleAccount` proxy from (`new
+/// ERC1967Proxy{salt: bytes32(salt)}(address(accountImplementation),
+/// abi.encodeCall(SimpleAccount.initialize, (owner)))`).
 ///
-/// PROVISIONAL (Phase 5): detection-only. The federation does not sign for
-/// this address in Phase 5; signing custody (SLIP-10 / additive-tweak /
-/// CREATE2 `SimpleAccount`) is reconciled in Phase 7. Both the client (wasm)
-/// and every guardian call this exact function so the address they watch is
-/// bit-for-bit identical.
+/// Source: `eth-infinitism/account-abstraction` git tag `v0.7.0`'s own
+/// `hardhat compile` output for
+/// `artifacts/@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol/
+/// ERC1967Proxy.json`'s `bytecode` field, committed here as this hex
+/// literal.
 ///
-/// # Panics
+/// NOTE: this is deliberately **not** `@openzeppelin/contracts@5.0.0`'s own
+/// standalone-published artifact (`build/contracts/ERC1967Proxy.json` on
+/// unpkg), even though that resolves to the identical Solidity source (the
+/// exact version `@account-abstraction/contracts@0.7.0` pins via its
+/// `yarn.lock` at this tag) compiled with the same solc `0.8.23` and
+/// `optimizer.runs = 1000000` (`hardhat.config.ts`). The two artifacts'
+/// bytecode differs anyway: `hardhat compile` (no explicit `evmVersion`
+/// override) resolves solc 0.8.23's default target to `paris`, whereas a
+/// bare `forge build` of the same source/solc/optimizer settings defaults
+/// to `shanghai` (PUSH0-era codegen) -- a real, confirmed divergence, not a
+/// hypothetical one (`derive_deposit_account_matches_factory_get_address`
+/// below caught it during development). This constant was extracted by
+/// actually cloning the tag, `npm install`-ing its declared dependencies
+/// (resolving `@openzeppelin/contracts` to `5.0.0`, matching `yarn.lock`),
+/// and running `npx hardhat compile`; the resulting `SimpleAccountFactory`
+/// artifact byte-for-byte matches the one vendored in
+/// `fedimint-usdt-tests/tests/fixtures/erc4337/SimpleAccountFactory.json`
+/// (Phase 7 Task 1, fetched from unpkg), confirming this is the exact
+/// toolchain/settings that produced it, and this exact `ERC1967Proxy`
+/// bytecode is a literal contiguous substring of that artifact's
+/// `deployedBytecode` (the `new ERC1967Proxy{salt}(...)` call embeds it
+/// verbatim).
 ///
-/// Panics only in the astronomically unlikely event that the keccak digest
-/// used as the tweak is not a valid secp256k1 scalar, or that the resulting
-/// tweaked point is not a valid public key.
+/// Pinned against the real on-chain factory (not just trusted as copied
+/// correctly) by this module's self-verifying anvil test,
+/// `fedimint-usdt-tests/tests/erc4337_harness.rs`'s
+/// `derive_deposit_account_matches_factory_get_address`: if this constant
+/// were wrong, off-chain [`derive_deposit_account`] would disagree with
+/// `SimpleAccountFactory.getAddress` there.
+const ERC1967_PROXY_CREATION_CODE: &[u8] = &alloy_primitives::hex!(
+    "6080604052604051610417380380610417833981016040819052610022916102"
+    "68565b61002c8282610033565b5050610352565b61003c82610092565b604051"
+    "6001600160a01b038316907fbc7cd75a20ee27fd9adebab32041f755214dbc6b"
+    "ffa90cc0225b39da2e5c2d3b90600090a280511561008657610081828261010e"
+    "565b505050565b61008e610185565b5050565b806001600160a01b03163b6000"
+    "036100cd57604051634c9c8ce360e01b81526001600160a01b03821660048201"
+    "526024015b60405180910390fd5b7f360894a13ba1a3210667c828492db98dca"
+    "3e2076cc3735a920a3ca505d382bbc80546001600160a01b0319166001600160"
+    "a01b0392909216919091179055565b6060600080846001600160a01b03168460"
+    "405161012b9190610336565b600060405180830381855af49150503d80600081"
+    "14610166576040519150601f19603f3d011682016040523d82523d6000602084"
+    "013e61016b565b606091505b50909250905061017c8583836101a6565b959450"
+    "50505050565b34156101a45760405163b398979f60e01b815260040160405180"
+    "910390fd5b565b6060826101bb576101b682610205565b6101fe565b81511580"
+    "156101d257506001600160a01b0384163b155b156101fb57604051639996b315"
+    "60e01b81526001600160a01b03851660048201526024016100c4565b50805b93"
+    "92505050565b8051156102155780518082602001fd5b604051630a12f52160e1"
+    "1b815260040160405180910390fd5b634e487b7160e01b600052604160045260"
+    "246000fd5b60005b8381101561025f578181015183820152602001610247565b"
+    "50506000910152565b6000806040838503121561027b57600080fd5b82516001"
+    "600160a01b038116811461029257600080fd5b60208401519092506001600160"
+    "401b03808211156102af57600080fd5b818501915085601f8301126102c35760"
+    "0080fd5b8151818111156102d5576102d561022e565b604051601f8201601f19"
+    "908116603f011681019083821181831017156102fd576102fd61022e565b8160"
+    "405282815288602084870101111561031657600080fd5b610327836020830160"
+    "208801610244565b80955050505050509250929050565b600082516103488184"
+    "60208701610244565b9190910192915050565b60b7806103606000396000f3fe"
+    "6080604052600a600c565b005b60186014601a565b605e565b565b600060597f"
+    "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+    "5473ffffffffffffffffffffffffffffffffffffffff1690565b905090565b36"
+    "60008037600080366000845af43d6000803e808015607c573d6000f35b3d6000"
+    "fdfea2646970667358221220d7f23a80daebb5531c9e4a18d87e812fca112e5d"
+    "f7e56433218edcc12bbe415d64736f6c63430008170033"
+);
+
+/// Derives the counterfactual CREATE2 address of the per-`claim_pk`
+/// ERC-4337 v0.7 `SimpleAccount` deposit account (D3, Phase 7 Task 2's
+/// reconciliation of Phase 5's provisional additive-tweak EOA):
+///
+/// - `owner = evm_address(group_public_key)` -- a single DKG group key owns
+///   *every* deposit account (differentiated only by `salt`), so one MPC key
+///   signs every sweep, and (since it's an ERC-4337 smart account) the token
+///   paymaster pays gas in USDT, so a deposit address never needs ETH.
+/// - `salt = keccak256(DEPOSIT_ADDRESS_DOMAIN ‖ claim_pk.serialize())`
+///   (compressed, 33-byte).
+/// - `initCode = ERC1967Proxy_creationCode ‖ abi.encode(simple_account_impl,
+///   SimpleAccount.initialize(owner))`, mirroring
+///   `SimpleAccountFactory.createAccount`'s `new ERC1967Proxy{salt}(
+///   address(accountImplementation), abi.encodeCall(SimpleAccount.initialize,
+///   (owner)))`.
+/// - `address = keccak256(0xff ‖ account_factory ‖ salt ‖
+///   keccak256(initCode))[12..]` (EIP-1014), via
+///   [`alloy_primitives::Address::create2_from_code`].
+///
+/// Pure function, no RPC -- both the client (wasm) and every guardian call
+/// this exact function so the address they watch is bit-for-bit identical.
+/// Self-verified against `SimpleAccountFactory.getAddress` on a real
+/// anvil-deployed factory by
+/// `fedimint-usdt-tests/tests/erc4337_harness.rs`.
 #[must_use]
 pub fn derive_deposit_account(
     group_public_key: &secp256k1::PublicKey,
+    account_factory: EvmAddress,
+    simple_account_impl: EvmAddress,
     claim_pk: &secp256k1::PublicKey,
 ) -> EvmAddress {
+    use alloy_sol_types::{SolCall as _, SolValue as _};
+
+    let owner = evm_address(group_public_key);
+
     let mut hasher = Keccak256::new();
     hasher.update(DEPOSIT_ADDRESS_DOMAIN);
-    hasher.update(group_public_key.serialize()); // 33-byte compressed
-    hasher.update(claim_pk.serialize());
-    let tweak_bytes: [u8; 32] = hasher.finalize().into();
+    hasher.update(claim_pk.serialize()); // 33-byte compressed
+    let salt: [u8; 32] = hasher.finalize().into();
 
-    // keccak output ≥ curve order only with negligible probability; mirror
-    // the wallet's `tweak_public_key` which treats this as infallible.
-    let tweak = secp256k1::Scalar::from_be_bytes(tweak_bytes)
-        .expect("keccak digest is a valid secp256k1 scalar with overwhelming probability");
-    let derived = group_public_key
-        .add_exp_tweak(secp256k1::SECP256K1, &tweak)
-        .expect("additive tweak of a valid point is a valid point");
+    let initialize_calldata = ISimpleAccountInit::initializeCall {
+        anOwner: alloy_primitives::Address::from(owner.0),
+    }
+    .abi_encode();
+    // `abi.encode(address, bytes)`, matching `ERC1967Proxy`'s
+    // `constructor(address implementation, bytes memory _data)`.
+    let ctor_args = (
+        alloy_primitives::Address::from(simple_account_impl.0),
+        alloy_primitives::Bytes::from(initialize_calldata),
+    )
+        .abi_encode_params();
 
-    evm_address(&derived)
+    let mut init_code = ERC1967_PROXY_CREATION_CODE.to_vec();
+    init_code.extend_from_slice(&ctor_args);
+
+    let factory_address = alloy_primitives::Address::from(account_factory.0);
+    let derived = factory_address.create2_from_code(salt, init_code);
+
+    EvmAddress(derived.into_array())
 }
 
 /// Identifies one instance of the guardians co-signing a single 32-byte
@@ -590,21 +703,43 @@ mod tests {
         let claim_b = secp256k1::SecretKey::from_slice(&[4u8; 32])
             .unwrap()
             .public_key(secp256k1::SECP256K1);
+        // Fixed non-zero test constants; the CREATE2 math is exercised
+        // end-to-end (and pinned against a real on-chain factory) by
+        // `fedimint-usdt-tests/tests/erc4337_harness.rs`, so any non-zero
+        // addresses suffice here.
+        let factory = EvmAddress([0xfa; 20]);
+        let simple_account_impl = EvmAddress([0x1e; 20]);
 
         // Deterministic
         assert_eq!(
-            derive_deposit_account(&group, &claim_a),
-            derive_deposit_account(&group, &claim_a)
+            derive_deposit_account(&group, factory, simple_account_impl, &claim_a),
+            derive_deposit_account(&group, factory, simple_account_impl, &claim_a)
         );
         // Distinct per claim key
         assert_ne!(
-            derive_deposit_account(&group, &claim_a),
-            derive_deposit_account(&group, &claim_b)
+            derive_deposit_account(&group, factory, simple_account_impl, &claim_a),
+            derive_deposit_account(&group, factory, simple_account_impl, &claim_b)
         );
-        // Distinct from the untweaked group address (tweak is non-zero)
+        // Distinct from the bare (untweaked) group-key EOA address: the
+        // deposit account is a CREATE2 *smart contract* address, never
+        // literally `evm_address(group_public_key)`.
         assert_ne!(
-            derive_deposit_account(&group, &claim_a),
+            derive_deposit_account(&group, factory, simple_account_impl, &claim_a),
             evm_address(&group)
+        );
+        // Distinct per factory (a different `SimpleAccountFactory` deployment
+        // must never collide with another's counterfactual addresses).
+        let other_factory = EvmAddress([0xfb; 20]);
+        assert_ne!(
+            derive_deposit_account(&group, factory, simple_account_impl, &claim_a),
+            derive_deposit_account(&group, other_factory, simple_account_impl, &claim_a)
+        );
+        // Distinct per `simple_account_impl` (changes `initCode`, hence the
+        // CREATE2 address).
+        let other_impl = EvmAddress([0x1f; 20]);
+        assert_ne!(
+            derive_deposit_account(&group, factory, simple_account_impl, &claim_a),
+            derive_deposit_account(&group, factory, other_impl, &claim_a)
         );
     }
 

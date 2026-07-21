@@ -16,6 +16,8 @@ name = "fedimint_usdt_common"
 path = "src/lib.rs"
 
 [dependencies]
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
 anyhow = { workspace = true }
 fedimint-core = { workspace = true }
 secp256k1 = { workspace = true }

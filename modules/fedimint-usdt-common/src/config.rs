@@ -60,5 +60,10 @@ pub fn derive_deposit_account(
     cfg: &UsdtClientConfig,
     claim_pk: &secp256k1::PublicKey,
 ) -> crate::EvmAddress {
-    crate::derive_deposit_account(&cfg.group_public_key, claim_pk)
+    crate::derive_deposit_account(
+        &cfg.group_public_key,
+        cfg.account_factory,
+        cfg.simple_account_impl,
+        claim_pk,
+    )
 }

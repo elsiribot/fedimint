@@ -125,7 +125,16 @@ async fn client_deposit_address_matches_common_derivation() -> anyhow::Result<()
         secp256k1::Keypair::new(secp256k1::SECP256K1, &mut secp256k1::rand::thread_rng());
     let claim_pk = claim_keypair.public_key();
 
-    let expected = fedimint_usdt_common::derive_deposit_account(&group_public_key, &claim_pk);
+    // `fixtures()` never overrides `UsdtGenParams::default()`'s placeholder
+    // `account_factory`/`simple_account_impl` (both `EvmAddress([0; 20])`;
+    // see `fedimint_usdt_server::UsdtInit::default_config_gen_params`), so
+    // that's what the federation's `UsdtClientConfig` actually carries here.
+    let expected = fedimint_usdt_common::derive_deposit_account(
+        &group_public_key,
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+        &claim_pk,
+    );
     let actual = usdt.deposit_address(&claim_pk);
 
     assert_eq!(

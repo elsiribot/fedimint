@@ -1176,6 +1176,8 @@ impl Usdt {
         ensure!(
             fedimint_usdt_common::derive_deposit_account(
                 &self.cfg.consensus.group_public_key,
+                self.cfg.consensus.account_factory,
+                self.cfg.consensus.simple_account_impl,
                 &claim_pk
             ) == obs.account,
             "observation claim_pk does not derive its account"
@@ -1224,7 +1226,12 @@ impl Usdt {
         dbtx: &mut DatabaseTransaction<'_>,
         claim_pk: secp256k1::PublicKey,
     ) -> CheckDepositResponse {
-        let account = derive_deposit_account(&self.cfg.consensus.group_public_key, &claim_pk);
+        let account = derive_deposit_account(
+            &self.cfg.consensus.group_public_key,
+            self.cfg.consensus.account_factory,
+            self.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
 
         if dbtx.get_value(&PendingCheckKey(account)).await.is_some() {
             return CheckDepositResponse { account };
@@ -1252,7 +1259,12 @@ impl Usdt {
         dbtx: &mut DatabaseTransaction<'_>,
         claim_pk: secp256k1::PublicKey,
     ) -> DepositStatusResponse {
-        let account = derive_deposit_account(&self.cfg.consensus.group_public_key, &claim_pk);
+        let account = derive_deposit_account(
+            &self.cfg.consensus.group_public_key,
+            self.cfg.consensus.account_factory,
+            self.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
 
         let (credited, claimed) = dbtx
             .get_value(&DepositRecordKey(account))
@@ -2154,7 +2166,12 @@ mod tests {
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let db = module.db_for_test();
         let claim_pk = test_pubkey(0xaa);
-        let account = derive_deposit_account(&module.cfg.consensus.group_public_key, &claim_pk);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
 
         // A PendingCheck is not required for crediting (that is the whole
         // point of this fix — see `credit_deposit`'s doc comment), but a
@@ -2258,7 +2275,12 @@ mod tests {
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
         let claim_pk = test_pubkey(0xbb);
-        let account = derive_deposit_account(&module.cfg.consensus.group_public_key, &claim_pk);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
 
         {
             let mut dbtx = db.begin_transaction().await;
@@ -2322,7 +2344,12 @@ mod tests {
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let db = module.db_for_test();
         let claim_pk = test_pubkey(0x42);
-        let account = derive_deposit_account(&module.cfg.consensus.group_public_key, &claim_pk);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
 
         // Deliberately do NOT insert a `PendingCheck` for `account` —
         // simulating the guardian that `check_deposit` never reached.
@@ -2938,6 +2965,8 @@ mod tests {
         let claim_pk = test_pubkey(0x01);
         let expected_account = fedimint_usdt_common::derive_deposit_account(
             &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
             &claim_pk,
         );
 
@@ -3008,6 +3037,8 @@ mod tests {
         let claim_pk = test_pubkey(0x02);
         let expected_account = fedimint_usdt_common::derive_deposit_account(
             &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
             &claim_pk,
         );
 
@@ -3029,6 +3060,8 @@ mod tests {
         let claim_pk = test_pubkey(0x03);
         let account = fedimint_usdt_common::derive_deposit_account(
             &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
             &claim_pk,
         );
 
