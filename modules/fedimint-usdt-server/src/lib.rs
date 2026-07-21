@@ -2263,6 +2263,30 @@ impl Usdt {
             nonce: 0,
         });
 
+        // POOL-BALANCE GATE: only build a batch the pool can actually pay.
+        // Every withdrawal's `amount` (NOT `max_fee` -- the fee stays pooled as
+        // the federation's fee revenue and never leaves) must be covered by
+        // `PoolState.balance`. Without this gate a withdrawal requested before
+        // its backing deposits have swept into the pool would build an
+        // `executeBatch` the pool cannot fund; the on-chain call reverts,
+        // `apply_withdraw_confirmed` returns the withdrawals to `Queued`, and
+        // -- since their `requested_block` is unchanged -- an identical doomed
+        // batch is re-triggered every confirmation cycle, burning broadcaster
+        // gas until the sweeps happen to catch up. Gating here is
+        // determinism-safe: `pool.balance` and every `amount` are consensus-DB
+        // values, so every guardian reaches the identical decision. The batch
+        // simply waits (withdrawals stay `Queued`) until sweeps fund the pool;
+        // because every outstanding withdrawal is backed by credited deposits
+        // that are all eventually swept, and the in-flight guard means only
+        // sweeps (which add to the pool) can run while this batch waits,
+        // `pool.balance` rises monotonically to coverage -- no permanent wedge.
+        let batch_total = queued
+            .iter()
+            .fold(0u64, |acc, (_, w)| acc.saturating_add(w.amount.0));
+        if pool.balance.0 < batch_total {
+            return;
+        }
+
         let outpoints: Vec<OutPoint> = queued.iter().map(|(o, _)| *o).collect();
         let withdrawals: Vec<(fedimint_usdt_common::EvmAddress, UsdtAmount)> = queued
             .iter()
@@ -6549,6 +6573,19 @@ mod tests {
 
         {
             let mut dbtx = db.begin_transaction().await;
+            // Fund the pool so the pool-balance gate is satisfied (the batch
+            // total is 1M + 2M = 3M; 6M covers it generously). `nonce: 0`
+            // keeps the pool undeployed, so the `!init_code.is_empty()`
+            // (needs-deploy) assertion below still holds.
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(6_000_000),
+                    nonce: 0,
+                },
+            )
+            .await;
             dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_a), &withdrawal_a)
                 .await;
             dbtx.insert_new_entry(&WithdrawalStateKey(out_a), &WithdrawalState::Queued)
@@ -6683,6 +6720,17 @@ mod tests {
         let db = module.db_for_test();
 
         let mut dbtx = db.begin_transaction().await;
+        // Fund the pool so the pool-balance gate is satisfied. The batch total
+        // is BATCH_MAX_ITEMS * 1M = 20M; 40M covers it generously.
+        dbtx.insert_new_entry(
+            &PoolStateKey,
+            &PoolState {
+                account: module.pool_account(),
+                balance: UsdtAmount(40_000_000),
+                nonce: 0,
+            },
+        )
+        .await;
         for i in 0..BATCH_MAX_ITEMS {
             let out_point = test_out_point(i as u64);
             let byte = u8::try_from(i).expect("BATCH_MAX_ITEMS fits in u8");
@@ -6718,6 +6766,199 @@ mod tests {
             pending_count, 1,
             "reaching BATCH_MAX_ITEMS must trigger a batch even before the interval elapses"
         );
+    }
+
+    /// **Phase 9.** The pool-balance gate in
+    /// [`Usdt::maybe_trigger_withdrawal_batch`]: even with the interval
+    /// trigger satisfied, NO batch is built while `PoolState.balance` is below
+    /// the sum of the queued withdrawals' `amount`s; the batch fires the moment
+    /// the balance covers that total. Asserts both directions AND the exact
+    /// boundary (`balance == Σ amount` is sufficient, since the gate is a
+    /// strict `<`) AND that `max_fee` is NOT part of the coverage requirement
+    /// (a balance covering only `Σ amount`, strictly less than
+    /// `Σ (amount + max_fee)`, still builds the batch -- the fee stays pooled).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn maybe_trigger_withdrawal_batch_waits_until_pool_balance_covers_the_batch() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let out_a = test_out_point(5);
+        let out_b = test_out_point(1); // sorts BEFORE out_a
+        let amount_a = UsdtAmount(1_000_000);
+        let amount_b = UsdtAmount(2_000_000);
+        let total_amount = amount_a.0 + amount_b.0; // 3M
+        // Total incl. fees (3M + 3k); the gate must NOT require this much.
+        let total_with_fees = total_amount + 1_000 + 2_000;
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out_a),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xa1; 20]),
+                    amount: amount_a,
+                    max_fee: UsdtAmount(1_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out_a), &WithdrawalState::Queued)
+                .await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out_b),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xb1; 20]),
+                    amount: amount_b,
+                    max_fee: UsdtAmount(2_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out_b), &WithdrawalState::Queued)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Advance consensus block count strictly past `batch_interval_blocks()`
+        // (both withdrawals' `requested_block` is `0`) so the interval trigger
+        // is satisfied for the rest of the test. There is NO `PoolState` yet,
+        // so the trigger the `BlockCount` arm runs internally builds nothing:
+        // the pool-balance gate (`0 < 3M`) blocks it.
+        let vote = batch_interval_blocks() + 1;
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for p in 0..4u16 {
+                module
+                    .process_consensus_item(
+                        &mut dbtx.to_ref_nc(),
+                        UsdtConsensusItem::BlockCount(vote),
+                        PeerId::from(p),
+                    )
+                    .await
+                    .expect("block count vote succeeds");
+            }
+            dbtx.commit_tx().await;
+        }
+
+        // Direction 1a: interval satisfied but no `PoolState` (balance 0 < 3M).
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+                .await;
+            assert_eq!(
+                dbtx.to_ref_nc()
+                    .find_by_prefix(&PendingUserOpPrefix)
+                    .await
+                    .count()
+                    .await,
+                0,
+                "no batch may build while the pool cannot cover the withdrawals"
+            );
+            for &out_point in &[out_a, out_b] {
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalStateKey(out_point))
+                        .await,
+                    Some(WithdrawalState::Queued),
+                    "withdrawals stay Queued while the batch waits for pool funding"
+                );
+            }
+            dbtx.commit_tx().await;
+        }
+
+        // Direction 1b: a `PoolState` present but still one unit short of the
+        // total `amount` (3M - 1). The strict `<` gate must still block.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(total_amount - 1),
+                    nonce: 0,
+                },
+            )
+            .await;
+            module
+                .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+                .await;
+            assert_eq!(
+                dbtx.to_ref_nc()
+                    .find_by_prefix(&PendingUserOpPrefix)
+                    .await
+                    .count()
+                    .await,
+                0,
+                "one unit short of the total amount must still not build a batch"
+            );
+            for &out_point in &[out_a, out_b] {
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalStateKey(out_point))
+                        .await,
+                    Some(WithdrawalState::Queued),
+                );
+            }
+            dbtx.commit_tx().await;
+        }
+
+        // Direction 2: raise the balance to EXACTLY the sum of the `amount`s
+        // (the gate's boundary: `balance == Σ amount` is sufficient because the
+        // gate is a strict `<`). Crucially this balance is strictly LESS than
+        // `Σ (amount + max_fee)`, proving `max_fee` is not part of the coverage
+        // requirement -- the fee stays pooled as fee revenue.
+        assert!(
+            total_amount < total_with_fees,
+            "sanity: covering only Σ amount is strictly less than Σ (amount + max_fee)"
+        );
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(total_amount),
+                    nonce: 0,
+                },
+            )
+            .await;
+            module
+                .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+                .await;
+
+            let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+                .to_ref_nc()
+                .find_by_prefix(&PendingUserOpPrefix)
+                .await
+                .collect()
+                .await;
+            assert_eq!(
+                pending.len(),
+                1,
+                "the batch must build once balance covers Σ amount (fee not required)"
+            );
+            let (PendingUserOpKey(op_hash), record) = &pending[0];
+            let UserOpPurpose::Withdraw { outpoints } = &record.purpose else {
+                panic!("must be a Withdraw-purpose op");
+            };
+            assert_eq!(
+                outpoints,
+                &vec![out_b, out_a],
+                "outpoints must be sorted ascending by OutPoint"
+            );
+            for &out_point in &[out_a, out_b] {
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalStateKey(out_point))
+                        .await,
+                    Some(WithdrawalState::Signing(*op_hash)),
+                    "covered withdrawals must flip to Signing once the batch builds"
+                );
+            }
+            dbtx.commit_tx().await;
+        }
     }
 
     /// **Phase 8, Task 2.** A confirmed `Withdraw`-purpose `UserOp` (mirrors
