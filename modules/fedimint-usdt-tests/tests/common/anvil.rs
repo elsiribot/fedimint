@@ -58,6 +58,29 @@ sol! {
     }
 }
 
+sol! {
+    // The NON-STANDARD, mainnet-USDT-faithful fixture (see
+    // `tests/fixtures/nonstandard_usdt.json` /
+    // `contracts/NonStandardUsdt.sol`). The critical divergence from
+    // `ITestUsdt` above is that `transfer`/`transferFrom` are declared with NO
+    // return value -- exactly as the real TetherToken exposes them. This forces
+    // any Rust caller (like [`transfer_nonstandard_from_account_1`]) to invoke
+    // them the way the void-returning contract actually behaves: alloy decodes
+    // an EMPTY return, so declaring a `bool` return here (as `ITestUsdt` does)
+    // would make the call revert on decode against this token. `setParams`
+    // drives the Quirk-2 fee mechanism; `getBlackListStatus` is inert shape
+    // fidelity.
+    #[sol(rpc)]
+    interface INonStandardUsdt {
+        function mint(address to, uint256 amount) external;
+        function transfer(address to, uint256 amount) external;
+        function transferFrom(address from, address to, uint256 amount) external;
+        function setParams(uint256 newBasisPoints, uint256 newMaxFee) external;
+        function balanceOf(address account) external view returns (uint256);
+        function getBlackListStatus(address maker) external view returns (bool);
+    }
+}
+
 /// A running `anvil` dev-node child process. Killed on drop.
 pub struct AnvilHandle {
     child: Child,
@@ -257,6 +280,91 @@ pub async fn transfer_erc20_from_account_1(
     Ok(())
 }
 
+/// The vendored `NonStandardUsdt` fixture's creation bytecode + ABI, compiled
+/// offline (see `modules/fedimint-usdt-tests/contracts/NonStandardUsdt.sol`)
+/// and deployed here as-is, exactly like [`TEST_USDT_FIXTURE_JSON`]: this
+/// harness never invokes `solc`/`forge`. This is the mainnet-USDT-faithful,
+/// void-`transfer`-returning token (see [`INonStandardUsdt`]).
+const NONSTANDARD_USDT_FIXTURE_JSON: &str = include_str!("../fixtures/nonstandard_usdt.json");
+
+fn nonstandard_usdt_creation_bytecode() -> anyhow::Result<Vec<u8>> {
+    let fixture: serde_json::Value = serde_json::from_str(NONSTANDARD_USDT_FIXTURE_JSON)
+        .context("failed to parse tests/fixtures/nonstandard_usdt.json")?;
+    let bytecode_hex = fixture["bytecode"]
+        .as_str()
+        .context("fixture is missing a `bytecode` string field")?;
+    let bytecode_hex = bytecode_hex.strip_prefix("0x").unwrap_or(bytecode_hex);
+
+    hex::decode(bytecode_hex).context("fixture `bytecode` is not valid hex")
+}
+
+/// Deploys the vendored `NonStandardUsdt` fixture to `anvil` (as `anvil`'s
+/// deterministic account 0) and mints `amount` to `holder`. The mainnet-USDT-
+/// faithful counterpart of [`deploy_test_erc20`]: same deploy+mint shape, but
+/// the deployed token's `transfer`/`transferFrom` return NOTHING and it carries
+/// the `basisPointsRate`/`maximumFee` fee mechanism (default 0). Returns the
+/// deployed contract's address.
+pub async fn deploy_nonstandard_usdt(
+    anvil: &AnvilHandle,
+    holder: EvmAddress,
+    amount: UsdtAmount,
+) -> anyhow::Result<EvmAddress> {
+    let provider = wallet_provider(anvil, ANVIL_ACCOUNT_0_PRIVATE_KEY)?;
+
+    let bytecode = nonstandard_usdt_creation_bytecode()?;
+    let deploy_tx = TransactionRequest::default().with_deploy_code(bytecode);
+    let receipt = provider
+        .send_transaction(deploy_tx)
+        .await
+        .context("failed to send NonStandardUsdt creation transaction")?
+        .get_receipt()
+        .await
+        .context("failed to confirm NonStandardUsdt creation transaction")?;
+    let token_address = receipt
+        .contract_address
+        .context("NonStandardUsdt creation receipt is missing a contract_address")?;
+
+    let contract = INonStandardUsdt::new(token_address, &provider);
+    contract
+        .mint(Address::from(holder.0), U256::from(amount.0))
+        .send()
+        .await
+        .context("failed to send NonStandardUsdt.mint() transaction")?
+        .get_receipt()
+        .await
+        .context("failed to confirm NonStandardUsdt.mint() transaction")?;
+
+    Ok(EvmAddress(token_address.into_array()))
+}
+
+/// Transfers `amount` of the NON-STANDARD `token` from `anvil`'s account 1 to
+/// `to`, confirming the transaction before returning. The counterpart of
+/// [`transfer_erc20_from_account_1`] used to fund a counterfactual deposit
+/// account with the void-`transfer`-returning token: it drives
+/// [`INonStandardUsdt::transfer`] (no `bool` return), so it exercises exactly
+/// the wire shape the real TetherToken exposes. Reverts here would prove alloy
+/// mis-decodes a void return -- it does not.
+pub async fn transfer_nonstandard_from_account_1(
+    anvil: &AnvilHandle,
+    token: EvmAddress,
+    to: EvmAddress,
+    amount: UsdtAmount,
+) -> anyhow::Result<()> {
+    let provider = wallet_provider(anvil, ANVIL_ACCOUNT_1_PRIVATE_KEY)?;
+    let contract = INonStandardUsdt::new(Address::from(token.0), &provider);
+
+    contract
+        .transfer(Address::from(to.0), U256::from(amount.0))
+        .send()
+        .await
+        .context("failed to send NonStandardUsdt.transfer() transaction")?
+        .get_receipt()
+        .await
+        .context("failed to confirm NonStandardUsdt.transfer() transaction")?;
+
+    Ok(())
+}
+
 // --- ERC-4337 v0.7 stack (Phase 7, Task 1) -------------------------------
 //
 // Vendored artifacts live in `tests/fixtures/erc4337/` (fetched verbatim
@@ -429,6 +537,65 @@ pub async fn deploy_4337_stack(
     usdt_holder: EvmAddress,
     usdt_amount: UsdtAmount,
 ) -> anyhow::Result<Deployed4337> {
+    let infra = deploy_4337_infra(anvil).await?;
+    // Reuse the Phase-4 TestUsdt fixture deployer for the USDT token.
+    let usdt = deploy_test_erc20(anvil, usdt_holder, usdt_amount).await?;
+    Ok(infra.into_deployed(usdt))
+}
+
+/// The mainnet-USDT-faithful counterpart of [`deploy_4337_stack`]: an identical
+/// ERC-4337 v0.7 stack (real `EntryPoint`, `SimpleAccountFactory` + impl,
+/// staked paymaster), but the USDT token is the NON-STANDARD
+/// [`deploy_nonstandard_usdt`] fixture (void-returning `transfer`/
+/// `transferFrom` + the `basisPointsRate`/`maximumFee` fee mechanism) instead
+/// of the standard `TestUsdt`. Used by `tests/nonstandard_usdt_e2e.rs` to prove
+/// the whole sweep+withdrawal path survives real USDT's quirks. The returned
+/// [`Deployed4337::usdt`] is the non-standard token's address.
+///
+/// # Errors
+///
+/// Returns an error if any deployment/configuration transaction fails to send
+/// or confirm, or if a vendored artifact is malformed.
+pub async fn deploy_nonstandard_4337_stack(
+    anvil: &AnvilHandle,
+    usdt_holder: EvmAddress,
+    usdt_amount: UsdtAmount,
+) -> anyhow::Result<Deployed4337> {
+    let infra = deploy_4337_infra(anvil).await?;
+    let usdt = deploy_nonstandard_usdt(anvil, usdt_holder, usdt_amount).await?;
+    Ok(infra.into_deployed(usdt))
+}
+
+/// The token-independent part of a deployed ERC-4337 v0.7 stack: everything
+/// [`Deployed4337`] holds except the USDT token address. Produced by
+/// [`deploy_4337_infra`] and combined with a separately-deployed token
+/// (standard or non-standard) via [`Infra4337::into_deployed`].
+struct Infra4337 {
+    entry_point: EvmAddress,
+    factory: EvmAddress,
+    simple_account_impl: EvmAddress,
+    paymaster: EvmAddress,
+}
+
+impl Infra4337 {
+    fn into_deployed(self, usdt: EvmAddress) -> Deployed4337 {
+        Deployed4337 {
+            entry_point: self.entry_point,
+            factory: self.factory,
+            simple_account_impl: self.simple_account_impl,
+            paymaster: self.paymaster,
+            usdt,
+        }
+    }
+}
+
+/// Deploys the token-independent ERC-4337 v0.7 infrastructure shared by
+/// [`deploy_4337_stack`] and [`deploy_nonstandard_4337_stack`]: a real,
+/// constructor-deployed `EntryPoint`, a freshly deployed `SimpleAccountFactory`
+/// (+ its `SimpleAccount` implementation, read back), and a staked, deposit-
+/// funded `LegacyTokenPaymaster`. See [`deploy_4337_stack`]'s doc comment for
+/// the rationale behind the real-`EntryPoint`-deploy and paymaster choices.
+async fn deploy_4337_infra(anvil: &AnvilHandle) -> anyhow::Result<Infra4337> {
     let provider = wallet_provider(anvil, ANVIL_ACCOUNT_0_PRIVATE_KEY)?;
 
     // 1. Real-constructor-deploy the EntryPoint (see this function's doc comment
@@ -528,14 +695,10 @@ pub async fn deploy_4337_stack(
         .await
         .context("failed to confirm LegacyTokenPaymaster.deposit()")?;
 
-    // 4. Reuse the Phase-4 TestUsdt fixture deployer for the USDT token.
-    let usdt = deploy_test_erc20(anvil, usdt_holder, usdt_amount).await?;
-
-    Ok(Deployed4337 {
+    Ok(Infra4337 {
         entry_point: EvmAddress(entry_point_address.into_array()),
         factory: EvmAddress(factory_address.into_array()),
         simple_account_impl: EvmAddress(simple_account_impl.into_array()),
         paymaster: EvmAddress(paymaster_address.into_array()),
-        usdt,
     })
 }

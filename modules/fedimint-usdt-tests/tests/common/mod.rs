@@ -15,7 +15,9 @@ pub mod anvil;
 pub mod mock;
 
 pub use anvil::{
-    ANVIL_ACCOUNT_0_PRIVATE_KEY, AnvilHandle, Deployed4337, anvil_account_1_address,
-    deploy_4337_stack, deploy_test_erc20, spawn_anvil, transfer_erc20_from_account_1,
+    ANVIL_ACCOUNT_0_PRIVATE_KEY, ANVIL_ACCOUNT_1_PRIVATE_KEY, AnvilHandle, Deployed4337,
+    anvil_account_1_address, deploy_4337_stack, deploy_nonstandard_4337_stack,
+    deploy_nonstandard_usdt, deploy_test_erc20, spawn_anvil, transfer_erc20_from_account_1,
+    transfer_nonstandard_from_account_1,
 };
 pub use mock::MockEvmRpc;

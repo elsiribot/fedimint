@@ -64,7 +64,14 @@ impl GasBounds {
     /// exact bounds on `anvil` and confirms it succeeds end to end, which is
     /// this constant's actual validation (no gas-estimation tooling backs
     /// these numbers -- see this task's gas *estimation* deferral to Phase
-    /// 8). Reasoning behind each value:
+    /// 8). These bounds are ALSO validated against a faithful non-standard,
+    /// real-USDT-shaped token (void-returning `transfer`) by
+    /// `nonstandard_usdt_e2e.rs`'s full deploy-and-sweep gate: the sweep's
+    /// `execute`-wrapped void `transfer` confirms within these limits, so the
+    /// bounds are not underfunded for the real-token gas profile. They stay
+    /// deliberately generous (the `EntryPoint` refunds unused gas to the
+    /// prefund, so over-provisioning is harmless; only under-provisioning
+    /// would revert). Reasoning behind each value:
     /// - `verification_gas_limit = 500_000`: covers `ERC1967Proxy` constructor
     ///   + `SimpleAccount.initialize` + `validateUserOp`'s own `ECDSA.recover`.
     /// - `call_gas_limit = 200_000`: one `execute` dispatch wrapping one ERC-20
@@ -95,8 +102,14 @@ impl GasBounds {
     /// devnet-class fixed estimates (no `eth_estimateUserOperationGas`-style
     /// adapter call -- see that constant's own doc comment for the
     /// deferral), validated end to end by
-    /// `fedimint-usdt-tests`' real-anvil acceptance suite rather than by any
-    /// gas-estimation tooling. Reasoning behind each per-item increment:
+    /// `fedimint-usdt-tests`' real-anvil acceptance suite -- including
+    /// `nonstandard_usdt_e2e.rs`'s batched-withdrawal gate against a faithful
+    /// non-standard, real-USDT-shaped (void-returning `transfer`) token, which
+    /// confirms the `executeBatch` of void transfers stays within these bounds
+    /// -- rather than by any gas-estimation tooling. As with
+    /// `DEPLOY_AND_SWEEP_DEVNET`, the bounds are deliberately generous and the
+    /// `EntryPoint` refunds any unused gas. Reasoning behind each per-item
+    /// increment:
     /// - `verification_gas_limit`: `500_000` when `needs_deploy` (covers the
     ///   same `ERC1967Proxy` constructor + `initialize` + `ECDSA.recover` as
     ///   `DEPLOY_AND_SWEEP_DEVNET`), else `100_000` (signature check only --
