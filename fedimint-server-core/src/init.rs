@@ -45,12 +45,14 @@ pub struct EnvVarDoc {
 ///
 /// This replaces the per-module GenParams approach with a unified struct
 /// containing all the information modules need for DKG/config generation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConfigGenModuleArgs {
     /// Bitcoin network for the federation
     pub network: Network,
     /// Whether to disable base fees for this federation
     pub disable_base_fees: bool,
+    /// Module-instance-specific DKG/config-generation parameters
+    pub params: BTreeMap<String, String>,
 }
 
 /// Interface for Module Generation

@@ -984,6 +984,7 @@ impl IDashboardApi for ConsensusApi {
             consensus_version,
             network,
             disable_base_fees: false,
+            params: BTreeMap::new(),
         })
         .await?;
 

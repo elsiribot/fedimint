@@ -5,6 +5,8 @@
 //! P2P connections; consensus only carries proposal, approval, result and
 //! activation items. See `docs/superpowers/specs/` for the design.
 
+use std::collections::BTreeMap;
+
 use bitcoin::Network;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +53,11 @@ pub struct ModuleConfigProposal {
     pub consensus_version: ModuleConsensusVersion,
     pub network: Network,
     pub disable_base_fees: bool,
+    /// Module-specific generation parameters, e.g. the mint's
+    /// `amount_unit`. Stringly typed; each module parses and validates the
+    /// keys it understands (see `ServerModuleInit::config_gen_param_docs`).
+    #[serde(default)]
+    pub params: BTreeMap<String, String>,
 }
 
 /// Human-readable reason a generation was aborted.
@@ -125,6 +132,7 @@ mod tests {
                 consensus_version: ModuleConsensusVersion::new(2, 0),
                 network: Network::Regtest,
                 disable_base_fees: false,
+                params: BTreeMap::from([("amount_unit".to_string(), "1".to_string())]),
             },
         };
 

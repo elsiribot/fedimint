@@ -96,6 +96,7 @@ async fn propose(
         consensus_version,
         network: bitcoin::Network::Regtest,
         disable_base_fees: false,
+        params: std::collections::BTreeMap::new(),
     };
 
     let generation_id: ModuleGenerationId = apis[0]

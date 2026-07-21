@@ -207,6 +207,7 @@ impl GenerationManager {
         let args = ConfigGenModuleArgs {
             network: proposal.network,
             disable_base_fees: proposal.disable_base_fees,
+            params: proposal.params.clone(),
         };
 
         let result = fedimint_core::runtime::timeout(

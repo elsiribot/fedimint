@@ -484,6 +484,7 @@ impl ServerConfig {
         let args = ConfigGenModuleArgs {
             network: peer0.network,
             disable_base_fees: peer0.disable_base_fees,
+            params: BTreeMap::new(),
         };
 
         // Use legacy module ordering for backwards compatibility tests
@@ -644,6 +645,7 @@ impl ServerConfig {
         let args = ConfigGenModuleArgs {
             network: params.network,
             disable_base_fees: params.disable_base_fees,
+            params: BTreeMap::new(),
         };
 
         // Use legacy module ordering for backwards compatibility tests

@@ -376,6 +376,7 @@ mod tests {
             consensus_version: ModuleConsensusVersion::new(2, 0),
             network: Network::Regtest,
             disable_base_fees: false,
+            params: BTreeMap::new(),
         }
     }
 
@@ -712,6 +713,39 @@ mod tests {
 
         // Already active
         assert!(activate(&mut log, 0, 1).is_err());
+    }
+
+    #[test]
+    fn proposal_params_are_preserved_in_log() {
+        let mut log = GenerationLog::default();
+
+        let proposal = ModuleConfigProposal {
+            module_kind: ModuleKind::from_static_str("mint"),
+            consensus_version: ModuleConsensusVersion::new(2, 0),
+            network: Network::Regtest,
+            disable_base_fees: false,
+            params: BTreeMap::from([("amount_unit".to_string(), "1".to_string())]),
+        };
+
+        process_item(
+            test_ctx(),
+            &mut log,
+            ConfigGenItem::Propose {
+                generation_id: ModuleGenerationId(0),
+                proposal: proposal.clone(),
+            },
+            PeerId::from(0),
+        )
+        .expect("proposal accepted");
+
+        let GenerationState::Proposed {
+            proposal: stored, ..
+        } = &log.generations()[&ModuleGenerationId(0)]
+        else {
+            panic!("expected proposed state");
+        };
+
+        assert_eq!(stored.params, proposal.params);
     }
 
     #[test]
