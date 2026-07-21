@@ -16,7 +16,12 @@ name = "fedimint_usdt_common"
 path = "src/lib.rs"
 
 [dependencies]
-alloy-primitives = { workspace = true }
+# `serde` is additive to the workspace default (`std`) feature set: it is
+# needed here (unlike other `alloy-primitives` consumers in the workspace)
+# because `user_op::UnsignedUserOp` derives `Serialize`/`Deserialize` over a
+# struct containing `alloy_primitives::U256` fields. Pure serialization
+# support, no wasm-incompatible surface.
+alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-sol-types = { workspace = true }
 anyhow = { workspace = true }
 fedimint-core = { workspace = true }

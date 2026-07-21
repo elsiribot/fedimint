@@ -18,6 +18,7 @@ use thiserror::Error;
 // The client (and, in later phases, server) configuration
 pub mod config;
 pub mod endpoint_constants;
+pub mod user_op;
 
 /// Unique name for this module
 pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
