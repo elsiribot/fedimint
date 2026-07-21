@@ -6109,6 +6109,7 @@ dependencies = [
  "fedimint-api-client",
  "fedimint-client-module",
  "fedimint-core",
+ "fedimint-derive-secret",
  "fedimint-usdt-common",
  "futures",
  "serde",

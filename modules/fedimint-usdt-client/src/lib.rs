@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use api::UsdtFederationApi;
-use db::{ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix};
+use db::{
+    ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix, NextDepositIndexKey, NextDepositIndexPrefixAll,
+};
 use fedimint_api_client::api::DynModuleApi;
 use fedimint_client_module::db::ClientModuleMigrationFn;
 use fedimint_client_module::module::init::{ClientModuleInit, ClientModuleInitArgs};
@@ -28,11 +30,11 @@ use fedimint_core::module::{
     AmountUnit, Amounts, ApiVersion, ModuleCommon, ModuleInit, MultiApiVersion,
 };
 use fedimint_core::runtime::{Instant, sleep};
-use fedimint_core::secp256k1::rand::thread_rng;
-use fedimint_core::secp256k1::{self, Keypair};
+use fedimint_core::secp256k1::{self, Keypair, SECP256K1};
 use fedimint_core::{
     Amount, OutPoint, OutPointRange, PeerId, apply, async_trait_maybe_send, push_db_pair_items,
 };
+use fedimint_derive_secret::{ChildId, DerivableSecret};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
@@ -61,12 +63,59 @@ const CHECK_AND_CLAIM_MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// `withdrawal_status` polls, mirroring [`CHECK_AND_CLAIM_MAX_BACKOFF`].
 const AWAIT_WITHDRAWAL_CONFIRMED_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Namespaces deposit claim keys under the module root secret: every deposit
+/// claim key is derived as `module_root_secret.child_key(
+/// DEPOSIT_CLAIM_KEY_CHILD).child_key(ChildId(index))` (see
+/// [`UsdtClientModule::claim_keypair_for_index`]). Distinguishing this from any
+/// future key type derived from the same module root secret.
+const DEPOSIT_CLAIM_KEY_CHILD: ChildId = ChildId(0);
+
 #[derive(Debug)]
 pub struct UsdtClientModule {
     cfg: UsdtClientConfig,
     client_ctx: ClientContext<Self>,
     db: Database,
     module_api: DynModuleApi,
+    /// This module's root secret, from which all deposit claim keys are
+    /// deterministically derived (see
+    /// [`Self::claim_keypair_for_index`]). Persisting nothing but an index in
+    /// the client DB makes deposits seed-recoverable via
+    /// [`Self::recover_deposits`].
+    module_root_secret: DerivableSecret,
+}
+
+/// Summary returned by [`UsdtClientModule::recover_deposits`]: the deposit
+/// claim keys a seed-only rescan of the federation rediscovered, restored into
+/// the client DB.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoverySummary {
+    /// Number of deposit accounts rediscovered (indices the federation reports
+    /// as having been credited).
+    pub recovered: usize,
+    /// Sum of `credited` across every rediscovered account.
+    pub total_credited: UsdtAmount,
+    /// Sum of `claimable` (i.e. `credited - claimed`) across every
+    /// rediscovered account -- what a follow-up `claim` per account can still
+    /// pull into e-cash.
+    pub total_claimable: UsdtAmount,
+    /// One entry per rediscovered account.
+    pub accounts: Vec<RecoveredAccount>,
+}
+
+/// A single deposit account rediscovered by
+/// [`UsdtClientModule::recover_deposits`].
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveredAccount {
+    /// The seed-derivation index this account's claim key lives at.
+    pub index: u64,
+    /// The derived deposit account (EVM address) the federation watches.
+    pub account: EvmAddress,
+    /// The public key of the (re-derived, re-stored) claim keypair.
+    pub claim_pk: secp256k1::PublicKey,
+    /// USDT the federation has credited to this account so far.
+    pub credited: UsdtAmount,
+    /// USDT still claimable (`credited - claimed`) on this account.
+    pub claimable: UsdtAmount,
 }
 
 /// Data needed by the state machine
@@ -183,21 +232,129 @@ impl UsdtClientModule {
         fedimint_usdt_common::config::derive_deposit_account(&self.cfg, claim_pubkey)
     }
 
-    /// Generates a fresh claim keypair, persists it keyed by its derived
-    /// deposit address, and returns both so the caller can hand the address
-    /// out and later drive [`Self::check_and_claim`] with the keypair.
+    /// The deterministic claim keypair for seed-derivation `index`, derived
+    /// purely from `module_root_secret` (see [`DEPOSIT_CLAIM_KEY_CHILD`]).
+    ///
+    /// Deterministic: the same module root secret and `index` always yield the
+    /// same keypair, and distinct indices yield distinct keypairs. This is what
+    /// makes deposits seed-recoverable -- [`Self::recover_deposits`] walks the
+    /// indices from `0` and re-derives each key without touching the client DB.
+    #[must_use]
+    fn claim_keypair_static(module_root_secret: &DerivableSecret, index: u64) -> Keypair {
+        module_root_secret
+            .child_key(DEPOSIT_CLAIM_KEY_CHILD)
+            .child_key(ChildId(index))
+            .to_secp_key(SECP256K1)
+    }
+
+    /// The deterministic claim keypair for seed-derivation `index` under this
+    /// module's root secret (see [`Self::claim_keypair_static`]).
+    #[must_use]
+    fn claim_keypair_for_index(&self, index: u64) -> Keypair {
+        Self::claim_keypair_static(&self.module_root_secret, index)
+    }
+
+    /// Derives the next seed-indexed claim keypair, persists it keyed by its
+    /// derived deposit address, and returns both so the caller can hand the
+    /// address out and later drive [`Self::check_and_claim`] with the keypair.
+    ///
+    /// The claim key is deterministic from the module root secret and a
+    /// monotonically-increasing per-deposit index (persisted as
+    /// [`NextDepositIndexKey`]), so a deposit is recoverable from the seed
+    /// alone even if the client DB is lost: [`Self::recover_deposits`] rescans
+    /// the federation by index and re-derives the same keys.
     pub async fn allocate_deposit(&self) -> anyhow::Result<(Keypair, EvmAddress)> {
-        // Phase 9: deterministic-from-seed derivation for recovery; Phase 5 stores a
-        // random per-deposit key.
-        let claim_keypair = Keypair::new(secp256k1::SECP256K1, &mut thread_rng());
+        let mut dbtx = self.db.begin_transaction().await;
+
+        let index = dbtx
+            .get_value(&NextDepositIndexKey)
+            .await
+            .unwrap_or_default();
+        let claim_keypair = self.claim_keypair_for_index(index);
         let account = self.deposit_address(&claim_keypair.public_key());
 
-        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.insert_entry(&NextDepositIndexKey, &(index + 1)).await;
         dbtx.insert_entry(&ClaimKeyKey(account), &claim_keypair)
             .await;
         dbtx.commit_tx().await;
 
         Ok((claim_keypair, account))
+    }
+
+    /// Rescans the federation from the seed alone to rediscover deposits whose
+    /// client-DB state was lost, re-storing each rediscovered claim key so the
+    /// existing [`Self::claim`]/[`Self::check_and_claim`] path can then be run
+    /// per account.
+    ///
+    /// Gap-limit scan: walks seed-derivation indices from `0`, deriving
+    /// [`Self::claim_keypair_for_index`] and querying the federation's
+    /// `deposit_status` for each. An index whose account has been credited
+    /// (`credited > 0`) is treated as used -- its claim key is re-stored
+    /// ([`ClaimKeyKey`]) and recorded -- and resets the consecutive-miss
+    /// counter; an uncredited index increments it. The scan stops after
+    /// `gap_limit` consecutive misses.
+    ///
+    /// After scanning, [`NextDepositIndexKey`] is advanced to one past the
+    /// highest used index seen, so future [`Self::allocate_deposit`] calls do
+    /// not collide with recovered deposits (left untouched if none were found).
+    ///
+    /// This does NOT auto-claim: recovery is deliberately read-mostly plus
+    /// key-restoring, so the caller decides when to run [`Self::claim`] per
+    /// account with a nonzero `claimable`. This explicit rescan (plus its CLI
+    /// `recover` subcommand) is the module's recovery path; the module uses
+    /// [`NoModuleBackup`], so it is not wired into the client's global
+    /// `recover()` flow -- doing so is a possible follow-up.
+    pub async fn recover_deposits(&self, gap_limit: u64) -> anyhow::Result<RecoverySummary> {
+        let mut accounts = Vec::new();
+        let mut total_credited = UsdtAmount(0);
+        let mut total_claimable = UsdtAmount(0);
+        let mut highest_used_index: Option<u64> = None;
+        let mut consecutive_misses = 0u64;
+
+        let mut index = 0u64;
+        while consecutive_misses < gap_limit {
+            let claim_keypair = self.claim_keypair_for_index(index);
+            let claim_pk = claim_keypair.public_key();
+            let status = self.module_api.deposit_status(claim_pk).await?;
+
+            if status.credited.0 > 0 {
+                let mut dbtx = self.db.begin_transaction().await;
+                dbtx.insert_entry(&ClaimKeyKey(status.account), &claim_keypair)
+                    .await;
+                dbtx.commit_tx().await;
+
+                total_credited.0 = total_credited.0.saturating_add(status.credited.0);
+                total_claimable.0 = total_claimable.0.saturating_add(status.claimable.0);
+                accounts.push(RecoveredAccount {
+                    index,
+                    account: status.account,
+                    claim_pk,
+                    credited: status.credited,
+                    claimable: status.claimable,
+                });
+
+                highest_used_index = Some(index);
+                consecutive_misses = 0;
+            } else {
+                consecutive_misses += 1;
+            }
+
+            index += 1;
+        }
+
+        if let Some(highest) = highest_used_index {
+            let mut dbtx = self.db.begin_transaction().await;
+            dbtx.insert_entry(&NextDepositIndexKey, &(highest + 1))
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        Ok(RecoverySummary {
+            recovered: accounts.len(),
+            total_credited,
+            total_claimable,
+            accounts,
+        })
     }
 
     /// Enqueues this guardian's local deposit-checker task to start watching
@@ -617,6 +774,16 @@ impl ModuleInit for UsdtClientInit {
                         "Usdt Claim Keys"
                     );
                 }
+                DbKeyPrefix::NextDepositIndex => {
+                    push_db_pair_items!(
+                        dbtx,
+                        NextDepositIndexPrefixAll,
+                        NextDepositIndexKey,
+                        u64,
+                        items,
+                        "Usdt Next Deposit Index"
+                    );
+                }
             }
         }
 
@@ -640,10 +807,61 @@ impl ClientModuleInit for UsdtClientInit {
             client_ctx: args.context(),
             db: args.db().clone(),
             module_api: args.module_api().clone(),
+            module_root_secret: args.module_root_secret().clone(),
         })
     }
 
     fn get_database_migrations(&self) -> BTreeMap<DatabaseVersion, ClientModuleMigrationFn> {
         BTreeMap::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_derive_secret::DerivableSecret;
+
+    use super::UsdtClientModule;
+
+    /// The deposit claim-key derivation must be deterministic from the seed:
+    /// the same module root secret and index always yields the same key, and
+    /// distinct indices yield distinct keys. This is the invariant
+    /// [`UsdtClientModule::recover_deposits`] relies on to rediscover deposits
+    /// from the seed alone.
+    #[test]
+    fn claim_keypair_is_deterministic_from_seed() {
+        let secret = DerivableSecret::new_root(b"usdt-recovery-test-seed", b"salt");
+
+        // Same secret + same index => identical key.
+        for index in [0u64, 1, 2, 7, 100, u64::MAX] {
+            let a = UsdtClientModule::claim_keypair_static(&secret, index);
+            let b = UsdtClientModule::claim_keypair_static(&secret, index);
+            assert_eq!(
+                a, b,
+                "claim key for index {index} must be reproducible from the seed"
+            );
+        }
+
+        // Distinct indices => distinct keys.
+        let keys: Vec<_> = (0..16u64)
+            .map(|index| UsdtClientModule::claim_keypair_static(&secret, index).public_key())
+            .collect();
+        for (i, ki) in keys.iter().enumerate() {
+            for (j, kj) in keys.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        ki, kj,
+                        "indices {i} and {j} must derive distinct claim keys"
+                    );
+                }
+            }
+        }
+
+        // A different root secret => a different key at the same index.
+        let other = DerivableSecret::new_root(b"a-different-seed", b"salt");
+        assert_ne!(
+            UsdtClientModule::claim_keypair_static(&secret, 0),
+            UsdtClientModule::claim_keypair_static(&other, 0),
+            "a different seed must derive a different claim key"
+        );
     }
 }

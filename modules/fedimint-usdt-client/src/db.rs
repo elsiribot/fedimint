@@ -10,6 +10,10 @@ use strum_macros::EnumIter;
 pub enum DbKeyPrefix {
     /// Maps a derived deposit account to the claim keypair controlling it.
     ClaimKey = 0x01,
+    /// Singleton counter: the next seed-derivation index
+    /// [`crate::UsdtClientModule::allocate_deposit`] will use for a fresh
+    /// deposit claim key.
+    NextDepositIndex = 0x02,
 }
 
 /// Maps a derived deposit account (see
@@ -32,3 +36,26 @@ impl_db_record!(
 );
 
 impl_db_lookup!(key = ClaimKeyKey, query_prefix = ClaimKeyPrefixAll);
+
+/// Singleton key holding the next seed-derivation index used to derive a fresh
+/// deposit claim key. Incremented (from a default of `0`) by
+/// [`crate::UsdtClientModule::allocate_deposit`] every time it hands out a new
+/// deposit address, so each deposit gets a distinct, deterministic-from-seed
+/// claim key and a seed-only rescan
+/// ([`crate::UsdtClientModule::recover_deposits`]) can walk the indices.
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct NextDepositIndexKey;
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct NextDepositIndexPrefixAll;
+
+impl_db_record!(
+    key = NextDepositIndexKey,
+    value = u64,
+    db_prefix = DbKeyPrefix::NextDepositIndex,
+);
+
+impl_db_lookup!(
+    key = NextDepositIndexKey,
+    query_prefix = NextDepositIndexPrefixAll
+);

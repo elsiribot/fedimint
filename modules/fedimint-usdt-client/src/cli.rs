@@ -40,6 +40,15 @@ enum Opts {
     /// queued withdrawal, identified by the `OutPoint` (`txid`, `out_idx`)
     /// of the `withdraw` output that enqueued it.
     WithdrawalStatus { txid: TransactionId, out_idx: u64 },
+    /// Rescan the federation from the seed alone to rediscover deposits whose
+    /// client-DB state was lost, re-storing each rediscovered claim key (so
+    /// `claim` can then be run per account) and printing a summary. Scans
+    /// seed-derivation indices from 0, stopping after `gap_limit` consecutive
+    /// unused indices.
+    Recover {
+        #[arg(long, default_value = "20")]
+        gap_limit: u64,
+    },
 }
 
 pub(crate) async fn handle_cli_command(
@@ -79,6 +88,7 @@ pub(crate) async fn handle_cli_command(
             let out_point = OutPoint { txid, out_idx };
             json(usdt.withdrawal_status(out_point).await?)
         }
+        Opts::Recover { gap_limit } => json(usdt.recover_deposits(gap_limit).await?),
     };
 
     Ok(value)
@@ -153,6 +163,22 @@ mod tests {
                 amount: 2_000_000,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn parses_recover_default_gap_limit() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "recover"]).expect("parses"),
+            Opts::Recover { gap_limit: 20 }
+        ));
+    }
+
+    #[test]
+    fn parses_recover_explicit_gap_limit() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "recover", "--gap-limit", "5"]).expect("parses"),
+            Opts::Recover { gap_limit: 5 }
         ));
     }
 
