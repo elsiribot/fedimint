@@ -132,6 +132,7 @@ the guardian-local submitter re-submits UserOps that yield no receipt.
 | First-sweep-only (`nonce=0`); 2nd deposit to a swept account | **deferred** | Needs deposit-account nonce tracking / re-sweep; funds stay counted as `credited − swept` (solvent), just not re-swept. |
 | Dangling `SubmittedUserOp` / never-confirmed batch wedge | **deferred** | `BATCH_MAX_ITEMS` cap largely defuses; a deterministic staleness/expiry is the hardening. |
 | Session/chunk/failed-session GC | **deferred** | Unbounded-history rule keeps consensus correct; GC is space hygiene. |
+| Client recovery from seed (`ClientModuleInit::recover`) | **maintainer decision** | `allocate_deposit` currently generates a **random** claim key per deposit, persisted in the client DB — recoverable if that DB is retained, but NOT reconstructible from the seed alone. Seed-based recovery would require switching to **seed-indexed** claim keys (a client-key-model change) + a rescan state machine. Deferred pending the maintainer's choice of key model. Deposits remain fully spendable while the client DB is intact. |
 | DoS: `check_deposit` spam | **partial** | `deposit_check_fee` config exists (may be 0); per-connection rate-limit is operator/infra-level. |
 | Unchecked `u64` adds | **mitigated** | Flagged adds converted to `saturating_add`; overflow totals (>9.2e12 USDT) unreachable. |
 | Factory misconfiguration → unspendable addresses | **mitigated** | Startup warns on placeholder factory; operator must configure a factory matching the vendored proxy init code (documented). |
