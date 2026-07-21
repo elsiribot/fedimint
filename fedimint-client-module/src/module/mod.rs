@@ -104,6 +104,16 @@ pub trait ClientContextIface: MaybeSend + MaybeSync {
         outputs: Vec<OutPoint>,
     ) -> anyhow::Result<()>;
 
+    /// Like [`Self::await_primary_module_outputs`] but for the primary module
+    /// serving `unit` rather than the (implicit) Bitcoin one -- needed by
+    /// modules whose e-cash is denominated in a non-Bitcoin unit.
+    async fn await_primary_module_outputs_for_unit(
+        &self,
+        operation_id: OperationId,
+        outputs: Vec<OutPoint>,
+        unit: AmountUnit,
+    ) -> anyhow::Result<()>;
+
     fn operation_log(&self) -> &dyn IOperationLog;
 
     async fn has_active_states(&self, operation_id: OperationId) -> bool;
@@ -448,6 +458,22 @@ where
         self.client
             .get()
             .await_primary_module_outputs(operation_id, outputs)
+            .await
+    }
+
+    /// Like [`Self::await_primary_module_outputs`] but for the primary module
+    /// serving `unit` rather than the (implicit) Bitcoin one -- needed by
+    /// modules whose e-cash is denominated in a non-Bitcoin unit (e.g. the
+    /// usdt module awaiting its USDT-denominated `mintv2` issuance).
+    pub async fn await_primary_module_outputs_for_unit(
+        &self,
+        operation_id: OperationId,
+        outputs: Vec<OutPoint>,
+        unit: AmountUnit,
+    ) -> anyhow::Result<()> {
+        self.client
+            .get()
+            .await_primary_module_outputs_for_unit(operation_id, outputs, unit)
             .await
     }
 

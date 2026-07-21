@@ -562,12 +562,31 @@ impl UsdtClientModule {
                 .make_client_inputs(ClientInputBundle::new_no_sm(vec![input])),
         );
 
-        self.client_ctx
+        let range = self
+            .client_ctx
             .finalize_and_submit_transaction(
                 operation_id,
                 KIND.as_str(),
                 move |_range| UsdtOperationMeta::Claim { account, amount },
                 tx,
+            )
+            .await?;
+
+        // Await the primary-module (USDT-denominated `mintv2`) e-cash issuance
+        // so `claim` returns only once the e-cash is actually in hand -- the
+        // issuance is a blind-signature round-trip driven by the output state
+        // machine, which completes strictly AFTER
+        // `finalize_and_submit_transaction` returns (that only submits the tx).
+        // The unit-aware await (`..._for_unit(USDT_UNIT)`) is required because
+        // this module's e-cash is USDT-, not Bitcoin-denominated: the default
+        // `await_primary_module_outputs` resolves the primary module for
+        // `AmountUnit::BITCOIN` and would not cover our USDT-denominated
+        // `mintv2` primary module.
+        self.client_ctx
+            .await_primary_module_outputs_for_unit(
+                operation_id,
+                range.into_iter().collect(),
+                USDT_UNIT,
             )
             .await?;
 
