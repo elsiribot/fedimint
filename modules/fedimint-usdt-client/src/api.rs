@@ -3,16 +3,18 @@ use fedimint_api_client::api::{
 };
 use fedimint_core::module::ApiRequestErased;
 use fedimint_core::task::{MaybeSend, MaybeSync};
-use fedimint_core::{PeerId, apply, async_trait_maybe_send, secp256k1};
+use fedimint_core::{OutPoint, PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
     DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
     SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
+    WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositStatusRequest, DepositStatusResponse,
     PoolStateResponse, SigningSessionId, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse,
-    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
+    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatusRequest,
+    WithdrawalStatusResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -88,6 +90,16 @@ pub trait UsdtFederationApi {
         &self,
         amount: UsdtAmount,
     ) -> FederationResult<WithdrawFeeQuoteResponse>;
+
+    /// Reports the consensus-agreed lifecycle stage of a queued withdrawal,
+    /// identified by the `OutPoint` of the `UsdtOutput::V0` that enqueued it
+    /// (Phase 8, Task 3). Threshold-agreement (`request_current_consensus`,
+    /// mirroring [`Self::deposit_status`]/[`Self::withdraw_fee_quote`]): read
+    /// directly from consensus DB, so any guardian answers identically.
+    async fn withdrawal_status(
+        &self,
+        out_point: OutPoint,
+    ) -> FederationResult<WithdrawalStatusResponse>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -198,6 +210,17 @@ where
         self.request_current_consensus(
             WITHDRAW_FEE_QUOTE_ENDPOINT.to_string(),
             ApiRequestErased::new(WithdrawFeeQuoteRequest { amount }),
+        )
+        .await
+    }
+
+    async fn withdrawal_status(
+        &self,
+        out_point: OutPoint,
+    ) -> FederationResult<WithdrawalStatusResponse> {
+        self.request_current_consensus(
+            WITHDRAWAL_STATUS_ENDPOINT.to_string(),
+            ApiRequestErased::new(WithdrawalStatusRequest { out_point }),
         )
         .await
     }

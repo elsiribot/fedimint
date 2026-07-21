@@ -63,3 +63,11 @@ pub const USEROP_STATUS_ENDPOINT: &str = "userop_status";
 /// any guardian answers identically (threshold-agreement, not just a
 /// single-guardian estimate).
 pub const WITHDRAW_FEE_QUOTE_ENDPOINT: &str = "withdraw_fee_quote";
+
+/// Reports the consensus-agreed lifecycle stage (`Queued`/`Signing`/
+/// `Submitted`/`Confirmed`/`Failed`/`Unknown`) of a queued withdrawal,
+/// identified by the `OutPoint` of the `UsdtOutput::V0` that enqueued it
+/// (Phase 8, Task 3). Read from consensus DB, so any guardian answers
+/// identically (threshold-agreement via `request_current_consensus`,
+/// mirroring [`DEPOSIT_STATUS_ENDPOINT`]/[`WITHDRAW_FEE_QUOTE_ENDPOINT`]).
+pub const WITHDRAWAL_STATUS_ENDPOINT: &str = "withdrawal_status";

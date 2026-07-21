@@ -10,7 +10,7 @@ use fedimint_client::ClientHandleArc;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{IDatabaseTransactionOpsCore, IDatabaseTransactionOpsCoreTyped};
 use fedimint_core::runtime::{Instant, sleep};
-use fedimint_core::{Amount, PeerId, secp256k1};
+use fedimint_core::{Amount, BitcoinHash as _, PeerId, secp256k1};
 use fedimint_mint_client::{MintClientInit, MintClientModule};
 use fedimint_mint_server::MintInit;
 use fedimint_mintv2_client::MintClientInit as Mintv2ClientInit;
@@ -681,6 +681,114 @@ async fn find_sole_unclaimed_withdrawal(
     }
 }
 
+/// **Phase 8 Task 3 gating acceptance test.** Exercises the client-facing
+/// `withdrawal_status` endpoint/wrapper without waiting on any real-MPC
+/// pipeline (deliberately fast, unlike the Task-1/Task-2 tests above which
+/// wait for the Phase-7 sweep and/or Phase-8 batch to reach a quiescent
+/// terminal state before their byte-identical whole-DB compares): a bogus
+/// `OutPoint` (never enqueued) must report [`WithdrawalStatus::Unknown`], and
+/// a genuinely-submitted withdrawal must report [`WithdrawalStatus::Queued`]
+/// immediately after `withdraw()` returns (before any batch has had a chance
+/// to trigger, since the mock's block count never advances past its initial
+/// value here).
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_status_reports_unknown_then_queued() -> anyhow::Result<()> {
+    let mock = Arc::new(MockEvmRpc::new());
+    let usdt_contract = EvmAddress([0u8; 20]);
+    mock.set_chain_id(31337);
+    mock.set_block_number(100);
+    let scripted_fee = FeeVote {
+        max_fee_per_gas_wei: 20_000_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
+    let expected_quote =
+        withdrawal_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
+
+    let fed = dual_mint_fixtures(mock.clone())
+        .new_fed_builder(0)
+        .disable_mint_fees()
+        .build()
+        .await;
+    let client: ClientHandleArc = fed.new_client().await;
+    let usdt = client.get_first_module::<UsdtClientModule>()?;
+
+    // A bogus, never-enqueued OutPoint must report Unknown.
+    let bogus_out_point = fedimint_core::OutPoint {
+        txid: fedimint_core::TransactionId::from_byte_array([0xab; 32]),
+        out_idx: 0,
+    };
+    assert_eq!(
+        usdt.withdrawal_status(bogus_out_point).await?.status,
+        fedimint_usdt_common::WithdrawalStatus::Unknown
+    );
+
+    // Wait for the fee-vote median quote to converge (needed for a valid
+    // `max_fee`).
+    let quote_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let quote = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await?;
+        if quote.max_fee == expected_quote {
+            break;
+        }
+        if Instant::now() >= quote_deadline {
+            bail!("withdraw_fee_quote never converged before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+
+    // Fund the withdrawal: deposit + claim USDT e-cash (`25_600_000` is a
+    // 512-msat multiple, comfortably covering `amount + max_fee` below --
+    // mirrors `withdrawal_output_debits_queues_and_fee_median_is_deterministic`'s
+    // identical scripted fee, so the same deposit amount suffices here too).
+    // This does NOT wait for the Phase-7 background sweep pipeline the
+    // credited deposit auto-triggers -- unlike the Task-1/Task-2 tests
+    // above, this test never reads pool/sweep state, so there is nothing to
+    // wait on it for.
+    let deposit_amount = UsdtAmount(25_600_000);
+    let (claim_keypair, account) = usdt.allocate_deposit().await?;
+    mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
+    usdt.check_and_claim(&claim_keypair, Duration::from_secs(120))
+        .await?;
+    let fund_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if client.get_balance_for_unit(USDT_UNIT).await? == Amount::from_msats(deposit_amount.0) {
+            break;
+        }
+        if Instant::now() >= fund_deadline {
+            bail!("USDT e-cash was never minted before the deadline");
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // Submit the withdrawal (amount % 512 == 0 so amount + max_fee stays
+    // 512-aligned, mirroring the other withdrawal tests' dust-avoidance).
+    let recipient = EvmAddress([0x77; 20]);
+    let amount = UsdtAmount(2_000_000);
+    let range = usdt.withdraw(recipient, amount, expected_quote).await?;
+    let out_point = UsdtClientModule::withdrawal_out_point(&range);
+
+    // `withdraw()` already awaited the transaction's consensus acceptance,
+    // so `process_output` has run and the server-side `WithdrawalState`
+    // exists by the time we get here -- but `withdrawal_status` is a
+    // `request_current_consensus` call across a threshold of guardians who
+    // may apply the ordered output at slightly different wall-clock moments,
+    // so poll to convergence rather than reading eagerly.
+    let status_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = usdt.withdrawal_status(out_point).await?.status;
+        if status == fedimint_usdt_common::WithdrawalStatus::Queued {
+            break;
+        }
+        if Instant::now() >= status_deadline {
+            bail!("withdrawal_status never reported Queued before the deadline (last {status:?})");
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    Ok(())
+}
+
 /// **Phase 8 Task 1 gating acceptance test.** Drives the withdrawal
 /// debit/queue + FeeVote-median path end to end over a hermetic 4-guardian
 /// federation (shared [`MockEvmRpc`], so every guardian's fee-estimate poller
@@ -1261,6 +1369,32 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
             }
         }
     }
+
+    // 4b. **Phase 8 Task 3 gating assertion.** The client-facing
+    //     `withdrawal_status` endpoint (a `request_current_consensus` call,
+    //     mirroring `deposit_status`/`withdraw_fee_quote`) must report the
+    //     SAME `Confirmed { block: 77 }` this test already confirmed
+    //     server-side above (step 4) via `WithdrawalStateKey`, reached
+    //     through `UsdtClientModule::await_withdrawal_confirmed`'s polling
+    //     loop -- not by re-deriving it from the raw server DB. An `OutPoint`
+    //     that was never enqueued (a bogus `out_idx` on a real withdrawal's
+    //     `txid`) must report `Unknown`.
+    for out_point in [out_point_1, out_point_2] {
+        let block = usdt
+            .await_withdrawal_confirmed(out_point, Duration::from_secs(30))
+            .await?;
+        assert_eq!(block, 77);
+    }
+    let never_enqueued_out_point = fedimint_core::OutPoint {
+        txid: out_point_1.txid,
+        out_idx: 99,
+    };
+    assert_eq!(
+        usdt.withdrawal_status(never_enqueued_out_point)
+            .await?
+            .status,
+        fedimint_usdt_common::WithdrawalStatus::Unknown
+    );
 
     // 5. Every guardian's ENTIRE usdt module DB converges to byte-identical at the
     //    terminal state.

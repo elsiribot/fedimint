@@ -1,7 +1,8 @@
 use std::{ffi, iter};
 
 use clap::Parser;
-use fedimint_core::secp256k1;
+use fedimint_core::{OutPoint, TransactionId, secp256k1};
+use fedimint_usdt_common::{EvmAddress, UsdtAmount};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -24,6 +25,21 @@ enum Opts {
     /// that `claim_pk` was previously produced by `deposit-address` on this
     /// client).
     Claim { claim_pk: secp256k1::PublicKey },
+    /// Report the federation's current withdrawal fee quote for `amount`
+    /// (the smallest on-chain USDT unit, 1e-6 USDT) -- the minimum `max_fee`
+    /// a `withdraw` of `amount` must offer right now.
+    FeeQuote { amount: u64 },
+    /// Fetch the current withdrawal fee quote, submit a withdrawal of
+    /// `amount` (the smallest on-chain USDT unit) to `recipient` (a
+    /// 20-byte, optionally `0x`-prefixed hex EVM address), and print the
+    /// enqueued withdrawal's `OutPoint` -- pass it to `withdrawal-status`
+    /// to track the withdrawal.
+    Withdraw { recipient: EvmAddress, amount: u64 },
+    /// Report the consensus-agreed lifecycle stage
+    /// (`Unknown`/`Queued`/`Signing`/`Submitted`/`Confirmed`/`Failed`) of a
+    /// queued withdrawal, identified by the `OutPoint` (`txid`, `out_idx`)
+    /// of the `withdraw` output that enqueued it.
+    WithdrawalStatus { txid: TransactionId, out_idx: u64 },
 }
 
 pub(crate) async fn handle_cli_command(
@@ -45,6 +61,23 @@ pub(crate) async fn handle_cli_command(
         Opts::Claim { claim_pk } => {
             let claimed = usdt.claim(claim_pk).await?;
             json(serde_json::json!({ "claimed": claimed.0 }))
+        }
+        Opts::FeeQuote { amount } => json(usdt.withdraw_fee_quote(UsdtAmount(amount)).await?),
+        Opts::Withdraw { recipient, amount } => {
+            let amount = UsdtAmount(amount);
+            let quote = usdt.withdraw_fee_quote(amount).await?;
+            let range = usdt.withdraw(recipient, amount, quote.max_fee).await?;
+            let out_point = UsdtClientModule::withdrawal_out_point(&range);
+            json(serde_json::json!({
+                "out_point": out_point.to_string(),
+                "recipient": recipient.to_string(),
+                "amount": amount.0,
+                "max_fee": quote.max_fee.0,
+            }))
+        }
+        Opts::WithdrawalStatus { txid, out_idx } => {
+            let out_point = OutPoint { txid, out_idx };
+            json(usdt.withdrawal_status(out_point).await?)
         }
     };
 
@@ -95,6 +128,40 @@ mod tests {
         assert!(matches!(
             Opts::try_parse_from(["usdt", "claim", TEST_PUBKEY]).expect("parses"),
             Opts::Claim { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_fee_quote() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "fee-quote", "1000000"]).expect("parses"),
+            Opts::FeeQuote { amount: 1_000_000 }
+        ));
+    }
+
+    #[test]
+    fn parses_withdraw() {
+        assert!(matches!(
+            Opts::try_parse_from([
+                "usdt",
+                "withdraw",
+                "0x1111111111111111111111111111111111111111",
+                "2000000"
+            ])
+            .expect("parses"),
+            Opts::Withdraw {
+                amount: 2_000_000,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_withdrawal_status() {
+        let txid = "0".repeat(64);
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "withdrawal-status", &txid, "0"]).expect("parses"),
+            Opts::WithdrawalStatus { out_idx: 0, .. }
         ));
     }
 

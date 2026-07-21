@@ -42,6 +42,7 @@ use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
     DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
     SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
+    WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
@@ -50,8 +51,9 @@ use fedimint_usdt_common::{
     PoolStateResponse, SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
     UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
     UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
-    WithdrawFeeQuoteResponse, derive_deposit_account, derive_pool_account, evm_address,
-    signing_session_id, withdrawal_fee_quote,
+    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse,
+    derive_deposit_account, derive_pool_account, evm_address, signing_session_id,
+    withdrawal_fee_quote,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -1390,6 +1392,22 @@ impl ServerModule for Usdt {
                     })
                 }
             },
+            api_endpoint! {
+                WITHDRAWAL_STATUS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, req: WithdrawalStatusRequest| -> WithdrawalStatusResponse {
+                    // Read-only (Phase 8, Task 3): mirrors `deposit_status`/
+                    // `withdraw_fee_quote` -- reads consensus DB, so any
+                    // guardian answers identically (threshold-agreement via
+                    // `request_current_consensus`).
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+
+                    Ok(module
+                        .handle_withdrawal_status(&mut dbtx.to_ref_nc(), req.out_point)
+                        .await)
+                }
+            },
         ]
     }
 }
@@ -2417,6 +2435,30 @@ impl Usdt {
             claimed,
             claimable: UsdtAmount(credited.0.saturating_sub(claimed.0)),
         }
+    }
+
+    /// Reports `out_point`'s consensus-agreed [`WithdrawalStatus`] (Phase 8,
+    /// Task 3): the server-only [`WithdrawalState`] (`Queued`/`Signing`/
+    /// `Submitted`/`Confirmed`/`Failed`) mapped 1:1 onto its wasm-safe
+    /// `-common` mirror, or [`WithdrawalStatus::Unknown`] if no
+    /// [`WithdrawalStateKey`] record exists at all (e.g. a typo'd or
+    /// not-yet-processed `OutPoint`). Read-only, mirrors
+    /// [`Self::handle_deposit_status`].
+    async fn handle_withdrawal_status(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        out_point: OutPoint,
+    ) -> WithdrawalStatusResponse {
+        let status = match dbtx.get_value(&WithdrawalStateKey(out_point)).await {
+            None => WithdrawalStatus::Unknown,
+            Some(WithdrawalState::Queued) => WithdrawalStatus::Queued,
+            Some(WithdrawalState::Signing(op_hash)) => WithdrawalStatus::Signing { op_hash },
+            Some(WithdrawalState::Submitted(op_hash)) => WithdrawalStatus::Submitted { op_hash },
+            Some(WithdrawalState::Confirmed { block }) => WithdrawalStatus::Confirmed { block },
+            Some(WithdrawalState::Failed { reason }) => WithdrawalStatus::Failed { reason },
+        };
+
+        WithdrawalStatusResponse { status }
     }
 
     /// Processes one `MpcRound` chunk consensus item (the body of
@@ -4759,6 +4801,64 @@ mod tests {
         assert_eq!(response.credited, UsdtAmount(5_000_000));
         assert_eq!(response.claimed, UsdtAmount(2_000_000));
         assert_eq!(response.claimable, UsdtAmount(3_000_000));
+    }
+
+    #[tokio::test]
+    async fn withdrawal_status_reports_unknown_for_an_out_point_with_no_record() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let response = module
+            .handle_withdrawal_status(&mut dbtx.to_ref_nc(), test_out_point(0))
+            .await;
+
+        assert_eq!(response.status, WithdrawalStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn withdrawal_status_maps_every_withdrawal_state_variant_1_to_1() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let cases = [
+            (WithdrawalState::Queued, WithdrawalStatus::Queued),
+            (
+                WithdrawalState::Signing([1; 32]),
+                WithdrawalStatus::Signing { op_hash: [1; 32] },
+            ),
+            (
+                WithdrawalState::Submitted([2; 32]),
+                WithdrawalStatus::Submitted { op_hash: [2; 32] },
+            ),
+            (
+                WithdrawalState::Confirmed { block: 99 },
+                WithdrawalStatus::Confirmed { block: 99 },
+            ),
+            (
+                WithdrawalState::Failed {
+                    reason: "gas spike".to_string(),
+                },
+                WithdrawalStatus::Failed {
+                    reason: "gas spike".to_string(),
+                },
+            ),
+        ];
+
+        for (i, (state, expected_status)) in cases.into_iter().enumerate() {
+            let out_point = test_out_point(i as u64);
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &state)
+                .await;
+            dbtx.commit_tx().await;
+
+            let mut dbtx = db.begin_transaction_nc().await;
+            let response = module
+                .handle_withdrawal_status(&mut dbtx.to_ref_nc(), out_point)
+                .await;
+
+            assert_eq!(response.status, expected_status);
+        }
     }
 
     /// End-to-end drive of a runtime threshold-ECDSA signing session over

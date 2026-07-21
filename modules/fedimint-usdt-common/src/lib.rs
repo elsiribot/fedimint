@@ -8,7 +8,7 @@ use config::UsdtClientConfig;
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{AmountUnit, CommonModuleInit, ModuleCommon, ModuleConsensusVersion};
-use fedimint_core::{plugin_types_trait_impl_common, secp256k1};
+use fedimint_core::{OutPoint, plugin_types_trait_impl_common, secp256k1};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
@@ -596,6 +596,55 @@ pub struct WithdrawFeeQuoteRequest {
 pub struct WithdrawFeeQuoteResponse {
     pub max_fee: UsdtAmount,
     pub valid_blocks: u64,
+}
+
+/// Request for the current [`WithdrawalStatus`] of a withdrawal, identified
+/// by the `OutPoint` of the `UsdtOutput::V0` that enqueued it (Phase 8, Task
+/// 3).
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct WithdrawalStatusRequest {
+    pub out_point: OutPoint,
+}
+
+/// Wasm-safe mirror of `fedimint_usdt_server::db::WithdrawalState` (Phase 8,
+/// Task 3): the server-only type carries no cggmp21/EVM-RPC state itself
+/// (it's already plain consensus-DB data), but it lives in `-server` and is
+/// not reachable from a wasm client, so this is a plain-data duplicate
+/// exposed over the `withdrawal_status` endpoint, mirroring how
+/// [`PoolStateResponse`]/[`DepositStatusResponse`] expose other server
+/// consensus-DB state to `-common`/client. Adds `Unknown` (absent from
+/// `WithdrawalState` itself) for an `out_point` no `WithdrawalStateKey`
+/// record exists for at all -- e.g. a typo'd or not-yet-processed
+/// `OutPoint` -- mirroring [`UserOpStatus::Unknown`]'s equivalent
+/// not-found sentinel.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub enum WithdrawalStatus {
+    /// No `WithdrawalStateKey` record exists for the requested `OutPoint`.
+    Unknown,
+    /// Enqueued, awaiting the next withdrawal batch.
+    Queued,
+    /// Included in a withdrawal `UserOp` (`op_hash`) whose federation MPC
+    /// signing session is in progress.
+    Signing { op_hash: [u8; 32] },
+    /// The withdrawal's `UserOp` (`op_hash`) has been federation-agreed-
+    /// signed and is awaiting/undergoing guardian-local on-chain submission
+    /// and confirmation.
+    Submitted { op_hash: [u8; 32] },
+    /// The withdrawal's `UserOp` confirmed on-chain successfully at `block`;
+    /// terminal.
+    Confirmed { block: u64 },
+    /// The withdrawal's `UserOp` failed on-chain, or could not be
+    /// completed, for `reason`; terminal.
+    Failed { reason: String },
+}
+
+/// Response to the `withdrawal_status` endpoint (Phase 8, Task 3). Read
+/// directly from consensus DB, so any guardian answers identically
+/// (threshold-agreement via `request_current_consensus`, mirroring
+/// `deposit_status`/`withdraw_fee_quote`).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct WithdrawalStatusResponse {
+    pub status: WithdrawalStatus,
 }
 
 /// Per-instance config-gen params for the USDT module (Phase 4.5 mechanism).
@@ -1243,6 +1292,67 @@ mod tests {
             usdt_per_eth_e6: u64::MAX,
         };
         assert_eq!(withdrawal_fee_quote(&median), None);
+    }
+
+    fn test_out_point(idx: u64) -> OutPoint {
+        use fedimint_core::BitcoinHash as _;
+        OutPoint {
+            txid: fedimint_core::TransactionId::all_zeros(),
+            out_idx: idx,
+        }
+    }
+
+    #[test]
+    fn test_withdrawal_status_request_round_trips_through_consensus_encoding() {
+        let request = WithdrawalStatusRequest {
+            out_point: test_out_point(3),
+        };
+        let bytes = request.consensus_encode_to_vec();
+        let decoded = WithdrawalStatusRequest::consensus_decode_whole(
+            &bytes,
+            &ModuleDecoderRegistry::default(),
+        )
+        .expect("WithdrawalStatusRequest should decode what it just encoded");
+
+        assert_eq!(request.out_point, decoded.out_point);
+    }
+
+    #[test]
+    fn test_withdrawal_status_response_round_trips_every_variant_through_consensus_encoding() {
+        let responses = [
+            WithdrawalStatus::Unknown,
+            WithdrawalStatus::Queued,
+            WithdrawalStatus::Signing { op_hash: [1; 32] },
+            WithdrawalStatus::Submitted { op_hash: [2; 32] },
+            WithdrawalStatus::Confirmed { block: 99 },
+            WithdrawalStatus::Failed {
+                reason: "gas spike".to_string(),
+            },
+        ]
+        .map(|status| WithdrawalStatusResponse { status });
+
+        for response in responses {
+            let bytes = response.consensus_encode_to_vec();
+            let decoded = WithdrawalStatusResponse::consensus_decode_whole(
+                &bytes,
+                &ModuleDecoderRegistry::default(),
+            )
+            .expect("WithdrawalStatusResponse should decode what it just encoded");
+
+            assert_eq!(response, decoded);
+        }
+    }
+
+    #[test]
+    fn test_withdrawal_status_response_round_trips_through_serde_json() {
+        let response = WithdrawalStatusResponse {
+            status: WithdrawalStatus::Signing { op_hash: [7; 32] },
+        };
+        let json = fedimint_core::module::serde_json::to_string(&response).expect("serializes");
+        let decoded: WithdrawalStatusResponse = fedimint_core::module::serde_json::from_str(&json)
+            .expect("WithdrawalStatusResponse should deserialize what it just serialized");
+
+        assert_eq!(response, decoded);
     }
 
     #[test]

@@ -31,7 +31,7 @@ use fedimint_core::runtime::{Instant, sleep};
 use fedimint_core::secp256k1::rand::thread_rng;
 use fedimint_core::secp256k1::{self, Keypair};
 use fedimint_core::{
-    Amount, OutPointRange, PeerId, apply, async_trait_maybe_send, push_db_pair_items,
+    Amount, OutPoint, OutPointRange, PeerId, apply, async_trait_maybe_send, push_db_pair_items,
 };
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
@@ -39,6 +39,7 @@ use fedimint_usdt_common::{
     CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND, PoolStateResponse,
     SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtInput, UsdtInputV0,
     UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse, WithdrawFeeQuoteResponse,
+    WithdrawalStatus, WithdrawalStatusResponse,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,11 @@ pub mod states;
 /// Cap on the exponential backoff [`UsdtClientModule::check_and_claim`] waits
 /// between `deposit_status` polls.
 const CHECK_AND_CLAIM_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Cap on the exponential backoff
+/// [`UsdtClientModule::await_withdrawal_confirmed`] waits between
+/// `withdrawal_status` polls, mirroring [`CHECK_AND_CLAIM_MAX_BACKOFF`].
+const AWAIT_WITHDRAWAL_CONFIRMED_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct UsdtClientModule {
@@ -421,6 +427,66 @@ impl UsdtClientModule {
         amount: UsdtAmount,
     ) -> anyhow::Result<WithdrawFeeQuoteResponse> {
         Ok(self.module_api.withdraw_fee_quote(amount).await?)
+    }
+
+    /// The `OutPoint` of the withdrawal output enqueued by a call to
+    /// [`Self::withdraw`], given the `OutPointRange` it returned (Phase 8,
+    /// Task 3). The withdrawal output is always at `out_idx` 0 of `range`'s
+    /// `txid` (see [`Self::withdraw`]'s doc comment for why: it is the sole
+    /// output added there, before the primary module appends its mint-change
+    /// outputs). Pass the result to [`Self::withdrawal_status`] or
+    /// [`Self::await_withdrawal_confirmed`] to track the withdrawal.
+    #[must_use]
+    pub fn withdrawal_out_point(range: &OutPointRange) -> OutPoint {
+        OutPoint {
+            txid: range.txid(),
+            out_idx: 0,
+        }
+    }
+
+    /// Reports `out_point`'s consensus-agreed withdrawal lifecycle stage
+    /// (thin wrapper around [`UsdtFederationApi::withdrawal_status`]; Phase
+    /// 8, Task 3). See [`Self::withdrawal_out_point`] for how to derive
+    /// `out_point` from [`Self::withdraw`]'s return value.
+    pub async fn withdrawal_status(
+        &self,
+        out_point: OutPoint,
+    ) -> anyhow::Result<WithdrawalStatusResponse> {
+        Ok(self.module_api.withdrawal_status(out_point).await?)
+    }
+
+    /// Polls [`Self::withdrawal_status`] until `out_point` reaches a
+    /// terminal state (`Confirmed`/`Failed`) or `deadline` elapses,
+    /// mirroring [`Self::check_and_claim`]'s exponential-backoff polling
+    /// loop. Returns the confirmed block on success; `Err` on `Failed`, an
+    /// elapsed deadline, or an API error.
+    pub async fn await_withdrawal_confirmed(
+        &self,
+        out_point: OutPoint,
+        deadline: Duration,
+    ) -> anyhow::Result<u64> {
+        let deadline_at = Instant::now() + deadline;
+        let mut backoff = Duration::from_millis(250);
+
+        loop {
+            match self.module_api.withdrawal_status(out_point).await?.status {
+                WithdrawalStatus::Confirmed { block } => return Ok(block),
+                WithdrawalStatus::Failed { reason } => {
+                    bail!("withdrawal {out_point} failed: {reason}");
+                }
+                WithdrawalStatus::Unknown
+                | WithdrawalStatus::Queued
+                | WithdrawalStatus::Signing { .. }
+                | WithdrawalStatus::Submitted { .. } => {}
+            }
+
+            if Instant::now() >= deadline_at {
+                bail!("withdrawal {out_point} was not confirmed before the deadline");
+            }
+
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(AWAIT_WITHDRAWAL_CONFIRMED_MAX_BACKOFF);
+        }
     }
 
     /// Submits a withdrawal output transaction, burning `amount + max_fee`
