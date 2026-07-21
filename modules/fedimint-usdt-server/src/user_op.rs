@@ -24,6 +24,7 @@ alloy::sol! {
 
     interface ISimpleAccount {
         function execute(address dest, uint256 value, bytes calldata func) external;
+        function executeBatch(address[] calldata dest, uint256[] calldata value, bytes[] calldata func) external;
     }
 
     interface IERC20Transfer {
@@ -80,6 +81,46 @@ impl GasBounds {
         max_priority_fee_per_gas: 1_500_000_000,
         max_fee_per_gas: 30_000_000_000,
     };
+
+    /// Sized for a withdrawal-BATCH `UserOp` from the pool `SimpleAccount`
+    /// (Phase 8, Task 2): `validateUserOp` (plus, when `needs_deploy`, the
+    /// pool's own one-time `ERC1967Proxy` CREATE2 deploy + `SimpleAccount.
+    /// initialize`) followed by one `executeBatch` dispatching
+    /// `withdrawal_count` ERC-20 `transfer`s. Scaled by `withdrawal_count`
+    /// (unlike [`Self::DEPLOY_AND_SWEEP_DEVNET`]'s fixed bounds, sized for
+    /// exactly one transfer) so an arbitrarily-sized batch (up to this
+    /// module's `BATCH_MAX_ITEMS` cap) still gets a plausible bound rather
+    /// than a fixed one that would under-price a large batch or wastefully
+    /// over-price a small one. Like `DEPLOY_AND_SWEEP_DEVNET`, these are
+    /// devnet-class fixed estimates (no `eth_estimateUserOperationGas`-style
+    /// adapter call -- see that constant's own doc comment for the
+    /// deferral), validated end to end by
+    /// `fedimint-usdt-tests`' real-anvil acceptance suite rather than by any
+    /// gas-estimation tooling. Reasoning behind each per-item increment:
+    /// - `verification_gas_limit`: `500_000` when `needs_deploy` (covers the
+    ///   same `ERC1967Proxy` constructor + `initialize` + `ECDSA.recover` as
+    ///   `DEPLOY_AND_SWEEP_DEVNET`), else `100_000` (signature check only --
+    ///   the pool is already deployed).
+    /// - `call_gas_limit`: `60_000` base (the `executeBatch` dispatch loop
+    ///   itself) plus `80_000` per withdrawal (comfortably above a single
+    ///   ERC-20 `transfer`'s typical ~50-65k, mirroring
+    ///   `DEPLOY_AND_SWEEP_DEVNET`'s own per-transfer margin).
+    /// - `pre_verification_gas`: `100_000` base plus `20_000` per withdrawal,
+    ///   covering the extra calldata (three growing arrays instead of one
+    ///   `execute` call) a real bundler would price in.
+    /// - `max_priority_fee_per_gas`/`max_fee_per_gas`: unchanged from
+    ///   `DEPLOY_AND_SWEEP_DEVNET` (independent of batch size).
+    #[must_use]
+    pub fn withdrawal_batch(withdrawal_count: usize, needs_deploy: bool) -> GasBounds {
+        let count = u128::try_from(withdrawal_count).unwrap_or(u128::MAX);
+        GasBounds {
+            verification_gas_limit: if needs_deploy { 500_000 } else { 100_000 },
+            call_gas_limit: 60_000 + count.saturating_mul(80_000),
+            pre_verification_gas: 100_000 + count.saturating_mul(20_000),
+            max_priority_fee_per_gas: 1_500_000_000,
+            max_fee_per_gas: 30_000_000_000,
+        }
+    }
 }
 
 /// Parameters for [`build_deploy_and_sweep_userop`], grouped into one struct
@@ -221,6 +262,158 @@ pub fn decode_transfer_amount(op: &UnsignedUserOp) -> anyhow::Result<UsdtAmount>
     let amount = u64::try_from(transfer.amount).context("transfer() amount overflows u64")?;
 
     Ok(UsdtAmount(amount))
+}
+
+/// Parameters for [`build_withdrawal_batch_userop`] (Phase 8, Task 2),
+/// grouped into one struct per this workspace's convention (mirroring
+/// [`DeployAndSweepParams`]).
+#[derive(Debug, Clone)]
+pub struct WithdrawalBatchParams {
+    /// The deployed `SimpleAccountFactory` address.
+    pub account_factory: EvmAddress,
+    /// The ERC-20 contract every withdrawal in this batch pays out.
+    pub usdt_contract: EvmAddress,
+    /// The pool `SimpleAccount` -- this op's `sender`.
+    pub pool: EvmAddress,
+    /// The EOA `owner` the pool `SimpleAccount` was (or, if
+    /// `needs_deploy`, will be) initialized with -- the group-key EOA
+    /// (`fedimint_usdt_common::evm_address(&group_public_key)`).
+    pub owner: EvmAddress,
+    /// `(recipient, amount)` for every withdrawal in this batch, in the
+    /// EXACT deterministic order (sorted by `OutPoint`) the caller decided
+    /// on -- this function does not sort; see
+    /// `Usdt::maybe_trigger_withdrawal_batch`'s own doc comment for the
+    /// sorting rule.
+    pub withdrawals: Vec<(EvmAddress, UsdtAmount)>,
+    /// This op's `EntryPoint` nonce (`PoolState.nonce`).
+    pub nonce: U256,
+    /// Whether `initCode` must be populated: `PoolState.nonce == 0`, i.e.
+    /// the pool `SimpleAccount` has never submitted a `UserOp` (and, since
+    /// it is only ever the RECIPIENT of a plain ERC-20 `transfer`
+    /// otherwise, may genuinely still be un-deployed on-chain).
+    pub needs_deploy: bool,
+    /// Hook for a future token-paymaster's `paymasterAndData`; empty for
+    /// this task (broadcaster-EOA-fronted gas, matching
+    /// [`DeployAndSweepParams::paymaster_and_data`]).
+    pub paymaster_and_data: Vec<u8>,
+    pub gas_bounds: GasBounds,
+}
+
+/// Builds the [`UnsignedUserOp`] that deploys (if `params.needs_deploy`) the
+/// pool `SimpleAccount` and pays out every one of `params.withdrawals` in ONE
+/// `executeBatch` call (Phase 8, Task 2):
+/// - `sender = params.pool`.
+/// - `initCode = account_factory ‖ createAccount(owner, pool_salt)` when
+///   `needs_deploy` (empty otherwise), `pool_salt` computed identically to
+///   `fedimint_usdt_common::derive_pool_account`'s own salt (via the shared
+///   [`fedimint_usdt_common::pool_salt`] helper -- mirrors
+///   [`build_deploy_and_sweep_userop`]'s use of [`deposit_salt`] for the
+///   deposit-account case).
+/// - `callData = SimpleAccount.executeBatch(dest[], value[], func[])` where,
+///   for each `(recipient_i, amount_i)` in `params.withdrawals`, `dest[i] =
+///   usdt_contract`, `value[i] = 0`, `func[i] = USDT.transfer(recipient_i,
+///   amount_i)`.
+/// - `paymasterAndData = params.paymaster_and_data` (empty in this task).
+/// - Gas fields from `params.gas_bounds`.
+///
+/// Pure function: no RPC, no consensus DB. Consensus logic
+/// (`Usdt::maybe_trigger_withdrawal_batch`) calls this from `(sorted queued
+/// withdrawals, PoolState, config)` alone, so every guardian builds the
+/// byte-identical op.
+///
+/// # Panics
+///
+/// Never: `params.withdrawals` may be empty (an empty `executeBatch` is
+/// valid calldata, if a pointless one to submit -- the caller is expected
+/// never to call this with an empty batch, but this function itself has no
+/// such precondition).
+#[must_use]
+pub fn build_withdrawal_batch_userop(params: WithdrawalBatchParams) -> UnsignedUserOp {
+    let init_code = if params.needs_deploy {
+        let salt = fedimint_usdt_common::pool_salt();
+        let create_account_calldata = ISimpleAccountFactory::createAccountCall {
+            owner: Address::from(params.owner.0),
+            salt: U256::from_be_bytes(salt),
+        }
+        .abi_encode();
+
+        let mut init_code = params.account_factory.0.to_vec();
+        init_code.extend_from_slice(&create_account_calldata);
+        init_code
+    } else {
+        Vec::new()
+    };
+
+    let mut dest = Vec::with_capacity(params.withdrawals.len());
+    let mut value = Vec::with_capacity(params.withdrawals.len());
+    let mut func = Vec::with_capacity(params.withdrawals.len());
+    for (recipient, amount) in &params.withdrawals {
+        dest.push(Address::from(params.usdt_contract.0));
+        value.push(U256::ZERO);
+        func.push(Bytes::from(
+            IERC20Transfer::transferCall {
+                to: Address::from(recipient.0),
+                amount: U256::from(amount.0),
+            }
+            .abi_encode(),
+        ));
+    }
+
+    let call_data = ISimpleAccount::executeBatchCall { dest, value, func }.abi_encode();
+
+    UnsignedUserOp {
+        sender: params.pool,
+        nonce: params.nonce,
+        init_code,
+        call_data,
+        verification_gas_limit: params.gas_bounds.verification_gas_limit,
+        call_gas_limit: params.gas_bounds.call_gas_limit,
+        pre_verification_gas: U256::from(params.gas_bounds.pre_verification_gas),
+        max_priority_fee_per_gas: params.gas_bounds.max_priority_fee_per_gas,
+        max_fee_per_gas: params.gas_bounds.max_fee_per_gas,
+        paymaster_and_data: params.paymaster_and_data,
+    }
+}
+
+/// Decodes the TOTAL ERC-20 `transfer(to, amount)` amount embedded in a
+/// withdrawal-batch [`UnsignedUserOp`]'s `call_data` (a `SimpleAccount.
+/// executeBatch(dest[], value[], func[])` call wrapping one ERC-20 `transfer`
+/// per element -- see [`build_withdrawal_batch_userop`]): `sum(amount_i)`
+/// over every `func[i]`.
+///
+/// Mirrors [`decode_transfer_amount`]'s role for the `Withdraw` purpose:
+/// used by the guardian-local `UserOp` confirmation task
+/// (`Usdt::spawn_user_op_submitter`) to derive the total paid-out amount for
+/// a successful `UserOpConfirmed` observation directly from the
+/// already-federation-agreed `op` -- pure function, no RPC call needed for
+/// the amount itself, so every guardian proposing for the same op
+/// independently computes the identical total once they agree `success`.
+///
+/// # Errors
+///
+/// Returns an error if `op.call_data` is not a valid `executeBatch()` call
+/// wrapping valid `transfer()` calls (e.g. a `DeployAndSweep`-purpose op
+/// shaped differently), if `dest`/`value`/`func` are not all the same
+/// length, or if summing the decoded amounts overflows `u64`.
+pub fn decode_batch_transfer_total(op: &UnsignedUserOp) -> anyhow::Result<UsdtAmount> {
+    let batch = ISimpleAccount::executeBatchCall::abi_decode(&op.call_data)
+        .context("call_data is not a valid executeBatch() call")?;
+    anyhow::ensure!(
+        batch.dest.len() == batch.value.len() && batch.dest.len() == batch.func.len(),
+        "executeBatch()'s dest/value/func arrays have mismatched lengths"
+    );
+
+    let mut total: u64 = 0;
+    for func in &batch.func {
+        let transfer = IERC20Transfer::transferCall::abi_decode(func)
+            .context("executeBatch()'s func arg is not a valid transfer() call")?;
+        let amount = u64::try_from(transfer.amount).context("transfer() amount overflows u64")?;
+        total = total
+            .checked_add(amount)
+            .context("batch transfer total overflows u64")?;
+    }
+
+    Ok(UsdtAmount(total))
 }
 
 /// Assembles a 65-byte Ethereum `r ‖ s ‖ v` signature from a compact,
@@ -470,6 +663,197 @@ mod tests {
         let err = assemble_eth_signature(compact_rs, digest, wrong_owner)
             .expect_err("a signature from a different key must not assemble against wrong_owner");
         assert!(err.to_string().contains("neither recovery id"));
+    }
+
+    fn sample_withdrawal_batch_params(
+        withdrawals: Vec<(EvmAddress, UsdtAmount)>,
+        needs_deploy: bool,
+    ) -> WithdrawalBatchParams {
+        let owner_secret = test_secret_key(0x0a);
+        let owner_pk = owner_secret.public_key(secp256k1::SECP256K1);
+        let owner = fedimint_usdt_common::evm_address(&owner_pk);
+
+        WithdrawalBatchParams {
+            account_factory: EvmAddress([0xaa; 20]),
+            usdt_contract: EvmAddress([0xcc; 20]),
+            pool: EvmAddress([0xee; 20]),
+            owner,
+            withdrawals,
+            nonce: U256::from(3u64),
+            needs_deploy,
+            paymaster_and_data: Vec::new(),
+            gas_bounds: GasBounds::withdrawal_batch(2, needs_deploy),
+        }
+    }
+
+    #[test]
+    fn withdrawal_batch_selector_matches_the_real_execute_batch_selector() {
+        // `executeBatch(address[],uint256[],bytes[])`'s selector is a
+        // well-known constant, independent of `alloy_sol_types`'s own
+        // derivation (mirrors
+        // `builder_selectors_match_the_real_erc20_transfer_selector`).
+        let hash =
+            alloy::primitives::keccak256(b"executeBatch(address[],uint256[],bytes[])".as_slice());
+        assert_eq!(&ISimpleAccount::executeBatchCall::SELECTOR[..], &hash[..4]);
+    }
+
+    #[test]
+    fn withdrawal_batch_with_needs_deploy_populates_init_code_with_the_factory_prefix() {
+        let params = sample_withdrawal_batch_params(
+            vec![(EvmAddress([0x01; 20]), UsdtAmount(1_000_000))],
+            true,
+        );
+        let account_factory = params.account_factory;
+        let op = build_withdrawal_batch_userop(params);
+
+        assert!(!op.init_code.is_empty());
+        assert_eq!(&op.init_code[..20], &account_factory.0[..]);
+        assert_eq!(
+            &op.init_code[20..24],
+            &ISimpleAccountFactory::createAccountCall::SELECTOR[..]
+        );
+    }
+
+    #[test]
+    fn withdrawal_batch_without_needs_deploy_has_empty_init_code() {
+        let params = sample_withdrawal_batch_params(
+            vec![(EvmAddress([0x01; 20]), UsdtAmount(1_000_000))],
+            false,
+        );
+        let op = build_withdrawal_batch_userop(params);
+        assert!(op.init_code.is_empty());
+    }
+
+    #[test]
+    fn withdrawal_batch_sender_is_the_pool() {
+        let params = sample_withdrawal_batch_params(
+            vec![(EvmAddress([0x01; 20]), UsdtAmount(1_000_000))],
+            false,
+        );
+        let pool = params.pool;
+        let op = build_withdrawal_batch_userop(params);
+        assert_eq!(op.sender, pool);
+    }
+
+    #[test]
+    fn withdrawal_batch_call_data_is_an_execute_batch_call_wrapping_transfer_calls_in_order() {
+        let usdt_contract = EvmAddress([0xcc; 20]);
+        let withdrawals = vec![
+            (EvmAddress([0x01; 20]), UsdtAmount(1_000_000)),
+            (EvmAddress([0x02; 20]), UsdtAmount(2_500_000)),
+            (EvmAddress([0x03; 20]), UsdtAmount(3_750_000)),
+        ];
+        let params = sample_withdrawal_batch_params(withdrawals.clone(), false);
+        let op = build_withdrawal_batch_userop(params);
+
+        assert_eq!(
+            &op.call_data[..4],
+            &ISimpleAccount::executeBatchCall::SELECTOR[..]
+        );
+        let decoded = ISimpleAccount::executeBatchCall::abi_decode(&op.call_data)
+            .expect("build_withdrawal_batch_userop must produce valid executeBatch() calldata");
+        assert_eq!(decoded.dest.len(), withdrawals.len());
+        assert_eq!(decoded.value.len(), withdrawals.len());
+        assert_eq!(decoded.func.len(), withdrawals.len());
+
+        for (i, (recipient, amount)) in withdrawals.iter().enumerate() {
+            assert_eq!(
+                decoded.dest[i],
+                Address::from(usdt_contract.0),
+                "dest[{i}] must be the USDT contract"
+            );
+            assert_eq!(decoded.value[i], U256::ZERO, "value[{i}] must be zero");
+            assert_eq!(
+                &decoded.func[i][..4],
+                &IERC20Transfer::transferCall::SELECTOR[..]
+            );
+            let inner = IERC20Transfer::transferCall::abi_decode(&decoded.func[i])
+                .expect("each func[i] must be valid transfer() calldata");
+            assert_eq!(
+                inner.to,
+                Address::from(recipient.0),
+                "func[{i}] recipient must match withdrawals[{i}]"
+            );
+            assert_eq!(
+                inner.amount,
+                U256::from(amount.0),
+                "func[{i}] amount must match withdrawals[{i}]"
+            );
+        }
+    }
+
+    #[test]
+    fn withdrawal_batch_nonce_and_gas_bounds_carry_through() {
+        let params = sample_withdrawal_batch_params(
+            vec![(EvmAddress([0x01; 20]), UsdtAmount(1_000_000))],
+            false,
+        );
+        let (nonce, gas_bounds) = (params.nonce, params.gas_bounds);
+        let op = build_withdrawal_batch_userop(params);
+
+        assert_eq!(op.nonce, nonce);
+        assert_eq!(op.verification_gas_limit, gas_bounds.verification_gas_limit);
+        assert_eq!(op.call_gas_limit, gas_bounds.call_gas_limit);
+        assert_eq!(
+            op.pre_verification_gas,
+            U256::from(gas_bounds.pre_verification_gas)
+        );
+    }
+
+    #[test]
+    fn withdrawal_batch_gas_bounds_scale_with_item_count_and_deploy() {
+        let one_item_no_deploy = GasBounds::withdrawal_batch(1, false);
+        let three_items_no_deploy = GasBounds::withdrawal_batch(3, false);
+        let one_item_deploy = GasBounds::withdrawal_batch(1, true);
+
+        assert!(three_items_no_deploy.call_gas_limit > one_item_no_deploy.call_gas_limit);
+        assert!(
+            three_items_no_deploy.pre_verification_gas > one_item_no_deploy.pre_verification_gas
+        );
+        assert!(
+            one_item_deploy.verification_gas_limit > one_item_no_deploy.verification_gas_limit,
+            "a batch that must deploy the pool needs a larger verification gas limit"
+        );
+    }
+
+    #[test]
+    fn decode_batch_transfer_total_sums_every_transfer() {
+        let withdrawals = vec![
+            (EvmAddress([0x01; 20]), UsdtAmount(1_000_000)),
+            (EvmAddress([0x02; 20]), UsdtAmount(2_500_000)),
+            (EvmAddress([0x03; 20]), UsdtAmount(3_750_000)),
+        ];
+        let params = sample_withdrawal_batch_params(withdrawals, false);
+        let op = build_withdrawal_batch_userop(params);
+
+        let total = decode_batch_transfer_total(&op).expect("must decode a valid batch");
+        assert_eq!(total, UsdtAmount(1_000_000 + 2_500_000 + 3_750_000));
+    }
+
+    #[test]
+    fn decode_batch_transfer_total_rejects_a_single_execute_call() {
+        // A `DeployAndSweep`-purpose op's `call_data` is a single `execute()`
+        // call, not `executeBatch()` -- `decode_batch_transfer_total` must
+        // reject it rather than misinterpret it (the inverse of
+        // `decode_transfer_amount` rejecting an `executeBatch()` op, which is
+        // exercised implicitly by this pair of decoders never being
+        // interchangeable).
+        let op = build_deploy_and_sweep_userop(sample_params(false));
+        let err = decode_batch_transfer_total(&op)
+            .expect_err("a single execute() call must not decode as an executeBatch() call");
+        assert!(err.to_string().contains("executeBatch"));
+    }
+
+    #[test]
+    fn decode_transfer_amount_rejects_an_execute_batch_call() {
+        let params = sample_withdrawal_batch_params(
+            vec![(EvmAddress([0x01; 20]), UsdtAmount(1_000_000))],
+            false,
+        );
+        let op = build_withdrawal_batch_userop(params);
+        let err = decode_transfer_amount(&op)
+            .expect_err("an executeBatch() call must not decode as an execute() call");
+        assert!(err.to_string().contains("execute()"));
     }
 
     #[test]

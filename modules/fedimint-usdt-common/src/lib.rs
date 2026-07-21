@@ -331,12 +331,25 @@ pub fn derive_deposit_account(
     create2_simple_account(account_factory, simple_account_impl, owner, salt)
 }
 
+/// The CREATE2 `salt` for the federation's fixed pool `SimpleAccount`:
+/// `keccak256(POOL_ACCOUNT_DOMAIN)` (a single fixed salt, not mixed with any
+/// claim key -- there is only ever one pool account per federation). Extracted
+/// out of [`derive_pool_account`] (mirroring [`deposit_salt`]'s own
+/// extraction out of [`derive_deposit_account`]) so
+/// `fedimint-usdt-server`'s withdrawal-batch `UserOp` builder (Phase 8, Task
+/// 2) can compute the exact same salt for `SimpleAccountFactory.
+/// createAccount`'s `initCode` without duplicating (and risking drifting
+/// from) this formula.
+#[must_use]
+pub fn pool_salt() -> [u8; 32] {
+    Keccak256::digest(POOL_ACCOUNT_DOMAIN).into()
+}
+
 /// Derives the CREATE2 address of this federation's fixed pool `SimpleAccount`
 /// -- the swept-to destination of every deploy-and-sweep `UserOp` (Phase 7
-/// Task 5): `owner = evm_address(group_public_key)` (the same group key that
-/// owns every deposit account), `salt = keccak256(POOL_ACCOUNT_DOMAIN)` (a
-/// single fixed salt, not mixed with any claim key -- there is only ever one
-/// pool account per federation).
+/// Task 5), and the `sender` of every withdrawal-batch `UserOp` (Phase 8,
+/// Task 2): `owner = evm_address(group_public_key)` (the same group key that
+/// owns every deposit account), `salt = `[`pool_salt`]`()`.
 ///
 /// Pure function, no RPC -- every guardian (and, if a client ever needs it,
 /// the client too) calls this exact function so the pool address is
@@ -349,8 +362,7 @@ pub fn derive_pool_account(
     simple_account_impl: EvmAddress,
 ) -> EvmAddress {
     let owner = evm_address(group_public_key);
-    let salt: [u8; 32] = Keccak256::digest(POOL_ACCOUNT_DOMAIN).into();
-    create2_simple_account(account_factory, simple_account_impl, owner, salt)
+    create2_simple_account(account_factory, simple_account_impl, owner, pool_salt())
 }
 
 /// Shared CREATE2 computation behind [`derive_deposit_account`] and

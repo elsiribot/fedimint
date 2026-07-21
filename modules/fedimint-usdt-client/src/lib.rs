@@ -446,6 +446,33 @@ impl UsdtClientModule {
     /// wiring; this is deliberately minimal scaffolding so Phase 8's
     /// server-side debit/queue/fee-median logic (this task) can be
     /// exercised end to end over a real transaction.
+    ///
+    /// Before returning, this awaits the withdrawal transaction being
+    /// accepted into consensus -- both guaranteeing the server-side
+    /// `process_output` has run (so the withdrawal's server-side state
+    /// exists) by the time this returns, and surfacing a consensus-level
+    /// rejection (e.g. a stale `max_fee` below the fee-vote-median quote at
+    /// processing time) as an `Err` rather than a silently successful `Ok`.
+    /// This uses the same proven `transaction_updates(..).await_tx_accepted`
+    /// pattern as e.g. `fedimint-ln-client` / `fedimint-wallet-client`.
+    ///
+    /// It does NOT additionally await the transaction's mint-change
+    /// reissuance settling back into the client's spendable balance: callers
+    /// issuing withdrawals back-to-back should poll their own
+    /// `USDT_UNIT` balance (`Client::get_balance_for_unit`) down to the
+    /// expected post-burn value between calls, so the next withdrawal's
+    /// implicit funding sees the reissued change (the USDT-`mintv2` primary
+    /// module funds each withdrawal by spending notes and reissuing change
+    /// asynchronously). This mirrors this module's own claim path
+    /// (`submit_claim`), which likewise submits and lets the caller poll for
+    /// the effect rather than blocking on the primary module's output state
+    /// machines here.
+    ///
+    /// Returns the `OutPointRange` of the transaction's mint-change outputs
+    /// (empty if the funding was exact). The withdrawal output itself is
+    /// always at `out_idx` 0 of the returned range's `txid` (it is the sole
+    /// output added here, before the primary module appends its change), so
+    /// its `OutPoint` is `OutPoint { txid: range.txid(), out_idx: 0 }`.
     pub async fn withdraw(
         &self,
         recipient: EvmAddress,
@@ -478,6 +505,18 @@ impl UsdtClientModule {
                 tx,
             )
             .await?;
+
+        // Await consensus acceptance of the withdrawal tx: this both
+        // guarantees `process_output` has run (so the server-side
+        // `WithdrawalState` exists) and turns a consensus-level rejection
+        // (e.g. a stale `max_fee`) into an `Err` instead of a silently
+        // successful return.
+        self.client_ctx
+            .transaction_updates(operation_id)
+            .await
+            .await_tx_accepted(range.txid())
+            .await
+            .map_err(|err| anyhow::anyhow!("withdrawal transaction was rejected: {err}"))?;
 
         Ok(range)
     }

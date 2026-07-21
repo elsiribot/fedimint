@@ -290,14 +290,28 @@ impl_db_lookup!(
     query_prefix = MpcRoundChunkSessionRoundPeerPrefix,
 );
 
-/// What a [`PendingUserOp`]/[`SubmittedUserOp`] is for. Phase 7 only ever
-/// creates `DeployAndSweep` (the counterfactual deposit account's first,
-/// nonce-0 sweep to the pool); a `Withdraw` purpose is deferred to Phase 8.
+/// What a [`PendingUserOp`]/[`SubmittedUserOp`] is for. Phase 7 introduced
+/// `DeployAndSweep` (a counterfactual deposit account's first, nonce-0 sweep
+/// to the pool); Phase 8, Task 2 adds `Withdraw` (a batched payout FROM the
+/// pool account).
+/// [`Usdt::apply_user_op_confirmed`](crate::Usdt::apply_user_op_confirmed)
+/// branches on this to decide whether a confirmed op credits the pool
+/// (`DeployAndSweep`) or debits it (`Withdraw`).
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
 pub enum UserOpPurpose {
     /// Deploys (if not already deployed) and sweeps `source`'s full credited
     /// balance to the pool account.
     DeployAndSweep { source: EvmAddress },
+    /// A batched withdrawal payout `UserOp` from the pool `SimpleAccount`
+    /// (Phase 8, Task 2): `executeBatch`-transfers every one of
+    /// `outpoints`' queued `UsdtWithdrawalV0.amount` to its `recipient`.
+    /// `outpoints` are the (deterministically OutPoint-sorted) keys of the
+    /// [`UnclaimedWithdrawalKey`]/[`WithdrawalStateKey`] records this op
+    /// settles once confirmed -- carried here (not re-derived) so
+    /// `apply_user_op_confirmed` knows exactly which withdrawals this op
+    /// covers even after some of them may have been superseded/re-queued by
+    /// a later batch.
+    Withdraw { outpoints: Vec<OutPoint> },
 }
 
 /// A `UserOp` deterministically built from consensus DB state and enqueued
@@ -334,9 +348,18 @@ impl_db_lookup!(key = PendingUserOpKey, query_prefix = PendingUserOpPrefix);
 /// `op_hash` its originating [`PendingUserOp`] was keyed by. Cleared once
 /// `UsdtConsensusItem::UserOpConfirmed` reaches threshold agreement
 /// (`Usdt::apply_user_op_confirmed`).
+///
+/// `purpose` (Phase 8, Task 2) is carried forward unchanged from the
+/// originating [`PendingUserOp::purpose`] (`Usdt::process_mpc_signature`
+/// copies it across when finalizing) so `apply_user_op_confirmed` knows,
+/// purely from this consensus record, whether a confirmed op is a
+/// `DeployAndSweep` (credit the pool) or a `Withdraw` (debit the pool and
+/// settle the covered withdrawals) -- Phase 7 omitted this field since only
+/// `DeployAndSweep` existed yet.
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
 pub struct SubmittedUserOp {
     pub signed: SignedUserOp,
+    pub purpose: UserOpPurpose,
     /// The consensus block count as of this op's federation-agreed
     /// signature -- diagnostic bookkeeping only.
     pub submitted_block: u64,
@@ -358,15 +381,33 @@ impl_db_lookup!(
     query_prefix = SubmittedUserOpPrefix
 );
 
-/// The consensus-agreed pool `SimpleAccount`'s derived address and the USDT
-/// balance swept into it so far (Phase 7, Task 5). A module-wide singleton
-/// (queried directly via [`PoolStateKey`], mirroring e.g. `walletv2`'s
-/// `FederationWalletKey`) rather than per-account: there is only ever one
-/// pool account per federation.
+/// The consensus-agreed pool `SimpleAccount`'s derived address, the USDT
+/// balance swept into it so far (Phase 7, Task 5), and its `EntryPoint`
+/// nonce (Phase 8, Task 2). A module-wide singleton (queried directly via
+/// [`PoolStateKey`], mirroring e.g. `walletv2`'s `FederationWalletKey`)
+/// rather than per-account: there is only ever one pool account per
+/// federation.
+///
+/// `nonce` starts at `0`, meaning the pool `SimpleAccount` has never
+/// submitted a `UserOp` of its own (Phase 7's sweeps are `UserOp`s FROM the
+/// deposit account TO the pool, not from the pool itself -- the pool only
+/// ever RECEIVES a plain ERC-20 `transfer`, which needs no code/nonce at
+/// all, so a fresh federation's pool can sit un-deployed on-chain
+/// indefinitely). It is incremented by exactly `1` for every withdrawal
+/// batch `UserOp` the `EntryPoint` actually validates and includes --
+/// `Usdt::apply_user_op_confirmed`'s `Withdraw` branch bumps it whenever a
+/// `UserOpConfirmed` observation for a `Withdraw`-purpose op reaches
+/// threshold, REGARDLESS of `success` (a reverted `callData` execution still
+/// consumes the on-chain `EntryPoint` nonce; only validation/inclusion
+/// failing means no `UserOperationEvent` -- and hence no `UserOpConfirmed`
+/// observation at all -- is ever produced for that attempt). `nonce == 0` is
+/// therefore exactly the condition under which the pool's `initCode` must be
+/// populated (`needs_deploy`) the next time a withdrawal batch is built.
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
 pub struct PoolState {
     pub account: EvmAddress,
     pub balance: UsdtAmount,
+    pub nonce: u64,
 }
 
 #[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
@@ -463,8 +504,9 @@ pub enum WithdrawalState {
     /// Enqueued by `Usdt::process_output`, awaiting Task 2's batching logic
     /// to include it in a withdrawal `UserOp`.
     Queued,
-    /// Included in a withdrawal `UserOp` whose federation MPC signing
-    /// session (identified by its digest) is in progress (Task 2).
+    /// Included in a withdrawal `UserOp` (identified by its `op_hash`, the
+    /// same key as the [`PendingUserOp`] it was enqueued alongside) whose
+    /// federation MPC signing session is in progress (Task 2).
     Signing([u8; 32]),
     /// The withdrawal's `UserOp` has been federation-agreed-signed
     /// (identified by its `op_hash`) and is awaiting/undergoing guardian-
@@ -740,6 +782,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn withdraw_purpose_pending_and_submitted_user_op_round_trip() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let op_hash = [0x43; 32];
+        let outpoints = vec![test_out_point(0), test_out_point(1), test_out_point(2)];
+        let purpose = UserOpPurpose::Withdraw {
+            outpoints: outpoints.clone(),
+        };
+
+        let pending = PendingUserOp {
+            op: sample_unsigned_user_op(),
+            purpose: purpose.clone(),
+            created_block: 7,
+        };
+        let submitted = SubmittedUserOp {
+            signed: SignedUserOp {
+                unsigned: sample_unsigned_user_op(),
+                signature: vec![0xcc; 65],
+            },
+            purpose: purpose.clone(),
+            submitted_block: 8,
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&PendingUserOpKey(op_hash), &pending)
+            .await;
+        dbtx.insert_new_entry(&SubmittedUserOpKey(op_hash), &submitted)
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let fetched_pending = dbtx
+            .get_value(&PendingUserOpKey(op_hash))
+            .await
+            .expect("PendingUserOp must round-trip");
+        assert_eq!(fetched_pending.purpose, purpose);
+        let fetched_submitted = dbtx
+            .get_value(&SubmittedUserOpKey(op_hash))
+            .await
+            .expect("SubmittedUserOp must round-trip");
+        assert_eq!(fetched_submitted.purpose, purpose);
+        assert_eq!(
+            fetched_submitted.purpose,
+            UserOpPurpose::Withdraw { outpoints }
+        );
+    }
+
+    #[tokio::test]
     async fn submitted_user_op_round_trips() {
         let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
         let op_hash = [0x42; 32];
@@ -747,6 +836,9 @@ mod tests {
             signed: SignedUserOp {
                 unsigned: sample_unsigned_user_op(),
                 signature: vec![0xaa; 65],
+            },
+            purpose: UserOpPurpose::DeployAndSweep {
+                source: EvmAddress([0x51; 20]),
             },
             submitted_block: 43,
         };
@@ -769,6 +861,7 @@ mod tests {
         let state = PoolState {
             account: EvmAddress([0x61; 20]),
             balance: UsdtAmount(9_000_000),
+            nonce: 3,
         };
 
         let mut dbtx = db.begin_transaction().await;

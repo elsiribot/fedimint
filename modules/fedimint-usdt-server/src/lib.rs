@@ -74,7 +74,9 @@ use crate::db::{
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
-use crate::user_op::{DeployAndSweepParams, GasBounds, assemble_eth_signature};
+use crate::user_op::{
+    DeployAndSweepParams, GasBounds, WithdrawalBatchParams, assemble_eth_signature,
+};
 
 mod dkg;
 
@@ -883,6 +885,16 @@ impl ServerModule for Usdt {
 
                 dbtx.insert_entry(&BlockCountVoteKey(peer_id), &vote).await;
 
+                // Deterministic trigger (Phase 8, Task 2): every guardian,
+                // right here, checks whether the withdrawal-batch policy
+                // fires now that this vote may have moved the consensus
+                // block-count median forward -- mirrors
+                // `Usdt::maybe_trigger_sweep`'s placement in the `Deposit`
+                // arm (a pure function of the item, prior consensus-DB
+                // state, and config; see `Usdt::maybe_trigger_withdrawal_batch`'s
+                // own doc comment for the full determinism argument).
+                self.maybe_trigger_withdrawal_batch(dbtx).await;
+
                 Ok(())
             }
             UsdtConsensusItem::Deposit(obs) => {
@@ -1148,6 +1160,35 @@ impl ServerModule for Usdt {
         // consensus that it holds `credited` USDT there, it is already
         // vouching for that balance the same way the wallet module vouches
         // for UTXOs it controls.
+        //
+        // WITHDRAWAL OBLIGATION (Phase 8, Task 2, SOLVENCY-CRITICAL): a
+        // withdrawal output's `amount + max_fee` is burned from the user's
+        // e-cash the moment `process_output` accepts it -- i.e. the
+        // mintv2-USDT-instance liability drops by that much IMMEDIATELY,
+        // long before the pool actually pays it out. `PoolState.balance`
+        // above, however, is only debited once the withdrawal's batch
+        // `UserOp` confirms (`Usdt::apply_withdraw_confirmed`). Without a
+        // correction, `audit` would therefore transiently OVER-report net
+        // assets by exactly `amount` for every `Queued`/`Signing`/
+        // `Submitted` withdrawal (a temporary surplus, so still solvent --
+        // never a deficit -- but not the TIGHT/accurate figure). Subtracting
+        // every `UnclaimedWithdrawal.amount` below closes that gap exactly:
+        // `UnclaimedWithdrawalKey` records exist for precisely the
+        // `Queued`/`Signing`/`Submitted` set (removed the instant a
+        // withdrawal reaches `Confirmed`, see `apply_withdraw_confirmed`),
+        // so this subtraction is in effect for exactly as long as the
+        // corresponding `amount` remains counted in `PoolState.balance`
+        // above but no longer in the liability side -- keeping `audit`'s
+        // net figure CONSTANT (not just non-negative) across the entire
+        // queue -> batch -> confirm lifecycle. `max_fee` is deliberately
+        // NOT subtracted here: it was never earmarked to leave the pool (the
+        // recipient is only ever paid `amount`), so it correctly remains
+        // counted as the federation's own accrued fee revenue. This mirrors
+        // the wallet module's own peg-out accounting (`UnsignedTransaction`/
+        // `PendingTransaction`'s `change`-only reporting): the outgoing
+        // portion of a not-yet-broadcast/confirmed spend is excluded from
+        // assets as soon as it is committed to, not only once it lands
+        // on-chain.
         audit
             .add_items(dbtx, module_instance_id, &DepositRecordPrefix, |_k, v| {
                 i64::try_from(v.credited.0.saturating_sub(v.swept.0)).unwrap_or(i64::MAX)
@@ -1157,6 +1198,14 @@ impl ServerModule for Usdt {
             .add_items(dbtx, module_instance_id, &PoolStatePrefix, |_k, v| {
                 i64::try_from(v.balance.0).unwrap_or(i64::MAX)
             })
+            .await;
+        audit
+            .add_items(
+                dbtx,
+                module_instance_id,
+                &UnclaimedWithdrawalPrefix,
+                |_k, v| -i64::try_from(v.amount.0).unwrap_or(i64::MAX),
+            )
             .await;
     }
 
@@ -1273,6 +1322,7 @@ impl ServerModule for Usdt {
                     let pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
                         account: module.pool_account(),
                         balance: UsdtAmount(0),
+                        nonce: 0,
                     });
 
                     Ok(PoolStateResponse {
@@ -1599,12 +1649,14 @@ impl Usdt {
     /// ever cause is via the ordinary `UserOpConfirmed` consensus-item path
     /// (`Usdt::apply_user_op_confirmed`), gated on federation-wide
     /// threshold agreement, never on this task's own say-so. `swept` is
-    /// derived from the already-consensus-agreed `op`'s own transfer amount
-    /// (via [`crate::user_op::decode_transfer_amount`]), not from the RPC
-    /// response -- only `success`/`block` are guardian-local RPC reads;
-    /// `swept` is otherwise a pure function of consensus data, so every
-    /// guardian proposing for the same `op_hash` proposes an identical
-    /// `swept` value once they agree on `success`.
+    /// derived from the already-consensus-agreed `op`'s own calldata --
+    /// [`crate::user_op::decode_transfer_amount`] for a `DeployAndSweep` op,
+    /// [`crate::user_op::decode_batch_transfer_total`] for a `Withdraw` op
+    /// (Phase 8, Task 2) -- not from the RPC response; only `success`/
+    /// `block` are guardian-local RPC reads. `swept` is otherwise a pure
+    /// function of consensus data, so every guardian proposing for the same
+    /// `op_hash` proposes an identical `swept` value once they agree on
+    /// `success`.
     fn spawn_user_op_submitter(task_group: &TaskGroup, handles: UserOpSubmitterHandles) {
         let UserOpSubmitterHandles {
             db,
@@ -1636,9 +1688,28 @@ impl Usdt {
 
                     match evm_rpc.get_user_op_receipt(op_hash).await {
                         Ok(Some(receipt)) => {
+                            // `swept` doubles as "amount moved by this op":
+                            // swept-TO-the-pool for `DeployAndSweep`,
+                            // paid-OUT-of-the-pool for `Withdraw` (Phase 8,
+                            // Task 2) -- both decoded from the already
+                            // federation-agreed `op`'s own calldata, never
+                            // from the RPC response, per this fn's own doc
+                            // comment.
                             let swept = if receipt.success {
-                                crate::user_op::decode_transfer_amount(&record.signed.unsigned)
-                                    .unwrap_or(UsdtAmount(0))
+                                match &record.purpose {
+                                    UserOpPurpose::DeployAndSweep { .. } => {
+                                        crate::user_op::decode_transfer_amount(
+                                            &record.signed.unsigned,
+                                        )
+                                        .unwrap_or(UsdtAmount(0))
+                                    }
+                                    UserOpPurpose::Withdraw { .. } => {
+                                        crate::user_op::decode_batch_transfer_total(
+                                            &record.signed.unsigned,
+                                        )
+                                        .unwrap_or(UsdtAmount(0))
+                                    }
+                                }
                             } else {
                                 UsdtAmount(0)
                             };
@@ -1936,6 +2007,183 @@ impl Usdt {
             .await;
     }
 
+    /// `true` if a `Withdraw`-purpose `UserOp` is currently `Pending`
+    /// (awaiting/undergoing MPC signing) or `Submitted` (signed, awaiting
+    /// on-chain confirmation) -- i.e. a withdrawal batch is already "in
+    /// flight" and [`Usdt::maybe_trigger_withdrawal_batch`] must not start a
+    /// second one. Both tables are scanned fully and filtered by
+    /// `UserOpPurpose::Withdraw`, since -- unlike `DeployAndSweep` ops,
+    /// which are keyed per deposit account and may legitimately have many
+    /// concurrently pending -- this module never intentionally has more than
+    /// one `Withdraw`-purpose op outstanding at a time (see
+    /// `maybe_trigger_withdrawal_batch`'s doc comment for why: two
+    /// concurrent batches would both be built against the SAME
+    /// `PoolState.nonce`, since it only advances on confirm, and would
+    /// collide on-chain).
+    async fn withdraw_batch_in_flight(&self, dbtx: &mut DatabaseTransaction<'_>) -> bool {
+        let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        if pending
+            .iter()
+            .any(|(_, p)| matches!(p.purpose, UserOpPurpose::Withdraw { .. }))
+        {
+            return true;
+        }
+
+        let submitted: Vec<(SubmittedUserOpKey, SubmittedUserOp)> = dbtx
+            .find_by_prefix(&SubmittedUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        submitted
+            .iter()
+            .any(|(_, s)| matches!(s.purpose, UserOpPurpose::Withdraw { .. }))
+    }
+
+    /// Deterministically batches every currently-`Queued` withdrawal into
+    /// ONE `Withdraw`-purpose `UserOp` from the pool `SimpleAccount`, and
+    /// starts its MPC signing session, if the batching policy fires (Phase
+    /// 8, Task 2). Called from the `BlockCount` consensus-item arm, mirroring
+    /// where [`Usdt::maybe_trigger_sweep`] sits in the `Deposit` arm -- a
+    /// deterministic consensus-DB-driven trigger, not a background task.
+    ///
+    /// # Trigger policy
+    ///
+    /// Fires when at least one `Queued` withdrawal exists AND EITHER the
+    /// oldest of them (by `UsdtWithdrawalV0::requested_block`) has waited at
+    /// least [`batch_interval_blocks`] consensus blocks, OR there are at
+    /// least [`BATCH_MAX_ITEMS`] queued withdrawals. Using the oldest
+    /// queued withdrawal's own `requested_block` (already written by
+    /// `Usdt::process_output`) as the interval anchor -- rather than a
+    /// separate "last batch" singleton -- bounds every individual
+    /// withdrawal's own maximum queuing delay directly, and needs no extra
+    /// consensus-DB state.
+    ///
+    /// # Guards
+    ///
+    /// - [`Usdt::withdraw_batch_in_flight`]: never starts a second
+    ///   `Withdraw`-purpose op while one is `Pending`/`Submitted` (both would
+    ///   collide on the same `PoolState.nonce`).
+    /// - Only withdrawals whose [`WithdrawalState`] is EXACTLY `Queued` are
+    ///   ever candidates: one already `Signing`/`Submitted` (part of an
+    ///   in-flight batch) or terminal (`Confirmed`) is excluded, so a
+    ///   withdrawal is never double-batched.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of the full `UnclaimedWithdrawal`/`WithdrawalState`/
+    /// `PoolState` consensus-DB tables and this module's config
+    /// (`account_factory`/`usdt_contract`/`entry_point`/`chain_id`/
+    /// `group_public_key`) -- no RPC, no wall-clock, no `our_peer_id`.
+    /// `queued` is sorted by `OutPoint` (a total order) before being fed to
+    /// [`crate::user_op::build_withdrawal_batch_userop`], so every guardian
+    /// builds the byte-identical op/`op_hash` from the byte-identical
+    /// input. The only conditional consensus-DB writes
+    /// (`PendingUserOpKey`/`WithdrawalStateKey`/`SigningSession` inserts)
+    /// are gated on checks of that SAME consensus DB -- identical on every
+    /// guardian. `start_session`'s only `our_peer_id`-conditional part is
+    /// the in-memory off-thread signer spawn, a guardian-local side effect
+    /// (see its own doc comment).
+    async fn maybe_trigger_withdrawal_batch(&self, dbtx: &mut DatabaseTransaction<'_>) {
+        if self.withdraw_batch_in_flight(dbtx).await {
+            return;
+        }
+
+        let all: Vec<(UnclaimedWithdrawalKey, UsdtWithdrawalV0)> = dbtx
+            .find_by_prefix(&UnclaimedWithdrawalPrefix)
+            .await
+            .collect()
+            .await;
+
+        let mut queued: Vec<(OutPoint, UsdtWithdrawalV0)> = Vec::new();
+        for (UnclaimedWithdrawalKey(out_point), withdrawal) in all {
+            if dbtx.get_value(&WithdrawalStateKey(out_point)).await == Some(WithdrawalState::Queued)
+            {
+                queued.push((out_point, withdrawal));
+            }
+        }
+        if queued.is_empty() {
+            return;
+        }
+
+        let consensus_block_count = self.consensus_block_count(dbtx).await;
+        let oldest_requested_block = queued
+            .iter()
+            .map(|(_, w)| w.requested_block)
+            .min()
+            .expect("queued is non-empty, checked above");
+        let waited_long_enough =
+            consensus_block_count >= oldest_requested_block + batch_interval_blocks();
+        let enough_items = queued.len() >= BATCH_MAX_ITEMS;
+        if !waited_long_enough && !enough_items {
+            return;
+        }
+
+        // Deterministic ordering (`OutPoint`'s total `Ord`): every guardian
+        // sorts identically, so the batch's `dest`/`value`/`func` arrays
+        // (and hence `call_data`/`op_hash`) are byte-identical everywhere.
+        queued.sort_by_key(|(out_point, _)| *out_point);
+
+        let pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
+            account: self.pool_account(),
+            balance: UsdtAmount(0),
+            nonce: 0,
+        });
+
+        let outpoints: Vec<OutPoint> = queued.iter().map(|(o, _)| *o).collect();
+        let withdrawals: Vec<(fedimint_usdt_common::EvmAddress, UsdtAmount)> = queued
+            .iter()
+            .map(|(_, w)| (w.recipient, w.amount))
+            .collect();
+
+        let owner = evm_address(&self.cfg.consensus.group_public_key);
+        let needs_deploy = pool.nonce == 0;
+        let params = WithdrawalBatchParams {
+            account_factory: self.cfg.consensus.account_factory,
+            usdt_contract: self.cfg.consensus.usdt_contract,
+            pool: pool.account,
+            owner,
+            withdrawals: withdrawals.clone(),
+            nonce: alloy::primitives::U256::from(pool.nonce),
+            needs_deploy,
+            paymaster_and_data: Vec::new(),
+            gas_bounds: GasBounds::withdrawal_batch(withdrawals.len(), needs_deploy),
+        };
+        let op = crate::user_op::build_withdrawal_batch_userop(params);
+        let op_hash = user_op_hash(
+            &op,
+            self.cfg.consensus.entry_point,
+            self.cfg.consensus.chain_id,
+        );
+
+        dbtx.insert_entry(
+            &PendingUserOpKey(op_hash),
+            &PendingUserOp {
+                op: op.clone(),
+                purpose: UserOpPurpose::Withdraw {
+                    outpoints: outpoints.clone(),
+                },
+                created_block: consensus_block_count,
+            },
+        )
+        .await;
+
+        for &out_point in &outpoints {
+            dbtx.insert_entry(
+                &WithdrawalStateKey(out_point),
+                &WithdrawalState::Signing(op_hash),
+            )
+            .await;
+        }
+
+        let digest = eth_signed_message_hash(op_hash);
+        self.start_session(dbtx, SigningPurpose::UserOp(op_hash), digest, 0)
+            .await;
+    }
+
     /// This federation's fixed pool `SimpleAccount` address (see
     /// [`derive_pool_account`]) -- a pure function of config, computed fresh
     /// on every call rather than cached, so it is trivially identical on
@@ -1950,24 +2198,31 @@ impl Usdt {
     }
 
     /// Applies a threshold-agreed [`UserOpConfirmedObservation`] for
-    /// `op_hash`: if `success`, credits `PoolState.balance` by `obs.swept`
-    /// and marks the corresponding [`DepositRecord`] (recovered from the
-    /// [`SubmittedUserOp`]'s own `op.sender`, i.e. the swept deposit
-    /// account) as swept forward. Either way, clears the now-finalized
-    /// [`SubmittedUserOp`] and the op's vote prefix. Replay-safe: if
-    /// `SubmittedUserOpKey(op_hash)` is already absent (a prior
-    /// threshold-reaching duplicate vote already applied this `op_hash`), this
-    /// is a no-op.
+    /// `op_hash`, branching on the finalized [`SubmittedUserOp::purpose`]
+    /// (Phase 8, Task 2): a `DeployAndSweep` op, if `success`, credits
+    /// `PoolState.balance` by `obs.swept` and marks the corresponding
+    /// [`DepositRecord`] (recovered from the op's own `sender`, i.e. the
+    /// swept deposit account) as swept forward (Phase 7 behavior,
+    /// unchanged); a `Withdraw` op settles the covered withdrawals -- see
+    /// [`Usdt::apply_withdraw_confirmed`]'s own doc comment. Either way,
+    /// clears the now-finalized [`SubmittedUserOp`] and the op's vote
+    /// prefix. Replay-safe: if `SubmittedUserOpKey(op_hash)` is already
+    /// absent (a prior threshold-reaching duplicate vote already applied
+    /// this `op_hash`), this is a no-op.
     ///
     /// # Determinism (consensus-critical)
     ///
     /// A pure function of `op_hash`, `obs` (both from the ordered consensus
     /// item), and prior consensus-DB state (`SubmittedUserOp`/`PoolState`/
-    /// `DepositRecord`) -- byte-identical on every guardian, signer or not.
-    /// `obs` itself is federation-agreed (only reached after >= threshold
-    /// IDENTICAL votes, verified by the caller's full-field `PartialEq`
-    /// tally), so using its `success`/`swept` fields here is not reading
-    /// any single guardian's local RPC result.
+    /// `DepositRecord`/`UnclaimedWithdrawal`/`WithdrawalState`) --
+    /// byte-identical on every guardian, signer or not. `obs` itself is
+    /// federation-agreed (only reached after >= threshold IDENTICAL votes,
+    /// verified by the caller's full-field `PartialEq` tally), so using its
+    /// `success`/`swept`/`block` fields here is not reading any single
+    /// guardian's local RPC result. `submitted.purpose` is likewise
+    /// consensus-DB state (copied verbatim from the `PendingUserOp` that
+    /// started the signing session -- see `Usdt::process_mpc_signature`),
+    /// never `our_peer_id`-conditional.
     async fn apply_user_op_confirmed(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -1983,24 +2238,103 @@ impl Usdt {
             return;
         };
 
-        if obs.success {
-            let mut pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
-                account: self.pool_account(),
-                balance: UsdtAmount(0),
-            });
-            pool.balance = UsdtAmount(pool.balance.0 + obs.swept.0);
-            dbtx.insert_entry(&PoolStateKey, &pool).await;
+        match &submitted.purpose {
+            UserOpPurpose::DeployAndSweep { .. } => {
+                if obs.success {
+                    let mut pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
+                        account: self.pool_account(),
+                        balance: UsdtAmount(0),
+                        nonce: 0,
+                    });
+                    pool.balance = UsdtAmount(pool.balance.0 + obs.swept.0);
+                    dbtx.insert_entry(&PoolStateKey, &pool).await;
 
-            let source = submitted.signed.unsigned.sender;
-            if let Some(mut record) = dbtx.get_value(&DepositRecordKey(source)).await {
-                record.swept = UsdtAmount((record.swept.0 + obs.swept.0).min(record.credited.0));
-                dbtx.insert_entry(&DepositRecordKey(source), &record).await;
+                    let source = submitted.signed.unsigned.sender;
+                    if let Some(mut record) = dbtx.get_value(&DepositRecordKey(source)).await {
+                        record.swept =
+                            UsdtAmount((record.swept.0 + obs.swept.0).min(record.credited.0));
+                        dbtx.insert_entry(&DepositRecordKey(source), &record).await;
+                    }
+                }
+            }
+            UserOpPurpose::Withdraw { outpoints } => {
+                self.apply_withdraw_confirmed(dbtx, outpoints, obs).await;
             }
         }
 
         dbtx.remove_entry(&SubmittedUserOpKey(op_hash)).await;
         dbtx.remove_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
             .await;
+    }
+
+    /// Settles a confirmed `Withdraw`-purpose `UserOp`'s `outpoints` (Phase
+    /// 8, Task 2), called only from [`Usdt::apply_user_op_confirmed`].
+    ///
+    /// `PoolState.nonce` is incremented UNCONDITIONALLY (before branching on
+    /// `obs.success`): a `UserOpConfirmed` observation only ever exists for
+    /// an op the `EntryPoint` actually validated and included (produced a
+    /// `UserOperationEvent`) -- `success` there reflects only whether the
+    /// `callData` (`executeBatch`) execution itself reverted, which happens
+    /// strictly AFTER nonce validation/increment and (if `needs_deploy`) the
+    /// `initCode` deploy. So the on-chain nonce (and, if this was the pool's
+    /// first-ever op, its deployment) is consumed either way; failing to
+    /// mirror that here would make this guardian's `PoolState.nonce` fall
+    /// out of sync with the real on-chain value and every subsequent batch
+    /// would be built with a stale (already-consumed) nonce, permanently
+    /// wedging withdrawals.
+    ///
+    /// On `success`: debits `PoolState.balance` by `obs.swept` (the total
+    /// actually paid out, decoded from the agreed op's own calldata --
+    /// see [`crate::user_op::decode_batch_transfer_total`]), marks every
+    /// `outpoints` withdrawal `WithdrawalState::Confirmed { block: obs.block
+    /// }`, and removes its now-settled `UnclaimedWithdrawal` (so `Usdt::audit`
+    /// stops subtracting it -- see that method's doc comment for the
+    /// solvency argument).
+    ///
+    /// On `!success`: the DELIBERATE, solvent choice (documented per this
+    /// task's spec) is to revert every `outpoints` withdrawal back to
+    /// `WithdrawalState::Queued` -- NOT `Failed` -- so
+    /// `Usdt::maybe_trigger_withdrawal_batch` retries it in a later batch
+    /// (under a fresh, now-correct `PoolState.nonce`). `PoolState.balance`
+    /// is left untouched (nothing left the pool on-chain) and
+    /// `UnclaimedWithdrawal` is left in place (still a real, still-funded
+    /// obligation) -- a permanent `Failed` terminal state would need a
+    /// refund path this phase does not build, and would otherwise either
+    /// strand the user's already-burned e-cash unpaid (an actual loss to
+    /// them) or require re-issuing e-cash (a much larger, out-of-scope
+    /// change); retrying is simple, keeps the pool's on-chain and
+    /// consensus-DB `nonce` in lockstep, and never loses funds.
+    async fn apply_withdraw_confirmed(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        outpoints: &[OutPoint],
+        obs: &UserOpConfirmedObservation,
+    ) {
+        let mut pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
+            account: self.pool_account(),
+            balance: UsdtAmount(0),
+            nonce: 0,
+        });
+        pool.nonce += 1;
+
+        if obs.success {
+            pool.balance = UsdtAmount(pool.balance.0.saturating_sub(obs.swept.0));
+        }
+        dbtx.insert_entry(&PoolStateKey, &pool).await;
+
+        for &out_point in outpoints {
+            if obs.success {
+                dbtx.insert_entry(
+                    &WithdrawalStateKey(out_point),
+                    &WithdrawalState::Confirmed { block: obs.block },
+                )
+                .await;
+                dbtx.remove_entry(&UnclaimedWithdrawalKey(out_point)).await;
+            } else {
+                dbtx.insert_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+                    .await;
+            }
+        }
     }
 
     /// Derives `claim_pk`'s deposit account and enqueues a guardian-local
@@ -2371,6 +2705,12 @@ impl Usdt {
                 &SubmittedUserOpKey(op_hash),
                 &SubmittedUserOp {
                     signed,
+                    // Carried forward verbatim (Phase 8, Task 2) so
+                    // `apply_user_op_confirmed` knows purely from consensus
+                    // DB state whether this op is a `DeployAndSweep` or a
+                    // `Withdraw` once it confirms -- see
+                    // `SubmittedUserOp::purpose`'s doc comment.
+                    purpose: pending.purpose,
                     submitted_block,
                 },
             )
@@ -2629,6 +2969,30 @@ fn chunk_payload(payload: &[u8]) -> Vec<Vec<u8>> {
 fn timeout_blocks() -> u64 {
     if is_running_in_test_env() { 2 } else { 50 }
 }
+
+/// The number of consensus blocks the OLDEST currently-`Queued` withdrawal
+/// (by `UsdtWithdrawalV0::requested_block`) may wait before
+/// [`Usdt::maybe_trigger_withdrawal_batch`] forces a batch regardless of how
+/// few withdrawals are queued (Phase 8, Task 2). Small under
+/// `is_running_in_test_env()`, mirroring [`timeout_blocks`] -- both values
+/// are otherwise arbitrary policy knobs (bounding worst-case withdrawal
+/// latency vs. batching efficiency) with no consensus-correctness
+/// requirement beyond "every guardian computes the same one" (which
+/// `is_running_in_test_env()` does, being a pure function of the process
+/// environment, identical across a test federation's guardians).
+fn batch_interval_blocks() -> u64 {
+    if is_running_in_test_env() { 3 } else { 200 }
+}
+
+/// The number of `Queued` withdrawals that forces
+/// [`Usdt::maybe_trigger_withdrawal_batch`] to batch immediately, regardless
+/// of [`batch_interval_blocks`] (Phase 8, Task 2). A plain, non-test-scaled
+/// constant (unlike `batch_interval_blocks`): 20 ERC-20 transfers per
+/// `executeBatch` is a conservative bound that keeps a single batch's
+/// calldata/gas comfortably within typical limits, and a unit test can seed
+/// this many queued withdrawals directly without needing to wait on
+/// wall-clock/block-count timing.
+const BATCH_MAX_ITEMS: usize = 20;
 
 /// Free-function core of [`Usdt::consensus_block_count`], taking `num_peers`
 /// by value instead of borrowing it from `&self`, so it can be called both
@@ -5118,6 +5482,7 @@ mod tests {
                         unsigned: sample,
                         signature: vec![0xaa; 65],
                     },
+                    purpose: UserOpPurpose::DeployAndSweep { source },
                     submitted_block: 3,
                 },
             )
@@ -5299,6 +5664,7 @@ mod tests {
                         unsigned: sample,
                         signature: vec![0xbb; 65],
                     },
+                    purpose: UserOpPurpose::DeployAndSweep { source },
                     submitted_block: 3,
                 },
             )
@@ -5400,6 +5766,7 @@ mod tests {
             &PoolState {
                 account: module.pool_account(),
                 balance: UsdtAmount(6_000_000),
+                nonce: 1,
             },
         )
         .await;
@@ -5414,6 +5781,599 @@ mod tests {
         assert_eq!(
             net, 10_000_000,
             "every on-chain USDT unit must be counted exactly once"
+        );
+    }
+
+    /// **Phase 8, Task 2.** The deterministic batch trigger: before
+    /// `batch_interval_blocks()` elapses (and with fewer than
+    /// `BATCH_MAX_ITEMS` queued), nothing happens; once the oldest queued
+    /// withdrawal has waited long enough, EVERY currently-`Queued`
+    /// withdrawal is batched into one `Withdraw`-purpose `PendingUserOp`
+    /// with `outpoints` sorted ascending by `OutPoint` (deterministic
+    /// ordering) and each covered withdrawal's `WithdrawalState` flips to
+    /// `Signing(op_hash)`; a withdrawal queued AFTER that batch started does
+    /// not start a second, nonce-colliding batch (`withdraw_batch_in_flight`
+    /// guard).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn maybe_trigger_withdrawal_batch_waits_for_the_interval_then_batches_sorted_and_guards_against_a_second_batch()
+     {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let out_a = test_out_point(5);
+        let out_b = test_out_point(1); // sorts BEFORE out_a
+        let withdrawal_a = UsdtWithdrawalV0 {
+            recipient: EvmAddress([0xa1; 20]),
+            amount: UsdtAmount(1_000_000),
+            max_fee: UsdtAmount(1_000),
+            requested_block: 0,
+        };
+        let withdrawal_b = UsdtWithdrawalV0 {
+            recipient: EvmAddress([0xb1; 20]),
+            amount: UsdtAmount(2_000_000),
+            max_fee: UsdtAmount(2_000),
+            requested_block: 0,
+        };
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_a), &withdrawal_a)
+                .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out_a), &WithdrawalState::Queued)
+                .await;
+            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_b), &withdrawal_b)
+                .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out_b), &WithdrawalState::Queued)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Before the interval elapses (consensus block count is still 0,
+        // matching both withdrawals' requested_block): no trigger.
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+            .await;
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .find_by_prefix(&PendingUserOpPrefix)
+                .await
+                .count()
+                .await,
+            0,
+            "must not trigger before the interval elapses"
+        );
+        dbtx.commit_tx().await;
+
+        // Advance consensus block count strictly past
+        // `batch_interval_blocks()` (both withdrawals' `requested_block` is
+        // `0`); the `BlockCount` arm calls the trigger itself. Reads
+        // `batch_interval_blocks()` directly (rather than assuming its
+        // small `is_running_in_test_env()` value) since plain `cargo test`
+        // (unlike `cargo nextest run`) does not set the `NEXTEST` env var
+        // that function also checks, mirroring
+        // `timed_out_detects_stalled_session_via_consensus_block_count`'s
+        // own use of `timeout_blocks()` for the identical reason.
+        let vote = batch_interval_blocks() + 1;
+        let mut dbtx = db.begin_transaction().await;
+        for p in 0..4u16 {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::BlockCount(vote),
+                    PeerId::from(p),
+                )
+                .await
+                .expect("block count vote succeeds");
+        }
+        dbtx.commit_tx().await;
+
+        let op_hash = {
+            let mut dbtx = db.begin_transaction_nc().await;
+            let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+                .find_by_prefix(&PendingUserOpPrefix)
+                .await
+                .collect()
+                .await;
+            assert_eq!(pending.len(), 1, "exactly one batch must be triggered");
+            let (PendingUserOpKey(op_hash), record) = &pending[0];
+            let UserOpPurpose::Withdraw { outpoints } = &record.purpose else {
+                panic!("must be a Withdraw-purpose op");
+            };
+            assert_eq!(
+                outpoints,
+                &vec![out_b, out_a],
+                "outpoints must be sorted ascending by OutPoint"
+            );
+            assert_eq!(record.op.sender, module.pool_account());
+            assert!(
+                !record.op.init_code.is_empty(),
+                "the pool has never submitted a UserOp yet (PoolState.nonce==0), so this op \
+                 must deploy it"
+            );
+
+            for &out_point in &[out_a, out_b] {
+                assert_eq!(
+                    dbtx.get_value(&WithdrawalStateKey(out_point)).await,
+                    Some(WithdrawalState::Signing(*op_hash))
+                );
+            }
+            *op_hash
+        };
+        let digest = eth_signed_message_hash(op_hash);
+        let session_id = signing_session_id(&digest, 0);
+        let mut dbtx = db.begin_transaction_nc().await;
+        let session = dbtx
+            .get_value(&SigningSessionKey(session_id))
+            .await
+            .expect("SigningSession must be started");
+        assert_eq!(session.purpose, SigningPurpose::UserOp(op_hash));
+        drop(dbtx);
+
+        // A third withdrawal queued WHILE the batch above is still in
+        // flight (Pending) must not start a second, nonce-colliding batch.
+        let out_c = test_out_point(99);
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &UnclaimedWithdrawalKey(out_c),
+            &UsdtWithdrawalV0 {
+                recipient: EvmAddress([0xc1; 20]),
+                amount: UsdtAmount(3_000_000),
+                max_fee: UsdtAmount(3_000),
+                requested_block: 0,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(&WithdrawalStateKey(out_c), &WithdrawalState::Queued)
+            .await;
+        module
+            .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+            .await;
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .find_by_prefix(&PendingUserOpPrefix)
+                .await
+                .count()
+                .await,
+            1,
+            "must not start a second batch while one is Pending"
+        );
+        assert_eq!(
+            dbtx.to_ref_nc().get_value(&WithdrawalStateKey(out_c)).await,
+            Some(WithdrawalState::Queued),
+            "the newly-queued withdrawal must be left untouched, to be picked up by a LATER batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_trigger_withdrawal_batch_forces_a_batch_once_max_items_is_reached() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let mut dbtx = db.begin_transaction().await;
+        for i in 0..BATCH_MAX_ITEMS {
+            let out_point = test_out_point(i as u64);
+            let byte = u8::try_from(i).expect("BATCH_MAX_ITEMS fits in u8");
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out_point),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([byte; 20]),
+                    amount: UsdtAmount(1_000_000),
+                    max_fee: UsdtAmount(1_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+                .await;
+        }
+        dbtx.commit_tx().await;
+
+        // consensus_block_count is still 0 here (no BlockCount votes
+        // seeded), so the interval alone would NOT trigger yet -- only the
+        // item-count policy does.
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+            .await;
+        let pending_count = dbtx
+            .to_ref_nc()
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .count()
+            .await;
+        assert_eq!(
+            pending_count, 1,
+            "reaching BATCH_MAX_ITEMS must trigger a batch even before the interval elapses"
+        );
+    }
+
+    /// **Phase 8, Task 2.** A confirmed `Withdraw`-purpose `UserOp` (mirrors
+    /// `user_op_confirmed_applies_at_threshold_and_is_replay_safe`'s shape
+    /// for the `DeployAndSweep` purpose): at threshold, `success` debits
+    /// `PoolState.balance` by the total paid out, marks every covered
+    /// withdrawal `Confirmed`, removes its now-settled `UnclaimedWithdrawal`,
+    /// and bumps `PoolState.nonce`; replay-safe (a direct re-invocation of
+    /// `apply_user_op_confirmed` after `SubmittedUserOp` is already gone
+    /// must not double-debit/double-bump).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn user_op_confirmed_withdraw_purpose_success_settles_withdrawals_and_debits_pool() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let op_hash = [0xb1; 32];
+        let out_a = test_out_point(1);
+        let out_b = test_out_point(2);
+        let outpoints = vec![out_a, out_b];
+        let amount_a = UsdtAmount(1_000_000);
+        let amount_b = UsdtAmount(2_000_000);
+        let total = UsdtAmount(amount_a.0 + amount_b.0);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(5_000_000),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out_a),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc1; 20]),
+                    amount: amount_a,
+                    max_fee: UsdtAmount(1_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &WithdrawalStateKey(out_a),
+                &WithdrawalState::Signing(op_hash),
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out_b),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc2; 20]),
+                    amount: amount_b,
+                    max_fee: UsdtAmount(2_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &WithdrawalStateKey(out_b),
+                &WithdrawalState::Signing(op_hash),
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: sample_unsigned_user_op_for_test(),
+                        signature: vec![0xdd; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: outpoints.clone(),
+                    },
+                    submitted_block: 5,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: true,
+            block: 99,
+            swept: total,
+        };
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                .await
+                .expect("vote processes cleanly");
+        }
+
+        let pool = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState present");
+        assert_eq!(pool.balance, UsdtAmount(5_000_000 - total.0));
+        assert_eq!(pool.nonce, 1);
+
+        for &out_point in &outpoints {
+            let state = dbtx
+                .to_ref_nc()
+                .get_value(&WithdrawalStateKey(out_point))
+                .await
+                .expect("WithdrawalState present");
+            assert_eq!(state, WithdrawalState::Confirmed { block: 99 });
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&UnclaimedWithdrawalKey(out_point))
+                    .await
+                    .is_none(),
+                "UnclaimedWithdrawal must be removed once confirmed"
+            );
+        }
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(op_hash))
+                .await
+                .is_none()
+        );
+
+        // Replay-safety.
+        module
+            .apply_user_op_confirmed(
+                &mut dbtx.to_ref_nc(),
+                op_hash,
+                &UserOpConfirmedObservation {
+                    success: true,
+                    block: 99,
+                    swept: total,
+                },
+            )
+            .await;
+        let pool_after = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState present");
+        assert_eq!(
+            pool_after.balance,
+            UsdtAmount(5_000_000 - total.0),
+            "a replayed apply must not double-debit the pool"
+        );
+        assert_eq!(
+            pool_after.nonce, 1,
+            "a replayed apply must not double-bump the nonce"
+        );
+    }
+
+    /// **Phase 8, Task 2.** A `!success` `Withdraw`-purpose confirmation
+    /// reverts its withdrawals back to `Queued` (for a later batch to
+    /// retry) rather than crediting/debiting anything -- but the pool's
+    /// `nonce` is STILL bumped, since a `UserOpConfirmed` observation only
+    /// ever exists for an op the `EntryPoint` actually validated/included
+    /// (see `Usdt::apply_withdraw_confirmed`'s doc comment).
+    #[tokio::test]
+    async fn user_op_confirmed_withdraw_purpose_failure_reverts_to_queued_but_still_bumps_nonce() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let op_hash = [0xb2; 32];
+        let out_point = test_out_point(9);
+        let withdrawal = UsdtWithdrawalV0 {
+            recipient: EvmAddress([0xd1; 20]),
+            amount: UsdtAmount(1_500_000),
+            max_fee: UsdtAmount(500),
+            requested_block: 0,
+        };
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(3_000_000),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_point), &withdrawal)
+                .await;
+            dbtx.insert_new_entry(
+                &WithdrawalStateKey(out_point),
+                &WithdrawalState::Signing(op_hash),
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: sample_unsigned_user_op_for_test(),
+                        signature: vec![0xee; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: vec![out_point],
+                    },
+                    submitted_block: 5,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: false,
+            block: 101,
+            swept: UsdtAmount(0),
+        };
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                .await
+                .expect("vote processes cleanly");
+        }
+
+        let pool = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState present");
+        assert_eq!(
+            pool.balance,
+            UsdtAmount(3_000_000),
+            "a failed batch must not debit the pool"
+        );
+        assert_eq!(
+            pool.nonce, 1,
+            "the on-chain nonce is consumed even when the callData execution reverts"
+        );
+
+        let state = dbtx
+            .to_ref_nc()
+            .get_value(&WithdrawalStateKey(out_point))
+            .await
+            .expect("WithdrawalState present");
+        assert_eq!(
+            state,
+            WithdrawalState::Queued,
+            "a failed batch must revert its withdrawals to Queued for retry"
+        );
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .get_value(&UnclaimedWithdrawalKey(out_point))
+                .await,
+            Some(withdrawal),
+            "UnclaimedWithdrawal must survive a failed batch unchanged, for retry"
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(op_hash))
+                .await
+                .is_none()
+        );
+    }
+
+    /// **Solvency-critical, Phase 8 Task 2.** `audit`'s net figure must stay
+    /// CONSTANT (not just non-negative) across a withdrawal's entire
+    /// queue -> batch(-Signing/-Submitted) -> confirm lifecycle -- see
+    /// `Usdt::audit`'s own doc comment for the full reasoning this proves
+    /// (the `UnclaimedWithdrawal` subtraction and the eventual
+    /// `PoolState.balance` debit are exactly offsetting).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn audit_net_assets_are_invariant_across_the_withdrawal_lifecycle() {
+        async fn net_assets(module: &Usdt, db: &fedimint_core::db::Database) -> i64 {
+            let mut dbtx = db.begin_transaction().await;
+            let mut audit = fedimint_core::module::audit::Audit::default();
+            module.audit(&mut dbtx.to_ref_nc(), &mut audit, 0).await;
+            audit.net_assets().expect("no overflow").milli_sat
+        }
+
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let out_point = test_out_point(0);
+        let recipient = EvmAddress([0x55; 20]);
+        let amount = UsdtAmount(3_000_000);
+        let max_fee = UsdtAmount(100_000);
+        let op_hash = [7u8; 32];
+
+        // Start with a fully-swept deposit's worth of pool balance, as if a
+        // prior sweep already happened.
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &PoolStateKey,
+            &PoolState {
+                account: module.pool_account(),
+                balance: UsdtAmount(10_000_000),
+                nonce: 0,
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+        let before_queue = net_assets(&module, db).await;
+
+        // Queue the withdrawal (mirrors `process_output`'s writes directly,
+        // to isolate this test from fee-quote plumbing).
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &UnclaimedWithdrawalKey(out_point),
+            &UsdtWithdrawalV0 {
+                recipient,
+                amount,
+                max_fee,
+                requested_block: 0,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+            .await;
+        dbtx.commit_tx().await;
+        let after_queue = net_assets(&module, db).await;
+        assert_eq!(
+            after_queue,
+            before_queue - i64::try_from(amount.0).expect("fits"),
+            "queuing must immediately exclude `amount` (not max_fee) from net assets"
+        );
+
+        // Signing/Submitted must not move net assets further.
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_entry(
+            &WithdrawalStateKey(out_point),
+            &WithdrawalState::Signing(op_hash),
+        )
+        .await;
+        dbtx.commit_tx().await;
+        assert_eq!(
+            net_assets(&module, db).await,
+            after_queue,
+            "Signing must not change net assets"
+        );
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_entry(
+            &WithdrawalStateKey(out_point),
+            &WithdrawalState::Submitted(op_hash),
+        )
+        .await;
+        dbtx.commit_tx().await;
+        assert_eq!(
+            net_assets(&module, db).await,
+            after_queue,
+            "Submitted must not change net assets"
+        );
+
+        // Confirm: pool debited by `amount`, UnclaimedWithdrawal removed --
+        // net assets must be UNCHANGED from the queued figure (the
+        // subtraction and the debit are exactly offsetting).
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &SubmittedUserOpKey(op_hash),
+            &SubmittedUserOp {
+                signed: fedimint_usdt_common::user_op::SignedUserOp {
+                    unsigned: sample_unsigned_user_op_for_test(),
+                    signature: vec![0x11; 65],
+                },
+                purpose: UserOpPurpose::Withdraw {
+                    outpoints: vec![out_point],
+                },
+                submitted_block: 1,
+            },
+        )
+        .await;
+        module
+            .apply_user_op_confirmed(
+                &mut dbtx.to_ref_nc(),
+                op_hash,
+                &UserOpConfirmedObservation {
+                    success: true,
+                    block: 55,
+                    swept: amount,
+                },
+            )
+            .await;
+        dbtx.commit_tx().await;
+        assert_eq!(
+            net_assets(&module, db).await,
+            after_queue,
+            "confirming must not move net assets -- it only reconciles which record accounts \
+             for the already-excluded amount"
         );
     }
 
