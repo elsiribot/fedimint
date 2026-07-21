@@ -930,10 +930,9 @@ impl IDashboardApi for ConsensusApi {
     async fn module_generations(&self) -> Vec<ModuleGenerationSummary> {
         let identity = self.cfg.local.identity;
         let num_peers = self.cfg.consensus.broadcast_public_keys.len();
+        let log = self.generation_log().await;
 
-        self.generation_log()
-            .await
-            .generations()
+        log.generations()
             .iter()
             .map(|(generation_id, state)| {
                 let (module_kind, state_label, detail, can_approve, can_activate, can_abort) =
@@ -991,11 +990,29 @@ impl IDashboardApi for ConsensusApi {
                         ),
                     };
 
+                let params = state
+                    .proposal()
+                    .params
+                    .iter()
+                    .map(|(name, value)| {
+                        let display_value = value
+                            .parse::<u64>()
+                            .ok()
+                            .and_then(|id| log.assets().get(&id))
+                            .map_or_else(
+                                || value.clone(),
+                                |asset| format!("{} ({value})", asset.ticker),
+                            );
+                        (name.clone(), display_value)
+                    })
+                    .collect();
+
                 ModuleGenerationSummary {
                     generation_id: generation_id.0,
                     module_kind,
                     state: state_label.to_string(),
                     detail,
+                    params,
                     can_approve,
                     can_activate,
                     can_abort,

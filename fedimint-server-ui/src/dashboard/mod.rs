@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod audit;
 pub mod bitcoin;
 pub mod config_gen;
@@ -153,8 +154,12 @@ async fn dashboard_view(
         }
 
         div class="row gy-4 mt-2" {
-            div class="col-12" {
+            div class="col-lg-6" {
                 (config_gen::render(&state.api).await)
+            }
+
+            div class="col-lg-6" {
+                (assets::render(&state.api).await)
             }
         }
 
@@ -253,6 +258,10 @@ pub fn router(api: DynDashboardApi) -> Router {
             post(config_gen::post_propose),
         )
         .route(
+            config_gen::CONFIG_GEN_PROPOSE_FORM_ROUTE,
+            get(config_gen::get_propose_form),
+        )
+        .route(
             config_gen::CONFIG_GEN_APPROVE_ROUTE,
             post(config_gen::post_approve),
         )
@@ -263,7 +272,8 @@ pub fn router(api: DynDashboardApi) -> Router {
         .route(
             config_gen::CONFIG_GEN_ABORT_ROUTE,
             post(config_gen::post_abort),
-        );
+        )
+        .route(assets::ASSETS_REGISTER_ROUTE, post(assets::post_register));
 
     // routeradd LNv2 gateway routes if the module exists
     if api

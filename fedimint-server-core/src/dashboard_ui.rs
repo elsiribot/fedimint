@@ -162,6 +162,8 @@ pub struct ModuleGenerationSummary {
     pub state: String,
     /// Human-readable state detail, e.g. the approval count or abort reason
     pub detail: String,
+    /// Proposal params as display pairs, asset ids resolved to tickers
+    pub params: Vec<(String, String)>,
     /// This guardian can approve the generation
     pub can_approve: bool,
     /// The generation completed and can be activated

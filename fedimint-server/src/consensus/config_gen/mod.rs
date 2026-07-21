@@ -92,6 +92,17 @@ impl GenerationState {
             GenerationState::Proposed { .. } | GenerationState::Approved { .. }
         )
     }
+
+    /// The proposal every variant of this state carries.
+    pub fn proposal(&self) -> &ModuleConfigProposal {
+        match self {
+            GenerationState::Proposed { proposal, .. }
+            | GenerationState::Approved { proposal, .. }
+            | GenerationState::Generated { proposal, .. }
+            | GenerationState::Active { proposal, .. }
+            | GenerationState::Aborted { proposal, .. } => proposal,
+        }
+    }
 }
 
 /// A registered asset: human-readable metadata for a custom amount-unit id.
