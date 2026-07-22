@@ -125,7 +125,21 @@ FM_USDT_CONTRACT=0x…              # the USDT / test ERC-20 token
 FM_USDT_ENTRY_POINT=0x…           # deployed EntryPoint v0.7
 FM_USDT_ACCOUNT_FACTORY=0x…       # deployed SimpleAccountFactory (verified hash!)
 FM_USDT_SIMPLE_ACCOUNT_IMPL=0x…   # its SimpleAccount implementation
+FM_USDT_ETH_USD_PRICE_FEED=0x…    # Chainlink ETH/USD AggregatorV3 (default: mainnet feed)
 ```
+
+`FM_USDT_ETH_USD_PRICE_FEED` overrides `UsdtGenParams::eth_usd_price_feed`,
+the Chainlink `AggregatorV3` each guardian reads into its `FeeVote`'s
+`usdt_per_eth_e6` (see `docs/usdt-module.md`'s "Price source"). It defaults to
+the canonical mainnet ETH/USD feed — **wrong on a chain without Chainlink**
+(there is no such deployment on a fresh `anvil`/devnet). Point it at the
+all-zero address (`0x0000000000000000000000000000000000000000`) to disable
+the feed and fall back to a static `$3000.000000/ETH` price, or at a deployed
+mock aggregator (see `modules/fedimint-usdt-tests/contracts/MockAggregatorV3.sol`)
+to exercise a real feed read against `anvil`. Every anvil/devimint test
+harness in this repo (including `usdt_e2e`, the devimint binary) sets it to
+the all-zero address for exactly this reason, except `withdraw_e2e`, which
+deploys the mock aggregator to prove the real read path end to end.
 
 Per-guardian runtime (need not be identical across guardians):
 

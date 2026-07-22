@@ -129,9 +129,17 @@ startup warning if the factory/impl are left at the all-zero placeholder.
   *A true on-chain token paymaster (gas paid in USDT, ETH-net-zero) is a
   deferred production option — see the audit doc.*
 - **Price source.** Each guardian votes a `FeeVote { max_fee_per_gas_wei,
-  usdt_per_eth_e6 }` from its configured price source (devnet: static). The
-  median sets withdrawal fee quotes; a Byzantine outlier vote can move the
-  median only within the honest range.
+  usdt_per_eth_e6 }`; `usdt_per_eth_e6` comes from a Chainlink `AggregatorV3`
+  `latestRoundData()` read of the configured `eth_usd_price_feed` (defaults to
+  the canonical mainnet ETH/USD feed), guarded for staleness
+  (`price_feed_max_staleness_secs`, default 4h), non-positive answers, and
+  incomplete rounds. A bad/stale/unreachable reading makes that guardian
+  **abstain** (skip its vote that poll cycle) rather than vote a wrong price.
+  On a chain with no Chainlink deployment (e.g. local `anvil`/devnet),
+  `eth_usd_price_feed` is set to the all-zero address, which falls back to a
+  static `$3000.000000/ETH` price instead. The median (over whichever
+  guardians voted that round) sets withdrawal fee quotes; a Byzantine outlier
+  vote can move the median only within the honest range.
 - **`confirmation_depth`.** Choose conservatively for the target chain's reorg
   characteristics — it is the primary defense against reorged deposits (see
   the reorg note in the audit doc).
