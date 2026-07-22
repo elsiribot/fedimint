@@ -152,6 +152,14 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
     let evm_rpc: Arc<dyn IServerEvmRpc> = AlloyEvmRpc::new(anvil.url())?
         .with_broadcaster(common::ANVIL_ACCOUNT_0_PRIVATE_KEY)?
         .with_entry_point(stack.entry_point)
+        // Point the shared injected RPC at the mock Chainlink feed deployed
+        // above. This test injects a real `AlloyEvmRpc` via `with_evm_rpc`, so
+        // `init()` uses THIS instance rather than building one from
+        // `cfg.consensus` -- meaning the feed must be configured here (the
+        // `gen_params.eth_usd_price_feed` below only drives the non-override
+        // path). Without this, every guardian falls back to the static
+        // `$3000` price and the Task-5 quote assertion below cannot pass.
+        .with_price_feed(price_feed, 1_000_000)
         .into_dyn();
 
     // 3. Config-gen the federation with the REAL deployed addresses (Challenge A),
