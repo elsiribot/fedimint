@@ -69,7 +69,7 @@ impl std::fmt::Debug for UsdtConfigPrivate {
 /// RPC endpoint this guardian's own server should use. Every guardian may
 /// point at a different node, so unlike [`UsdtConfigConsensus`] this is never
 /// agreed on by the federation.
-#[derive(Clone, Debug, Serialize, Deserialize, Encodable, Decodable)]
+#[derive(Clone, Serialize, Deserialize, Encodable, Decodable)]
 pub struct UsdtConfigLocal {
     pub evm_rpc_url: String,
     /// This guardian's broadcaster EOA private key (hex, optionally
@@ -83,6 +83,23 @@ pub struct UsdtConfigLocal {
     /// production. Never put on the wire or into consensus (see this
     /// struct's own doc comment).
     pub broadcaster_private_key: Option<String>,
+}
+
+// `broadcaster_private_key` is secret key material (an EOA private key that
+// fronts gas and could be used to drain the broadcaster account), so it must
+// never leak into logs. Redact it explicitly instead of deriving `Debug`;
+// `evm_rpc_url` is non-secret and stays visible. Mirrors the redaction style
+// used by `UsdtConfigPrivate` above.
+impl std::fmt::Debug for UsdtConfigLocal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsdtConfigLocal")
+            .field("evm_rpc_url", &self.evm_rpc_url)
+            .field(
+                "broadcaster_private_key",
+                &self.broadcaster_private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Default EVM RPC URL used by [`crate::UsdtInit::trusted_dealer_gen`] and
@@ -145,3 +162,43 @@ plugin_types_trait_impl_config!(
     UsdtConfigConsensus,
     fedimint_usdt_common::config::UsdtClientConfig
 );
+
+#[cfg(test)]
+mod tests {
+    use super::{UsdtConfigLocal, default_evm_rpc_url};
+
+    /// A guardian's broadcaster EOA private key is secret key material and
+    /// must never appear in `Debug` output (which routinely reaches logs).
+    #[test]
+    fn local_config_debug_redacts_broadcaster_key() {
+        let secret = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let cfg = UsdtConfigLocal {
+            evm_rpc_url: default_evm_rpc_url(),
+            broadcaster_private_key: Some(secret.to_string()),
+        };
+
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains(secret),
+            "broadcaster private key leaked into Debug output: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "expected redaction marker in Debug output: {rendered}"
+        );
+        // The non-secret RPC URL stays visible.
+        assert!(
+            rendered.contains(&default_evm_rpc_url()),
+            "evm_rpc_url should remain visible in Debug output: {rendered}"
+        );
+
+        // `None` renders as `None`, not `<redacted>`.
+        let cfg_none = UsdtConfigLocal {
+            evm_rpc_url: default_evm_rpc_url(),
+            broadcaster_private_key: None,
+        };
+        let rendered_none = format!("{cfg_none:?}");
+        assert!(rendered_none.contains("None"));
+        assert!(!rendered_none.contains("<redacted>"));
+    }
+}

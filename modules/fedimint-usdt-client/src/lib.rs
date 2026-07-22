@@ -24,7 +24,8 @@ use fedimint_client_module::transaction::{
 };
 use fedimint_core::core::{Decoder, ModuleKind, OperationId};
 use fedimint_core::db::{
-    Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
+    AutocommitError, Database, DatabaseTransaction, DatabaseVersion,
+    IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::module::{
     AmountUnit, Amounts, ApiVersion, ModuleCommon, ModuleInit, MultiApiVersion,
@@ -66,8 +67,9 @@ const AWAIT_WITHDRAWAL_CONFIRMED_MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// Namespaces deposit claim keys under the module root secret: every deposit
 /// claim key is derived as `module_root_secret.child_key(
 /// DEPOSIT_CLAIM_KEY_CHILD).child_key(ChildId(index))` (see
-/// [`UsdtClientModule::claim_keypair_for_index`]). Distinguishing this from any
-/// future key type derived from the same module root secret.
+/// [`UsdtClientModule::claim_keypair_for_index`]). This distinguishes deposit
+/// claim keys from any future key type derived from the same module root
+/// secret.
 const DEPOSIT_CLAIM_KEY_CHILD: ChildId = ChildId(0);
 
 #[derive(Debug)]
@@ -264,21 +266,42 @@ impl UsdtClientModule {
     /// alone even if the client DB is lost: [`Self::recover_deposits`] rescans
     /// the federation by index and re-derives the same keys.
     pub async fn allocate_deposit(&self) -> anyhow::Result<(Keypair, EvmAddress)> {
-        let mut dbtx = self.db.begin_transaction().await;
+        // Read-modify-write of the `NextDepositIndexKey` counter (plus the
+        // matching `ClaimKeyKey` write) in one atomic, retried unit: a bare
+        // `begin_transaction`/`commit_tx` pair would let two concurrent
+        // `allocate_deposit` calls read the same index and hand out colliding
+        // deposit addresses/claim keys (and `commit_tx` could panic on the
+        // write conflict). `autocommit` retries the closure until it commits
+        // cleanly. Mirrors the standard fedimint counter pattern (e.g.
+        // `fedimint-mint-client`'s note-index bumps).
+        self.db
+            .autocommit(
+                |dbtx, _| {
+                    Box::pin(async {
+                        let index = dbtx
+                            .get_value(&NextDepositIndexKey)
+                            .await
+                            .unwrap_or_default();
+                        let claim_keypair = self.claim_keypair_for_index(index);
+                        let account = self.deposit_address(&claim_keypair.public_key());
 
-        let index = dbtx
-            .get_value(&NextDepositIndexKey)
+                        dbtx.insert_entry(&NextDepositIndexKey, &index.saturating_add(1))
+                            .await;
+                        dbtx.insert_entry(&ClaimKeyKey(account), &claim_keypair)
+                            .await;
+
+                        Ok::<_, anyhow::Error>((claim_keypair, account))
+                    })
+                },
+                None,
+            )
             .await
-            .unwrap_or_default();
-        let claim_keypair = self.claim_keypair_for_index(index);
-        let account = self.deposit_address(&claim_keypair.public_key());
-
-        dbtx.insert_entry(&NextDepositIndexKey, &(index + 1)).await;
-        dbtx.insert_entry(&ClaimKeyKey(account), &claim_keypair)
-            .await;
-        dbtx.commit_tx().await;
-
-        Ok((claim_keypair, account))
+            .map_err(|e| match e {
+                AutocommitError::ClosureError { error, .. } => error,
+                AutocommitError::CommitFailed { last_error, .. } => {
+                    anyhow::anyhow!("Commit to DB failed: {last_error}")
+                }
+            })
     }
 
     /// Rescans the federation from the seed alone to rediscover deposits whose
@@ -304,6 +327,15 @@ impl UsdtClientModule {
     /// `recover` subcommand) is the module's recovery path; the module uses
     /// [`NoModuleBackup`], so it is not wired into the client's global
     /// `recover()` flow -- doing so is a possible follow-up.
+    ///
+    /// # Known limitation
+    ///
+    /// This rediscovers only deposits the federation has already CREDITED (a
+    /// [`Self::check_deposit`] -> observe -> credit must have happened for the
+    /// account); a funded-but-never-checked deposit at scan time reports
+    /// `credited == 0` and is skipped. Such funds are not lost -- re-running
+    /// `check-deposit` for the address and re-scanning finds them once the
+    /// federation credits the deposit.
     pub async fn recover_deposits(&self, gap_limit: u64) -> anyhow::Result<RecoverySummary> {
         let mut accounts = Vec::new();
         let mut total_credited = UsdtAmount(0);
@@ -344,8 +376,16 @@ impl UsdtClientModule {
 
         if let Some(highest) = highest_used_index {
             let mut dbtx = self.db.begin_transaction().await;
-            dbtx.insert_entry(&NextDepositIndexKey, &(highest + 1))
-                .await;
+            // Never LOWER the counter: on a partially-intact DB the existing
+            // `NextDepositIndexKey` may already sit above `highest + 1` (e.g.
+            // allocations that were never funded), and regressing it would
+            // reuse indices/addresses. Take the max of the two.
+            let existing = dbtx.get_value(&NextDepositIndexKey).await.unwrap_or(0);
+            dbtx.insert_entry(
+                &NextDepositIndexKey,
+                &existing.max(highest.saturating_add(1)),
+            )
+            .await;
             dbtx.commit_tx().await;
         }
 
