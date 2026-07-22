@@ -59,7 +59,7 @@ use fedimint_usdt_common::{
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
 use strum::IntoEnumIterator;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 use crate::db::{
@@ -2181,6 +2181,15 @@ impl Usdt {
             },
         )
         .await;
+        info!(
+            target: "usdt",
+            ?op_hash,
+            %account,
+            remainder,
+            nonce = record.nonce,
+            needs_deploy = record.nonce == 0,
+            "sweep enqueued (PendingUserOp), starting MPC signing session"
+        );
 
         // Same consensus-ordered `start_session` path Phase 6a's
         // `debug_start_signing` uses -- every guardian processes this
@@ -2499,6 +2508,16 @@ impl Usdt {
                 .await;
             return;
         };
+
+        info!(
+            target: "usdt",
+            ?op_hash,
+            success = obs.success,
+            swept = obs.swept.0,
+            block = obs.block,
+            purpose = ?submitted.purpose,
+            "UserOp confirmed on-chain (applying threshold-agreed outcome)"
+        );
 
         // Set to the swept deposit account only for a SUCCESSFUL
         // `DeployAndSweep`, so that -- after this op is cleared from the
@@ -3053,6 +3072,11 @@ impl Usdt {
             )
             .await;
             dbtx.remove_entry(&PendingUserOpKey(op_hash)).await;
+            info!(
+                target: "usdt",
+                ?op_hash,
+                "MPC signature verified; UserOp finalized to SubmittedUserOp (submitter will broadcast handleOps)"
+            );
         }
 
         Ok(())
