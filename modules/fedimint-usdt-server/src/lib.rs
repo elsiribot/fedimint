@@ -2392,11 +2392,21 @@ impl Usdt {
         // gas until the sweeps happen to catch up. Gating here is
         // determinism-safe: `pool.balance` and every `amount` are consensus-DB
         // values, so every guardian reaches the identical decision. The batch
-        // simply waits (withdrawals stay `Queued`) until sweeps fund the pool;
-        // because every outstanding withdrawal is backed by credited deposits
-        // that are all eventually swept, and the in-flight guard means only
-        // sweeps (which add to the pool) can run while this batch waits,
-        // `pool.balance` rises monotonically to coverage -- no permanent wedge.
+        // simply waits (withdrawals stay `Queued`) until sweeps fund the pool.
+        //
+        // Wedge-freedom is CONDITIONAL, not absolute: it holds only WHILE the
+        // backing deposits' sweeps eventually succeed. Each outstanding
+        // withdrawal is backed by credited deposits, and the in-flight guard
+        // means only sweeps (which add to the pool) can run while this batch
+        // waits, so `pool.balance` rises to coverage AS LONG AS those sweeps
+        // confirm. The exception: `apply_user_op_confirmed` deliberately does
+        // NOT auto-retrigger a FAILED sweep (see `retrigger_source` there), so
+        // a deposit whose sweep persistently reverts (e.g. a blacklisted /
+        // paused / fee-reverting token) never funds the pool -- and a
+        // withdrawal whose e-cash was already burned then wedges in `Queued`
+        // indefinitely with its backing e-cash destroyed. That failure mode is
+        // a documented maintainer design item (no withdrawal escape-hatch /
+        // Failed-refund path yet), out of scope for this gate.
         let batch_total = queued
             .iter()
             .fold(0u64, |acc, (_, w)| acc.saturating_add(w.amount.0));
@@ -2527,7 +2537,13 @@ impl Usdt {
         // non-standard token whose `transfer` reverts) would otherwise
         // tight-loop, re-enqueuing and burning gas every confirmation cycle.
         // On failure the remainder simply stays `credited - swept` (solvent,
-        // still on-chain) and is retried by a later deposit observation.
+        // still on-chain) and is retried only by a LATER deposit observation on
+        // this account (`credit_deposit` -> `maybe_trigger_sweep`). NOTE: if no
+        // such future deposit ever arrives, the remainder stays un-swept
+        // indefinitely -- there is no standalone sweep-retry -- which can wedge
+        // any already-burned withdrawal that was relying on it (documented
+        // maintainer design item; see `maybe_trigger_withdrawal_batch`'s
+        // pool-balance gate).
         let mut retrigger_source: Option<fedimint_usdt_common::EvmAddress> = None;
 
         match &submitted.purpose {
