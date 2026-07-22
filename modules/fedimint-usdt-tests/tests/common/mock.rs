@@ -173,6 +173,11 @@ impl IServerEvmRpc for MockEvmRpc {
             .unwrap_or(UsdtAmount(0)))
     }
 
+    async fn get_erc20_basis_points_rate(&self, _token: EvmAddress) -> anyhow::Result<u64> {
+        // Mock: a standard (fee-less) token.
+        Ok(0)
+    }
+
     async fn get_fee_estimate(&self) -> anyhow::Result<FeeVote> {
         Ok(self.lock().fee)
     }

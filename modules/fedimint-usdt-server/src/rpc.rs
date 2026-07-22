@@ -23,6 +23,12 @@ sol! {
     #[sol(rpc)]
     interface IERC20 {
         function balanceOf(address account) external view returns (uint256);
+        // Tether-specific transfer-fee parameter (`basisPointsRate` on the
+        // mainnet `TetherToken`). NOT part of the ERC-20 standard: a call to it
+        // on a standard token reverts, which the startup fee check treats as
+        // "no transfer-fee mechanism". Currently 0 on mainnet USDT; a nonzero
+        // value would make transfers deliver less than the requested amount.
+        function basisPointsRate() external view returns (uint256);
     }
 }
 
@@ -112,6 +118,16 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
         holder: EvmAddress,
         at_block: u64,
     ) -> anyhow::Result<UsdtAmount>;
+
+    /// The token's Tether-style `basisPointsRate` transfer-fee parameter, used
+    /// by the startup solvency check ([`crate::UsdtInit::init`]). Returns `Err`
+    /// if the token does not implement it (a standard ERC-20 — the
+    /// `basisPointsRate()` call reverts) or the node is unreachable; both
+    /// are treated as "no transfer fee, skip the check". A returned `Ok(n)`
+    /// with `n != 0` means the token deducts a fee on transfer, which this
+    /// module's accounting does NOT compensate for (see the audit
+    /// register's fee-insolvency risk).
+    async fn get_erc20_basis_points_rate(&self, token: EvmAddress) -> anyhow::Result<u64>;
 
     /// The current EVM fee market and USDT/ETH exchange rate, as seen by
     /// this guardian's node, forming this guardian's contribution to the
@@ -304,6 +320,19 @@ impl IServerEvmRpc for AlloyEvmRpc {
         })?;
 
         Ok(UsdtAmount(balance))
+    }
+
+    async fn get_erc20_basis_points_rate(&self, token: EvmAddress) -> anyhow::Result<u64> {
+        let contract = IERC20::new(Address::from(token.0), &self.provider);
+        // On a standard ERC-20 (no `basisPointsRate`) this call reverts, which
+        // surfaces as `Err` here; the caller treats that as "no transfer fee".
+        let rate: U256 = contract
+            .basisPointsRate()
+            .call()
+            .await
+            .with_context(|| format!("basisPointsRate() on {token}"))?;
+        u64::try_from(rate)
+            .with_context(|| format!("basisPointsRate {rate} on {token} overflows u64"))
     }
 
     async fn get_fee_estimate(&self) -> anyhow::Result<FeeVote> {

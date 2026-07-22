@@ -461,6 +461,53 @@ impl ServerModuleInit for UsdtInit {
             }
             rpc.into_dyn()
         };
+
+        // Startup transfer-fee solvency check (best-effort, guardian-local,
+        // NON-FATAL). This module credits the pool by the full REQUESTED
+        // transfer amount, not the on-chain balance delta, so a token that
+        // deducts a transfer fee (Tether-style `basisPointsRate != 0`) would
+        // make `PoolState.balance` drift ABOVE real holdings (cumulative
+        // insolvency) and short-pay withdrawal recipients (see the audit
+        // register's fee-insolvency risk). Warn loudly if the configured token
+        // charges a fee. Spawned rather than awaited inline so a slow or
+        // unreachable node can never block or fail module startup; a standard
+        // fee-less ERC-20 reverts the `basisPointsRate()` call, which we treat
+        // as "no fee" (skipped). Not a consensus path -- a guardian-local
+        // observation like the deposit checker, never gating a consensus write.
+        let fee_check_rpc = evm_rpc.clone();
+        let usdt_contract = cfg.consensus.usdt_contract;
+        args.task_group()
+            .spawn_cancellable("usdt-token-fee-check", async move {
+                match fee_check_rpc
+                    .get_erc20_basis_points_rate(usdt_contract)
+                    .await
+                {
+                    Ok(0) => debug!(
+                        target: "usdt",
+                        %usdt_contract,
+                        "startup fee check: token charges no transfer fee (basisPointsRate == 0)"
+                    ),
+                    Ok(basis_points) => warn!(
+                        target: "usdt",
+                        %usdt_contract,
+                        basis_points,
+                        "STARTUP FEE CHECK: the configured USDT token deducts a transfer fee \
+                         (basisPointsRate != 0). This module credits the pool by the full \
+                         requested amount, so a fee-charging token drifts PoolState.balance ABOVE \
+                         real holdings (cumulative INSOLVENCY) and short-pays withdrawal \
+                         recipients. Do NOT operate against a fee-charging token -- see the audit \
+                         register's fee-insolvency risk."
+                    ),
+                    Err(err) => debug!(
+                        target: "usdt",
+                        %usdt_contract,
+                        err = %err.fmt_compact_anyhow(),
+                        "startup fee check skipped: could not read basisPointsRate (token likely \
+                         implements no transfer fee, or the node was unreachable at startup)"
+                    ),
+                }
+            });
+
         Ok(Usdt::new(
             cfg,
             evm_rpc,
@@ -3709,6 +3756,14 @@ mod tests {
                 .get(&(token, holder))
                 .and_then(|by_block| by_block.range(..=at_block).next_back())
                 .map_or(fedimint_usdt_common::UsdtAmount(0), |(_, balance)| *balance))
+        }
+
+        async fn get_erc20_basis_points_rate(
+            &self,
+            _token: fedimint_usdt_common::EvmAddress,
+        ) -> anyhow::Result<u64> {
+            // Mock: a standard (fee-less) token.
+            Ok(0)
         }
 
         async fn get_fee_estimate(&self) -> anyhow::Result<fedimint_usdt_common::FeeVote> {
