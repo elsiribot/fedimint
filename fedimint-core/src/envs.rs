@@ -74,6 +74,10 @@ pub const FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV: &str = "FM_USDT_SIMPLE_ACCOUNT_IMPL";
 /// a shared key across guardians is fine.
 pub const FM_USDT_BROADCASTER_PRIVATE_KEY_ENV: &str = "FM_USDT_BROADCASTER_PRIVATE_KEY";
 
+/// Overrides the ERC-4337 USDT module's Chainlink ETH/USD price-feed address
+/// (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.
+pub const FM_USDT_ETH_USD_PRICE_FEED_ENV: &str = "FM_USDT_ETH_USD_PRICE_FEED";
+
 /// Env var to override the `mintv2` module's `amount_unit` config-gen param
 /// (a decimal [`crate::module::AmountUnit`] id, e.g. `1` for
 /// `fedimint_usdt_common::USDT_UNIT`).

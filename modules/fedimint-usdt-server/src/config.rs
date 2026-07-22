@@ -159,6 +159,15 @@ pub struct UsdtConfigConsensus {
     /// stays deterministic; genuinely per-chain, so a config field rather
     /// than a compiled constant.
     pub broadcaster_min_balance_wei: u64,
+    /// Chainlink ETH/USD aggregator address each guardian reads to vote
+    /// `FeeVote::usdt_per_eth_e6` (see
+    /// `fedimint_usdt_common::UsdtGenParams::eth_usd_price_feed`). All-zero
+    /// disables it (static fallback).
+    pub eth_usd_price_feed: EvmAddress,
+    /// Max age (seconds, chain time) of a Chainlink reading before a guardian
+    /// abstains (see
+    /// `fedimint_usdt_common::UsdtGenParams::price_feed_max_staleness_secs`).
+    pub price_feed_max_staleness_secs: u64,
 }
 
 // Wire together the configs for this module

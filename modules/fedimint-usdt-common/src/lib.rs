@@ -895,6 +895,15 @@ pub struct UsdtGenParams {
     /// float, and (unlike `u128`) `fedimint_core`-`Encodable` for the
     /// consensus config it is threaded into.
     pub broadcaster_min_balance_wei: u64,
+    /// Chainlink ETH/USD aggregator address whose `latestRoundData()` each
+    /// guardian reads to vote `FeeVote::usdt_per_eth_e6`. Defaults to the
+    /// canonical mainnet ETH/USD feed; set to `EvmAddress([0; 20])` on a chain
+    /// without Chainlink (e.g. anvil) to fall back to a static price. See
+    /// `chainlink_eth_usd_to_usdt_per_eth_e6`.
+    pub eth_usd_price_feed: EvmAddress,
+    /// Max age (seconds, chain time) of a Chainlink reading before a guardian
+    /// abstains. ~1h heartbeat feeds -> 4h default is comfortably above cadence.
+    pub price_feed_max_staleness_secs: u64,
 }
 
 impl Default for UsdtGenParams {
@@ -910,6 +919,10 @@ impl Default for UsdtGenParams {
             // 0.05 ETH: enough to front many UserOps' L1 gas on a typical
             // chain, negligible to top up on a devnet.
             broadcaster_min_balance_wei: 50_000_000_000_000_000,
+            eth_usd_price_feed: EvmAddress(alloy_primitives::hex!(
+                "5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
+            )),
+            price_feed_max_staleness_secs: 14_400,
         }
     }
 }

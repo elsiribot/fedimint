@@ -19,8 +19,9 @@ use fedimint_core::db::{
 };
 use fedimint_core::envs::{
     FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
-    FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV, FM_USDT_EVM_RPC_URL_ENV,
-    FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, is_env_var_set_opt, is_running_in_test_env,
+    FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV,
+    FM_USDT_EVM_RPC_URL_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, is_env_var_set_opt,
+    is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -406,6 +407,10 @@ impl ServerModuleInit for UsdtInit {
                 factory_bytecode::derive_simple_account_impl(params.account_factory)
             });
 
+        if let Some(feed) = env_override(FM_USDT_ETH_USD_PRICE_FEED_ENV) {
+            params.eth_usd_price_feed = feed;
+        }
+
         params
     }
 
@@ -438,6 +443,10 @@ impl ServerModuleInit for UsdtInit {
             EnvVarDoc {
                 name: FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
                 description: "Overrides this guardian's broadcaster EOA private key (hex) at runtime, taking priority over the configured `broadcaster_private_key`. Needed to front UserOp gas for sweeps/withdrawals.",
+            },
+            EnvVarDoc {
+                name: FM_USDT_ETH_USD_PRICE_FEED_ENV,
+                description: "Overrides the ERC-4337 USDT module's Chainlink ETH/USD price-feed config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.",
             },
         ]
     }
@@ -617,6 +626,8 @@ impl ServerModuleInit for UsdtInit {
                         simple_account_impl: params.simple_account_impl,
                         check_ttl_blocks: params.check_ttl_blocks,
                         broadcaster_min_balance_wei: params.broadcaster_min_balance_wei,
+                        eth_usd_price_feed: params.eth_usd_price_feed,
+                        price_feed_max_staleness_secs: params.price_feed_max_staleness_secs,
                     },
                 };
 
