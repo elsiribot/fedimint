@@ -86,7 +86,10 @@ use fedimint_mintv2_common::config::MintGenParams;
 use fedimint_mintv2_server::MintInit as Mintv2Init;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_usdt_client::{UsdtClientInit, UsdtClientModule};
-use fedimint_usdt_common::{EvmAddress, USDT_UNIT, UsdtAmount, UsdtGenParams, WithdrawalStatus};
+use fedimint_usdt_common::{
+    EvmAddress, FeeVote, USDT_UNIT, UsdtAmount, UsdtGenParams, WithdrawalStatus,
+    withdrawal_fee_quote,
+};
 use fedimint_usdt_server::UsdtInit;
 use fedimint_usdt_server::rpc::{AlloyEvmRpc, IServerEvmRpc};
 
@@ -137,6 +140,13 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
     let usdt_holder = common::anvil_account_1_address()?;
     let stack = common::deploy_4337_stack(&anvil, usdt_holder, UsdtAmount(50_000_000)).await?;
 
+    // Deploy a mock Chainlink ETH/USD feed reporting a fixed $4000.00000000
+    // (8 decimals), proving `AlloyEvmRpc::get_fee_estimate` reads a REAL
+    // on-chain feed into the withdrawal fee quote rather than the static
+    // `$3000` anvil fallback (see step 9's assertion below).
+    const MOCK_FEED_ANSWER_E8: i128 = 4000_00000000;
+    let price_feed = common::deploy_mock_price_feed(&anvil, MOCK_FEED_ANSWER_E8).await?;
+
     // 2. The REAL AlloyEvmRpc, broadcaster = anvil account 0, shared across every
     //    guardian.
     let evm_rpc: Arc<dyn IServerEvmRpc> = AlloyEvmRpc::new(anvil.url())?
@@ -163,11 +173,14 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
         simple_account_impl,
         check_ttl_blocks: 10_000,
         broadcaster_min_balance_wei: 0,
-        // No Chainlink on anvil: all-zero disables the feed and falls back
-        // to `AlloyEvmRpc::STATIC_USDT_PER_ETH_E6` (see Task 4 of the
-        // ETH/USD price-feed plan).
-        eth_usd_price_feed: EvmAddress([0u8; 20]),
-        price_feed_max_staleness_secs: 14_400,
+        // Point every guardian at the mock Chainlink feed deployed above
+        // (real read, Task 3/5 of the ETH/USD price-feed plan) instead of
+        // the static `$3000` fallback. A generously large staleness bound:
+        // this test's real DKG + two real cggmp21 MPC sessions can take
+        // several minutes of REAL anvil chain time, all of which must stay
+        // within the feed's fixed `updatedAt` staleness window.
+        eth_usd_price_feed: price_feed,
+        price_feed_max_staleness_secs: 1_000_000,
     };
 
     let fed = Fixtures::new_primary(Mintv2ClientInit, Mintv2Init)
@@ -314,6 +327,31 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
         }
         sleep(Duration::from_millis(300)).await;
     };
+
+    // THE TASK-5 GATE: the federation's live quote (fed by every guardian's
+    // real read of the mock $4000 Chainlink feed configured above) must be
+    // STRICTLY GREATER than what the same pure `withdrawal_fee_quote` formula
+    // would produce for the same gas price at the static `$3000` fallback --
+    // proving the on-chain feed read, not the placeholder, drove the quote.
+    // `evm_rpc` (this harness's own `AlloyEvmRpc`, built above with no
+    // `.with_price_feed(..)`) reads the SAME live anvil gas price the
+    // guardians just voted with, but falls back to the static
+    // `usdt_per_eth_e6 == 3_000_000_000` price (no feed configured), giving
+    // an apples-to-apples baseline via the real formula rather than a magic
+    // number.
+    let baseline_fee_vote = evm_rpc.get_fee_estimate().await?;
+    let baseline_quote = withdrawal_fee_quote(&FeeVote {
+        max_fee_per_gas_wei: baseline_fee_vote.max_fee_per_gas_wei,
+        usdt_per_eth_e6: 3_000_000_000,
+    })
+    .context("baseline withdrawal_fee_quote must not overflow for a realistic anvil gas price")?;
+    assert!(
+        raw_quote.0 > baseline_quote.0,
+        "the live quote ({raw_quote}), driven by the mock $4000 Chainlink feed, must exceed the \
+         same formula's output at the static $3000 fallback ({baseline_quote}) -- otherwise the \
+         real on-chain feed read isn't actually driving the quote"
+    );
+
     // 20% margin over the live quote, covering fee-market movement between this
     // read and the withdrawal transaction actually being processed (mirrors
     // `WITHDRAWAL_FEE_BUFFER_PERCENT`'s own rationale in `-common`, applied again

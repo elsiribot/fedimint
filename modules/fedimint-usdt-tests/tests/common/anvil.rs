@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, I256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
@@ -363,6 +363,59 @@ pub async fn transfer_nonstandard_from_account_1(
         .context("failed to confirm NonStandardUsdt.transfer() transaction")?;
 
     Ok(())
+}
+
+// --- Chainlink ETH/USD mock price feed -----------------------------------
+
+/// The vendored `MockAggregatorV3` fixture's creation bytecode, compiled
+/// offline (see `modules/fedimint-usdt-tests/contracts/MockAggregatorV3.sol`)
+/// and deployed here as-is, exactly like [`TEST_USDT_FIXTURE_JSON`]/
+/// [`NONSTANDARD_USDT_FIXTURE_JSON`]: this harness never invokes `solc`/
+/// `forge`. A minimal Chainlink `AggregatorV3Interface` stand-in used by
+/// `tests/withdraw_e2e.rs` to prove `AlloyEvmRpc::get_fee_estimate` reads a
+/// real on-chain feed (rather than the static `$3000` fallback).
+const MOCK_AGGREGATOR_V3_FIXTURE_JSON: &str = include_str!("../fixtures/mock_aggregator_v3.json");
+
+/// Deploys the vendored `MockAggregatorV3` fixture to `anvil` (as `anvil`'s
+/// deterministic account 0), constructor-configured to report `answer_e8` (a
+/// Chainlink-style, 8-decimal fixed-point USD price -- e.g. `4000_00000000`
+/// == $4000.00000000, matching the real mainnet ETH/USD feed's 8 decimals)
+/// forever from the deploy block's timestamp. Returns the deployed contract's
+/// address, suitable for `UsdtGenParams::eth_usd_price_feed`.
+pub async fn deploy_mock_price_feed(
+    anvil: &AnvilHandle,
+    answer_e8: i128,
+) -> anyhow::Result<EvmAddress> {
+    let provider = wallet_provider(anvil, ANVIL_ACCOUNT_0_PRIVATE_KEY)?;
+
+    let bytecode = artifact_hex_field(MOCK_AGGREGATOR_V3_FIXTURE_JSON, "bytecode")
+        .context("failed to extract MockAggregatorV3 bytecode")?;
+    // Constructor: `(int256 answer_, uint8 decimals_)`. Both are static,
+    // word-padded types under Solidity ABI encoding, so encoding `decimals`
+    // (8, matching the real mainnet ETH/USD feed) as a `U256` produces the
+    // byte-identical word a `uint8` parameter would -- elementary static
+    // types under 256 bits are still individually padded to a full 32-byte
+    // word (`u8` itself has no `SolValue` impl in `alloy-sol-types`, as it is
+    // reserved for `bytes`/`bytesN` specialization).
+    let answer = I256::try_from(answer_e8)
+        .with_context(|| format!("mock aggregator answer {answer_e8} overflows I256"))?;
+    let ctor_args = (answer, U256::from(8u8)).abi_encode_params();
+    let mut deploy_code = bytecode;
+    deploy_code.extend_from_slice(&ctor_args);
+
+    let deploy_tx = TransactionRequest::default().with_deploy_code(deploy_code);
+    let receipt = provider
+        .send_transaction(deploy_tx)
+        .await
+        .context("failed to send MockAggregatorV3 creation transaction")?
+        .get_receipt()
+        .await
+        .context("failed to confirm MockAggregatorV3 creation transaction")?;
+    let feed_address = receipt
+        .contract_address
+        .context("MockAggregatorV3 creation receipt is missing a contract_address")?;
+
+    Ok(EvmAddress(feed_address.into_array()))
 }
 
 // --- ERC-4337 v0.7 stack (Phase 7, Task 1) -------------------------------

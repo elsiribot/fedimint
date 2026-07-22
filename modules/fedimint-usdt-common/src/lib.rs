@@ -902,7 +902,8 @@ pub struct UsdtGenParams {
     /// `chainlink_eth_usd_to_usdt_per_eth_e6`.
     pub eth_usd_price_feed: EvmAddress,
     /// Max age (seconds, chain time) of a Chainlink reading before a guardian
-    /// abstains. ~1h heartbeat feeds -> 4h default is comfortably above cadence.
+    /// abstains. ~1h heartbeat feeds -> 4h default is comfortably above
+    /// cadence.
     pub price_feed_max_staleness_secs: u64,
 }
 
@@ -1619,15 +1620,8 @@ mod tests {
     #[test]
     fn chainlink_price_happy_path_8_decimals() {
         // $3000.00 at 8 decimals, fresh, complete round -> 3000_000000 (1e-6 USDT)
-        let v = chainlink_eth_usd_to_usdt_per_eth_e6(
-            3000_00000000,
-            8,
-            42,
-            42,
-            1_000,
-            1_500,
-            14_400,
-        );
+        let v =
+            chainlink_eth_usd_to_usdt_per_eth_e6(300_000_000_000, 8, 42, 42, 1_000, 1_500, 14_400);
         assert_eq!(v, Some(3_000_000_000));
     }
 
@@ -1647,7 +1641,7 @@ mod tests {
     fn chainlink_price_rejects_incomplete_round() {
         // answered_in_round < round_id -> carried-over/incomplete
         assert_eq!(
-            chainlink_eth_usd_to_usdt_per_eth_e6(3000_00000000, 8, 42, 41, 1_000, 1_100, 14_400),
+            chainlink_eth_usd_to_usdt_per_eth_e6(300_000_000_000, 8, 42, 41, 1_000, 1_100, 14_400),
             None
         );
     }
@@ -1656,7 +1650,7 @@ mod tests {
     fn chainlink_price_rejects_stale() {
         // chain_now - updated_at (20_000) > max_staleness (14_400)
         assert_eq!(
-            chainlink_eth_usd_to_usdt_per_eth_e6(3000_00000000, 8, 1, 1, 1_000, 21_000, 14_400),
+            chainlink_eth_usd_to_usdt_per_eth_e6(300_000_000_000, 8, 1, 1, 1_000, 21_000, 14_400),
             None
         );
     }
@@ -1665,7 +1659,7 @@ mod tests {
     fn chainlink_price_rejects_future_timestamp() {
         // updated_at > chain_now (clock/feed anomaly) -> abstain
         assert_eq!(
-            chainlink_eth_usd_to_usdt_per_eth_e6(3000_00000000, 8, 1, 1, 2_000, 1_000, 14_400),
+            chainlink_eth_usd_to_usdt_per_eth_e6(300_000_000_000, 8, 1, 1, 2_000, 1_000, 14_400),
             None
         );
     }
