@@ -149,6 +149,9 @@ claim, fee-quote, withdraw, withdrawal-status, pool-state, userop-status}`.
 
 ## See also
 
+- `docs/usdt-test-federation.md` — step-by-step runbook + operational
+  requirements for standing up a minimal USDT-only test federation (usdt wallet
+  + USDT-denominated `mintv2`).
 - `docs/usdt-module-audit.md` — threat model, invariants, crypto-integration
   decisions, and accepted/deferred risks (external-audit package).
 - `docs/superpowers/plans/2026-07-15-usdt-evm-module-master-plan.md` — the
