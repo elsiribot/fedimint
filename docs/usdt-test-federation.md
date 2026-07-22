@@ -65,8 +65,14 @@ Everything the federation needs beyond the fedimintd/fedimint-cli binaries:
    account, and the pool account) must have its own `EntryPoint` deposit to pay
    for its UserOp — otherwise the op fails validation (`AA21 didn't pay
    prefund`). **The module does NOT auto-prefund this today.** For a test,
-   prefund via `EntryPoint.depositTo(account)` from the broadcaster (~1 ETH each
-   is plenty), as the e2e does:
+   prefund via `EntryPoint.depositTo(account)` from the broadcaster. This is a
+   **refundable prepayment balance**, not a cost — the account draws its actual
+   UserOp gas from it and any unused remainder stays withdrawable. Size it to a
+   few ops' worth of gas: a deploy-and-sweep op is ~350–450k gas and a
+   withdrawal batch similar, so on a testnet this is a small fraction of an ETH
+   per account (the e2e parks a flat 1 ETH only because anvil ETH is free — do
+   NOT read that as a sizing recommendation; each deposit account is single-use,
+   so over-provisioning just strands refundable per-account dust). Prefund:
    - the **pool account** (its address is config-derived and known immediately
      after DKG — `fedimint-cli module usdt pool-state` returns it), and
    - each **deposit account** before/around funding it with USDT (its address
