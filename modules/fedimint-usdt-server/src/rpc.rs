@@ -6,9 +6,10 @@
 use std::sync::Arc;
 
 use alloy::eips::BlockId;
+use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
-use alloy::rpc::types::Filter;
+use alloy::rpc::types::{Filter, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolEvent as _;
@@ -16,6 +17,11 @@ use anyhow::Context as _;
 use fedimint_usdt_common::user_op::{PackedUserOperation, SignedUserOp, UserOpReceipt};
 use fedimint_usdt_common::{EvmAddress, FeeVote, UsdtAmount};
 use tracing::{debug, warn};
+
+use crate::factory_bytecode::{
+    ARACHNID_DEPLOY_TX_COST_WEI, ARACHNID_DEPLOYER, ARACHNID_DEPLOYER_SIGNER,
+    ARACHNID_RAW_DEPLOY_TX, factory_create2_salt, factory_init_code,
+};
 
 /// Type-erased handle to a [`IServerEvmRpc`] implementation.
 pub type DynServerEvmRpc = Arc<dyn IServerEvmRpc>;
@@ -184,6 +190,40 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
     /// Broadcasts a fully-signed raw transaction to the network, returning
     /// its transaction hash.
     async fn send_raw_transaction(&self, signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]>;
+
+    /// Part A: ensures the canonical Arachnid CREATE2 deployer
+    /// ([`crate::factory_bytecode::ARACHNID_DEPLOYER`]) exists on-chain, a
+    /// prerequisite for [`Self::deploy_factory`]. Idempotent: a no-op if the
+    /// deployer already has code (the common steady state — mainnet and public
+    /// testnets ship it pre-deployed). Otherwise (e.g. a fresh `anvil` devnet)
+    /// funds its one-time signer EOA from this guardian's broadcaster and
+    /// broadcasts the canonical pre-signed deploy transaction. A guardian-local
+    /// side effect that writes NO consensus item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no broadcaster is configured, or if any funding/
+    /// deploy transaction fails to send or confirm, or if the deployer is still
+    /// absent afterwards.
+    async fn ensure_create2_deployer(&self) -> anyhow::Result<()>;
+
+    /// Part A: CREATE2-deploys this module's `SimpleAccountFactory` (from the
+    /// vendored [`crate::factory_bytecode::FACTORY_CREATION_CODE`] plus
+    /// `abi.encode(entry_point)`, under
+    /// [`crate::factory_bytecode::factory_create2_salt`]) by sending
+    /// `salt ‖ initCode` calldata to the Arachnid deployer from this guardian's
+    /// broadcaster. The resulting address equals
+    /// [`crate::factory_bytecode::derive_account_factory`] (the config-gen'd
+    /// `account_factory`). A guardian-local side effect that writes NO
+    /// consensus item; requires [`Self::ensure_create2_deployer`] to have
+    /// succeeded first. A redundant deploy (another guardian raced) reverts
+    /// harmlessly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no broadcaster is configured, or if the deploy
+    /// transaction fails to send or confirm (including reverting).
+    async fn deploy_factory(&self, entry_point: EvmAddress) -> anyhow::Result<()>;
 
     /// Submits `ops` to the configured `EntryPoint` via `handleOps`, fronting
     /// gas from this guardian's (or the shared broadcaster's) EOA (Phase 7
@@ -439,6 +479,104 @@ impl IServerEvmRpc for AlloyEvmRpc {
         let pending = self.provider.send_raw_transaction(&signed_tx).await?;
 
         Ok(pending.tx_hash().0)
+    }
+
+    async fn ensure_create2_deployer(&self) -> anyhow::Result<()> {
+        // Idempotent: the common steady state (mainnet / public testnets ship
+        // the proxy pre-deployed) short-circuits with no transaction at all.
+        if self.get_code_len(ARACHNID_DEPLOYER).await? > 0 {
+            return Ok(());
+        }
+
+        let broadcaster = self.broadcaster.as_ref().context(
+            "AlloyEvmRpc::ensure_create2_deployer requires a broadcaster (see Self::with_broadcaster)",
+        )?;
+
+        // 1. Fund the canonical one-time signer with the deploy transaction's full gas
+        //    budget (`gasLimit * gasPrice`), from this guardian's broadcaster. A plain
+        //    value transfer never reverts at estimation, so the default nonce manager
+        //    is safe here; awaited to its receipt so the signer is funded before the
+        //    raw tx is broadcast.
+        let fund_tx = TransactionRequest::default()
+            .with_to(Address::from(ARACHNID_DEPLOYER_SIGNER.0))
+            .with_value(U256::from(ARACHNID_DEPLOY_TX_COST_WEI));
+        let fund_receipt = broadcaster
+            .send_transaction(fund_tx)
+            .await
+            .context("send Arachnid deployer-signer funding transaction")?
+            .get_receipt()
+            .await
+            .context("confirm Arachnid deployer-signer funding transaction")?;
+        anyhow::ensure!(
+            fund_receipt.status(),
+            "Arachnid deployer-signer funding transaction reverted (tx {:?})",
+            fund_receipt.transaction_hash
+        );
+
+        // 2. Broadcast the canonical, pre-signed (pre-EIP-155) deploy tx. It is
+        //    self-signed by the one-time signer, so it is submitted via the read
+        //    provider (not the broadcaster wallet). Deliberately NOT gated on
+        //    `receipt.status()`: this ancient legacy tx can surface a misleading
+        //    receipt status on some nodes (observed on `anvil`) even though it deploys
+        //    correctly, so success is verified by the deployer's code appearing below.
+        self.provider
+            .send_raw_transaction(ARACHNID_RAW_DEPLOY_TX)
+            .await
+            .context("broadcast Arachnid CREATE2-deployer deploy transaction")?
+            .get_receipt()
+            .await
+            .context("confirm Arachnid CREATE2-deployer deploy transaction")?;
+
+        anyhow::ensure!(
+            self.get_code_len(ARACHNID_DEPLOYER).await? > 0,
+            "Arachnid CREATE2 deployer still has no code after broadcasting its deploy transaction",
+        );
+
+        Ok(())
+    }
+
+    async fn deploy_factory(&self, entry_point: EvmAddress) -> anyhow::Result<()> {
+        let broadcaster = self.broadcaster.as_ref().context(
+            "AlloyEvmRpc::deploy_factory requires a broadcaster (see Self::with_broadcaster)",
+        )?;
+        let broadcaster_address = self
+            .broadcaster_address
+            .expect("set alongside `broadcaster` in with_broadcaster");
+
+        // Calldata the Arachnid deployer interprets as `salt (32 bytes) ‖
+        // initCode`, CREATE2-deploying the factory at `derive_account_factory`.
+        let mut calldata = factory_create2_salt().to_vec();
+        calldata.extend_from_slice(&factory_init_code(entry_point));
+
+        // Explicit pending nonce (like `submit_user_ops`): a redundant deploy
+        // (another guardian already deployed the factory) reverts during gas
+        // estimation, and the default cached nonce manager would leak a nonce on
+        // that failed `.send()` and wedge later broadcaster transactions.
+        // Deriving the nonce from chain state each call avoids that.
+        let nonce = broadcaster
+            .get_transaction_count(broadcaster_address)
+            .pending()
+            .await
+            .context("fetch broadcaster nonce for factory deploy")?;
+
+        let deploy_tx = TransactionRequest::default()
+            .with_to(Address::from(ARACHNID_DEPLOYER.0))
+            .with_input(calldata)
+            .with_nonce(nonce);
+        let receipt = broadcaster
+            .send_transaction(deploy_tx)
+            .await
+            .context("send SimpleAccountFactory CREATE2 deploy transaction")?
+            .get_receipt()
+            .await
+            .context("confirm SimpleAccountFactory CREATE2 deploy transaction")?;
+        anyhow::ensure!(
+            receipt.status(),
+            "SimpleAccountFactory CREATE2 deploy transaction reverted (tx {:?})",
+            receipt.transaction_hash
+        );
+
+        Ok(())
     }
 
     async fn submit_user_ops(&self, ops: Vec<SignedUserOp>) -> anyhow::Result<()> {

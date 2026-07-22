@@ -88,6 +88,7 @@ mod trusted_dealer_primes;
 
 pub mod config;
 pub mod db;
+pub mod factory_bytecode;
 pub mod rpc;
 pub mod signing;
 pub mod user_op;
@@ -360,28 +361,50 @@ impl ServerModuleInit for UsdtInit {
         let mut params = fedimint_usdt_common::UsdtGenParams::default();
 
         // Each override is a `0x`-prefixed 20-byte hex EvmAddress; an
-        // unset/empty var leaves the compiled-in placeholder in place. A
-        // malformed value is a config-gen-leader misconfiguration, so panic
-        // (deterministically, before any consensus starts) rather than silently
-        // deploy against a wrong address.
-        let apply_address_override =
-            |env_name: &str, field: &mut fedimint_usdt_common::EvmAddress| {
-                if let Ok(value) = std::env::var(env_name)
-                    && !value.is_empty()
-                {
-                    *field = value.parse().unwrap_or_else(|err| {
+        // unset/empty var is treated as absent. A malformed value is a
+        // config-gen-leader misconfiguration, so panic (deterministically,
+        // before any consensus starts) rather than silently deploy against a
+        // wrong address.
+        let env_override =
+            |env_name: &str| -> Option<fedimint_usdt_common::EvmAddress> {
+                match std::env::var(env_name) {
+                    Ok(value) if !value.is_empty() => Some(value.parse().unwrap_or_else(|err| {
                         panic!("{env_name} must be a valid EvmAddress: {err}")
-                    });
+                    })),
+                    _ => None,
                 }
             };
 
-        apply_address_override(FM_USDT_CONTRACT_ENV, &mut params.usdt_contract);
-        apply_address_override(FM_USDT_ENTRY_POINT_ENV, &mut params.entry_point);
-        apply_address_override(FM_USDT_ACCOUNT_FACTORY_ENV, &mut params.account_factory);
-        apply_address_override(
-            FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
-            &mut params.simple_account_impl,
-        );
+        if let Some(usdt_contract) = env_override(FM_USDT_CONTRACT_ENV) {
+            params.usdt_contract = usdt_contract;
+        }
+        if let Some(entry_point) = env_override(FM_USDT_ENTRY_POINT_ENV) {
+            params.entry_point = entry_point;
+        }
+
+        // Part A: the ERC-4337 `account_factory`/`simple_account_impl` are
+        // DERIVED deterministically from the (now-resolved) `entry_point` plus
+        // vendored constants, so the operator need not supply them and every
+        // guardian computes the byte-identical addresses (a pure function of
+        // the consensus `entry_point`). `account_factory =
+        // CREATE2(ARACHNID_DEPLOYER, factory_create2_salt(),
+        // FACTORY_CREATION_CODE ‖ abi.encode(entry_point))`;
+        // `simple_account_impl = CREATE(account_factory, 1)` (the factory's
+        // constructor's first internal deploy). The module then self-deploys
+        // that exact factory on-chain (see `Usdt::spawn_bootstrap_observer`'s
+        // deploy tick), and Part C's `getAddress`-equivalence readiness gate
+        // verifies the on-chain factory matches before any deposit address is
+        // handed out (fail-safe on a wrong constant).
+        //
+        // The `FM_USDT_ACCOUNT_FACTORY`/`FM_USDT_SIMPLE_ACCOUNT_IMPL` env
+        // overrides remain an ESCAPE HATCH for a pre-deployed / nonstandard
+        // stack: an explicit override always wins over the computed value.
+        params.account_factory = env_override(FM_USDT_ACCOUNT_FACTORY_ENV)
+            .unwrap_or_else(|| factory_bytecode::derive_account_factory(params.entry_point));
+        params.simple_account_impl =
+            env_override(FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV).unwrap_or_else(|| {
+                factory_bytecode::derive_simple_account_impl(params.account_factory)
+            });
 
         params
     }
@@ -423,47 +446,17 @@ impl ServerModuleInit for UsdtInit {
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
         let cfg: UsdtConfig = args.cfg().to_typed()?;
 
-        // Factory-config setup-validation guard (Phase 9, Task 1 hardening;
-        // deferred from Phase 7/9). We cannot RPC the configured
-        // `account_factory.getAddress` here to fully cross-check it against
-        // `derive_deposit_account` without complicating module startup
-        // (ordering a live EVM RPC call before the module -- which owns the
-        // RPC client -- is even constructed), so this is deliberately a
-        // pragmatic, LOCAL-only check: warn if `account_factory` or
-        // `simple_account_impl` is still the compiled-in all-zero
-        // placeholder (`EvmAddress([0u8; 20])`, see
-        // `fedimint_usdt_common::UsdtGenParams::default`).
-        //
-        // The real hazard this guards against: a real deployment's
-        // `account_factory`/`simple_account_impl` MUST point at a deployed
-        // `SimpleAccountFactory`/`SimpleAccount` whose on-chain CREATE2
-        // `initCodeHash` matches this build's vendored
-        // `ERC1967_PROXY_CREATION_CODE` (see
-        // `fedimint_usdt_common::derive_deposit_account`'s doc comment). If
-        // it doesn't -- e.g. a mis-compiled or wrong-version factory -- every
-        // off-chain-derived deposit address disagrees with the real
-        // on-chain `account_factory.getAddress`, and any USDT sent to the
-        // (wrong) derived address becomes UNSPENDABLE. A guardian operator
-        // MUST independently verify this off-chain before going live (see
-        // the ops runbook); this check can only catch the placeholder case.
-        //
-        // Deliberately non-fatal (`warn!`, never `Err`): hermetic tests
-        // routinely construct modules with the placeholder (no real EVM
-        // stack deployed), and erroring here would break them.
-        if cfg.consensus.account_factory.0 == [0u8; 20]
-            || cfg.consensus.simple_account_impl.0 == [0u8; 20]
-        {
-            warn!(
-                account_factory = %cfg.consensus.account_factory,
-                simple_account_impl = %cfg.consensus.simple_account_impl,
-                "USDT module configured with a placeholder account_factory/simple_account_impl \
-                 (all-zero address). Deposit-account derivation will not match any real \
-                 on-chain factory. This is expected for hermetic tests, but a real deployment \
-                 MUST configure both to a deployed SimpleAccountFactory/SimpleAccount whose \
-                 CREATE2 initCodeHash matches this build's vendored ERC1967_PROXY_CREATION_CODE, \
-                 or deposits sent to derived addresses will be unspendable."
-            );
-        }
+        // NOTE: the old all-zero-placeholder startup `warn!` guard was removed
+        // as obsolete. `account_factory`/`simple_account_impl` are now DERIVED
+        // deterministically from `entry_point` at config-gen (Part A, see
+        // `default_config_gen_params`), so they are never the all-zero
+        // placeholder in practice; the module self-deploys that exact factory
+        // on-chain; and the real "does the on-chain factory match this build's
+        // vendored proxy code so derived deposit addresses are spendable?"
+        // hazard is now caught on-chain by the readiness gate's
+        // `factory_get_address == derive_pool_account` check (Part C), which
+        // fail-safes (the federation never reports `Ready`, so no deposit
+        // address is ever handed out) instead of merely warning.
 
         let evm_rpc = if let Some(evm_rpc) = &self.evm_rpc_override {
             evm_rpc.clone()
@@ -1962,6 +1955,28 @@ impl Usdt {
 
         task_group.spawn_cancellable("usdt-bootstrap-observer", async move {
             loop {
+                // Part A deploy tick (guardian-local side effect, writes NO
+                // consensus): self-deploy the SimpleAccountFactory if it is not
+                // yet on-chain and this guardian's broadcaster is funded. Runs
+                // before observing so a just-deployed factory can be voted ready
+                // on the same tick. Best-effort: any error is logged and the
+                // observation still proceeds (a wrong/absent factory simply
+                // keeps the federation not-`Ready` via Part C's gate).
+                if let Err(err) = Self::ensure_factory_deployed(
+                    evm_rpc.as_ref(),
+                    entry_point,
+                    account_factory,
+                    broadcaster_min_balance_wei,
+                )
+                .await
+                {
+                    warn!(
+                        target: "usdt",
+                        err = %err.fmt_compact_anyhow(),
+                        "factory self-deploy tick failed; will retry next tick"
+                    );
+                }
+
                 let observation = Self::observe_bootstrap(
                     evm_rpc.as_ref(),
                     &group_public_key,
@@ -2059,6 +2074,61 @@ impl Usdt {
                 }
             }
         }
+    }
+
+    /// Part A: self-deploys this module's `SimpleAccountFactory` on-chain if it
+    /// is not already present and this guardian's broadcaster is funded. A
+    /// guardian-local side effect that writes NO consensus item (exactly like
+    /// the deposit-checker / `UserOp` submitter); the deployed factory becomes
+    /// a federation fact only once guardians *observe* it and vote it ready
+    /// (Part C). Idempotent and race-safe:
+    ///
+    /// 1. If `account_factory` already has code, do nothing (the common steady
+    ///    state; kept off the hot path).
+    /// 2. Else, only if this guardian's broadcaster holds at least the
+    ///    configured minimum ETH: ensure the canonical Arachnid CREATE2
+    ///    deployer exists (bootstrapping it on a bare devnet), then
+    ///    CREATE2-deploy the factory from the vendored creation code. Two
+    ///    guardians racing is harmless — the deterministic CREATE2 address
+    ///    means the redundant deploy reverts (and its explicit-nonce
+    ///    broadcaster tx cannot wedge later submissions).
+    ///
+    /// The factory address the deploy produces equals
+    /// [`factory_bytecode::derive_account_factory`]`(entry_point)` ==
+    /// `account_factory` (the config-gen'd value), so Part C's on-chain
+    /// `getAddress`-equivalence check then verifies it and lets the federation
+    /// reach `Ready`.
+    async fn ensure_factory_deployed(
+        evm_rpc: &dyn crate::rpc::IServerEvmRpc,
+        entry_point: fedimint_usdt_common::EvmAddress,
+        account_factory: fedimint_usdt_common::EvmAddress,
+        broadcaster_min_balance_wei: u64,
+    ) -> anyhow::Result<()> {
+        // 1. Already deployed -> nothing to do.
+        if evm_rpc.get_code_len(account_factory).await? > 0 {
+            return Ok(());
+        }
+
+        // 2. Only the guardians whose broadcaster is funded attempt the deploy
+        //    (fronting its gas). `None` (no broadcaster) counts as not funded.
+        let funded = evm_rpc
+            .broadcaster_eth_balance()
+            .await?
+            .is_some_and(|balance| balance >= u128::from(broadcaster_min_balance_wei));
+        if !funded {
+            return Ok(());
+        }
+
+        evm_rpc.ensure_create2_deployer().await?;
+        evm_rpc.deploy_factory(entry_point).await?;
+        info!(
+            target: "usdt",
+            %account_factory,
+            %entry_point,
+            "self-deployed the module's SimpleAccountFactory on-chain"
+        );
+
+        Ok(())
     }
 
     /// Spawns a background task that periodically scans this guardian's
@@ -4153,6 +4223,17 @@ mod tests {
 
         async fn send_raw_transaction(&self, _signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]> {
             Ok([0u8; 32])
+        }
+
+        async fn ensure_create2_deployer(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn deploy_factory(
+            &self,
+            _entry_point: fedimint_usdt_common::EvmAddress,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
 
         async fn submit_user_ops(

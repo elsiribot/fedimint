@@ -225,6 +225,17 @@ impl ClientModule for UsdtClientModule {
 }
 
 impl UsdtClientModule {
+    /// This module's client configuration (the consensus-agreed EVM
+    /// addresses/network this federation is configured for). Exposed so
+    /// integration tests can read the config-gen'd `account_factory`/
+    /// `simple_account_impl` (Part A derives these deterministically from
+    /// `entry_point`, so they are no longer known ahead of config-gen) when
+    /// scripting readiness.
+    #[must_use]
+    pub fn config(&self) -> &UsdtClientConfig {
+        &self.cfg
+    }
+
     /// The deposit address this federation watches for `claim_pubkey`.
     ///
     /// PROVISIONAL (Phase 5): detection-only; signing custody reconciled in

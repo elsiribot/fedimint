@@ -107,9 +107,9 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     common::mock_ready_stack(
         &mock,
         &group_public_key,
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
+        usdt1.config().entry_point,
+        usdt1.config().account_factory,
+        usdt1.config().simple_account_impl,
     );
     common::await_usdt_ready(&usdt1, Duration::from_secs(60)).await?;
 

@@ -234,6 +234,17 @@ impl IServerEvmRpc for MockEvmRpc {
         Ok(self.lock().broadcaster_eth_balance)
     }
 
+    async fn ensure_create2_deployer(&self) -> anyhow::Result<()> {
+        // Hermetic tests never deploy anything (they script readiness directly
+        // via `mock_ready_stack`); the Part A deploy path is exercised against
+        // real `anvil` in `deploy_and_sweep_e2e`/`factory_pinning`.
+        Ok(())
+    }
+
+    async fn deploy_factory(&self, _entry_point: EvmAddress) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn send_raw_transaction(&self, signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]> {
         let mut state = self.lock();
         // A deterministic, content-derived "hash" (not a real keccak256) is

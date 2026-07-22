@@ -22,7 +22,124 @@ sol! {
     #[sol(rpc)]
     interface ISimpleAccountFactory {
         function getAddress(address owner, uint256 salt) external view returns (address);
+        function accountImplementation() external view returns (address);
     }
+}
+
+/// Part A drift guard (no `anvil`): the creation bytecode vendored into
+/// `fedimint-usdt-server` (`FACTORY_CREATION_CODE`, the source of both the
+/// config-gen `account_factory` prediction and the on-chain self-deploy) must
+/// be byte-for-byte the `.bytecode` field of the vendored
+/// `SimpleAccountFactory.json` artifact. Re-parses that artifact here so any
+/// future re-vendor that forgets to update the server constant fails loudly.
+#[test]
+fn factory_creation_code_matches_vendored_artifact() {
+    let artifact_json = include_str!("fixtures/erc4337/SimpleAccountFactory.json");
+    let artifact: serde_json::Value =
+        serde_json::from_str(artifact_json).expect("SimpleAccountFactory.json parses");
+    let bytecode_hex = artifact["bytecode"]
+        .as_str()
+        .expect("artifact has a `bytecode` string");
+    let bytecode_hex = bytecode_hex.strip_prefix("0x").unwrap_or(bytecode_hex);
+    let expected = alloy::hex::decode(bytecode_hex).expect("artifact bytecode is valid hex");
+
+    assert_eq!(
+        fedimint_usdt_server::factory_bytecode::FACTORY_CREATION_CODE,
+        expected.as_slice(),
+        "vendored FACTORY_CREATION_CODE has drifted from SimpleAccountFactory.json's `.bytecode`"
+    );
+}
+
+/// **Part A gating pinning test (live `anvil`).** Exercises the module's OWN
+/// deploy path end-to-end and pins every off-chain prediction against the real
+/// on-chain result:
+///
+/// 1. `AlloyEvmRpc::ensure_create2_deployer` bootstraps the Arachnid CREATE2
+///    proxy on a bare `anvil` (proving the vendored pre-signed raw tx is
+///    authentic and lands the proxy at its canonical address).
+/// 2. `AlloyEvmRpc::deploy_factory(entry_point)` CREATE2-deploys the factory
+///    from the vendored creation code.
+/// 3. `derive_account_factory(entry_point)` (the config-gen prediction) equals
+///    the address the factory actually deployed at.
+/// 4. `create_address(factory, 1)` / `derive_simple_account_impl` equals the
+///    factory's on-chain `accountImplementation()` (pins the RLP-CREATE math).
+/// 5. `factory.getAddress(owner, pool_salt())` equals off-chain
+///    `derive_pool_account` (the footgun-killer that proves derived deposit/
+///    pool addresses are spendable under this vendored bytecode + salt).
+#[tokio::test]
+async fn factory_pinning() -> anyhow::Result<()> {
+    use fedimint_usdt_common::{derive_pool_account, evm_address, pool_salt};
+    use fedimint_usdt_server::factory_bytecode::{
+        derive_account_factory, derive_simple_account_impl,
+    };
+
+    let Some(anvil) = common::spawn_anvil().await? else {
+        eprintln!(
+            "SKIP: anvil not available (set FM_ANVIL_BASE_EXECUTABLE to an anvil binary, or \
+             install foundry, and re-run)"
+        );
+        return Ok(());
+    };
+
+    // The factory constructor only STORES `entry_point` (as an immutable, via
+    // `new SimpleAccount(entryPoint)`); it makes no call into it, so any fixed
+    // address exercises the real CREATE2 initCode. Use a distinctive constant.
+    let entry_point = EvmAddress([0xE7; 20]);
+
+    let rpc = AlloyEvmRpc::new(anvil.url())?
+        .with_broadcaster(common::ANVIL_ACCOUNT_0_PRIVATE_KEY)?
+        .with_entry_point(entry_point);
+
+    // 1 + 2: the module self-deploys the Arachnid proxy, then the factory.
+    rpc.ensure_create2_deployer().await?;
+    rpc.deploy_factory(entry_point).await?;
+
+    // 3: config-gen prediction == the address the factory deployed at.
+    let predicted_factory = derive_account_factory(entry_point);
+    assert!(
+        rpc.get_code_len(predicted_factory).await? > 0,
+        "derive_account_factory must equal the CREATE2 address the factory deployed at"
+    );
+
+    let provider = ProviderBuilder::new().connect_http(anvil.url().parse()?);
+    let factory = ISimpleAccountFactory::new(Address::from(predicted_factory.0), &provider);
+
+    // 4: RLP-CREATE impl prediction == on-chain accountImplementation().
+    let onchain_impl = factory
+        .accountImplementation()
+        .call()
+        .await
+        .context("factory.accountImplementation() eth_call failed")?;
+    let predicted_impl = derive_simple_account_impl(predicted_factory);
+    assert_eq!(
+        Address::from(predicted_impl.0),
+        onchain_impl,
+        "create_address(factory, 1) must equal the factory's accountImplementation()"
+    );
+    // (equivalent to the general create_address; sanity-check the two agree)
+    assert_eq!(
+        predicted_impl,
+        fedimint_usdt_common::create_address(predicted_factory, 1),
+    );
+
+    // 5: on-chain getAddress(owner, pool_salt) == off-chain derive_pool_account
+    //    (the footgun-killer, mirroring Part C's readiness gate).
+    let group_pk = test_pubkey(0xaa);
+    let owner = Address::from(evm_address(&group_pk).0);
+    let onchain_pool = factory
+        .getAddress(owner, U256::from_be_bytes(pool_salt()))
+        .call()
+        .await
+        .context("factory.getAddress(owner, pool_salt) eth_call failed")?;
+    let offchain_pool = derive_pool_account(&group_pk, predicted_factory, predicted_impl);
+    assert_eq!(
+        Address::from(offchain_pool.0),
+        onchain_pool,
+        "off-chain derive_pool_account must match on-chain factory.getAddress under the \
+         vendored FACTORY_CREATION_CODE + factory_create2_salt"
+    );
+
+    Ok(())
 }
 
 sol! {

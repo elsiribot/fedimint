@@ -41,7 +41,6 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
-use alloy::sol_types::SolValue as _;
 use anyhow::{Context, ensure};
 use clap::Parser;
 use devimint::cli::{self, cleanup_on_exit};
@@ -54,8 +53,7 @@ use fedimint_core::envs::{
     FM_DISABLE_BASE_FEES_ENV, FM_ENABLE_MODULE_LNV1_ENV, FM_ENABLE_MODULE_LNV2_ENV,
     FM_ENABLE_MODULE_MINT_ENV, FM_ENABLE_MODULE_MINTV2_ENV, FM_ENABLE_MODULE_USDT_ENV,
     FM_ENABLE_MODULE_WALLET_ENV, FM_ENABLE_MODULE_WALLETV2_ENV, FM_MINTV2_AMOUNT_UNIT_ENV,
-    FM_USDT_ACCOUNT_FACTORY_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV, FM_USDT_CONTRACT_ENV,
-    FM_USDT_ENTRY_POINT_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
+    FM_USDT_BROADCASTER_PRIVATE_KEY_ENV, FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV,
 };
 use fedimint_usdt_common::{EvmAddress, USDT_UNIT, UsdtAmount};
 use tracing::info;
@@ -84,14 +82,19 @@ async fn main() -> anyhow::Result<()> {
         let token = deploy_test_erc20(&anvil, holder, UsdtAmount(10_000_000)).await?;
 
         // The withdrawal leg (unlike deposit->claim) submits real UserOps
-        // through a real EntryPoint, so the ERC-4337 stack must exist on the
-        // anvil BEFORE config-gen (the deposit/pool account addresses are a
-        // pure function of the factory + implementation, so config must point
-        // at the deployed addresses). Deposit->claim needs none of this.
-        info!("Deploying the minimal ERC-4337 stack (EntryPoint + SimpleAccountFactory)...");
-        let (entry_point, account_factory, simple_account_impl) =
-            deploy_4337_minimal(&anvil).await?;
-        info!(%entry_point, %account_factory, %simple_account_impl, "ERC-4337 stack deployed");
+        // through a real EntryPoint, so the EntryPoint must exist on the anvil
+        // BEFORE config-gen: the derived `account_factory`/`simple_account_impl`
+        // (and thus every deposit/pool account address) are a pure function of
+        // `entry_point`, so it must be known at config-gen.
+        //
+        // Part A: deploy ONLY the EntryPoint here (canonical; the module never
+        // deploys it). The SimpleAccountFactory + impl are derived from
+        // `entry_point` at config-gen and SELF-DEPLOYED by the module via the
+        // Arachnid CREATE2 proxy (which the module also bootstraps on this bare
+        // anvil), so this harness deliberately does not deploy them.
+        info!("Deploying the ERC-4337 EntryPoint (the module self-deploys its factory)...");
+        let entry_point = deploy_entry_point(&anvil).await?;
+        info!(%entry_point, "ERC-4337 EntryPoint deployed");
 
         // SAFETY: single-threaded at this point, and set before any
         // `fedimintd` subprocess is spawned below -- env vars are captured at
@@ -130,19 +133,17 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_var(FM_DISABLE_BASE_FEES_ENV, "1");
             std::env::set_var(FM_USDT_CONTRACT_ENV, token.to_string());
 
-            // Point config-gen at the ERC-4337 stack deployed above so the
-            // guardians derive the same counterfactual deposit/pool account
-            // addresses the sweep + withdrawal UserOps target, and give them a
-            // funded broadcaster EOA to front UserOp gas from. This federation
-            // uses the broadcaster-fronts-ETH model (no paymaster). Account 0
-            // is pre-funded with ETH by anvil (it is also the deployer/miner
-            // here; the deposit funder is account 1, so there is no conflict).
+            // Point config-gen at the deployed EntryPoint. The config-gen
+            // leader then DERIVES `account_factory`/`simple_account_impl` from
+            // it deterministically (Part A), and the module self-deploys that
+            // factory on-chain, so `FM_USDT_ACCOUNT_FACTORY`/
+            // `FM_USDT_SIMPLE_ACCOUNT_IMPL` are deliberately NOT set here. The
+            // guardians share the broadcaster-fronts-ETH model (no paymaster);
+            // account 0 is pre-funded with ETH by anvil (it is also the
+            // deployer/miner here; the deposit funder is account 1, so there is
+            // no conflict) and is the broadcaster that fronts the factory-deploy
+            // gas.
             std::env::set_var(FM_USDT_ENTRY_POINT_ENV, entry_point.to_string());
-            std::env::set_var(FM_USDT_ACCOUNT_FACTORY_ENV, account_factory.to_string());
-            std::env::set_var(
-                FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
-                simple_account_impl.to_string(),
-            );
             std::env::set_var(
                 FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
                 ANVIL_ACCOUNT_0_PRIVATE_KEY,
@@ -477,13 +478,6 @@ sol! {
     }
 }
 
-sol! {
-    #[sol(rpc)]
-    interface ISimpleAccountFactory {
-        function accountImplementation() external view returns (address);
-    }
-}
-
 /// Private key of `anvil`'s first deterministic default account (derived
 /// from its well-known dev mnemonic); used to deploy the test ERC-20 and to
 /// fund block-mining transactions.
@@ -587,25 +581,22 @@ async fn erc20_balance_of(
     balance.try_into().context("ERC-20 balance exceeds u64")
 }
 
-// --- ERC-4337 stack deploy ---------------------------------------------
+// --- ERC-4337 EntryPoint deploy ----------------------------------------
 //
-// Minimal port of `tests/common/anvil.rs::deploy_4337_infra`: only the pieces
-// the broadcaster-fronts-ETH withdrawal path needs -- a real,
-// constructor-deployed `EntryPoint`, a `SimpleAccountFactory` pointed at it,
-// and the `SimpleAccount` implementation the factory deploys (read back). The
-// paymaster/stake pieces are deliberately skipped -- this federation fronts
-// UserOp gas from the broadcaster EOA, not a paymaster. The `bin/` target
-// can't import the `tests/` `common` module, so this (and the two artifacts)
-// are duplicated, mirroring the ERC-20 helpers above.
+// Part A: this harness deploys ONLY the `EntryPoint` (canonical per-chain; the
+// module never deploys it). The `SimpleAccountFactory` + its `SimpleAccount`
+// implementation are DERIVED at config-gen from `entry_point` and SELF-DEPLOYED
+// by the module (via the Arachnid CREATE2 proxy), so this harness deliberately
+// does NOT deploy them -- proving the module stands up its own factory. The
+// paymaster/stake pieces are likewise skipped: this federation fronts UserOp
+// gas from the broadcaster EOA, not a paymaster. The `bin/` target can't import
+// the `tests/` `common` module, so this (and the artifact) are duplicated,
+// mirroring the ERC-20 helpers above.
 
 /// The vendored ERC-4337 v0.7 `EntryPoint` creation artifact (compiled
 /// offline; this harness never invokes `solc`/`forge`), shared with
 /// `tests/common/anvil.rs`.
 const ENTRY_POINT_ARTIFACT_JSON: &str = include_str!("../tests/fixtures/erc4337/EntryPoint.json");
-/// The vendored `SimpleAccountFactory` creation artifact, shared with
-/// `tests/common/anvil.rs`.
-const SIMPLE_ACCOUNT_FACTORY_ARTIFACT_JSON: &str =
-    include_str!("../tests/fixtures/erc4337/SimpleAccountFactory.json");
 
 /// Extracts a top-level hex-string field (`"0x..."`) from a vendored artifact
 /// JSON, decoding it to raw bytes. Miniature copy of
@@ -621,18 +612,13 @@ fn artifact_hex_field(artifact_json: &str, field: &str) -> anyhow::Result<Vec<u8
     hex::decode(hex_str).with_context(|| format!("artifact `{field}` is not valid hex"))
 }
 
-/// Deploys the minimal ERC-4337 v0.7 infrastructure the withdrawal path needs
-/// (as account 0): a real, constructor-deployed `EntryPoint` (no ctor args),
-/// then a `SimpleAccountFactory` pointed at it (ctor: a single `address
-/// _entryPoint`), then reads back the `SimpleAccount` implementation the
-/// factory deploys. Returns `(entry_point, account_factory,
-/// simple_account_impl)`.
-async fn deploy_4337_minimal(
-    anvil: &Anvil,
-) -> anyhow::Result<(EvmAddress, EvmAddress, EvmAddress)> {
+/// Real-constructor-deploys ONLY the ERC-4337 v0.7 `EntryPoint` (no ctor args)
+/// as account 0, returning its address. The `SimpleAccountFactory`/impl are
+/// derived from this address at config-gen and self-deployed by the module
+/// (Part A), so they are intentionally NOT deployed here.
+async fn deploy_entry_point(anvil: &Anvil) -> anyhow::Result<EvmAddress> {
     let provider = wallet_provider(anvil, ANVIL_ACCOUNT_0_PRIVATE_KEY)?;
 
-    // 1. Real-constructor-deploy the EntryPoint (no constructor args).
     let entry_point_creation_bytecode = artifact_hex_field(ENTRY_POINT_ARTIFACT_JSON, "bytecode")
         .context("failed to extract EntryPoint bytecode")?;
     let entry_point_receipt = provider
@@ -648,37 +634,7 @@ async fn deploy_4337_minimal(
         .contract_address
         .context("EntryPoint creation receipt is missing a contract_address")?;
 
-    // 2. Deploy SimpleAccountFactory (ctor: `address _entryPoint`), pointed at the
-    //    EntryPoint above. A single static `address` param is just its left-padded
-    //    word -- `abi_encode_params` on a 1-tuple gives exactly that.
-    let mut factory_deploy_code =
-        artifact_hex_field(SIMPLE_ACCOUNT_FACTORY_ARTIFACT_JSON, "bytecode")
-            .context("failed to extract SimpleAccountFactory bytecode")?;
-    factory_deploy_code.extend_from_slice(&(entry_point_address,).abi_encode_params());
-    let factory_receipt = provider
-        .send_transaction(TransactionRequest::default().with_deploy_code(factory_deploy_code))
-        .await
-        .context("failed to send SimpleAccountFactory creation transaction")?
-        .get_receipt()
-        .await
-        .context("failed to confirm SimpleAccountFactory creation transaction")?;
-    let factory_address = factory_receipt
-        .contract_address
-        .context("SimpleAccountFactory creation receipt is missing a contract_address")?;
-
-    // 3. Read back the SimpleAccount implementation the factory deployed.
-    let factory = ISimpleAccountFactory::new(factory_address, &provider);
-    let simple_account_impl = factory
-        .accountImplementation()
-        .call()
-        .await
-        .context("failed to read SimpleAccountFactory.accountImplementation()")?;
-
-    Ok((
-        EvmAddress(entry_point_address.into_array()),
-        EvmAddress(factory_address.into_array()),
-        EvmAddress(simple_account_impl.into_array()),
-    ))
+    Ok(EvmAddress(entry_point_address.into_array()))
 }
 
 /// Transfers `amount` of `token` from `anvil`'s account 1 to `to`,

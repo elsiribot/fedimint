@@ -177,13 +177,20 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
         .with_entry_point(stack.entry_point)
         .into_dyn();
 
+    // Part A: the module self-deploys its own SimpleAccountFactory; config
+    // points at the DERIVED (CREATE2) factory/impl addresses it will deploy
+    // at, not a harness-deployed factory.
+    let account_factory =
+        fedimint_usdt_server::factory_bytecode::derive_account_factory(stack.entry_point);
+    let simple_account_impl =
+        fedimint_usdt_server::factory_bytecode::derive_simple_account_impl(account_factory);
     let gen_params = UsdtGenParams {
         usdt_contract: stack.usdt,
         chain_id: 31337,
         confirmation_depth: 1,
         entry_point: stack.entry_point,
-        account_factory: stack.factory,
-        simple_account_impl: stack.simple_account_impl,
+        account_factory,
+        simple_account_impl,
         check_ttl_blocks: 10_000,
         broadcaster_min_balance_wei: 0,
     };
@@ -373,13 +380,20 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
         .with_entry_point(stack.entry_point)
         .into_dyn();
 
+    // Part A: the module self-deploys its own SimpleAccountFactory; config
+    // points at the DERIVED (CREATE2) factory/impl addresses it will deploy
+    // at, not a harness-deployed factory.
+    let account_factory =
+        fedimint_usdt_server::factory_bytecode::derive_account_factory(stack.entry_point);
+    let simple_account_impl =
+        fedimint_usdt_server::factory_bytecode::derive_simple_account_impl(account_factory);
     let gen_params = UsdtGenParams {
         usdt_contract: stack.usdt,
         chain_id: 31337,
         confirmation_depth: 1,
         entry_point: stack.entry_point,
-        account_factory: stack.factory,
-        simple_account_impl: stack.simple_account_impl,
+        account_factory,
+        simple_account_impl,
         check_ttl_blocks: 10_000,
         broadcaster_min_balance_wei: 0,
     };

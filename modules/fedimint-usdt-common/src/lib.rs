@@ -219,6 +219,66 @@ pub fn evm_address(pk: &secp256k1::PublicKey) -> EvmAddress {
     EvmAddress(address)
 }
 
+/// The `CREATE` (nonce-based, non-CREATE2) contract address a `deployer`
+/// account produces at a given `nonce`: `keccak256(rlp([deployer,
+/// nonce]))[12..]` (the classic Ethereum contract-creation address rule,
+/// EIP-161 §1).
+///
+/// Used by Part A to predict the `SimpleAccount` implementation the
+/// `SimpleAccountFactory`'s constructor deploys as its first internal `CREATE`
+/// (`new SimpleAccount(entryPoint)`, i.e. `create_address(factory, 1)`); kept
+/// general over `nonce` even though the module only ever needs `1`.
+///
+/// Pure function, WASM-safe (pure-Rust `sha3`, no `alloy-rlp`): the two-item
+/// RLP list `[20-byte address, nonce]` is short enough to hand-encode. For
+/// `nonce == 1` this is exactly `keccak256(0xd6 ‖ 0x94 ‖ deployer ‖
+/// 0x01)[12..]`. Verified against known Ethereum `CREATE` vectors in this
+/// crate's tests and pinned against a real on-chain `accountImplementation()`
+/// by `fedimint-usdt-tests`' live-anvil `factory_pinning` test.
+#[must_use]
+pub fn create_address(deployer: EvmAddress, nonce: u64) -> EvmAddress {
+    // The nonce's minimal big-endian encoding (leading zero bytes stripped);
+    // empty when `nonce == 0`. A `u64` has at most 8 significant bytes.
+    let be = nonce.to_be_bytes();
+    let significant = match be.iter().position(|&b| b != 0) {
+        Some(first) => &be[first..],
+        None => &[][..],
+    };
+
+    // RLP-encode the nonce (an integer): 0 -> empty string 0x80; a single byte
+    // in `0x00..=0x7f` -> the byte itself; otherwise 0x80+len followed by the
+    // significant bytes. `significant.len()` is at most 8, so the `0x80 + len`
+    // byte never overflows (the `unwrap_or` branch is unreachable).
+    let mut nonce_rlp = Vec::with_capacity(1 + significant.len());
+    match significant {
+        [] => nonce_rlp.push(0x80),
+        [b] if *b < 0x80 => nonce_rlp.push(*b),
+        _ => {
+            nonce_rlp.push(0x80 + u8::try_from(significant.len()).unwrap_or(0));
+            nonce_rlp.extend_from_slice(significant);
+        }
+    }
+
+    // RLP-encode the 20-byte address as a string (0x80 + 20 == 0x94, then the
+    // bytes), then wrap `[address, nonce]` in a list. The payload is always
+    // well under 55 bytes (21 address bytes + at most 9 nonce bytes), so the
+    // list header is a single `0xc0 + len` byte (the `unwrap_or` is
+    // unreachable).
+    let mut payload = Vec::with_capacity(1 + 20 + nonce_rlp.len());
+    payload.push(0x94);
+    payload.extend_from_slice(&deployer.0);
+    payload.extend_from_slice(&nonce_rlp);
+
+    let mut rlp = Vec::with_capacity(1 + payload.len());
+    rlp.push(0xc0 + u8::try_from(payload.len()).unwrap_or(0));
+    rlp.extend_from_slice(&payload);
+
+    let hash = Keccak256::digest(&rlp);
+    let mut address = [0u8; 20];
+    address.copy_from_slice(&hash[12..]);
+    EvmAddress(address)
+}
+
 alloy_sol_types::sol! {
     /// Only the ABI signature is needed here (to produce `initialize`'s
     /// calldata for [`derive_deposit_account`]'s `initCode`); mirrors
@@ -1092,6 +1152,36 @@ mod tests {
             .expect("EvmAddress should decode what it just encoded");
 
         assert_eq!(address, decoded);
+    }
+
+    #[test]
+    fn create_address_matches_known_ethereum_vectors() {
+        // Canonical EIP-161 §1 CREATE-address example: sender
+        // 0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0 produces these contracts.
+        let sender = "0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0"
+            .parse::<EvmAddress>()
+            .unwrap();
+        assert_eq!(
+            create_address(sender, 0),
+            "0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8d"
+                .parse::<EvmAddress>()
+                .unwrap(),
+        );
+        assert_eq!(
+            create_address(sender, 1),
+            "0x343c43a37d37dff08ae8c4a11544c718abb4fcf8"
+                .parse::<EvmAddress>()
+                .unwrap(),
+        );
+
+        // Multi-byte nonce vector (nonce 0x100 == 256), exercising the
+        // length-prefixed RLP integer branch.
+        assert_eq!(
+            create_address(sender, 256),
+            "0x3837c1ae70354f670550c746580199ac6a73cb0a"
+                .parse::<EvmAddress>()
+                .unwrap(),
+        );
     }
 
     #[test]

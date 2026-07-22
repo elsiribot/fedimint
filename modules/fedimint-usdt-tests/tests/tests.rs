@@ -209,9 +209,9 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     common::mock_ready_stack(
         &mock,
         &group_public_key,
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
 
@@ -543,9 +543,9 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
     common::mock_ready_stack(
         &mock,
         &group_public_key,
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
 
@@ -787,9 +787,9 @@ async fn withdrawal_status_reports_unknown_then_queued() -> anyhow::Result<()> {
     common::mock_ready_stack(
         &mock,
         &group_public_key,
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let deposit_amount = UsdtAmount(25_600_000);
@@ -916,9 +916,9 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
     common::mock_ready_stack(
         &mock,
         &group_public_key,
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let deposit_amount = UsdtAmount(25_600_000);
@@ -1192,9 +1192,9 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
     common::mock_ready_stack(
         &mock,
         &group_public_key,
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let deposit_amount = UsdtAmount(30_720_000);
