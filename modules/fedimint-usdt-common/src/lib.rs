@@ -188,6 +188,38 @@ pub fn withdrawal_fee_quote(median: &FeeVote) -> Option<UsdtAmount> {
     u64::try_from(fee).ok().map(UsdtAmount)
 }
 
+/// Converts a Chainlink ETH/USD `latestRoundData()` reading into
+/// [`FeeVote::usdt_per_eth_e6`], applying sanity + staleness guards. Pure and
+/// WASM-safe (integer math only). Returns `None` — meaning the guardian should
+/// ABSTAIN from voting a price this cycle — when the reading is unusable:
+/// non-positive `answer`, incomplete round (`answered_in_round < round_id`),
+/// stale (`chain_now - updated_at > max_staleness_secs`, or `updated_at` in the
+/// future), or the `answer * 1e6 / 10^feed_decimals` conversion overflows.
+/// All inputs are read from the on-chain feed by the caller (see
+/// `fedimint_usdt_server::rpc::AlloyEvmRpc::get_fee_estimate`).
+#[must_use]
+pub fn chainlink_eth_usd_to_usdt_per_eth_e6(
+    answer: i128,
+    feed_decimals: u8,
+    round_id: u128,
+    answered_in_round: u128,
+    updated_at: u64,
+    chain_now: u64,
+    max_staleness_secs: u64,
+) -> Option<u64> {
+    if answer <= 0 || answered_in_round < round_id {
+        return None;
+    }
+    // `checked_sub` returns None if `updated_at` is in the future.
+    if chain_now.checked_sub(updated_at)? > max_staleness_secs {
+        return None;
+    }
+    let answer = u128::try_from(answer).ok()?;
+    let scaled = answer.checked_mul(1_000_000)?; // 1e6 USDT fixed-point
+    let divisor = 10u128.checked_pow(u32::from(feed_decimals))?;
+    u64::try_from(scaled.checked_div(divisor)?).ok()
+}
+
 /// Domain-separation tag mixed into a deposit account's CREATE2 `salt` (see
 /// [`derive_deposit_account`]).
 pub const DEPOSIT_ADDRESS_DOMAIN: &[u8] = b"fedimint-usdt-deposit-v0";
@@ -1569,6 +1601,60 @@ mod tests {
             usdt_per_eth_e6: u64::MAX,
         };
         assert_eq!(withdrawal_fee_quote(&median), None);
+    }
+
+    #[test]
+    fn chainlink_price_happy_path_8_decimals() {
+        // $3000.00 at 8 decimals, fresh, complete round -> 3000_000000 (1e-6 USDT)
+        let v = chainlink_eth_usd_to_usdt_per_eth_e6(
+            3000_00000000,
+            8,
+            42,
+            42,
+            1_000,
+            1_500,
+            14_400,
+        );
+        assert_eq!(v, Some(3_000_000_000));
+    }
+
+    #[test]
+    fn chainlink_price_rejects_non_positive_answer() {
+        assert_eq!(
+            chainlink_eth_usd_to_usdt_per_eth_e6(0, 8, 1, 1, 1_000, 1_000, 14_400),
+            None
+        );
+        assert_eq!(
+            chainlink_eth_usd_to_usdt_per_eth_e6(-1, 8, 1, 1, 1_000, 1_000, 14_400),
+            None
+        );
+    }
+
+    #[test]
+    fn chainlink_price_rejects_incomplete_round() {
+        // answered_in_round < round_id -> carried-over/incomplete
+        assert_eq!(
+            chainlink_eth_usd_to_usdt_per_eth_e6(3000_00000000, 8, 42, 41, 1_000, 1_100, 14_400),
+            None
+        );
+    }
+
+    #[test]
+    fn chainlink_price_rejects_stale() {
+        // chain_now - updated_at (20_000) > max_staleness (14_400)
+        assert_eq!(
+            chainlink_eth_usd_to_usdt_per_eth_e6(3000_00000000, 8, 1, 1, 1_000, 21_000, 14_400),
+            None
+        );
+    }
+
+    #[test]
+    fn chainlink_price_rejects_future_timestamp() {
+        // updated_at > chain_now (clock/feed anomaly) -> abstain
+        assert_eq!(
+            chainlink_eth_usd_to_usdt_per_eth_e6(3000_00000000, 8, 1, 1, 2_000, 1_000, 14_400),
+            None
+        );
     }
 
     fn test_out_point(idx: u64) -> OutPoint {
