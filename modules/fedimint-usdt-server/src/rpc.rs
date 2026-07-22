@@ -48,6 +48,18 @@ sol! {
         // value would make transfers deliver less than the requested amount.
         function basisPointsRate() external view returns (uint256);
     }
+
+    // Chainlink's standard price-feed ABI (`AggregatorV3Interface`), used by
+    // `AlloyEvmRpc::get_fee_estimate` to read the ETH/USD price each
+    // guardian votes into `FeeVote::usdt_per_eth_e6` (see
+    // `fedimint_usdt_common::chainlink_eth_usd_to_usdt_per_eth_e6`).
+    #[sol(rpc)]
+    interface IAggregatorV3 {
+        function decimals() external view returns (uint8);
+        function latestRoundData() external view returns (
+            uint80 roundId, int256 answer, uint256 startedAt,
+            uint256 updatedAt, uint80 answeredInRound);
+    }
 }
 
 alloy::sol! {
@@ -281,6 +293,9 @@ pub struct AlloyEvmRpc {
     /// [`IServerEvmRpc::get_user_op_receipt`] target. `None` until
     /// [`Self::with_entry_point`] is called.
     entry_point: Option<EvmAddress>,
+    /// Chainlink ETH/USD feed; `None` or all-zero -> static price fallback.
+    eth_usd_price_feed: Option<EvmAddress>,
+    price_feed_max_staleness_secs: u64,
 }
 
 impl std::fmt::Debug for AlloyEvmRpc {
@@ -324,6 +339,8 @@ impl AlloyEvmRpc {
             broadcaster: None,
             broadcaster_address: None,
             entry_point: None,
+            eth_usd_price_feed: None,
+            price_feed_max_staleness_secs: 0,
         })
     }
 
@@ -372,7 +389,20 @@ impl AlloyEvmRpc {
         self.entry_point = Some(entry_point);
         self
     }
+
+    /// Configure the Chainlink ETH/USD feed the fee poller reads. An all-zero
+    /// address disables it (static fallback).
+    #[must_use]
+    pub fn with_price_feed(mut self, feed: EvmAddress, max_staleness_secs: u64) -> Self {
+        self.eth_usd_price_feed = (feed.0 != [0u8; 20]).then_some(feed);
+        self.price_feed_max_staleness_secs = max_staleness_secs;
+        self
+    }
 }
+
+/// Static ETH/USD fallback (== $3000.000000/ETH) used only when NO Chainlink
+/// feed is configured (e.g. local anvil). A real deployment configures a feed.
+const STATIC_USDT_PER_ETH_E6: u64 = 3_000_000_000;
 
 #[async_trait::async_trait]
 impl IServerEvmRpc for AlloyEvmRpc {
@@ -423,14 +453,46 @@ impl IServerEvmRpc for AlloyEvmRpc {
         let max_fee_per_gas_wei = u64::try_from(gas_price_wei)
             .with_context(|| format!("gas price {gas_price_wei} wei overflows u64"))?;
 
+        let usdt_per_eth_e6 = match self.eth_usd_price_feed {
+            Some(feed) => {
+                let feed_addr = Address::from(feed.0);
+                let aggregator = IAggregatorV3::new(feed_addr, &self.provider);
+                let decimals = aggregator.decimals().call().await?;
+                let round = aggregator.latestRoundData().call().await?;
+                let block = self
+                    .provider
+                    .get_block(BlockId::latest())
+                    .await?
+                    .context("latest block missing for price staleness check")?;
+                let chain_now = block.header.timestamp;
+
+                let answer: i128 = round
+                    .answer
+                    .try_into()
+                    .context("Chainlink answer does not fit i128")?;
+                let round_id = u128::try_from(round.roundId).unwrap_or(u128::MAX);
+                let answered_in_round = u128::try_from(round.answeredInRound).unwrap_or(u128::MAX);
+                let updated_at = u64::try_from(round.updatedAt).unwrap_or(u64::MAX);
+
+                fedimint_usdt_common::chainlink_eth_usd_to_usdt_per_eth_e6(
+                    answer,
+                    decimals,
+                    round_id,
+                    answered_in_round,
+                    updated_at,
+                    chain_now,
+                    self.price_feed_max_staleness_secs,
+                )
+                .context(
+                    "Chainlink ETH/USD reading unusable (stale/invalid); abstaining from FeeVote",
+                )?
+            }
+            None => STATIC_USDT_PER_ETH_E6,
+        };
+
         Ok(FeeVote {
             max_fee_per_gas_wei,
-            // Phase 4 has no price oracle wired up yet; Phase 8 wires a real
-            // price source. `3_000_000_000` == 3000.000000 USDT/ETH (fixed
-            // point, 1e-6 USDT precision), a placeholder in the right
-            // ballpark so `FeeVote` consensus can be exercised end-to-end
-            // before a real feed exists.
-            usdt_per_eth_e6: 3_000_000_000,
+            usdt_per_eth_e6,
         })
     }
 

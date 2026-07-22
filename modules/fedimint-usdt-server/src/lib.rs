@@ -474,8 +474,12 @@ impl ServerModuleInit for UsdtInit {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| cfg.private.local.evm_rpc_url.clone());
-            let mut rpc =
-                AlloyEvmRpc::new(&evm_rpc_url)?.with_entry_point(cfg.consensus.entry_point);
+            let mut rpc = AlloyEvmRpc::new(&evm_rpc_url)?
+                .with_entry_point(cfg.consensus.entry_point)
+                .with_price_feed(
+                    cfg.consensus.eth_usd_price_feed,
+                    cfg.consensus.price_feed_max_staleness_secs,
+                );
             let broadcaster_private_key = std::env::var(FM_USDT_BROADCASTER_PRIVATE_KEY_ENV)
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -1921,7 +1925,7 @@ impl Usdt {
                         warn!(
                             target: "usdt",
                             err = %err.fmt_compact_anyhow(),
-                            "fee estimate poll failed"
+                            "fee estimate poll failed; keeping last vote (abstaining this cycle)"
                         );
                     }
                 }
@@ -4069,6 +4073,8 @@ mod tests {
             simple_account_impl: fedimint_usdt_common::EvmAddress([0xcf; 20]),
             check_ttl_blocks: 500,
             broadcaster_min_balance_wei: 1_000,
+            eth_usd_price_feed: fedimint_usdt_common::EvmAddress([0xd0; 20]),
+            price_feed_max_staleness_secs: 3_600,
         };
 
         let server_cfgs = UsdtInit::default().trusted_dealer_gen(&peers, &args, &params);
