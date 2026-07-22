@@ -190,6 +190,31 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     let client: ClientHandleArc = fed.new_client().await;
     let usdt = client.get_first_module::<UsdtClientModule>()?;
 
+    // Part C gate proof: before the on-chain readiness stack is observed,
+    // the module is not `Ready` and `allocate_deposit` is refused.
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    assert_ne!(
+        usdt.status().await?.state,
+        fedimint_usdt_common::BootstrapState::Ready,
+        "module must not be Ready before the readiness stack is observed"
+    );
+    assert!(
+        usdt.allocate_deposit().await.is_err(),
+        "allocate_deposit must be gated until the module is Ready"
+    );
+
+    // Drive the readiness state machine to `Ready` (script the mock so every
+    // guardian's bootstrap poll votes all-true), then wait for it to
+    // propagate through consensus.
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+
     // 1. Derive a deposit address.
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
 
@@ -513,6 +538,17 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
     );
     let non_signer = PeerId::from(3); // signer_subset(0) is the fixed {0,1,2}
 
+    // Part C: drive the module to Ready before allocating a deposit.
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+
     // 1. Allocate + fund a deposit; wait for it to be credited.
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
     let deposit_amount = UsdtAmount(2_500_000);
@@ -745,6 +781,17 @@ async fn withdrawal_status_reports_unknown_then_queued() -> anyhow::Result<()> {
     // credited deposit auto-triggers -- unlike the Task-1/Task-2 tests
     // above, this test never reads pool/sweep state, so there is nothing to
     // wait on it for.
+    //
+    // Part C: drive the module to Ready before allocating a deposit.
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let deposit_amount = UsdtAmount(25_600_000);
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
     mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
@@ -863,6 +910,17 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
     // 2. Fund the withdrawal: deposit + claim USDT e-cash. `25_600_000` is a
     //    multiple of 512 msat (no mintv2 denomination-rounding dust) and
     //    comfortably covers `amount + max_fee`.
+    //
+    // Part C: drive the module to Ready before allocating a deposit.
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let deposit_amount = UsdtAmount(25_600_000);
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
     mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
@@ -1129,6 +1187,16 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
     //    the claim mints exactly `deposit_amount` (must be a 512 multiple), and
     //    each withdrawal burns `amount_i + quote` (which must be a 512 multiple --
     //    since `quote % 512 == 384`, each `amount_i % 512 == 128`).
+    // Part C: drive the module to Ready before allocating a deposit.
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let deposit_amount = UsdtAmount(30_720_000);
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
     mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);

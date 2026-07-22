@@ -2,7 +2,9 @@ use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::secp256k1::PublicKey;
 use fedimint_core::{OutPoint, PeerId, impl_db_lookup, impl_db_record};
 use fedimint_usdt_common::user_op::{SignedUserOp, UnsignedUserOp};
-use fedimint_usdt_common::{DepositObservation, EvmAddress, FeeVote, SigningSessionId, UsdtAmount};
+use fedimint_usdt_common::{
+    BootstrapObservation, DepositObservation, EvmAddress, FeeVote, SigningSessionId, UsdtAmount,
+};
 use serde::Serialize;
 use strum_macros::EnumIter;
 
@@ -60,6 +62,19 @@ pub enum DbKeyPrefix {
     /// The consensus-agreed lifecycle stage of a queued withdrawal (Phase 8,
     /// Task 1).
     WithdrawalState = 0x0D,
+    /// Per-peer votes on the module's on-chain readiness (Part C), mirroring
+    /// [`Self::FeeVote`]'s per-peer-vote shape. The federation's readiness
+    /// state is the per-field threshold count over these votes (see
+    /// `fedimint_usdt_server::Usdt::bootstrap_state`), not any single peer's
+    /// vote.
+    BootstrapVote = 0x0E,
+    /// A module-wide singleton latch (see [`HasEverBeenReadyKey`]): present
+    /// once the readiness tally has reached `Ready` at least once (Part C).
+    /// Set deterministically inside `process_consensus_item`, so
+    /// `bootstrap_state` can distinguish `Degraded` (was `Ready`, regressed)
+    /// from `AwaitingInfra` (never `Ready`) -- a pure count over the current
+    /// votes cannot.
+    HasEverBeenReady = 0x0F,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -547,6 +562,45 @@ impl_db_lookup!(
     query_prefix = WithdrawalStatePrefix
 );
 
+/// One peer's most recent readiness vote (Part C), mirroring [`FeeVoteKey`]
+/// exactly: `process_consensus_item` overwrites this peer's entry on each new
+/// vote, and `Usdt::bootstrap_state` range-scans every peer's entry (via
+/// [`BootstrapVotePrefix`]) to tally the per-field threshold counts.
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct BootstrapVoteKey(pub PeerId);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct BootstrapVotePrefix;
+
+impl_db_record!(
+    key = BootstrapVoteKey,
+    value = BootstrapObservation,
+    db_prefix = DbKeyPrefix::BootstrapVote,
+);
+impl_db_lookup!(key = BootstrapVoteKey, query_prefix = BootstrapVotePrefix);
+
+/// Module-wide singleton latch (Part C): present once the readiness tally has
+/// reached `Ready` at least once. A unit-keyed, unit-valued singleton
+/// (mirroring `fedimint-mint-server`'s `NonceKey`-style `value = ()` records),
+/// queried directly via this key. Its presence is what lets
+/// `Usdt::bootstrap_state` report `Degraded` (was `Ready`, now regressed)
+/// distinctly from `AwaitingInfra` (never `Ready`).
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct HasEverBeenReadyKey;
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct HasEverBeenReadyPrefix;
+
+impl_db_record!(
+    key = HasEverBeenReadyKey,
+    value = (),
+    db_prefix = DbKeyPrefix::HasEverBeenReady,
+);
+impl_db_lookup!(
+    key = HasEverBeenReadyKey,
+    query_prefix = HasEverBeenReadyPrefix
+);
+
 #[cfg(test)]
 mod tests {
     use fedimint_core::PeerId;
@@ -979,6 +1033,61 @@ mod tests {
         );
         assert_eq!(
             dbtx.find_by_prefix(&UnclaimedWithdrawalPrefix)
+                .await
+                .count()
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_vote_round_trips_and_filters_by_prefix() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let obs = |funded: bool| BootstrapObservation {
+            entry_point_ok: true,
+            factory_ok: true,
+            impl_ok: true,
+            broadcaster_funded: funded,
+            rpc_healthy: true,
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&BootstrapVoteKey(PeerId::from(0)), &obs(true))
+            .await;
+        dbtx.insert_new_entry(&BootstrapVoteKey(PeerId::from(1)), &obs(false))
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&BootstrapVoteKey(PeerId::from(0))).await,
+            Some(obs(true))
+        );
+        assert_eq!(
+            dbtx.find_by_prefix(&BootstrapVotePrefix)
+                .await
+                .count()
+                .await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn has_ever_been_ready_round_trips_as_a_singleton() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+
+        let mut dbtx = db.begin_transaction().await;
+        assert!(
+            dbtx.get_value(&HasEverBeenReadyKey).await.is_none(),
+            "latch absent until first set"
+        );
+        dbtx.insert_new_entry(&HasEverBeenReadyKey, &()).await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(dbtx.get_value(&HasEverBeenReadyKey).await, Some(()));
+        assert_eq!(
+            dbtx.find_by_prefix(&HasEverBeenReadyPrefix)
                 .await
                 .count()
                 .await,

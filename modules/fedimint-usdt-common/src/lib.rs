@@ -517,6 +517,106 @@ pub struct DepositObservation {
     pub claim_pk: secp256k1::PublicKey,
 }
 
+/// Payload of a `UsdtConsensusItem::BootstrapObservation` (Part C): one
+/// guardian's periodic view of whether the module's on-chain infrastructure
+/// is ready to honor the full deposit->claim->sweep->withdraw lifecycle.
+///
+/// The first three fields are *federation facts* (the same on-chain reality
+/// every honest guardian observes -- EntryPoint/factory/impl deployed and,
+/// for the factory, its `getAddress` matching this build's off-chain
+/// [`derive_deposit_account`] CREATE2 math); the last two are *self-facts*
+/// (this guardian's own broadcaster funding and RPC health). All five are
+/// counted independently and threshold-aggregated by
+/// `fedimint_usdt_server::Usdt::bootstrap_state` -- no single guardian's
+/// observation gates the federation's readiness (see that method's
+/// determinism argument). Mirrors [`DepositObservation`]'s role in the
+/// deposit-observation quorum: carried whole in the vote so the readiness
+/// tally is a pure function of consensus data.
+// Five independent on-chain readiness conditions, each counted separately by
+// the threshold tally -- deliberately flat booleans (not a state machine), so
+// `struct_excessive_bools` does not apply.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
+pub struct BootstrapObservation {
+    /// The configured `EntryPoint` has contract code deployed.
+    pub entry_point_ok: bool,
+    /// The configured `account_factory` has code AND its on-chain
+    /// `getAddress(owner, salt)` matches this build's off-chain
+    /// [`derive_pool_account`] CREATE2 derivation (the immutable-invariant
+    /// check that proves derived deposit addresses are spendable -- the
+    /// footgun-killer).
+    pub factory_ok: bool,
+    /// The configured `simple_account_impl` has contract code deployed.
+    pub impl_ok: bool,
+    /// This guardian's broadcaster EOA holds at least the per-chain
+    /// configured minimum ETH balance to front `UserOp` gas.
+    pub broadcaster_funded: bool,
+    /// This guardian's last round of readiness RPC reads succeeded.
+    pub rpc_healthy: bool,
+}
+
+impl fmt::Display for BootstrapObservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "BootstrapObservation(entry_point_ok={}, factory_ok={}, impl_ok={}, \
+             broadcaster_funded={}, rpc_healthy={})",
+            self.entry_point_ok,
+            self.factory_ok,
+            self.impl_ok,
+            self.broadcaster_funded,
+            self.rpc_healthy
+        )
+    }
+}
+
+/// The module-level readiness state (Part C), derived by
+/// `fedimint_usdt_server::Usdt::bootstrap_state` as a pure function of the
+/// threshold-aggregated [`BootstrapObservation`] votes plus a persisted
+/// "has ever been ready" latch.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
+pub enum BootstrapState {
+    /// The module is running (post-DKG) but not all readiness conditions are
+    /// met yet, and it has never been `Ready`. Deposit-address handout is
+    /// blocked.
+    AwaitingInfra,
+    /// The full deposit->claim->sweep->withdraw lifecycle is operational.
+    Ready,
+    /// The module was `Ready` at some point but a condition has since
+    /// regressed (e.g. a broadcaster's ETH ran low). Advisory; distinguished
+    /// from [`Self::AwaitingInfra`] only by the persisted latch.
+    Degraded,
+}
+
+impl fmt::Display for BootstrapState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+/// Response to the `usdt_status` endpoint (Part C): the consensus-agreed
+/// [`BootstrapState`] plus the per-condition tally it was derived from. Read
+/// directly from consensus DB (the threshold-aggregated
+/// [`BootstrapObservation`] votes + the readiness latch), so any guardian
+/// answers identically (threshold-agreement via `request_current_consensus`,
+/// mirroring [`PoolStateResponse`]/[`DepositStatusResponse`]).
+///
+/// `entry_point_ok`/`factory_ok`/`impl_ok` are the *federation facts* (each
+/// `true` once at least `threshold` guardians vote it); `funded_guardians`/
+/// `healthy_guardians` are the raw counts of guardians currently reporting a
+/// funded broadcaster / healthy RPC (each must reach `threshold` for
+/// `Ready`).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct StatusResponse {
+    pub state: BootstrapState,
+    pub entry_point_ok: bool,
+    pub factory_ok: bool,
+    pub impl_ok: bool,
+    pub funded_guardians: u16,
+    pub healthy_guardians: u16,
+    pub threshold: u16,
+}
+
 /// Request to enqueue this guardian's local deposit-checker task to start
 /// watching `claim_pk`'s deposit address (see [`derive_deposit_account`]),
 /// and to have the derived address returned to the caller. Idempotent: a
@@ -695,6 +795,14 @@ pub struct UsdtGenParams {
     /// 7). Placeholder; real deployments/tests must override.
     pub simple_account_impl: EvmAddress,
     pub check_ttl_blocks: u64,
+    /// The minimum ETH balance (in wei) a guardian's broadcaster EOA must
+    /// hold to count as "funded" for the Part C readiness state machine (see
+    /// `BootstrapObservation::broadcaster_funded`). Genuinely per-chain (gas
+    /// costs vary), so a config field rather than a compiled constant. A
+    /// `u64` holds up to ~18 ETH of wei -- far above any sane per-guardian gas
+    /// float, and (unlike `u128`) `fedimint_core`-`Encodable` for the
+    /// consensus config it is threaded into.
+    pub broadcaster_min_balance_wei: u64,
 }
 
 impl Default for UsdtGenParams {
@@ -707,6 +815,9 @@ impl Default for UsdtGenParams {
             account_factory: EvmAddress([0u8; 20]),
             simple_account_impl: EvmAddress([0u8; 20]),
             check_ttl_blocks: 10_000,
+            // 0.05 ETH: enough to front many UserOps' L1 gas on a typical
+            // chain, negligible to top up on a devnet.
+            broadcaster_min_balance_wei: 50_000_000_000_000_000,
         }
     }
 }
@@ -797,6 +908,19 @@ pub enum UsdtConsensusItem {
     /// decision) -- the federation-wide fee decision is always the MEDIAN
     /// read from consensus DB, never a single guardian's raw RPC value.
     FeeVote(FeeVote),
+    /// One guardian's periodic observation of whether the module's on-chain
+    /// infrastructure is ready to honor the full deposit->claim->sweep->
+    /// withdraw lifecycle (Part C), mirroring [`Self::Deposit`]'s per-peer
+    /// observation-vote shape: `process_consensus_item` stores this peer's
+    /// vote under `BootstrapVoteKey(ordered-item's peer)` (with a redundancy
+    /// guard) and then deterministically latches "has ever been ready" the
+    /// first time the aggregate tally reaches `Ready`. The federation's
+    /// readiness state is never any single guardian's raw observation -- it
+    /// is the per-field threshold count over all stored votes (see
+    /// `fedimint_usdt_server::Usdt::bootstrap_state`). The five booleans come
+    /// from this guardian's local, guardian-LOCAL read-only EVM RPC + config
+    /// (never itself a consensus decision).
+    BootstrapObservation(BootstrapObservation),
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -991,6 +1115,43 @@ mod tests {
             .expect("FeeVote should decode what it just encoded");
 
         assert_eq!(vote, decoded);
+    }
+
+    #[test]
+    fn test_bootstrap_observation_round_trips_through_consensus_item_encoding() {
+        let obs = BootstrapObservation {
+            entry_point_ok: true,
+            factory_ok: false,
+            impl_ok: true,
+            broadcaster_funded: false,
+            rpc_healthy: true,
+        };
+        let item = UsdtConsensusItem::BootstrapObservation(obs);
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("BootstrapObservation item should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn test_status_response_round_trips_through_consensus_encoding() {
+        let response = StatusResponse {
+            state: BootstrapState::Degraded,
+            entry_point_ok: true,
+            factory_ok: true,
+            impl_ok: true,
+            funded_guardians: 2,
+            healthy_guardians: 3,
+            threshold: 3,
+        };
+        let bytes = response.consensus_encode_to_vec();
+        let decoded =
+            StatusResponse::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("StatusResponse should decode what it just encoded");
+
+        assert_eq!(response, decoded);
     }
 
     #[test]

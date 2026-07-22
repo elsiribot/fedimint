@@ -166,6 +166,7 @@ async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint(
         account_factory: stack.factory,
         simple_account_impl: stack.simple_account_impl,
         check_ttl_blocks: 10_000,
+        broadcaster_min_balance_wei: 0,
     };
 
     let fed = Fixtures::new_primary(MintClientInit, MintInit)
@@ -190,6 +191,12 @@ async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint(
     // 4. NOW derive the deposit account -- the federation's UsdtClientConfig
     //    carries both the real (trusted-dealer) DKG group key and the real
     //    factory/impl addresses injected in step 3.
+    //
+    // Part C: wait for the readiness state machine to report Ready before
+    // allocating -- the real deployed 4337 stack + funded broadcaster satisfy
+    // every readiness condition, but it must first propagate through
+    // consensus (the client gates `allocate_deposit` on it).
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let (claim_keypair, deposit_account) = usdt.allocate_deposit().await?;
 
     let code_len_before = evm_rpc.get_code_len(deposit_account).await?;

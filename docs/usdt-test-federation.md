@@ -157,7 +157,17 @@ a real chain's reorg characteristics), and `check_ttl_blocks` come from
 
 ## Driving it with `fedimint-cli`
 
+The module now exposes a consensus-agreed readiness state
+(`AwaitingInfra`/`Ready`/`Degraded`, via `module usdt status`), and the client
+refuses `deposit-address` until the federation reports `Ready` (EntryPoint/factory/
+impl deployed + verified, plus a quorum of funded broadcasters and healthy RPC) --
+so on a freshly started federation, wait for `status` to report `Ready` before
+step 1.
+
 ```sh
+# 0. Check the module is ready to accept deposits
+fedimint-cli module usdt status                 # -> { state: "Ready", ... }
+
 # 1. Get a fresh deposit address (a claim key is derived + stored client-side)
 fedimint-cli module usdt deposit-address        # -> { claim_pk, account }
 
@@ -182,8 +192,9 @@ fedimint-cli module usdt withdraw <recipient> <amount>   # -> out_point (txid:id
 fedimint-cli module usdt withdrawal-status <txid> <out_idx>   # poll to Confirmed
 ```
 
-Other subcommands: `userop-status`, and `recover --gap-limit N` (rescans the
-federation from the seed to restore lost deposit claim keys).
+Other subcommands: `status` (readiness state), `userop-status`, and `recover
+--gap-limit N` (rescans the federation from the seed to restore lost deposit
+claim keys).
 
 ## Notes, gotchas, and rough edges
 

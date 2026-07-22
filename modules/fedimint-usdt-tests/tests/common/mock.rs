@@ -25,6 +25,12 @@ struct State {
     balances: HashMap<(EvmAddress, EvmAddress), BTreeMap<u64, UsdtAmount>>,
     /// Addresses with "contract code" present, and its length.
     code_len: HashMap<EvmAddress, usize>,
+    /// Scripted `factory_get_address` responses, keyed by `(factory, owner,
+    /// salt)` (Part C readiness).
+    factory_addresses: HashMap<(EvmAddress, EvmAddress, [u8; 32]), EvmAddress>,
+    /// Scripted broadcaster ETH balance (wei); `None` means "no broadcaster
+    /// configured" (Part C readiness).
+    broadcaster_eth_balance: Option<u128>,
     fee: FeeVote,
     sent_raw_transactions: Vec<Vec<u8>>,
     /// Every `SignedUserOp` batch previously passed to `submit_user_ops`, in
@@ -41,6 +47,8 @@ impl Default for State {
             block_number: 0,
             balances: HashMap::new(),
             code_len: HashMap::new(),
+            factory_addresses: HashMap::new(),
+            broadcaster_eth_balance: None,
             fee: FeeVote {
                 max_fee_per_gas_wei: 0,
                 usdt_per_eth_e6: 0,
@@ -114,6 +122,28 @@ impl MockEvmRpc {
         self.lock().code_len.insert(addr, len);
     }
 
+    /// Scripts the address returned by
+    /// [`IServerEvmRpc::factory_get_address`] for `(factory, owner, salt)`
+    /// (Part C readiness).
+    pub fn set_factory_get_address(
+        &self,
+        factory: EvmAddress,
+        owner: EvmAddress,
+        salt: [u8; 32],
+        address: EvmAddress,
+    ) {
+        self.lock()
+            .factory_addresses
+            .insert((factory, owner, salt), address);
+    }
+
+    /// Scripts the broadcaster ETH balance (wei) returned by
+    /// [`IServerEvmRpc::broadcaster_eth_balance`] (Part C readiness). `None`
+    /// (the default) reports "no broadcaster configured".
+    pub fn set_broadcaster_eth_balance(&self, balance: Option<u128>) {
+        self.lock().broadcaster_eth_balance = balance;
+    }
+
     /// Scripts the [`FeeVote`] returned by
     /// [`IServerEvmRpc::get_fee_estimate`].
     pub fn set_fee_estimate(&self, fee: FeeVote) {
@@ -184,6 +214,24 @@ impl IServerEvmRpc for MockEvmRpc {
 
     async fn get_code_len(&self, addr: EvmAddress) -> anyhow::Result<usize> {
         Ok(self.lock().code_len.get(&addr).copied().unwrap_or(0))
+    }
+
+    async fn factory_get_address(
+        &self,
+        factory: EvmAddress,
+        owner: EvmAddress,
+        salt: [u8; 32],
+    ) -> anyhow::Result<EvmAddress> {
+        Ok(self
+            .lock()
+            .factory_addresses
+            .get(&(factory, owner, salt))
+            .copied()
+            .unwrap_or(EvmAddress([0u8; 20])))
+    }
+
+    async fn broadcaster_eth_balance(&self) -> anyhow::Result<Option<u128>> {
+        Ok(self.lock().broadcaster_eth_balance)
     }
 
     async fn send_raw_transaction(&self, signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]> {

@@ -71,3 +71,12 @@ pub const WITHDRAW_FEE_QUOTE_ENDPOINT: &str = "withdraw_fee_quote";
 /// identically (threshold-agreement via `request_current_consensus`,
 /// mirroring [`DEPOSIT_STATUS_ENDPOINT`]/[`WITHDRAW_FEE_QUOTE_ENDPOINT`]).
 pub const WITHDRAWAL_STATUS_ENDPOINT: &str = "withdrawal_status";
+
+/// Reports the module's consensus-agreed readiness state (Part C):
+/// `AwaitingInfra`/`Ready`/`Degraded`, plus the per-condition tally it was
+/// derived from. Read from the threshold-aggregated `BootstrapObservation`
+/// votes in consensus DB, so any guardian answers identically
+/// (threshold-agreement via `request_current_consensus`, mirroring
+/// [`POOL_STATE_ENDPOINT`]/[`DEPOSIT_STATUS_ENDPOINT`]). The client gates
+/// deposit-address handout on this reporting `Ready`.
+pub const USDT_STATUS_ENDPOINT: &str = "usdt_status";

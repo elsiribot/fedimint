@@ -42,18 +42,19 @@ use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
     DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
-    SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
-    WITHDRAWAL_STATUS_ENDPOINT,
+    SIGNING_SESSION_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
+    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
-    CheckDepositRequest, CheckDepositResponse, DepositObservation, DepositStatusRequest,
-    DepositStatusResponse, FeeVote, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem,
-    PoolStateResponse, SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
+    BootstrapObservation, BootstrapState, CheckDepositRequest, CheckDepositResponse,
+    DepositObservation, DepositStatusRequest, DepositStatusResponse, FeeVote,
+    MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse,
+    SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
     UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
     UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
     WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse,
-    derive_deposit_account, derive_pool_account, evm_address, signing_session_id,
+    derive_deposit_account, derive_pool_account, evm_address, pool_salt, signing_session_id,
     withdrawal_fee_quote,
 };
 use futures::StreamExt as _;
@@ -63,9 +64,10 @@ use tracing::{debug, info, warn};
 
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 use crate::db::{
-    BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, DepositObservationVoteAccountPrefix,
-    DepositObservationVoteKey, DepositObservationVotePrefix, DepositRecord, DepositRecordKey,
-    DepositRecordPrefix, FeeVoteKey, FeeVotePrefix, MpcRoundChunk, MpcRoundChunkKey,
+    BlockCountVoteKey, BlockCountVotePrefix, BootstrapVoteKey, BootstrapVotePrefix, DbKeyPrefix,
+    DepositObservationVoteAccountPrefix, DepositObservationVoteKey, DepositObservationVotePrefix,
+    DepositRecord, DepositRecordKey, DepositRecordPrefix, FeeVoteKey, FeeVotePrefix,
+    HasEverBeenReadyKey, HasEverBeenReadyPrefix, MpcRoundChunk, MpcRoundChunkKey,
     MpcRoundChunkPrefix, MpcRoundChunkSessionRoundPrefix, PendingCheck, PendingCheckKey,
     PendingCheckPrefix, PendingUserOp, PendingUserOpKey, PendingUserOpPrefix, PoolState,
     PoolStateKey, PoolStatePrefix, SessionState, SigningPurpose, SigningSession, SigningSessionKey,
@@ -285,6 +287,26 @@ impl ModuleInit for UsdtInit {
                         WithdrawalState,
                         items,
                         "Withdrawal States"
+                    );
+                }
+                DbKeyPrefix::BootstrapVote => {
+                    push_db_pair_items!(
+                        dbtx,
+                        BootstrapVotePrefix,
+                        BootstrapVoteKey,
+                        fedimint_usdt_common::BootstrapObservation,
+                        items,
+                        "Bootstrap Votes"
+                    );
+                }
+                DbKeyPrefix::HasEverBeenReady => {
+                    push_db_pair_items!(
+                        dbtx,
+                        HasEverBeenReadyPrefix,
+                        HasEverBeenReadyKey,
+                        (),
+                        items,
+                        "Has Ever Been Ready"
                     );
                 }
             }
@@ -601,6 +623,7 @@ impl ServerModuleInit for UsdtInit {
                         account_factory: params.account_factory,
                         simple_account_impl: params.simple_account_impl,
                         check_ttl_blocks: params.check_ttl_blocks,
+                        broadcaster_min_balance_wei: params.broadcaster_min_balance_wei,
                     },
                 };
 
@@ -794,6 +817,14 @@ pub struct Usdt {
     /// "chain not observed yet" state already handled elsewhere. `None`
     /// until the poller's first successful read.
     fee_estimate: Arc<Mutex<Option<FeeVote>>>,
+    /// Readiness observations gathered by the background bootstrap-observer
+    /// task (Part C; spawned in [`Usdt::new`], see
+    /// [`Usdt::spawn_bootstrap_observer`]), drained into
+    /// `UsdtConsensusItem::BootstrapObservation` proposals in
+    /// `consensus_proposal`. Mirrors `deposit_proposals`'s drain pattern;
+    /// each observation is this guardian's own guardian-LOCAL read of the
+    /// on-chain readiness conditions, never itself a consensus decision.
+    bootstrap_proposals: Arc<Mutex<Vec<BootstrapObservation>>>,
 }
 
 /// One guardian-local observation of a submitted `UserOp`'s on-chain outcome
@@ -808,6 +839,20 @@ struct UserOpConfirmedProposal {
     success: bool,
     block: u64,
     swept: UsdtAmount,
+}
+
+/// Per-field tally of the [`BootstrapObservation`] votes currently in the
+/// consensus `BootstrapVote` table (Part C), produced by
+/// [`Usdt::bootstrap_counts`]. Each field counts the guardians whose latest
+/// vote has that condition `true`; the readiness derivation compares each
+/// against `threshold`.
+#[derive(Debug, Default, Clone, Copy)]
+struct BootstrapCounts {
+    entry_point_ok: usize,
+    factory_ok: usize,
+    impl_ok: usize,
+    funded: usize,
+    rpc_healthy: usize,
 }
 
 /// Grouped handles/config for [`Usdt::spawn_deposit_checker`], bundling its
@@ -831,6 +876,20 @@ struct UserOpSubmitterHandles {
     db: Database,
     evm_rpc: DynServerEvmRpc,
     user_op_confirmed_proposals: Arc<Mutex<Vec<UserOpConfirmedProposal>>>,
+}
+
+/// Grouped handles/config for [`Usdt::spawn_bootstrap_observer`] (Part C),
+/// mirroring [`DepositCheckerHandles`]'s convention. All fields are read-only
+/// inputs to the guardian-local readiness poll (config values + the EVM RPC
+/// handle + the proposal sink); the poll never touches the consensus DB.
+struct BootstrapObserverHandles {
+    evm_rpc: DynServerEvmRpc,
+    bootstrap_proposals: Arc<Mutex<Vec<BootstrapObservation>>>,
+    group_public_key: secp256k1::PublicKey,
+    entry_point: fedimint_usdt_common::EvmAddress,
+    account_factory: fedimint_usdt_common::EvmAddress,
+    simple_account_impl: fedimint_usdt_common::EvmAddress,
+    broadcaster_min_balance_wei: u64,
 }
 
 /// Implementation of consensus for the server module
@@ -876,6 +935,23 @@ impl ServerModule for Usdt {
             let current_vote = dbtx.get_value(&FeeVoteKey(self.our_peer_id)).await;
             if current_vote != Some(vote) {
                 items.push(UsdtConsensusItem::FeeVote(vote));
+            }
+        }
+
+        // Propose this guardian's most recent readiness observation (Part C;
+        // gathered by `spawn_bootstrap_observer`), mirroring the `FeeVote`
+        // proposal above: equality-based dedup (the readiness conditions move
+        // in both directions), and only the LATEST drained observation
+        // matters (the poller queues its full current view each tick, so
+        // earlier queued views are stale). Skip proposing when it is
+        // unchanged from this peer's already-recorded vote, so an unchanged
+        // readiness state does not spam consensus every round.
+        let latest_bootstrap =
+            std::mem::take(&mut *self.bootstrap_proposals.lock().expect("not poisoned")).pop();
+        if let Some(obs) = latest_bootstrap {
+            let current_vote = dbtx.get_value(&BootstrapVoteKey(self.our_peer_id)).await;
+            if current_vote != Some(obs) {
+                items.push(UsdtConsensusItem::BootstrapObservation(obs));
             }
         }
 
@@ -1053,6 +1129,7 @@ impl ServerModule for Usdt {
         items
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_consensus_item<'a, 'b>(
         &'a self,
         dbtx: &mut DatabaseTransaction<'b>,
@@ -1192,6 +1269,35 @@ impl ServerModule for Usdt {
                 ensure!(current_vote != Some(vote), "FeeVote is redundant");
 
                 dbtx.insert_entry(&FeeVoteKey(peer_id), &vote).await;
+
+                Ok(())
+            }
+            UsdtConsensusItem::BootstrapObservation(obs) => {
+                // DETERMINISTIC (Part C), mirrors the `Deposit`/`FeeVote`
+                // arms' discipline: store the ORDERED item's origin peer's
+                // vote (keyed by `peer_id`, the framework-supplied origin --
+                // NEVER `self.our_peer_id`), with an equality-based
+                // redundancy guard (reject an EXACT repeat of this peer's
+                // current vote; the readiness conditions move in both
+                // directions).
+                let key = BootstrapVoteKey(peer_id);
+                if dbtx.insert_entry(&key, &obs).await.as_ref() == Some(&obs) {
+                    bail!("Bootstrap observation vote is redundant");
+                }
+
+                // Deterministic readiness latch: the moment the aggregate
+                // tally first reaches `Ready`, persist `HasEverBeenReadyKey`
+                // so `bootstrap_state` can later report `Degraded` (was
+                // `Ready`, regressed) distinctly from `AwaitingInfra`. This
+                // is a pure function of (ordered item + prior consensus DB +
+                // config): it reads only the just-updated `BootstrapVote`
+                // table and the threshold, and writes the latch identically
+                // on every guardian.
+                if self.bootstrap_ready(dbtx).await
+                    && dbtx.get_value(&HasEverBeenReadyKey).await.is_none()
+                {
+                    dbtx.insert_new_entry(&HasEverBeenReadyKey, &()).await;
+                }
 
                 Ok(())
             }
@@ -1602,6 +1708,22 @@ impl ServerModule for Usdt {
                         .await)
                 }
             },
+            api_endpoint! {
+                USDT_STATUS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, _params: ()| -> StatusResponse {
+                    // Read-only (Part C): the readiness state + per-condition
+                    // tally are derived entirely from the threshold-aggregated
+                    // `BootstrapObservation` votes (and the readiness latch) in
+                    // consensus DB, so any guardian answers identically
+                    // (threshold-agreement via `request_current_consensus`,
+                    // mirroring `pool_state`/`withdraw_fee_quote`).
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+
+                    Ok(module.handle_status(&mut dbtx.to_ref_nc()).await)
+                }
+            },
         ]
     }
 }
@@ -1658,6 +1780,20 @@ impl Usdt {
         let fee_estimate = Arc::new(Mutex::new(None));
         Self::spawn_fee_estimate_poller(&task_group, evm_rpc.clone(), fee_estimate.clone());
 
+        let bootstrap_proposals = Arc::new(Mutex::new(Vec::new()));
+        Self::spawn_bootstrap_observer(
+            &task_group,
+            BootstrapObserverHandles {
+                evm_rpc: evm_rpc.clone(),
+                bootstrap_proposals: bootstrap_proposals.clone(),
+                group_public_key: cfg.consensus.group_public_key,
+                entry_point: cfg.consensus.entry_point,
+                account_factory: cfg.consensus.account_factory,
+                simple_account_impl: cfg.consensus.simple_account_impl,
+                broadcaster_min_balance_wei: cfg.consensus.broadcaster_min_balance_wei,
+            },
+        );
+
         Usdt {
             cfg,
             evm_rpc,
@@ -1674,6 +1810,7 @@ impl Usdt {
             suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
             user_op_confirmed_proposals,
             fee_estimate,
+            bootstrap_proposals,
         }
     }
 
@@ -1704,6 +1841,11 @@ impl Usdt {
             suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
             user_op_confirmed_proposals: Arc::new(Mutex::new(Vec::new())),
             fee_estimate: Arc::new(Mutex::new(None)),
+            // The bootstrap-observer poller is NOT spawned in tests (mirroring
+            // the other pollers, skipped by `new_for_test`); tests drive
+            // readiness by feeding `BootstrapObservation` items through
+            // `process_consensus_item` directly.
+            bootstrap_proposals: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1788,6 +1930,135 @@ impl Usdt {
                 .await;
             }
         });
+    }
+
+    /// Spawns the Part C bootstrap-observer: a background task that
+    /// periodically computes this guardian's [`BootstrapObservation`] (the
+    /// five readiness booleans) from read-only EVM RPC + config and pushes it
+    /// into `bootstrap_proposals`, for `consensus_proposal` to drain into
+    /// `UsdtConsensusItem::BootstrapObservation` proposals. Mirrors
+    /// [`Usdt::spawn_fee_estimate_poller`]'s cadence/style exactly.
+    ///
+    /// A PURE READER: it makes only read-only RPC calls and reads no
+    /// consensus DB. Its output influences consensus solely via the proposals
+    /// it queues, which are threshold-aggregated by
+    /// [`Usdt::bootstrap_state`] -- exactly the deposit-checker /
+    /// fee-estimate pattern.
+    ///
+    /// Every RPC error fails the whole observation to the all-`false`
+    /// (unhealthy) value, so a guardian whose node is unreachable votes
+    /// itself out of the readiness quorum rather than silently reporting
+    /// stale readiness.
+    fn spawn_bootstrap_observer(task_group: &TaskGroup, handles: BootstrapObserverHandles) {
+        let BootstrapObserverHandles {
+            evm_rpc,
+            bootstrap_proposals,
+            group_public_key,
+            entry_point,
+            account_factory,
+            simple_account_impl,
+            broadcaster_min_balance_wei,
+        } = handles;
+
+        task_group.spawn_cancellable("usdt-bootstrap-observer", async move {
+            loop {
+                let observation = Self::observe_bootstrap(
+                    evm_rpc.as_ref(),
+                    &group_public_key,
+                    entry_point,
+                    account_factory,
+                    simple_account_impl,
+                    broadcaster_min_balance_wei,
+                )
+                .await;
+
+                bootstrap_proposals
+                    .lock()
+                    .expect("not poisoned")
+                    .push(observation);
+
+                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
+                    1
+                } else {
+                    10
+                }))
+                .await;
+            }
+        });
+    }
+
+    /// Computes this guardian's [`BootstrapObservation`] from read-only EVM
+    /// RPC + config (the body of [`Usdt::spawn_bootstrap_observer`]'s loop,
+    /// extracted so it is independently testable). Guardian-local: no
+    /// consensus DB, no `our_peer_id`, no wall-clock.
+    ///
+    /// If ANY RPC read errors, returns the all-`false` observation
+    /// (`rpc_healthy = false`, and every other field best-effort `false`):
+    /// an unhealthy node must not report readiness.
+    async fn observe_bootstrap(
+        evm_rpc: &dyn crate::rpc::IServerEvmRpc,
+        group_public_key: &secp256k1::PublicKey,
+        entry_point: fedimint_usdt_common::EvmAddress,
+        account_factory: fedimint_usdt_common::EvmAddress,
+        simple_account_impl: fedimint_usdt_common::EvmAddress,
+        broadcaster_min_balance_wei: u64,
+    ) -> BootstrapObservation {
+        let observe = || async {
+            let entry_point_ok = evm_rpc.get_code_len(entry_point).await? > 0;
+
+            // Factory readiness (the footgun-killer): the factory must have
+            // code AND its on-chain `getAddress(owner, pool_salt)` must equal
+            // this build's off-chain `derive_pool_account` -- proving the
+            // deployed factory's immutable `accountImplementation` + baked
+            // `ERC1967Proxy` initCode match this build's vendored proxy code,
+            // so every derived deposit/pool address is spendable. The pool
+            // account (a fixed, claim-key-independent address) is used as the
+            // representative counterfactual since it shares the exact CREATE2
+            // construction with every deposit account.
+            let factory_has_code = evm_rpc.get_code_len(account_factory).await? > 0;
+            let owner = evm_address(group_public_key);
+            let expected_pool =
+                derive_pool_account(group_public_key, account_factory, simple_account_impl);
+            let onchain_pool = evm_rpc
+                .factory_get_address(account_factory, owner, pool_salt())
+                .await?;
+            let factory_ok = factory_has_code && onchain_pool == expected_pool;
+
+            let impl_ok = evm_rpc.get_code_len(simple_account_impl).await? > 0;
+
+            // Broadcaster funding: `None` (no broadcaster configured) counts
+            // as not funded.
+            let broadcaster_funded = evm_rpc
+                .broadcaster_eth_balance()
+                .await?
+                .is_some_and(|balance| balance >= u128::from(broadcaster_min_balance_wei));
+
+            Ok::<BootstrapObservation, anyhow::Error>(BootstrapObservation {
+                entry_point_ok,
+                factory_ok,
+                impl_ok,
+                broadcaster_funded,
+                rpc_healthy: true,
+            })
+        };
+
+        match observe().await {
+            Ok(observation) => observation,
+            Err(err) => {
+                warn!(
+                    target: "usdt",
+                    err = %err.fmt_compact_anyhow(),
+                    "bootstrap readiness poll failed; reporting unhealthy"
+                );
+                BootstrapObservation {
+                    entry_point_ok: false,
+                    factory_ok: false,
+                    impl_ok: false,
+                    broadcaster_funded: false,
+                    rpc_healthy: false,
+                }
+            }
+        }
     }
 
     /// Spawns a background task that periodically scans this guardian's
@@ -1997,6 +2268,84 @@ impl Usdt {
     /// have been cast.
     pub async fn fee_vote_median(&self, dbtx: &mut DatabaseTransaction<'_>) -> Option<FeeVote> {
         fee_vote_median(dbtx).await
+    }
+
+    /// Tallies the per-field [`BootstrapObservation`] vote counts across every
+    /// peer (Part C). A pure read over the consensus `BootstrapVote` table
+    /// (order-independent counting, so the range-scan order is irrelevant),
+    /// used by both [`Usdt::bootstrap_ready`] and the `usdt_status` endpoint.
+    async fn bootstrap_counts(&self, dbtx: &mut DatabaseTransaction<'_>) -> BootstrapCounts {
+        let votes: Vec<BootstrapObservation> = dbtx
+            .find_by_prefix(&BootstrapVotePrefix)
+            .await
+            .map(|(_, v)| v)
+            .collect()
+            .await;
+
+        let mut counts = BootstrapCounts::default();
+        for vote in votes {
+            counts.entry_point_ok += usize::from(vote.entry_point_ok);
+            counts.factory_ok += usize::from(vote.factory_ok);
+            counts.impl_ok += usize::from(vote.impl_ok);
+            counts.funded += usize::from(vote.broadcaster_funded);
+            counts.rpc_healthy += usize::from(vote.rpc_healthy);
+        }
+        counts
+    }
+
+    /// Whether the aggregate readiness tally currently meets every condition
+    /// at threshold (Part C): each of the three federation facts
+    /// (EntryPoint/factory/impl) and both self-fact quorums
+    /// (broadcaster-funded / RPC-healthy) must be voted by at least
+    /// `threshold` guardians. A pure function of the consensus `BootstrapVote`
+    /// table and config -- byte-identical on every guardian. NB this is the
+    /// raw "ready now" predicate (it does NOT consult the `HasEverBeenReady`
+    /// latch), so it is exactly what `process_consensus_item` checks before
+    /// setting that latch.
+    async fn bootstrap_ready(&self, dbtx: &mut DatabaseTransaction<'_>) -> bool {
+        let counts = self.bootstrap_counts(dbtx).await;
+        let t = self.num_peers.threshold();
+        counts.entry_point_ok >= t
+            && counts.factory_ok >= t
+            && counts.impl_ok >= t
+            && counts.funded >= t
+            && counts.rpc_healthy >= t
+    }
+
+    /// Derives the module's consensus-agreed [`BootstrapState`] (Part C):
+    /// `Ready` if the tally meets every condition at threshold now; otherwise
+    /// `Degraded` if the `HasEverBeenReady` latch is set (it was `Ready`
+    /// before and has regressed); otherwise `AwaitingInfra`. A pure function
+    /// of the consensus `BootstrapVote` table, the latch, and config -- so
+    /// every guardian answers identically.
+    async fn bootstrap_state(&self, dbtx: &mut DatabaseTransaction<'_>) -> BootstrapState {
+        if self.bootstrap_ready(dbtx).await {
+            return BootstrapState::Ready;
+        }
+        if dbtx.get_value(&HasEverBeenReadyKey).await.is_some() {
+            BootstrapState::Degraded
+        } else {
+            BootstrapState::AwaitingInfra
+        }
+    }
+
+    /// Assembles the `usdt_status` endpoint's [`StatusResponse`] from the
+    /// consensus-agreed readiness tally + state + threshold (Part C). Read
+    /// entirely from consensus DB, so any guardian answers identically.
+    async fn handle_status(&self, dbtx: &mut DatabaseTransaction<'_>) -> StatusResponse {
+        let counts = self.bootstrap_counts(dbtx).await;
+        let state = self.bootstrap_state(dbtx).await;
+        let t = self.num_peers.threshold();
+
+        StatusResponse {
+            state,
+            entry_point_ok: counts.entry_point_ok >= t,
+            factory_ok: counts.factory_ok >= t,
+            impl_ok: counts.impl_ok >= t,
+            funded_guardians: u16::try_from(counts.funded).unwrap_or(u16::MAX),
+            healthy_guardians: u16::try_from(counts.rpc_healthy).unwrap_or(u16::MAX),
+            threshold: u16::try_from(t).unwrap_or(u16::MAX),
+        }
     }
 
     /// Whether `session` has gone `timeout_blocks()` consensus blocks
@@ -3638,6 +3987,7 @@ mod tests {
             account_factory: fedimint_usdt_common::EvmAddress([0xce; 20]),
             simple_account_impl: fedimint_usdt_common::EvmAddress([0xcf; 20]),
             check_ttl_blocks: 500,
+            broadcaster_min_balance_wei: 1_000,
         };
 
         let server_cfgs = UsdtInit::default().trusted_dealer_gen(&peers, &args, &params);
@@ -3788,6 +4138,19 @@ mod tests {
             Ok(0)
         }
 
+        async fn factory_get_address(
+            &self,
+            _factory: fedimint_usdt_common::EvmAddress,
+            _owner: fedimint_usdt_common::EvmAddress,
+            _salt: [u8; 32],
+        ) -> anyhow::Result<fedimint_usdt_common::EvmAddress> {
+            Ok(fedimint_usdt_common::EvmAddress([0u8; 20]))
+        }
+
+        async fn broadcaster_eth_balance(&self) -> anyhow::Result<Option<u128>> {
+            Ok(None)
+        }
+
         async fn send_raw_transaction(&self, _signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]> {
             Ok([0u8; 32])
         }
@@ -3892,6 +4255,131 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("redundant"));
+    }
+
+    /// An all-conditions-met [`BootstrapObservation`] (Part C).
+    fn ready_observation() -> BootstrapObservation {
+        BootstrapObservation {
+            entry_point_ok: true,
+            factory_ok: true,
+            impl_ok: true,
+            broadcaster_funded: true,
+            rpc_healthy: true,
+        }
+    }
+
+    /// Feeds `obs` as peer `peer`'s `BootstrapObservation` through
+    /// `process_consensus_item` (the deterministic vote-recording path).
+    async fn vote_bootstrap(
+        module: &Usdt,
+        dbtx: &mut DatabaseTransaction<'_>,
+        peer: u16,
+        obs: BootstrapObservation,
+    ) {
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::BootstrapObservation(obs),
+                PeerId::from(peer),
+            )
+            .await
+            .expect("recording a fresh bootstrap vote succeeds");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_state_is_awaiting_infra_with_no_votes() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        assert_eq!(
+            module.bootstrap_state(&mut dbtx.to_ref_nc()).await,
+            BootstrapState::AwaitingInfra
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_state_is_awaiting_infra_below_threshold() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        // Only 2 of 4 peers report all-ready: below the threshold of 3.
+        for p in [0u16, 1] {
+            vote_bootstrap(&module, &mut dbtx.to_ref_nc(), p, ready_observation()).await;
+        }
+
+        assert_eq!(
+            module.bootstrap_state(&mut dbtx.to_ref_nc()).await,
+            BootstrapState::AwaitingInfra
+        );
+        // The latch was never set (never reached Ready).
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&HasEverBeenReadyKey)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_state_becomes_ready_at_threshold_and_sets_latch() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        for p in [0u16, 1, 2] {
+            vote_bootstrap(&module, &mut dbtx.to_ref_nc(), p, ready_observation()).await;
+        }
+
+        assert_eq!(
+            module.bootstrap_state(&mut dbtx.to_ref_nc()).await,
+            BootstrapState::Ready
+        );
+        // The latch was set deterministically inside `process_consensus_item`.
+        assert_eq!(
+            dbtx.to_ref_nc().get_value(&HasEverBeenReadyKey).await,
+            Some(())
+        );
+
+        // The status endpoint reports the same state + tally.
+        let status = module.handle_status(&mut dbtx.to_ref_nc()).await;
+        assert_eq!(status.state, BootstrapState::Ready);
+        assert!(status.entry_point_ok && status.factory_ok && status.impl_ok);
+        assert_eq!(status.funded_guardians, 3);
+        assert_eq!(status.healthy_guardians, 3);
+        assert_eq!(status.threshold, 3);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_state_regresses_to_degraded_after_ready() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        // Reach Ready (sets the latch).
+        for p in [0u16, 1, 2] {
+            vote_bootstrap(&module, &mut dbtx.to_ref_nc(), p, ready_observation()).await;
+        }
+        assert_eq!(
+            module.bootstrap_state(&mut dbtx.to_ref_nc()).await,
+            BootstrapState::Ready
+        );
+
+        // Peer 0's broadcaster runs low: funded count drops to 2 < threshold,
+        // so the federation is no longer Ready -- but the latch persists, so
+        // the state is Degraded (not AwaitingInfra).
+        vote_bootstrap(
+            &module,
+            &mut dbtx.to_ref_nc(),
+            0,
+            BootstrapObservation {
+                broadcaster_funded: false,
+                ..ready_observation()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            module.bootstrap_state(&mut dbtx.to_ref_nc()).await,
+            BootstrapState::Degraded
+        );
     }
 
     /// Deterministic `secp256k1::PublicKey` derived from `byte`, for tests

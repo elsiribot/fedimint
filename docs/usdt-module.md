@@ -145,7 +145,17 @@ startup warning if the factory/impl are left at the all-zero placeholder.
 ## CLI
 
 `fedimint-cli module usdt {deposit-address, check-deposit, deposit-status,
-claim, fee-quote, withdraw, withdrawal-status, pool-state, userop-status}`.
+claim, fee-quote, withdraw, withdrawal-status, pool-state, userop-status,
+status, recover}`.
+
+`status` reports the module's consensus-agreed readiness state
+(`AwaitingInfra`/`Ready`/`Degraded`) plus the per-condition tally, derived from
+threshold-aggregated per-guardian readiness observations (EntryPoint/factory/impl
+deployed and verified, plus a quorum of funded broadcasters and healthy RPC).
+The client refuses `deposit-address` unless the federation reports `Ready`, so a
+user is never told to deposit into a federation that cannot yet honor the full
+deposit->claim->sweep->withdraw lifecycle; `claim`/`withdraw`/`pool-state` stay
+queryable in every state.
 
 ## See also
 

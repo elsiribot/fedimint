@@ -185,6 +185,7 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
         account_factory: stack.factory,
         simple_account_impl: stack.simple_account_impl,
         check_ttl_blocks: 10_000,
+        broadcaster_min_balance_wei: 0,
     };
 
     let fed = Fixtures::new_primary(MintClientInit, MintInit)
@@ -206,6 +207,9 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
         "this test assumes the default 4-guardian fixture"
     );
 
+    // Part C: wait for the readiness state machine to report Ready (real
+    // deployed stack + funded broadcaster) before allocating.
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let (claim_keypair, deposit_account) = usdt.allocate_deposit().await?;
     let code_len_before = evm_rpc.get_code_len(deposit_account).await?;
     assert_eq!(
@@ -377,6 +381,7 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
         account_factory: stack.factory,
         simple_account_impl: stack.simple_account_impl,
         check_ttl_blocks: 10_000,
+        broadcaster_min_balance_wei: 0,
     };
 
     let fed = Fixtures::new_primary(Mintv2ClientInit, Mintv2Init)
@@ -424,6 +429,8 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
         .context("failed to confirm EntryPoint.depositTo(pool_account)")?;
 
     // Derive the deposit account and prefund its EntryPoint deposit too.
+    // Part C: wait for the readiness state machine to report Ready first.
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let (claim_keypair, deposit_account) = usdt.allocate_deposit().await?;
     assert_eq!(
         evm_rpc.get_code_len(deposit_account).await?,

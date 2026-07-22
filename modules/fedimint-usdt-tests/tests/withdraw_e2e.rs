@@ -155,6 +155,7 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
         account_factory: stack.factory,
         simple_account_impl: stack.simple_account_impl,
         check_ttl_blocks: 10_000,
+        broadcaster_min_balance_wei: 0,
     };
 
     let fed = Fixtures::new_primary(Mintv2ClientInit, Mintv2Init)
@@ -208,6 +209,11 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
     // 5. NOW derive the deposit account (Challenge A's second half) and prefund ITS
     //    EntryPoint deposit too (Challenge B, sweep leg) -- mirrors
     //    `deploy_and_sweep_e2e.rs` steps 4-5 exactly.
+    //
+    // Part C: wait for the readiness state machine to report Ready (real
+    // deployed stack + funded broadcaster) before allocating -- the client
+    // gates `allocate_deposit` on it.
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let (claim_keypair, deposit_account) = usdt.allocate_deposit().await?;
     assert_eq!(
         evm_rpc.get_code_len(deposit_account).await?,

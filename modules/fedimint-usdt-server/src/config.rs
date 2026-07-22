@@ -152,6 +152,13 @@ pub struct UsdtConfigConsensus {
     /// Guardian-side: how many blocks a claimed-but-unconfirmed deposit
     /// check remains valid for before it must be re-issued.
     pub check_ttl_blocks: u64,
+    /// The minimum ETH balance (in wei) a guardian's broadcaster EOA must
+    /// hold to count as "funded" for the Part C readiness state machine (see
+    /// `fedimint_usdt_common::BootstrapObservation::broadcaster_funded`).
+    /// Consensus-agreed (identical on every guardian) so the readiness tally
+    /// stays deterministic; genuinely per-chain, so a config field rather
+    /// than a compiled constant.
+    pub broadcaster_min_balance_wei: u64,
 }
 
 // Wire together the configs for this module

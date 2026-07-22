@@ -39,10 +39,10 @@ use fedimint_derive_secret::{ChildId, DerivableSecret};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
-    CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND, PoolStateResponse,
-    SigningSessionId, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtInput, UsdtInputV0,
-    UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse, WithdrawFeeQuoteResponse,
-    WithdrawalStatus, WithdrawalStatusResponse,
+    BootstrapState, CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND,
+    PoolStateResponse, SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
+    UsdtInput, UsdtInputV0, UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse,
+    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -266,6 +266,28 @@ impl UsdtClientModule {
     /// alone even if the client DB is lost: [`Self::recover_deposits`] rescans
     /// the federation by index and re-derives the same keys.
     pub async fn allocate_deposit(&self) -> anyhow::Result<(Keypair, EvmAddress)> {
+        // Readiness gate (Part C): refuse to hand out a new deposit address
+        // unless the federation reports `Ready`, so a user is never told to
+        // deposit into a federation that cannot yet honor the full
+        // deposit->claim->sweep->withdraw lifecycle. Only the ADVERTISEMENT of
+        // new addresses is gated -- claim/withdraw/pool-state stay ungated (a
+        // credited deposit is already backed in its own account).
+        let status = self.module_api.status().await?;
+        if status.state != BootstrapState::Ready {
+            bail!(
+                "federation not ready to accept deposits (state: {:?}); \
+                 entry_point_ok={}, factory_ok={}, impl_ok={}, funded_guardians={}, \
+                 healthy_guardians={}, threshold={}",
+                status.state,
+                status.entry_point_ok,
+                status.factory_ok,
+                status.impl_ok,
+                status.funded_guardians,
+                status.healthy_guardians,
+                status.threshold,
+            );
+        }
+
         // Read-modify-write of the `NextDepositIndexKey` counter (plus the
         // matching `ClaimKeyKey` write) in one atomic, retried unit: a bare
         // `begin_transaction`/`commit_tx` pair would let two concurrent
@@ -488,6 +510,15 @@ impl UsdtClientModule {
         op_hash: [u8; 32],
     ) -> anyhow::Result<UserOpStatusResponse> {
         Ok(self.module_api.userop_status(peer, op_hash).await?)
+    }
+
+    /// Reports the federation's consensus-agreed readiness state (Part C):
+    /// `AwaitingInfra`/`Ready`/`Degraded`, plus the per-condition tally (thin
+    /// wrapper around [`UsdtFederationApi::status`]). Threshold-agreement --
+    /// every guardian answers identically, since it is derived from consensus
+    /// DB. [`Self::allocate_deposit`] gates on this reporting `Ready`.
+    pub async fn status(&self) -> anyhow::Result<StatusResponse> {
+        Ok(self.module_api.status().await?)
     }
 
     /// Looks up the claim keypair persisted by [`Self::allocate_deposit`] for

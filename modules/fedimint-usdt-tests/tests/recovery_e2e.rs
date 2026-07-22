@@ -37,6 +37,7 @@ use fedimint_mintv2_common::KIND as MINTV2_KIND;
 use fedimint_mintv2_common::config::MintGenParams;
 use fedimint_mintv2_server::MintInit as Mintv2Init;
 use fedimint_testing::fixtures::Fixtures;
+use fedimint_usdt_client::api::UsdtFederationApi;
 use fedimint_usdt_client::{UsdtClientInit, UsdtClientModule};
 use fedimint_usdt_common::{EvmAddress, USDT_UNIT, UsdtAmount};
 use fedimint_usdt_server::UsdtInit;
@@ -95,6 +96,22 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     // --- Client 1: allocate + fund + get the deposit credited. ---
     let client1 = join_with_root_secret(&fed, root_secret.clone()).await;
     let usdt1 = client1.get_first_module::<UsdtClientModule>()?;
+
+    // Part C: drive the module to Ready before allocating a deposit (the
+    // client gates `allocate_deposit` on the readiness state machine).
+    let group_public_key = client1
+        .api()
+        .with_module(usdt1.id)
+        .group_public_key()
+        .await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+        EvmAddress([0u8; 20]),
+    );
+    common::await_usdt_ready(&usdt1, Duration::from_secs(60)).await?;
 
     let (claim_keypair, account) = usdt1.allocate_deposit().await?;
 
@@ -164,6 +181,9 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     // with the recovered index 0: `recover_deposits` advanced
     // `NextDepositIndex` past it, so the next deposit uses index 1 (a distinct
     // account).
+    // The federation is already `Ready` (same shared mock/consensus DB as
+    // client 1), so this returns immediately; kept for robustness.
+    common::await_usdt_ready(&usdt2, Duration::from_secs(60)).await?;
     let (_next_keypair, next_account) = usdt2.allocate_deposit().await?;
     assert_ne!(
         next_account, account,

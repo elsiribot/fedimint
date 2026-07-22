@@ -7,14 +7,14 @@ use fedimint_core::{OutPoint, PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
     DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
-    SIGNING_SESSION_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
-    WITHDRAWAL_STATUS_ENDPOINT,
+    SIGNING_SESSION_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
+    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositStatusRequest, DepositStatusResponse,
-    PoolStateResponse, SigningSessionId, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse,
-    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatusRequest,
-    WithdrawalStatusResponse,
+    PoolStateResponse, SigningSessionId, StatusResponse, UsdtAmount, UserOpStatusRequest,
+    UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
+    WithdrawalStatusRequest, WithdrawalStatusResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -100,6 +100,14 @@ pub trait UsdtFederationApi {
         &self,
         out_point: OutPoint,
     ) -> FederationResult<WithdrawalStatusResponse>;
+
+    /// Reports the module's consensus-agreed readiness state (Part C):
+    /// `AwaitingInfra`/`Ready`/`Degraded`, plus the per-condition tally.
+    /// Threshold-agreement (`request_current_consensus`, mirroring
+    /// [`Self::withdraw_fee_quote`]): derived entirely from the
+    /// threshold-aggregated `BootstrapObservation` votes in consensus DB, so
+    /// any guardian answers identically.
+    async fn status(&self) -> FederationResult<StatusResponse>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -221,6 +229,14 @@ where
         self.request_current_consensus(
             WITHDRAWAL_STATUS_ENDPOINT.to_string(),
             ApiRequestErased::new(WithdrawalStatusRequest { out_point }),
+        )
+        .await
+    }
+
+    async fn status(&self) -> FederationResult<StatusResponse> {
+        self.request_current_consensus(
+            USDT_STATUS_ENDPOINT.to_string(),
+            ApiRequestErased::default(),
         )
         .await
     }

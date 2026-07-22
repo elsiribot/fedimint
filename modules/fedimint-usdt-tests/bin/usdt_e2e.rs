@@ -171,6 +171,29 @@ async fn main() -> anyhow::Result<()> {
         // anvil account 0, already ETH-rich) and lets the module top up the
         // pool + deposit accounts' deposits as it submits their UserOps.
 
+        // Part C: the client refuses `deposit-address` unless the module's
+        // readiness state machine reports `Ready` (EntryPoint/factory/impl
+        // deployed + verified, plus a quorum of funded broadcasters and
+        // healthy RPC). The real deployed 4337 stack + funded broadcaster
+        // satisfy every condition; poll `status` until it propagates through
+        // consensus, mirroring the deposit-status poll below.
+        info!("Polling status until the module reports Ready...");
+        let ready_deadline = fedimint_core::time::now() + Duration::from_secs(120);
+        loop {
+            let status = cmd!(client, "module", "usdt", "status").out_json().await?;
+            let state = status["state"]
+                .as_str()
+                .context("status response missing state")?;
+            if state == "Ready" {
+                break;
+            }
+            ensure!(
+                fedimint_core::time::now() < ready_deadline,
+                "usdt module never reported Ready before the deadline (last status: {status})"
+            );
+            fedimint_core::runtime::sleep(Duration::from_secs(2)).await;
+        }
+
         info!("Deriving a deposit address...");
         let deposit_address = cmd!(client, "module", "usdt", "deposit-address")
             .out_json()

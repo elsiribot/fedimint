@@ -47,6 +47,10 @@ enum Opts {
     /// the first sweep, and `balance` converges to the swept-in total once a
     /// sweep's `UserOpConfirmed` reaches threshold agreement.
     PoolState,
+    /// Report the module's consensus-agreed readiness state
+    /// (`AwaitingInfra`/`Ready`/`Degraded`) and the per-condition tally.
+    /// `deposit-address` is refused unless this reports `Ready`.
+    Status,
     /// Rescan the federation from the seed alone to rediscover deposits whose
     /// client-DB state was lost, re-storing each rediscovered claim key (so
     /// `claim` can then be run per account) and printing a summary. Scans
@@ -112,6 +116,7 @@ pub(crate) async fn handle_cli_command(
                 "balance": pool.balance.0,
             }))
         }
+        Opts::Status => json(usdt.status().await?),
         Opts::Recover { gap_limit } => json(usdt.recover_deposits(gap_limit).await?),
     };
 
@@ -195,6 +200,14 @@ mod tests {
         assert!(matches!(
             Opts::try_parse_from(["usdt", "pool-state"]).expect("parses"),
             Opts::PoolState
+        ));
+    }
+
+    #[test]
+    fn parses_status() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "status"]).expect("parses"),
+            Opts::Status
         ));
     }
 

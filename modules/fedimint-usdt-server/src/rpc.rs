@@ -22,6 +22,17 @@ pub type DynServerEvmRpc = Arc<dyn IServerEvmRpc>;
 
 sol! {
     #[sol(rpc)]
+    interface ISimpleAccountFactory {
+        // Part C readiness: the counterfactual CREATE2 address the factory
+        // would deploy `owner`'s `SimpleAccount` at for `salt`. Used to
+        // cross-check the on-chain factory's immutable `accountImplementation`
+        // + baked `ERC1967Proxy` initCode against this build's off-chain
+        // `derive_deposit_account`/`derive_pool_account` CREATE2 math -- the
+        // footgun-killer that proves derived deposit addresses are spendable.
+        function getAddress(address owner, uint256 salt) external view returns (address);
+    }
+
+    #[sol(rpc)]
     interface IERC20 {
         function balanceOf(address account) external view returns (uint256);
         // Tether-specific transfer-fee parameter (`basisPointsRate` on the
@@ -147,6 +158,28 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
     /// The length of the contract code deployed at `addr`, used to
     /// distinguish EOAs (len 0) from contracts.
     async fn get_code_len(&self, addr: EvmAddress) -> anyhow::Result<usize>;
+
+    /// `SimpleAccountFactory(factory).getAddress(owner, salt)`: the
+    /// counterfactual CREATE2 address the factory would deploy `owner`'s
+    /// `SimpleAccount` at for `salt` (Part C readiness verification). Compared
+    /// against this build's off-chain
+    /// [`fedimint_usdt_common::derive_pool_account`] to prove the on-chain
+    /// factory matches this build's vendored proxy initCode (the footgun-
+    /// killer). `salt` is the raw 32-byte CREATE2 salt (see
+    /// [`fedimint_usdt_common::pool_salt`]).
+    async fn factory_get_address(
+        &self,
+        factory: EvmAddress,
+        owner: EvmAddress,
+        salt: [u8; 32],
+    ) -> anyhow::Result<EvmAddress>;
+
+    /// This guardian's broadcaster EOA's ETH balance, in wei (`None` if no
+    /// broadcaster is configured for this instance). Used by the Part C
+    /// readiness poller to decide `BootstrapObservation::broadcaster_funded`.
+    /// A `u128` comfortably holds any real ETH balance (total supply is
+    /// ~1e26 wei, far below `u128::MAX` ~3.4e38).
+    async fn broadcaster_eth_balance(&self) -> anyhow::Result<Option<u128>>;
 
     /// Broadcasts a fully-signed raw transaction to the network, returning
     /// its transaction hash.
@@ -369,6 +402,37 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .await?;
 
         Ok(code.len())
+    }
+
+    async fn factory_get_address(
+        &self,
+        factory: EvmAddress,
+        owner: EvmAddress,
+        salt: [u8; 32],
+    ) -> anyhow::Result<EvmAddress> {
+        let contract = ISimpleAccountFactory::new(Address::from(factory.0), &self.provider);
+        let address = contract
+            .getAddress(Address::from(owner.0), U256::from_be_bytes(salt))
+            .call()
+            .await
+            .with_context(|| format!("getAddress(owner, salt) on factory {factory}"))?;
+
+        Ok(EvmAddress(address.into_array()))
+    }
+
+    async fn broadcaster_eth_balance(&self) -> anyhow::Result<Option<u128>> {
+        let Some(address) = self.broadcaster_address else {
+            return Ok(None);
+        };
+        let balance: U256 = self
+            .provider
+            .get_balance(address)
+            .await
+            .with_context(|| format!("get_balance({address}) for broadcaster"))?;
+        let balance = u128::try_from(balance)
+            .with_context(|| format!("broadcaster ETH balance {balance} wei overflows u128"))?;
+
+        Ok(Some(balance))
     }
 
     async fn send_raw_transaction(&self, signed_tx: Vec<u8>) -> anyhow::Result<[u8; 32]> {
