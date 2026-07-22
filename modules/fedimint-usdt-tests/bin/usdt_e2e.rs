@@ -54,6 +54,7 @@ use fedimint_core::envs::{
     FM_ENABLE_MODULE_MINT_ENV, FM_ENABLE_MODULE_MINTV2_ENV, FM_ENABLE_MODULE_USDT_ENV,
     FM_ENABLE_MODULE_WALLET_ENV, FM_ENABLE_MODULE_WALLETV2_ENV, FM_MINTV2_AMOUNT_UNIT_ENV,
     FM_USDT_BROADCASTER_PRIVATE_KEY_ENV, FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV,
+    FM_USDT_ETH_USD_PRICE_FEED_ENV,
 };
 use fedimint_usdt_common::{EvmAddress, USDT_UNIT, UsdtAmount};
 use tracing::info;
@@ -147,6 +148,14 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_var(
                 FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
                 ANVIL_ACCOUNT_0_PRIVATE_KEY,
+            );
+
+            // No Chainlink on anvil: all-zero disables the feed and falls
+            // back to `AlloyEvmRpc`'s static ETH/USD price (see Task 4 of
+            // the ETH/USD price-feed plan).
+            std::env::set_var(
+                FM_USDT_ETH_USD_PRICE_FEED_ENV,
+                EvmAddress([0u8; 20]).to_string(),
             );
         }
 

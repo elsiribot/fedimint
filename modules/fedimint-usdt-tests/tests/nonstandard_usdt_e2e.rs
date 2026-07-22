@@ -193,6 +193,11 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
         simple_account_impl,
         check_ttl_blocks: 10_000,
         broadcaster_min_balance_wei: 0,
+        // No Chainlink on anvil: all-zero disables the feed and falls back
+        // to `AlloyEvmRpc::STATIC_USDT_PER_ETH_E6` (see Task 4 of the
+        // ETH/USD price-feed plan).
+        eth_usd_price_feed: EvmAddress([0u8; 20]),
+        price_feed_max_staleness_secs: 14_400,
     };
 
     let fed = Fixtures::new_primary(MintClientInit, MintInit)
@@ -396,6 +401,11 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
         simple_account_impl,
         check_ttl_blocks: 10_000,
         broadcaster_min_balance_wei: 0,
+        // No Chainlink on anvil: all-zero disables the feed and falls back
+        // to `AlloyEvmRpc::STATIC_USDT_PER_ETH_E6` (see Task 4 of the
+        // ETH/USD price-feed plan).
+        eth_usd_price_feed: EvmAddress([0u8; 20]),
+        price_feed_max_staleness_secs: 14_400,
     };
 
     let fed = Fixtures::new_primary(Mintv2ClientInit, Mintv2Init)

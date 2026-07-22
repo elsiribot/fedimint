@@ -82,7 +82,7 @@ use fedimint_mint_server::MintInit;
 use fedimint_testing::federation::FederationTest;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_usdt_client::{UsdtClientInit, UsdtClientModule};
-use fedimint_usdt_common::{UsdtAmount, UsdtGenParams, UserOpStatus};
+use fedimint_usdt_common::{EvmAddress, UsdtAmount, UsdtGenParams, UserOpStatus};
 use fedimint_usdt_server::UsdtInit;
 use fedimint_usdt_server::db::{PendingUserOpKey, PendingUserOpPrefix};
 use fedimint_usdt_server::rpc::{AlloyEvmRpc, IServerEvmRpc};
@@ -174,6 +174,11 @@ async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint(
         simple_account_impl,
         check_ttl_blocks: 10_000,
         broadcaster_min_balance_wei: 0,
+        // No Chainlink on anvil: all-zero disables the feed and falls back
+        // to `AlloyEvmRpc::STATIC_USDT_PER_ETH_E6` (see Task 4 of the
+        // ETH/USD price-feed plan).
+        eth_usd_price_feed: EvmAddress([0u8; 20]),
+        price_feed_max_staleness_secs: 14_400,
     };
 
     let fed = Fixtures::new_primary(MintClientInit, MintInit)
