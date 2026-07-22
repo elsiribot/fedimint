@@ -15,6 +15,7 @@ use alloy::sol_types::SolEvent as _;
 use anyhow::Context as _;
 use fedimint_usdt_common::user_op::{PackedUserOperation, SignedUserOp, UserOpReceipt};
 use fedimint_usdt_common::{EvmAddress, FeeVote, UsdtAmount};
+use tracing::{debug, warn};
 
 /// Type-erased handle to a [`IServerEvmRpc`] implementation.
 pub type DynServerEvmRpc = Arc<dyn IServerEvmRpc>;
@@ -58,6 +59,15 @@ alloy::sol! {
     #[sol(rpc)]
     interface IEntryPoint {
         function handleOps(PackedUserOperationRpc[] calldata ops, address payable beneficiary) external;
+        // Part B (auto-prefund): the `EntryPoint`'s own gas-*deposit*
+        // accounting, used by `submit_user_ops` to self-fund each op sender's
+        // deposit from the broadcaster before `handleOps`. `balanceOf` here is
+        // the sender's ETH deposit held *inside the EntryPoint* to pay for its
+        // UserOp gas -- NOT the ERC-20 `IERC20::balanceOf` above (a distinct
+        // `sol!` interface, so the two generate distinct Rust `*Call` types
+        // with no collision). `depositTo` tops that deposit up (payable).
+        function depositTo(address account) external payable;
+        function balanceOf(address account) external view returns (uint256);
     }
 
     /// `EntryPoint` v0.7's `UserOperationEvent`
@@ -383,6 +393,96 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .map(|op| to_rpc_packed_user_op(&op.pack()))
             .collect();
 
+        let entry_point = IEntryPoint::new(Address::from(entry_point.0), broadcaster);
+
+        // Part B (auto-prefund): before `handleOps`, self-fund each op sender's
+        // `EntryPoint` gas *deposit* from the broadcaster, so no external
+        // `depositTo` is ever required. Guardian-local, non-consensus -- purely
+        // an on-chain side effect of the submit path.
+        //
+        // FAIL-SOFT: the whole read+top-up is wrapped so any error (RPC hiccup,
+        // etc.) is logged and execution PROCEEDS to `handleOps` regardless --
+        // prefunding is never fatal to submission. A genuinely-underfunded op
+        // just fails validation and retries next tick, exactly as before this
+        // change. Multiple guardians may each top up the same account: harmless
+        // and refundable, so no coordination is needed.
+        for op in &ops {
+            let sender = Address::from(op.unsigned.sender.0);
+            let prefund: anyhow::Result<()> = async {
+                // The op's max L1 gas cost from its own static bounds, read
+                // straight off the unpacked `UnsignedUserOp` (no bit-unpacking
+                // of `accountGasLimits`/`gasFees` needed -- the unpacked gas
+                // fields are carried directly). `need = (verificationGasLimit +
+                // callGasLimit + preVerificationGas) * maxFeePerGas`.
+                let u = &op.unsigned;
+                let total_gas = U256::from(u.verification_gas_limit)
+                    .saturating_add(U256::from(u.call_gas_limit))
+                    .saturating_add(u.pre_verification_gas);
+                let need = total_gas.saturating_mul(U256::from(u.max_fee_per_gas));
+                // Safety margin (need * 1.5) to absorb fee/estimate drift
+                // between now and inclusion.
+                let need_with_margin = need.saturating_add(need / U256::from(2u8));
+
+                // Read the sender's current EntryPoint *deposit* FIRST (a call,
+                // no tx) so the common already-funded case sends no extra tx and
+                // stays off the nonce hot path entirely.
+                let deposit: U256 = entry_point
+                    .balanceOf(sender)
+                    .call()
+                    .await
+                    .context("EntryPoint.balanceOf(sender) deposit read")?;
+
+                if deposit < need_with_margin {
+                    let topup = need_with_margin - deposit;
+                    // NONCE SEQUENCING: `depositTo` is a SECOND broadcaster tx.
+                    // Set its nonce explicitly (NOT the provider's auto nonce
+                    // filler) and `get_receipt()` on it BEFORE the `handleOps`
+                    // pending-nonce fetch below, so the two txs never share or
+                    // gap a nonce (re-introducing the nonce-leak wedge). Each
+                    // iteration awaits its receipt, so the next pending fetch --
+                    // this loop's next `depositTo` or the final `handleOps` --
+                    // already reflects the mined tx.
+                    let nonce = broadcaster
+                        .get_transaction_count(beneficiary)
+                        .pending()
+                        .await
+                        .context("fetch broadcaster nonce for depositTo")?;
+                    let receipt = entry_point
+                        .depositTo(sender)
+                        .value(topup)
+                        .nonce(nonce)
+                        .send()
+                        .await
+                        .context("send EntryPoint.depositTo transaction")?
+                        .get_receipt()
+                        .await
+                        .context("confirm EntryPoint.depositTo transaction")?;
+                    anyhow::ensure!(
+                        receipt.status(),
+                        "EntryPoint.depositTo transaction reverted (tx {:?})",
+                        receipt.transaction_hash
+                    );
+                    debug!(
+                        target: "usdt",
+                        %sender,
+                        topup = %topup,
+                        "auto-prefunded EntryPoint deposit for op sender",
+                    );
+                }
+                Ok(())
+            }
+            .await;
+
+            if let Err(err) = prefund {
+                warn!(
+                    target: "usdt",
+                    %sender,
+                    err = %err,
+                    "auto-prefund of EntryPoint deposit failed; proceeding to handleOps anyway",
+                );
+            }
+        }
+
         // Fetch the broadcaster's *pending* nonce fresh from chain state and
         // set it explicitly on the transaction, instead of leaving it to the
         // provider's default cached nonce manager. That manager reserves and
@@ -405,7 +505,6 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .await
             .context("failed to fetch broadcaster nonce")?;
 
-        let entry_point = IEntryPoint::new(Address::from(entry_point.0), broadcaster);
         let receipt = entry_point
             .handleOps(packed_ops, beneficiary)
             .nonce(nonce)

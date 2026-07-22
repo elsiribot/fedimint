@@ -163,21 +163,13 @@ async fn main() -> anyhow::Result<()> {
 
         let client = fed.new_joined_client("usdt-e2e").await?;
 
-        // No paymaster: every account that sends a UserOp must have its own
-        // EntryPoint deposit to pay for its gas. The pool `SimpleAccount`'s
-        // address is config-derived (group key + factory + impl), so it's
-        // known post-DKG before any sweep or withdrawal -- read it from
-        // pool-state and prefund its EntryPoint deposit now so the later
-        // withdrawal batch UserOp can pay for its own deploy+execute gas.
-        info!("Reading the config-derived pool account and prefunding its EntryPoint deposit...");
-        let pool_account: EvmAddress = cmd!(client, "module", "usdt", "pool-state")
-            .out_json()
-            .await?["account"]
-            .as_str()
-            .context("pool-state response missing account")?
-            .parse()?;
-        prefund_entry_point_deposit(&anvil, entry_point, pool_account).await?;
-        info!(%pool_account, "Pool EntryPoint deposit prefunded");
+        // Part B (module self-prefund): no external `depositTo` here. The
+        // module now funds each op sender's `EntryPoint` gas deposit from the
+        // broadcaster inside its own submit path (see
+        // `fedimint_usdt_server::rpc`'s `submit_user_ops`), so this harness only
+        // funds the broadcaster EOA (via `FM_USDT_BROADCASTER_PRIVATE_KEY` =
+        // anvil account 0, already ETH-rich) and lets the module top up the
+        // pool + deposit accounts' deposits as it submits their UserOps.
 
         info!("Deriving a deposit address...");
         let deposit_address = cmd!(client, "module", "usdt", "deposit-address")
@@ -192,12 +184,9 @@ async fn main() -> anyhow::Result<()> {
             .context("deposit-address response missing account")?
             .parse()?;
 
-        // Prefund the deposit account's EntryPoint deposit too (same
-        // no-paymaster reason as the pool above): the automatic
-        // deploy-and-sweep UserOp that fires once this deposit is credited is
-        // sent FROM this account and must cover its own deploy+sweep gas.
-        info!(%account, "Prefunding the deposit account's EntryPoint deposit...");
-        prefund_entry_point_deposit(&anvil, entry_point, account).await?;
+        // No manual EntryPoint prefund of the deposit account (Part B): the
+        // module self-funds its deposit from the broadcaster when it submits
+        // the automatic deploy-and-sweep UserOp sent FROM this account.
 
         info!(%account, "Transferring USDT to the deposit address on-chain...");
         // Must be a multiple of the `mintv2` denomination granularity (512
@@ -472,20 +461,6 @@ sol! {
     }
 }
 
-sol! {
-    #[sol(rpc)]
-    interface IEntryPointDeposit {
-        function depositTo(address account) external payable;
-    }
-}
-
-/// ETH the broadcaster prefunds into each sending account's `EntryPoint`
-/// deposit so it can cover its own UserOp gas (this federation fronts ETH via
-/// the broadcaster rather than using a paymaster). 1 ETH comfortably covers
-/// the worst-case first-UserOp (deploy + sweep, or deploy + withdrawal batch)
-/// gas several times over. Mirrors `withdraw_e2e.rs`'s identical constant.
-const ENTRY_POINT_DEPOSIT_WEI: u128 = 1_000_000_000_000_000_000; // 1 ETH
-
 /// Private key of `anvil`'s first deterministic default account (derived
 /// from its well-known dev mnemonic); used to deploy the test ERC-20 and to
 /// fund block-mining transactions.
@@ -587,32 +562,6 @@ async fn erc20_balance_of(
         .context("failed to read ERC-20 balanceOf()")?;
 
     balance.try_into().context("ERC-20 balance exceeds u64")
-}
-
-/// Prefunds `account`'s deposit on the `entry_point` with
-/// [`ENTRY_POINT_DEPOSIT_WEI`] of ETH, sent (and confirmed) by the broadcaster
-/// EOA (`anvil` account 0). Because this federation uses no paymaster, every
-/// account that sends a UserOp (the deposit account for the deploy-and-sweep,
-/// the pool account for the withdrawal batch) needs its own EntryPoint deposit
-/// to pay its gas.
-async fn prefund_entry_point_deposit(
-    anvil: &Anvil,
-    entry_point: EvmAddress,
-    account: EvmAddress,
-) -> anyhow::Result<()> {
-    let provider = wallet_provider(anvil, ANVIL_ACCOUNT_0_PRIVATE_KEY)?;
-    let entry_point = IEntryPointDeposit::new(Address::from(entry_point.0), &provider);
-    entry_point
-        .depositTo(Address::from(account.0))
-        .value(U256::from(ENTRY_POINT_DEPOSIT_WEI))
-        .send()
-        .await
-        .context("failed to send EntryPoint.depositTo()")?
-        .get_receipt()
-        .await
-        .context("failed to confirm EntryPoint.depositTo()")?;
-
-    Ok(())
 }
 
 // --- ERC-4337 stack deploy ---------------------------------------------
