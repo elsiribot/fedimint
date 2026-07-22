@@ -19,9 +19,9 @@ use fedimint_core::db::{
 };
 use fedimint_core::envs::{
     FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
-    FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV,
-    FM_USDT_EVM_RPC_URL_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, is_env_var_set_opt,
-    is_running_in_test_env,
+    FM_USDT_CHAIN_ID_ENV, FM_USDT_CONFIRMATION_DEPTH_ENV, FM_USDT_CONTRACT_ENV,
+    FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV, FM_USDT_EVM_RPC_URL_ENV,
+    FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, is_env_var_set_opt, is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -411,6 +411,30 @@ impl ServerModuleInit for UsdtInit {
             params.eth_usd_price_feed = feed;
         }
 
+        // Numeric config-gen overrides. `chain_id` and `confirmation_depth`
+        // default to anvil values (31337 / 1); a real chain (e.g. Sepolia)
+        // MUST override `chain_id` -- it is bound into the ERC-4337
+        // `userOpHash` the federation signs, so a wrong value makes every
+        // signature invalid on-chain. As with the address overrides, a
+        // malformed value is a config-gen-leader misconfiguration -> panic
+        // deterministically before consensus starts.
+        let u64_env_override = |env_name: &str| -> Option<u64> {
+            match std::env::var(env_name) {
+                Ok(value) if !value.is_empty() => Some(
+                    value
+                        .parse()
+                        .unwrap_or_else(|err| panic!("{env_name} must be a valid u64: {err}")),
+                ),
+                _ => None,
+            }
+        };
+        if let Some(chain_id) = u64_env_override(FM_USDT_CHAIN_ID_ENV) {
+            params.chain_id = chain_id;
+        }
+        if let Some(confirmation_depth) = u64_env_override(FM_USDT_CONFIRMATION_DEPTH_ENV) {
+            params.confirmation_depth = confirmation_depth;
+        }
+
         params
     }
 
@@ -447,6 +471,14 @@ impl ServerModuleInit for UsdtInit {
             EnvVarDoc {
                 name: FM_USDT_ETH_USD_PRICE_FEED_ENV,
                 description: "Overrides the ERC-4337 USDT module's Chainlink ETH/USD price-feed config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.",
+            },
+            EnvVarDoc {
+                name: FM_USDT_CHAIN_ID_ENV,
+                description: "Overrides the USDT module's `chain_id` config-gen param (decimal EVM chain id) for the config-gen leader. REQUIRED for non-anvil chains: chain_id is bound into the signed ERC-4337 userOpHash. Defaults to 31337.",
+            },
+            EnvVarDoc {
+                name: FM_USDT_CONFIRMATION_DEPTH_ENV,
+                description: "Overrides the USDT module's `confirmation_depth` config-gen param (decimal block count) for the config-gen leader. Raise for a real chain's reorg characteristics. Defaults to 1.",
             },
         ]
     }

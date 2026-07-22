@@ -78,6 +78,19 @@ pub const FM_USDT_BROADCASTER_PRIVATE_KEY_ENV: &str = "FM_USDT_BROADCASTER_PRIVA
 /// (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.
 pub const FM_USDT_ETH_USD_PRICE_FEED_ENV: &str = "FM_USDT_ETH_USD_PRICE_FEED";
 
+/// Overrides the USDT module's `chain_id` config-gen param (a decimal EVM
+/// chain id, e.g. `11155111` for Sepolia) for the config-gen leader. REQUIRED
+/// for any non-anvil chain: `chain_id` is bound into the ERC-4337 `userOpHash`
+/// the federation signs, so a wrong value makes every signature invalid
+/// on-chain. Defaults to `31337` (anvil).
+pub const FM_USDT_CHAIN_ID_ENV: &str = "FM_USDT_CHAIN_ID";
+
+/// Overrides the USDT module's `confirmation_depth` config-gen param (a decimal
+/// block count) for the config-gen leader. Deposits are credited only at
+/// `head - confirmation_depth`; raise it for a real chain's reorg
+/// characteristics. Defaults to `1` (anvil).
+pub const FM_USDT_CONFIRMATION_DEPTH_ENV: &str = "FM_USDT_CONFIRMATION_DEPTH";
+
 /// Env var to override the `mintv2` module's `amount_unit` config-gen param
 /// (a decimal [`crate::module::AmountUnit`] id, e.g. `1` for
 /// `fedimint_usdt_common::USDT_UNIT`).
