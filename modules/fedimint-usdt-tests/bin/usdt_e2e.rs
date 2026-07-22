@@ -46,6 +46,7 @@ use anyhow::{Context, ensure};
 use clap::Parser;
 use devimint::cli::{self, cleanup_on_exit};
 use devimint::cmd;
+use devimint::envs::FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS_ENV;
 use devimint::external::{Anvil, Bitcoind};
 use devimint::federation::{Client, Federation};
 use devimint::tests::log_binary_versions;
@@ -101,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
             // Paillier aux-gen that exceeds devimint's default 60s config-gen
             // (invite-code) timeout; give it room (see the same var in
             // `devimint::federation`).
-            std::env::set_var("FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS", "300");
+            std::env::set_var(FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS_ENV, "300");
 
             // Minimal USDT-only federation: the ONLY modules are the usdt
             // wallet and a single USDT-denominated `mintv2` (the primary module

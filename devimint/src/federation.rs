@@ -32,12 +32,12 @@ use fs_lock::FileLock;
 use futures::future::{join_all, try_join_all};
 use tokio::task::{JoinSet, spawn_blocking};
 use tokio::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::external::Bitcoind;
 use super::util::{Command, ProcessHandle, ProcessManager, cmd};
 use super::vars::utf8;
-use crate::envs::{FM_CLIENT_DIR_ENV, FM_DATA_DIR_ENV};
+use crate::envs::{FM_CLIENT_DIR_ENV, FM_DATA_DIR_ENV, FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS_ENV};
 use crate::util::{FedimintdCmd, poll, poll_with_timeout};
 use crate::version_constants::{VERSION_0_10_0_ALPHA, VERSION_0_11_0_ALPHA, VERSION_0_12_0_ALPHA};
 use crate::{poll_almost_equal, poll_eq, vars};
@@ -426,10 +426,24 @@ impl Federation {
                 // changing the fast path for every other test (this poll
                 // returns the instant the invite code appears, so a larger
                 // timeout only raises the ceiling, never the happy-path wait).
-                let config_gen_timeout = std::env::var("FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map_or(Duration::from_secs(60), Duration::from_secs);
+                let config_gen_timeout = match std::env::var(
+                    FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS_ENV,
+                ) {
+                    Ok(raw) => match raw.parse::<u64>() {
+                        Ok(secs) => Duration::from_secs(secs),
+                        Err(err) => {
+                            warn!(
+                                target: "devimint",
+                                %raw,
+                                %err,
+                                env = FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS_ENV,
+                                "Ignoring unparseable config-gen timeout override; falling back to 60s"
+                            );
+                            Duration::from_secs(60)
+                        }
+                    },
+                    Err(_) => Duration::from_secs(60),
+                };
                 let invite_code =
                     poll_with_timeout("awaiting-invite-code", config_gen_timeout, || async {
                         let path = format!("{peer_data_dir}/{invite_code_filename_original}");
