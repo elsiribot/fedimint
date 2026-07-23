@@ -64,9 +64,7 @@ impl GasBounds {
             .saturating_add(self.call_gas_limit)
             .saturating_add(self.pre_verification_gas)
     }
-}
 
-impl GasBounds {
     /// Sized for THIS module's specific deploy-and-sweep op shape (one
     /// `ERC1967Proxy` CREATE2 deploy + `SimpleAccount.initialize` + one
     /// `execute`-wrapped ERC-20 `transfer`) on a devnet/anvil-class chain.

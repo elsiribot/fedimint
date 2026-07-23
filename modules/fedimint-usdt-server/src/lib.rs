@@ -1407,21 +1407,16 @@ impl ServerModule for Usdt {
             });
         }
 
-        // Mirrors `process_output`'s `median`/`quote` handling exactly,
-        // modulo the error type: `UsdtInputError` has no `NoFeeQuoteAvailable`/
-        // `FeeQuoteOverflow` analog (only `DepositFeeInsufficient`), so an
-        // absent-or-overflowing quote is represented as an effectively
-        // infinite `quote` (`UsdtAmount(u64::MAX)`) fed into the SAME
-        // `DepositFeeInsufficient` check below. No finite `input.fee` can
-        // ever clear `u64::MAX`, so -- exactly like `process_output`
-        // unconditionally rejecting with `NoFeeQuoteAvailable` when
-        // `median` is `None` -- a deposit can never be claimed before the
-        // federation has a working fee quote, regardless of the fee
-        // offered.
-        let median = self.fee_vote_median(dbtx).await;
-        let quote = median
-            .and_then(|median| deposit_fee_quote(&median))
-            .unwrap_or(UsdtAmount(u64::MAX));
+        // Mirrors `process_output`'s `median`/`quote` handling exactly: an
+        // absent median (no fee vote has landed yet) or an overflowing quote
+        // computation are distinct, explicit rejections rather than being
+        // folded into `DepositFeeInsufficient` via an effectively-infinite
+        // sentinel quote.
+        let median = self
+            .fee_vote_median(dbtx)
+            .await
+            .ok_or(UsdtInputError::NoFeeQuoteAvailable)?;
+        let quote = deposit_fee_quote(&median).ok_or(UsdtInputError::FeeQuoteOverflow)?;
         if input.fee.0 < quote.0 {
             return Err(UsdtInputError::DepositFeeInsufficient {
                 quote,
@@ -1823,11 +1818,11 @@ impl ServerModule for Usdt {
                     // Before any `FeeVote` has landed, `fee` reports `0` (a
                     // sentinel meaning "no quote yet") rather than erroring --
                     // `process_input` is what actually enforces rejection in
-                    // that case (via `DepositFeeInsufficient` with an
-                    // effectively-infinite quote); a `0` quote here can never
-                    // be used to claim a deposit for free, since any `fee`
-                    // (even `0`) still needs `process_input`'s own median
-                    // lookup to succeed at the point the transaction lands.
+                    // that case (via `NoFeeQuoteAvailable`); a `0` quote here
+                    // can never be used to claim a deposit for free, since any
+                    // `fee` (even `0`) still needs `process_input`'s own
+                    // median lookup to succeed at the point the transaction
+                    // lands.
                     let db = context.db();
                     let mut dbtx = db.begin_transaction_nc().await;
 
@@ -6189,10 +6184,10 @@ mod tests {
 
     #[tokio::test]
     async fn process_input_rejects_when_no_fee_median_exists() {
-        // Mirrors `process_output_rejects_when_no_fee_median_exists`
-        // exactly: even an enormous offered `fee` cannot clear an absent
-        // median, since `process_input` substitutes an effectively-infinite
-        // quote (`UsdtAmount(u64::MAX)`) when `fee_vote_median` is `None`.
+        // Mirrors `process_output_rejects_when_no_fee_median_exists` exactly:
+        // an absent median is now a distinct, explicit rejection
+        // (`NoFeeQuoteAvailable`) rather than being folded into
+        // `DepositFeeInsufficient` via an effectively-infinite sentinel quote.
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
         let account = EvmAddress([0x59; 20]);
@@ -6228,13 +6223,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(
-            err,
-            UsdtInputError::DepositFeeInsufficient {
-                quote: UsdtAmount(u64::MAX),
-                offered: UsdtAmount(u64::MAX - 1),
-            }
-        );
+        assert_eq!(err, UsdtInputError::NoFeeQuoteAvailable);
 
         let record = dbtx
             .to_ref_nc()

@@ -1186,6 +1186,10 @@ pub enum UsdtInputError {
     },
     #[error("This input's fee {fee} would consume all or more of its {amount} claimed amount")]
     FeeExceedsAmount { amount: UsdtAmount, fee: UsdtAmount },
+    #[error("No federation fee-vote median is available yet; deposits cannot be claimed")]
+    NoFeeQuoteAvailable,
+    #[error("Computing the deposit fee quote overflowed")]
+    FeeQuoteOverflow,
 }
 
 /// Errors that might be returned by the server
