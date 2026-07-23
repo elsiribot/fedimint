@@ -3940,15 +3940,20 @@ fn timeout_blocks() -> u64 {
 /// The number of consensus blocks the OLDEST currently-`Queued` withdrawal
 /// (by `UsdtWithdrawalV0::requested_block`) may wait before
 /// [`Usdt::maybe_trigger_withdrawal_batch`] forces a batch regardless of how
-/// few withdrawals are queued (Phase 8, Task 2). Small under
-/// `is_running_in_test_env()`, mirroring [`timeout_blocks`] -- both values
-/// are otherwise arbitrary policy knobs (bounding worst-case withdrawal
-/// latency vs. batching efficiency) with no consensus-correctness
-/// requirement beyond "every guardian computes the same one" (which
-/// `is_running_in_test_env()` does, being a pure function of the process
-/// environment, identical across a test federation's guardians).
+/// few withdrawals are queued (Phase 8, Task 2).
+///
+/// At ~12s per EVM block, 2 blocks bounds a lone withdrawal's queuing delay
+/// to ~24s -- near-immediate, while still coalescing any withdrawals that
+/// pile up within that window into one `executeBatch` op (one pool nonce,
+/// one MPC signing session). Small under `is_running_in_test_env()`,
+/// mirroring [`timeout_blocks`] -- both values are otherwise arbitrary policy
+/// knobs (bounding worst-case withdrawal latency vs. batching efficiency)
+/// with no consensus-correctness requirement beyond "every guardian computes
+/// the same one" (which `is_running_in_test_env()` does, being a pure
+/// function of the process environment, identical across a test federation's
+/// guardians).
 fn batch_interval_blocks() -> u64 {
-    if is_running_in_test_env() { 3 } else { 200 }
+    if is_running_in_test_env() { 3 } else { 2 }
 }
 
 /// The number of `Queued` withdrawals that forces
