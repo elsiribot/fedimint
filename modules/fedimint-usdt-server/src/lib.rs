@@ -2740,6 +2740,33 @@ impl Usdt {
             .await;
     }
 
+    /// Actively (re)triggers a deploy-and-sweep for every deposit account with
+    /// an un-swept remainder (`credited > swept`), pulling their USDT into the
+    /// pool to fund queued withdrawals sooner than passively waiting for each
+    /// deposit's own credit-triggered sweep. Called by
+    /// [`Usdt::maybe_trigger_withdrawal_batch`] when the pool-balance gate
+    /// finds the pool cannot yet cover the queued batch.
+    ///
+    /// DETERMINISTIC + IDEMPOTENT: it iterates the consensus `DepositRecord`
+    /// set (fixed key order) and defers to [`Usdt::maybe_trigger_sweep`], whose
+    /// in-flight guard skips any account already mid-sweep and whose op is a
+    /// pure function of the account's record -- so every guardian enqueues the
+    /// identical set of sweep ops, and re-running it (every waiting trigger)
+    /// enqueues nothing new.
+    async fn accelerate_sweeps_for_withdrawals(&self, dbtx: &mut DatabaseTransaction<'_>) {
+        let records: Vec<(fedimint_usdt_common::EvmAddress, DepositRecord)> = dbtx
+            .find_by_prefix(&DepositRecordPrefix)
+            .await
+            .map(|(DepositRecordKey(account), record)| (account, record))
+            .collect()
+            .await;
+        for (account, record) in records {
+            if record.credited.0 > record.swept.0 {
+                self.maybe_trigger_sweep(dbtx, account).await;
+            }
+        }
+    }
+
     /// `true` if a `Withdraw`-purpose `UserOp` is currently `Pending`
     /// (awaiting/undergoing MPC signing) or `Submitted` (signed, awaiting
     /// on-chain confirmation) -- i.e. a withdrawal batch is already "in
@@ -2947,6 +2974,15 @@ impl Usdt {
             .iter()
             .fold(0u64, |acc, (_, w)| acc.saturating_add(w.amount.0));
         if pool.balance.0 < batch_total {
+            // ACCELERATE SWEEP: the pool cannot yet cover the queued
+            // withdrawals. Rather than passively wait for each backing
+            // deposit's own credit-triggered sweep, actively (re)trigger a
+            // sweep for every deposit that still has an un-swept remainder so
+            // their USDT flows into the pool and covers the batch sooner. The
+            // withdrawal batch fires on a later trigger once those sweeps
+            // confirm and `pool.balance` rises. Deterministic + idempotent (see
+            // the helper).
+            self.accelerate_sweeps_for_withdrawals(dbtx).await;
             return;
         }
 
