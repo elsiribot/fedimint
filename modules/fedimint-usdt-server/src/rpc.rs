@@ -404,6 +404,14 @@ impl AlloyEvmRpc {
 /// feed is configured (e.g. local anvil). A real deployment configures a feed.
 const STATIC_USDT_PER_ETH_E6: u64 = 3_000_000_000;
 
+/// Recent-block window scanned by [`AlloyEvmRpc::get_user_op_receipt`]'s
+/// `eth_getLogs` for a `UserOperationEvent`. A UserOp confirms within a few
+/// blocks of submission, so a small window suffices; kept small (~2000 blocks,
+/// ~7h on mainnet) to stay within even restrictive RPC providers' getLogs
+/// block-range caps -- scanning from block 0 (the whole chain) is rejected by
+/// public providers.
+const USER_OP_RECEIPT_LOOKBACK_BLOCKS: u64 = 2_000;
+
 #[async_trait::async_trait]
 impl IServerEvmRpc for AlloyEvmRpc {
     async fn get_chain_id(&self) -> anyhow::Result<u64> {
@@ -796,11 +804,26 @@ impl IServerEvmRpc for AlloyEvmRpc {
             "AlloyEvmRpc::get_user_op_receipt requires an EntryPoint address (see Self::with_entry_point)",
         )?;
 
+        // Bound the `eth_getLogs` block range to a recent window. A UserOp
+        // confirms within a few blocks of submission, so scanning from block 0
+        // (which spans the entire chain) is unnecessary AND rejected by public
+        // RPC providers -- they cap the getLogs block range (e.g. 50k, or as
+        // little as 50 blocks) and gate old ("archive") blocks behind a paid
+        // token. Guardian-LOCAL read: the window need not be deterministic (the
+        // event's on-chain block is identical for every guardian that finds
+        // it), and each guardian votes the same on-chain block.
+        let latest = self
+            .provider
+            .get_block_number()
+            .await
+            .context("get_block_number for the UserOperationEvent lookback window")?;
+        let from_block = latest.saturating_sub(USER_OP_RECEIPT_LOOKBACK_BLOCKS);
         let filter = Filter::new()
             .address(Address::from(entry_point.0))
             .event_signature(UserOperationEvent::SIGNATURE_HASH)
             .topic1(alloy::primitives::FixedBytes::<32>::from(user_op_hash))
-            .from_block(0u64);
+            .from_block(from_block)
+            .to_block(latest);
 
         let logs = self
             .provider
