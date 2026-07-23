@@ -2669,6 +2669,12 @@ impl Usdt {
             return;
         }
 
+        // Price the op from the consensus live-gas median (not the 30 gwei
+        // devnet default) so the broadcaster-fronted EntryPoint prefund stays
+        // affordable on a real chain. Deterministic: the median is a consensus
+        // value, so every guardian builds the identical op (its
+        // `max_fee_per_gas` is part of the signed `userOpHash`).
+        let median = self.fee_vote_median(dbtx).await;
         let owner = evm_address(&self.cfg.consensus.group_public_key);
         let params = DeployAndSweepParams {
             account_factory: self.cfg.consensus.account_factory,
@@ -2681,7 +2687,8 @@ impl Usdt {
             nonce: alloy::primitives::U256::from(record.nonce),
             needs_deploy: record.nonce == 0,
             paymaster_and_data: Vec::new(),
-            gas_bounds: GasBounds::DEPLOY_AND_SWEEP_DEVNET,
+            gas_bounds: GasBounds::DEPLOY_AND_SWEEP_DEVNET
+                .with_median_fees(median.map(|m| m.max_fee_per_gas_wei)),
         };
         let op = crate::user_op::build_deploy_and_sweep_userop(params);
         let op_hash = user_op_hash(
@@ -2949,6 +2956,8 @@ impl Usdt {
             .map(|(_, w)| (w.recipient, w.amount))
             .collect();
 
+        // Consensus live-gas median prices the op (see the sweep site's note).
+        let median = self.fee_vote_median(dbtx).await;
         let owner = evm_address(&self.cfg.consensus.group_public_key);
         let needs_deploy = pool.nonce == 0;
         let params = WithdrawalBatchParams {
@@ -2960,7 +2969,8 @@ impl Usdt {
             nonce: alloy::primitives::U256::from(pool.nonce),
             needs_deploy,
             paymaster_and_data: Vec::new(),
-            gas_bounds: GasBounds::withdrawal_batch(withdrawals.len(), needs_deploy),
+            gas_bounds: GasBounds::withdrawal_batch(withdrawals.len(), needs_deploy)
+                .with_median_fees(median.map(|m| m.max_fee_per_gas_wei)),
         };
         let op = crate::user_op::build_withdrawal_batch_userop(params);
         let op_hash = user_op_hash(

@@ -134,6 +134,48 @@ impl GasBounds {
             max_fee_per_gas: 30_000_000_000,
         }
     }
+
+    /// Lower bound applied to a median-derived `max_fee_per_gas` so an idle or
+    /// zero-median chain still yields an includable op (1 gwei).
+    const OP_FEE_FLOOR_WEI: u128 = 1_000_000_000;
+    /// Upper bound so a spiked or byzantine-voted median cannot inflate the
+    /// op's `max_fee_per_gas` -- and hence the EntryPoint prefund the
+    /// broadcaster fronts (`need = totalGas * maxFeePerGas`, see
+    /// `rpc.rs`) -- to a catastrophic amount (200 gwei).
+    const OP_FEE_CEILING_WEI: u128 = 200_000_000_000;
+    /// Priority-fee tip for the op (1 gwei), clamped never to exceed the
+    /// resolved `max_fee_per_gas`.
+    const OP_PRIORITY_FEE_WEI: u128 = 1_000_000_000;
+
+    /// Replaces the (devnet-constant)
+    /// `max_fee_per_gas`/`max_priority_fee_per_gas` on these bounds with
+    /// values derived from the federation's **consensus fee-vote median**
+    /// (`median_max_fee_per_gas_wei` = the threshold-agreed
+    /// live `eth_gasPrice`; `None` when no fee vote has landed yet).
+    ///
+    /// This is the value that prices the on-chain sweep/withdrawal `UserOp`
+    /// (and, transitively, the EntryPoint prefund the broadcaster fronts).
+    /// The devnet default (30 gwei) massively over-provisions the prefund on a
+    /// cheap-gas mainnet (base fee ~0.1-1 gwei), which can exceed a modestly
+    /// funded broadcaster's balance and wedge the whole sweep/withdrawal path;
+    /// tracking the live median instead keeps the prefund affordable.
+    ///
+    /// Applies 2x headroom (the base fee can rise between building the op and
+    /// its on-chain inclusion), then clamps to [`Self::OP_FEE_FLOOR_WEI`,
+    /// `Self::OP_FEE_CEILING_WEI`]. PURE and DETERMINISTIC: the median is a
+    /// consensus value and the constants are compiled in, so every guardian
+    /// builds the byte-identical op -- essential, since `max_fee_per_gas` is
+    /// part of the signed `userOpHash`.
+    #[must_use]
+    pub fn with_median_fees(mut self, median_max_fee_per_gas_wei: Option<u64>) -> Self {
+        let live = median_max_fee_per_gas_wei.map_or(0u128, u128::from);
+        let max_fee = live
+            .saturating_mul(2)
+            .clamp(Self::OP_FEE_FLOOR_WEI, Self::OP_FEE_CEILING_WEI);
+        self.max_fee_per_gas = max_fee;
+        self.max_priority_fee_per_gas = Self::OP_PRIORITY_FEE_WEI.min(max_fee);
+        self
+    }
 }
 
 /// Parameters for [`build_deploy_and_sweep_userop`], grouped into one struct
