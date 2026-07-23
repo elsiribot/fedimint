@@ -455,7 +455,7 @@ impl ServerModuleInit for UsdtInit {
             },
             EnvVarDoc {
                 name: FM_USDT_EVM_RPC_API_KEY_ENV,
-                description: "Optional per-guardian API key appended as the final path segment of the EVM RPC URL (Alchemy/Infura-style). Keeps the secret key out of the URL config. An archive-capable provider is required on a real chain for UserOp-receipt observation.",
+                description: "Optional per-guardian API key appended as the final path segment of the EVM RPC URL (Alchemy/Infura-style). Keeps the secret key out of the URL config. A bundler-capable provider (Alchemy/Infura/QuickNode) is required on a real chain: receipts are read via eth_getUserOperationReceipt.",
             },
             EnvVarDoc {
                 name: FM_USDT_CONTRACT_ENV,

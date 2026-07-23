@@ -45,9 +45,10 @@ pub const FM_USDT_EVM_RPC_URL_ENV: &str = "FM_USDT_EVM_RPC_URL";
 /// `https://eth-mainnet.g.alchemy.com/v2/<key>`. Lets the (secret) key live in
 /// its own env var instead of being baked into the RPC URL config. No-op when
 /// unset (put the full authenticated URL in `FM_USDT_EVM_RPC_URL` instead).
-/// An archive-capable provider is REQUIRED on a real chain: the module observes
-/// `UserOp` receipts via `eth_getLogs` over a recent window, which free public
-/// endpoints gate or cap too tightly.
+/// A BUNDLER-capable provider is REQUIRED on a real chain: the module observes
+/// `UserOp` receipts via ERC-4337 `eth_getUserOperationReceipt` (Alchemy,
+/// Infura, QuickNode, … expose it on their standard endpoint); a plain node RPC
+/// does not implement that method.
 pub const FM_USDT_EVM_RPC_API_KEY_ENV: &str = "FM_USDT_EVM_RPC_API_KEY";
 
 /// Env var to override the USDT module's `usdt_contract` config-gen param

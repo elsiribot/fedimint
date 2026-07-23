@@ -9,10 +9,9 @@ use alloy::eips::BlockId;
 use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
-use alloy::rpc::types::{Filter, TransactionRequest};
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
-use alloy::sol_types::SolEvent as _;
 use anyhow::Context as _;
 use fedimint_usdt_common::user_op::{PackedUserOperation, SignedUserOp, UserOpReceipt};
 use fedimint_usdt_common::{EvmAddress, FeeVote, UsdtAmount};
@@ -404,14 +403,6 @@ impl AlloyEvmRpc {
 /// feed is configured (e.g. local anvil). A real deployment configures a feed.
 const STATIC_USDT_PER_ETH_E6: u64 = 3_000_000_000;
 
-/// Recent-block window scanned by [`AlloyEvmRpc::get_user_op_receipt`]'s
-/// `eth_getLogs` for a `UserOperationEvent`. A `UserOp` confirms within a few
-/// blocks of submission, so a small window suffices; kept small (~2000 blocks,
-/// ~7h on mainnet) to stay within even restrictive RPC providers' getLogs
-/// block-range caps -- scanning from block 0 (the whole chain) is rejected by
-/// public providers.
-const USER_OP_RECEIPT_LOOKBACK_BLOCKS: u64 = 2_000;
-
 #[async_trait::async_trait]
 impl IServerEvmRpc for AlloyEvmRpc {
     async fn get_chain_id(&self) -> anyhow::Result<u64> {
@@ -800,62 +791,54 @@ impl IServerEvmRpc for AlloyEvmRpc {
         &self,
         user_op_hash: [u8; 32],
     ) -> anyhow::Result<Option<UserOpReceipt>> {
-        let entry_point = self.entry_point.context(
-            "AlloyEvmRpc::get_user_op_receipt requires an EntryPoint address (see Self::with_entry_point)",
-        )?;
-
-        // Bound the `eth_getLogs` block range to a recent window. A UserOp
-        // confirms within a few blocks of submission, so scanning from block 0
-        // (which spans the entire chain) is unnecessary AND rejected by public
-        // RPC providers -- they cap the getLogs block range (e.g. 50k, or as
-        // little as 50 blocks) and gate old ("archive") blocks behind a paid
-        // token. Guardian-LOCAL read: the window need not be deterministic (the
-        // event's on-chain block is identical for every guardian that finds
-        // it), and each guardian votes the same on-chain block.
-        let latest = self
+        // Query the bundler for the op's receipt DIRECTLY by its hash (ERC-4337
+        // `eth_getUserOperationReceipt`), rather than scanning `EntryPoint`
+        // event logs. The op is identified by its consensus `userOpHash`, so
+        // every guardian queries the same key and gets the same on-chain result
+        // -- and this sidesteps the `eth_getLogs` block-range + archive limits
+        // that free RPC tiers impose (as little as a 10-50 block range, and old
+        // blocks paywalled), which made a log-scan approach unworkable on a real
+        // chain. Requires a bundler-capable RPC (Alchemy/Infura/QuickNode/...
+        // expose this method on their standard endpoint). `None` until mined.
+        let op_hash_hex = format!("0x{}", alloy::hex::encode(user_op_hash));
+        let resp: Option<BundlerUserOpReceipt> = self
             .provider
-            .get_block_number()
+            .raw_request::<_, Option<BundlerUserOpReceipt>>(
+                std::borrow::Cow::Borrowed("eth_getUserOperationReceipt"),
+                (op_hash_hex,),
+            )
             .await
-            .context("get_block_number for the UserOperationEvent lookback window")?;
-        let from_block = latest.saturating_sub(USER_OP_RECEIPT_LOOKBACK_BLOCKS);
-        let filter = Filter::new()
-            .address(Address::from(entry_point.0))
-            .event_signature(UserOperationEvent::SIGNATURE_HASH)
-            .topic1(alloy::primitives::FixedBytes::<32>::from(user_op_hash))
-            .from_block(from_block)
-            .to_block(latest);
+            .context("eth_getUserOperationReceipt failed")?;
 
-        let logs = self
-            .provider
-            .get_logs(&filter)
-            .await
-            .context("eth_getLogs(UserOperationEvent) failed")?;
-
-        let Some(log) = logs.into_iter().next() else {
+        let Some(receipt) = resp else {
             return Ok(None);
         };
-
-        let block = log
-            .block_number
-            .context("UserOperationEvent log is missing a block_number")?;
-        let decoded = log
-            .log_decode::<UserOperationEvent>()
-            .context("failed to decode UserOperationEvent log")?;
-
-        let actual_gas_cost =
-            u64::try_from(decoded.inner.data.actualGasCost).with_context(|| {
-                format!(
-                    "UserOperationEvent.actualGasCost {} overflows u64",
-                    decoded.inner.data.actualGasCost
-                )
-            })?;
-
+        let actual_gas_cost = u64::try_from(receipt.actual_gas_cost).unwrap_or(u64::MAX);
+        let block = u64::try_from(receipt.receipt.block_number)
+            .context("UserOp receipt blockNumber overflows u64")?;
         Ok(Some(UserOpReceipt {
-            success: decoded.inner.data.success,
+            success: receipt.success,
             block,
             actual_cost_usdt: UsdtAmount(actual_gas_cost),
         }))
     }
+}
+
+/// Subset of an ERC-4337 `eth_getUserOperationReceipt` response the module
+/// needs (see [`AlloyEvmRpc::get_user_op_receipt`]). Hex-string numbers decode
+/// via `alloy`'s `U256` serde.
+#[derive(Debug, serde::Deserialize)]
+struct BundlerUserOpReceipt {
+    success: bool,
+    #[serde(rename = "actualGasCost")]
+    actual_gas_cost: U256,
+    receipt: BundlerInnerReceipt,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BundlerInnerReceipt {
+    #[serde(rename = "blockNumber")]
+    block_number: U256,
 }
 
 #[cfg(test)]
