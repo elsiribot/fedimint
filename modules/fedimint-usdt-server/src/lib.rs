@@ -18,7 +18,8 @@ use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::envs::{
-    FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
+    FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV,
+    FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
     FM_USDT_CHAIN_ID_ENV, FM_USDT_CONFIRMATION_DEPTH_ENV, FM_USDT_CONTRACT_ENV,
     FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV, FM_USDT_EVM_RPC_URL_ENV,
     FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, is_env_var_set_opt, is_running_in_test_env,
@@ -434,6 +435,9 @@ impl ServerModuleInit for UsdtInit {
         if let Some(confirmation_depth) = u64_env_override(FM_USDT_CONFIRMATION_DEPTH_ENV) {
             params.confirmation_depth = confirmation_depth;
         }
+        if let Some(min_balance) = u64_env_override(FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV) {
+            params.broadcaster_min_balance_wei = min_balance;
+        }
 
         params
     }
@@ -479,6 +483,10 @@ impl ServerModuleInit for UsdtInit {
             EnvVarDoc {
                 name: FM_USDT_CONFIRMATION_DEPTH_ENV,
                 description: "Overrides the USDT module's `confirmation_depth` config-gen param (decimal block count) for the config-gen leader. Raise for a real chain's reorg characteristics. Defaults to 1.",
+            },
+            EnvVarDoc {
+                name: FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV,
+                description: "Overrides the USDT module's `broadcaster_min_balance_wei` config-gen param (decimal wei) for the config-gen leader — the min broadcaster ETH for the readiness `broadcaster_funded` condition. Defaults to 0.05 ETH; lower it for a cheap real-network test.",
             },
         ]
     }

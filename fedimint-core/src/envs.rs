@@ -91,6 +91,13 @@ pub const FM_USDT_CHAIN_ID_ENV: &str = "FM_USDT_CHAIN_ID";
 /// characteristics. Defaults to `1` (anvil).
 pub const FM_USDT_CONFIRMATION_DEPTH_ENV: &str = "FM_USDT_CONFIRMATION_DEPTH";
 
+/// Overrides the USDT module's `broadcaster_min_balance_wei` config-gen param
+/// (decimal wei) for the config-gen leader — the minimum broadcaster ETH
+/// balance for the Part C readiness `broadcaster_funded` condition. Defaults to
+/// `50_000_000_000_000_000` (0.05 ETH); lower it for a cheap real-network test
+/// so the gas wallet needn't hold that much. Gas cost itself is unaffected.
+pub const FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV: &str = "FM_USDT_BROADCASTER_MIN_BALANCE_WEI";
+
 /// Env var to override the `mintv2` module's `amount_unit` config-gen param
 /// (a decimal [`crate::module::AmountUnit`] id, e.g. `1` for
 /// `fedimint_usdt_common::USDT_UNIT`).
