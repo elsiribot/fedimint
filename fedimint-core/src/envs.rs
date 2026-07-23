@@ -78,24 +78,28 @@ pub const FM_USDT_BROADCASTER_PRIVATE_KEY_ENV: &str = "FM_USDT_BROADCASTER_PRIVA
 /// (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.
 pub const FM_USDT_ETH_USD_PRICE_FEED_ENV: &str = "FM_USDT_ETH_USD_PRICE_FEED";
 
-/// Overrides the USDT module's `chain_id` config-gen param (a decimal EVM
-/// chain id, e.g. `11155111` for Sepolia) for the config-gen leader. REQUIRED
-/// for any non-anvil chain: `chain_id` is bound into the ERC-4337 `userOpHash`
-/// the federation signs, so a wrong value makes every signature invalid
-/// on-chain. Defaults to `31337` (anvil).
+/// Overrides the USDT module's `chain_id` config-gen param for the config-gen
+/// leader (a decimal EVM chain id, e.g. `11155111` for Sepolia).
+///
+/// REQUIRED for any non-anvil chain: `chain_id` is bound into the ERC-4337
+/// `userOpHash` the federation signs, so a wrong value makes every signature
+/// invalid on-chain. Defaults to `31337` (anvil).
 pub const FM_USDT_CHAIN_ID_ENV: &str = "FM_USDT_CHAIN_ID";
 
-/// Overrides the USDT module's `confirmation_depth` config-gen param (a decimal
-/// block count) for the config-gen leader. Deposits are credited only at
-/// `head - confirmation_depth`; raise it for a real chain's reorg
-/// characteristics. Defaults to `1` (anvil).
+/// Overrides the USDT module's `confirmation_depth` config-gen param for the
+/// config-gen leader (a decimal block count).
+///
+/// Deposits are credited only at `head - confirmation_depth`; raise it for a
+/// real chain's reorg characteristics. Defaults to `1` (anvil).
 pub const FM_USDT_CONFIRMATION_DEPTH_ENV: &str = "FM_USDT_CONFIRMATION_DEPTH";
 
 /// Overrides the USDT module's `broadcaster_min_balance_wei` config-gen param
-/// (decimal wei) for the config-gen leader — the minimum broadcaster ETH
-/// balance for the Part C readiness `broadcaster_funded` condition. Defaults to
-/// `50_000_000_000_000_000` (0.05 ETH); lower it for a cheap real-network test
-/// so the gas wallet needn't hold that much. Gas cost itself is unaffected.
+/// for the config-gen leader (decimal wei).
+///
+/// The minimum broadcaster ETH balance for the Part C readiness
+/// `broadcaster_funded` condition. Defaults to `50_000_000_000_000_000`
+/// (0.05 ETH); lower it for a cheap real-network test so the gas wallet needn't
+/// hold that much. Gas cost itself is unaffected.
 pub const FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV: &str = "FM_USDT_BROADCASTER_MIN_BALANCE_WEI";
 
 /// Env var to override the `mintv2` module's `amount_unit` config-gen param
