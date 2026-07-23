@@ -64,6 +64,14 @@ pub const USEROP_STATUS_ENDPOINT: &str = "userop_status";
 /// single-guardian estimate).
 pub const WITHDRAW_FEE_QUOTE_ENDPOINT: &str = "withdraw_fee_quote";
 
+/// Reports the current deposit fee quote: the minimum `fee` a
+/// `UsdtInput::V0` claiming a credited deposit must offer, derived from the
+/// federation's consensus-agreed `FeeVote` median (see
+/// `fedimint_usdt_common::deposit_fee_quote`). Read from consensus DB, so
+/// any guardian answers identically (threshold-agreement, not just a
+/// single-guardian estimate), mirroring [`WITHDRAW_FEE_QUOTE_ENDPOINT`].
+pub const DEPOSIT_FEE_QUOTE_ENDPOINT: &str = "deposit_fee_quote";
+
 /// Reports the consensus-agreed lifecycle stage (`Queued`/`Signing`/
 /// `Submitted`/`Confirmed`/`Failed`/`Unknown`) of a queued withdrawal,
 /// identified by the `OutPoint` of the `UsdtOutput::V0` that enqueued it

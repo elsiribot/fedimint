@@ -148,35 +148,46 @@ pub const WITHDRAWAL_FEE_BUFFER_PERCENT: u128 = 20;
 /// degenerate zero-median edge case this const exists to close.
 pub const MIN_WITHDRAWAL_FEE: UsdtAmount = UsdtAmount(10_000);
 
-/// Computes the minimum USDT fee (in [`UsdtAmount`]'s smallest on-chain
-/// unit) a withdrawal output must offer as `max_fee`, given the
-/// federation's current [`FeeVote`] median (see
-/// `fedimint_usdt_server::Usdt::fee_vote_median`).
+/// Total gas-unit estimate for a `DEPLOY_AND_SWEEP` `UserOp` -- verification
+/// `500_000` (one-time `ERC1967Proxy` `CREATE2` deploy + `SimpleAccount.
+/// initialize` + signature) + call `200_000` (execute-wrapped transfer) +
+/// preVerification `100_000` = `800_000`.
 ///
-/// `= max(MIN_WITHDRAWAL_FEE, WITHDRAWAL_GAS_UNITS *
+/// Basis for [`deposit_fee_quote`]: every deposit lands in a fresh
+/// counterfactual account the federation must deploy AND sweep to pull the
+/// USDT into the pool, so the depositor is charged the full deploy+sweep
+/// cost (never amortized or partially excluded). Kept in lockstep with
+/// `GasBounds::DEPLOY_AND_SWEEP_DEVNET` by a drift-guard test in the server
+/// crate.
+pub const SWEEP_GAS_UNITS: u128 = 800_000;
+
+/// Floor applied by [`deposit_fee_quote`] on top of the computed
+/// gas-cost-derived fee, mirroring [`MIN_WITHDRAWAL_FEE`]: guarantees a
+/// degenerate zero (or near-zero) `FeeVote` median can never yield a free
+/// (or near-free) deposit.
+pub const MIN_DEPOSIT_FEE: UsdtAmount = UsdtAmount(10_000);
+
+/// Shared core of the gas-derived fee quotes ([`withdrawal_fee_quote`],
+/// [`deposit_fee_quote`]): `max(floor_raw, gas_units *
 /// median.max_fee_per_gas_wei (wei) * median.usdt_per_eth_e6 / 1e18 * (100 +
 /// WITHDRAWAL_FEE_BUFFER_PERCENT) / 100)`, ceiling-rounded (`(numerator +
 /// denominator - 1) / denominator`) so the federation is never left
-/// undercharged by integer-division truncation, and floored at
-/// [`MIN_WITHDRAWAL_FEE`] so a degenerate zero (or near-zero) `FeeVote`
-/// median can never yield a free (or near-free) withdrawal (see
-/// [`MIN_WITHDRAWAL_FEE`]'s doc comment).
+/// undercharged by integer-division truncation, and floored at `floor_raw`
+/// so a degenerate zero (or near-zero) `FeeVote` median can never yield a
+/// free (or near-free) quote.
 ///
 /// All arithmetic happens in `u128` via `checked_*` operations: two `u64`
 /// fee-vote fields multiplied together (`max_fee_per_gas_wei *
 /// usdt_per_eth_e6`) can already approach `u128::MAX`, and multiplying that
-/// by [`WITHDRAWAL_GAS_UNITS`] and the buffer can overflow it outright for
-/// an extreme (e.g. byzantine-voted) `FeeVote` -- this returns `None` rather
-/// than panicking or silently wrapping in that case. A pure function of
-/// `median` alone (no RPC, no wall-clock, no `our_peer_id`), so every
-/// guardian computes byte-identical output from the same consensus-agreed
-/// median; [`MIN_WITHDRAWAL_FEE`] is a compile-time const, so the `max` with
-/// it stays just as deterministic.
-#[must_use]
-pub fn withdrawal_fee_quote(median: &FeeVote) -> Option<UsdtAmount> {
+/// by `gas_units` and the buffer can overflow it outright for an extreme
+/// (e.g. byzantine-voted) `FeeVote` -- this returns `None` rather than
+/// panicking or silently wrapping in that case. A pure function of its args
+/// alone (no RPC, no wall-clock, no `our_peer_id`), so every guardian
+/// computes byte-identical output from the same consensus-agreed median.
+fn gas_cost_fee_quote(gas_units: u128, median: &FeeVote, floor_raw: u64) -> Option<UsdtAmount> {
     const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
 
-    let gas_cost_wei = WITHDRAWAL_GAS_UNITS.checked_mul(u128::from(median.max_fee_per_gas_wei))?;
+    let gas_cost_wei = gas_units.checked_mul(u128::from(median.max_fee_per_gas_wei))?;
     let numerator = gas_cost_wei
         .checked_mul(u128::from(median.usdt_per_eth_e6))?
         .checked_mul(100 + WITHDRAWAL_FEE_BUFFER_PERCENT)?;
@@ -184,9 +195,39 @@ pub fn withdrawal_fee_quote(median: &FeeVote) -> Option<UsdtAmount> {
     let fee = numerator
         .checked_add(denominator - 1)?
         .checked_div(denominator)?
-        .max(u128::from(MIN_WITHDRAWAL_FEE.0));
+        .max(u128::from(floor_raw));
 
     u64::try_from(fee).ok().map(UsdtAmount)
+}
+
+/// Computes the minimum USDT fee (in [`UsdtAmount`]'s smallest on-chain
+/// unit) a withdrawal output must offer as `max_fee`, given the
+/// federation's current [`FeeVote`] median (see
+/// `fedimint_usdt_server::Usdt::fee_vote_median`).
+///
+/// See [`gas_cost_fee_quote`] for the shared formula; this instantiates it
+/// with [`WITHDRAWAL_GAS_UNITS`] and floors at [`MIN_WITHDRAWAL_FEE`] so a
+/// degenerate zero (or near-zero) `FeeVote` median can never yield a free
+/// (or near-free) withdrawal (see [`MIN_WITHDRAWAL_FEE`]'s doc comment). A
+/// pure function of `median` alone, so every guardian computes
+/// byte-identical output from the same consensus-agreed median;
+/// [`MIN_WITHDRAWAL_FEE`] is a compile-time const, so the `max` with it
+/// stays just as deterministic.
+#[must_use]
+pub fn withdrawal_fee_quote(median: &FeeVote) -> Option<UsdtAmount> {
+    gas_cost_fee_quote(WITHDRAWAL_GAS_UNITS, median, MIN_WITHDRAWAL_FEE.0)
+}
+
+/// Minimum USDT deposit fee given the current [`FeeVote`] median: the gas
+/// cost of the depositor's deploy+sweep ([`SWEEP_GAS_UNITS`]) converted to
+/// USDT with the standard buffer, floored at [`MIN_DEPOSIT_FEE`].
+///
+/// See [`gas_cost_fee_quote`] for the shared formula. Pure function of
+/// `median` alone (no RPC, no wall-clock, no `our_peer_id`) -- deterministic
+/// across guardians.
+#[must_use]
+pub fn deposit_fee_quote(median: &FeeVote) -> Option<UsdtAmount> {
+    gas_cost_fee_quote(SWEEP_GAS_UNITS, median, MIN_DEPOSIT_FEE.0)
 }
 
 /// Converts a Chainlink ETH/USD `latestRoundData()` reading into
@@ -817,6 +858,27 @@ pub struct WithdrawFeeQuoteResponse {
     pub valid_blocks: u64,
 }
 
+/// Request for the current deposit fee quote, mirroring
+/// [`WithdrawFeeQuoteRequest`]. Unit-like: [`deposit_fee_quote`] does not
+/// (yet) depend on the amount being claimed, but the request is kept as a
+/// struct for forward-compatibility with a future amount-dependent fee
+/// model, mirroring the withdraw side.
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct DepositFeeQuoteRequest;
+
+/// Response to the `deposit_fee_quote` endpoint, mirroring
+/// [`WithdrawFeeQuoteResponse`]: `fee` is the minimum fee a `UsdtInput::V0`
+/// claiming a credited deposit must offer right now; `valid_blocks` is how
+/// many further guardian-observed EVM blocks the quote should be treated as
+/// valid for before re-querying (fee-vote-median-derived quotes can move as
+/// guardians' `FeeVote`s change), a fixed, non-consensus advisory hint
+/// rather than an enforced on-chain expiry.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct DepositFeeQuoteResponse {
+    pub fee: UsdtAmount,
+    pub valid_blocks: u64,
+}
+
 /// Request for the current [`WithdrawalStatus`] of a withdrawal, identified
 /// by the `OutPoint` of the `UsdtOutput::V0` that enqueued it (Phase 8, Task
 /// 3).
@@ -1043,11 +1105,22 @@ pub enum UsdtInput {
     Default { variant: u64, bytes: Vec<u8> },
 }
 
-/// Data for a `UsdtInput::V0`
+/// Data for a `UsdtInput::V0`: claim `amount` of credited deposit from
+/// `account`, offering `fee` (in the same [`UsdtAmount`] unit, mirroring
+/// [`UsdtOutputV0::max_fee`]) to cover the federation's on-chain gas cost of
+/// deploying and sweeping the deposit account. The server's `process_input`
+/// rejects the input (`UsdtInputError::DepositFeeInsufficient`) if `fee` is
+/// below the federation's current fee-vote-median-derived quote (see
+/// [`deposit_fee_quote`]), and rejects it
+/// (`UsdtInputError::FeeExceedsAmount`) if `fee >= amount`; the e-cash
+/// actually issued to the claimant is `amount - fee`, while `fee`'s USDT
+/// stays credited-but-unissued backing that the sweep still pulls into the
+/// pool.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
 pub struct UsdtInputV0 {
     pub account: EvmAddress,
     pub amount: UsdtAmount,
+    pub fee: UsdtAmount,
 }
 
 /// Output for a fedimint transaction (Phase 8, Task 1): a user burning USDT
@@ -1106,6 +1179,13 @@ pub enum UsdtInputError {
         available: UsdtAmount,
         requested: UsdtAmount,
     },
+    #[error("This input's fee {offered} is below the federation's deposit fee quote {quote}")]
+    DepositFeeInsufficient {
+        quote: UsdtAmount,
+        offered: UsdtAmount,
+    },
+    #[error("This input's fee {fee} would consume all or more of its {amount} claimed amount")]
+    FeeExceedsAmount { amount: UsdtAmount, fee: UsdtAmount },
 }
 
 /// Errors that might be returned by the server
@@ -1530,6 +1610,7 @@ mod tests {
         let input = UsdtInput::V0(UsdtInputV0 {
             account: EvmAddress([9; 20]),
             amount: UsdtAmount(1_000_000),
+            fee: UsdtAmount(1_000),
         });
         let bytes = input.consensus_encode_to_vec();
         let decoded = UsdtInput::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
@@ -1616,6 +1697,77 @@ mod tests {
             usdt_per_eth_e6: u64::MAX,
         };
         assert_eq!(withdrawal_fee_quote(&median), None);
+    }
+
+    #[test]
+    fn deposit_fee_quote_computes_expected_value() {
+        // 30 gwei max_fee_per_gas, 3000.000000 USDT/ETH.
+        let median = FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        // gas_cost_wei = 800_000 * 30e9 = 2.4e16
+        // numerator = 2.4e16 * 3_000_000_000 * 120 = 8.64e27
+        // denominator = 1e18 * 100 = 1e20
+        // fee = 8.64e27 / 1e20 = 86_400_000 (raw USDT units == 86.4 USDT,
+        // i.e. the unbuffered 72_000_000 scaled by the 20% buffer)
+        let quote = deposit_fee_quote(&median).expect("must not overflow for realistic input");
+        assert_eq!(quote, UsdtAmount(86_400_000));
+    }
+
+    #[test]
+    fn deposit_fee_quote_is_deterministic() {
+        let median = FeeVote {
+            max_fee_per_gas_wei: 87_654_321,
+            usdt_per_eth_e6: 3_456_789_012,
+        };
+        assert_eq!(deposit_fee_quote(&median), deposit_fee_quote(&median));
+    }
+
+    #[test]
+    fn deposit_fee_quote_scales_with_gas_price() {
+        let low = FeeVote {
+            max_fee_per_gas_wei: 10_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        let high = FeeVote {
+            max_fee_per_gas_wei: 100_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        let quote_low = deposit_fee_quote(&low).expect("must not overflow");
+        let quote_high = deposit_fee_quote(&high).expect("must not overflow");
+        assert!(quote_high.0 > quote_low.0);
+    }
+
+    #[test]
+    fn deposit_fee_quote_zero_median_is_floored() {
+        // A degenerate all-zero `FeeVote` median (e.g. an idle `anvil`
+        // devnet reporting a zero base fee, or every guardian voting zeros)
+        // must never yield a zero (free) deposit quote: the
+        // `MIN_DEPOSIT_FEE` floor kicks in instead, mirroring
+        // `withdrawal_fee_quote_zero_median_is_floored_not_free`.
+        let median = FeeVote {
+            max_fee_per_gas_wei: 0,
+            usdt_per_eth_e6: 0,
+        };
+        let quote = deposit_fee_quote(&median).expect("zero median must not overflow");
+        assert_eq!(quote, MIN_DEPOSIT_FEE);
+        assert_ne!(
+            quote.0, 0,
+            "a degenerate zero median must never quote a free deposit"
+        );
+    }
+
+    #[test]
+    fn deposit_fee_quote_overflow_is_none_not_a_panic() {
+        // An extreme (e.g. byzantine-voted) FeeVote whose product overflows
+        // u128 part-way through the computation must return `None`, never
+        // panic (no unwrap/wrapping arithmetic).
+        let median = FeeVote {
+            max_fee_per_gas_wei: u64::MAX,
+            usdt_per_eth_e6: u64::MAX,
+        };
+        assert_eq!(deposit_fee_quote(&median), None);
     }
 
     #[test]
