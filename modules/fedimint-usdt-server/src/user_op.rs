@@ -139,7 +139,7 @@ impl GasBounds {
     /// zero-median chain still yields an includable op (1 gwei).
     const OP_FEE_FLOOR_WEI: u128 = 1_000_000_000;
     /// Upper bound so a spiked or byzantine-voted median cannot inflate the
-    /// op's `max_fee_per_gas` -- and hence the EntryPoint prefund the
+    /// op's `max_fee_per_gas` -- and hence the `EntryPoint` prefund the
     /// broadcaster fronts (`need = totalGas * maxFeePerGas`, see
     /// `rpc.rs`) -- to a catastrophic amount (200 gwei).
     const OP_FEE_CEILING_WEI: u128 = 200_000_000_000;
@@ -154,7 +154,7 @@ impl GasBounds {
     /// live `eth_gasPrice`; `None` when no fee vote has landed yet).
     ///
     /// This is the value that prices the on-chain sweep/withdrawal `UserOp`
-    /// (and, transitively, the EntryPoint prefund the broadcaster fronts).
+    /// (and, transitively, the `EntryPoint` prefund the broadcaster fronts).
     /// The devnet default (30 gwei) massively over-provisions the prefund on a
     /// cheap-gas mainnet (base fee ~0.1-1 gwei), which can exceed a modestly
     /// funded broadcaster's balance and wedge the whole sweep/withdrawal path;
