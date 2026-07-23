@@ -107,17 +107,18 @@ impl fmt::Display for FeeVote {
     }
 }
 
-/// Static, conservative gas-unit estimate for a single-transfer withdrawal
-/// `UserOp` executed from the pool `SimpleAccount` (already deployed by the
-/// first Phase-7 sweep, so -- unlike
-/// `fedimint_usdt_server::user_op::GasBounds::DEPLOY_AND_SWEEP_DEVNET`'s
-/// first-sweep case -- there is no `initCode`/CREATE2 deploy overhead to
-/// cover): just `validateUserOp`'s signature check plus one
-/// `execute`-wrapped ERC-20 `transfer`. Used only to QUOTE the withdrawal
-/// fee ([`withdrawal_fee_quote`]); Task 2 builds the actual batched
-/// withdrawal `UserOp`'s own gas bounds when it constructs it, independent
-/// of this constant.
-pub const WITHDRAWAL_GAS_UNITS: u128 = 150_000;
+/// Total gas-unit estimate for a single-transfer withdrawal `UserOp` (pool
+/// already deployed): the sum of the three ERC-4337 gas components the
+/// builder provisions for a batch of one: `verification_gas_limit`
+/// (`100_000`), `call_gas_limit` (`140_000`), and `pre_verification_gas`
+/// (`120_000`).
+///
+/// A withdrawal is quoted per-item BEFORE its batch is composed, so the only
+/// safe (never-undercharging) figure is this batch-of-1 total; larger
+/// batches amortize the fixed per-batch overhead and over-collect slightly
+/// (safe). Kept in lockstep with `GasBounds::withdrawal_batch(1, false)` by
+/// `withdrawal_gas_units_matches_the_batch_of_one_builder_bound`.
+pub const WITHDRAWAL_GAS_UNITS: u128 = 360_000;
 
 /// Percentage buffer [`withdrawal_fee_quote`] applies on top of the raw
 /// gas-cost estimate, covering fee-market movement between the quote being
@@ -142,7 +143,7 @@ pub const WITHDRAWAL_FEE_BUFFER_PERCENT: u128 = 20;
 /// unit): large enough to guarantee the quote is never literally zero, but
 /// negligible next to any realistic gas-market-derived quote (tens of
 /// thousands to millions of raw units at normal EVM gas prices -- see
-/// `withdrawal_fee_quote_computes_expected_value`'s `16_200_000`-unit
+/// `withdrawal_fee_quote_computes_expected_value`'s `38_880_000`-unit
 /// example), so it never distorts a real quote and only ever bites in the
 /// degenerate zero-median edge case this const exists to close.
 pub const MIN_WITHDRAWAL_FEE: UsdtAmount = UsdtAmount(10_000);
@@ -1572,13 +1573,13 @@ mod tests {
             max_fee_per_gas_wei: 30_000_000_000,
             usdt_per_eth_e6: 3_000_000_000,
         };
-        // gas_cost_wei = 150_000 * 30e9 = 4.5e15
-        // numerator = 4.5e15 * 3_000_000_000 * 120 = 1.62e27
+        // gas_cost_wei = 360_000 * 30e9 = 1.08e16
+        // numerator = 1.08e16 * 3_000_000_000 * 120 = 3.888e27
         // denominator = 1e18 * 100 = 1e20
-        // fee = 1.62e27 / 1e20 = 16_200_000 (raw USDT units == 16.2 USDT,
-        // i.e. the unbuffered 13_500_000 scaled by the 20% buffer)
+        // fee = 3.888e27 / 1e20 = 38_880_000 (raw USDT units == 38.88 USDT,
+        // i.e. the unbuffered 32_400_000 scaled by the 20% buffer)
         let quote = withdrawal_fee_quote(&median).expect("must not overflow for realistic input");
-        assert_eq!(quote, UsdtAmount(16_200_000));
+        assert_eq!(quote, UsdtAmount(38_880_000));
     }
 
     #[test]
@@ -1767,7 +1768,7 @@ mod tests {
             usdt_per_eth_e6: 3_000_000_000,
         };
         let quote = withdrawal_fee_quote(&median).expect("must not overflow for realistic input");
-        assert_eq!(quote, UsdtAmount(16_200_000));
+        assert_eq!(quote, UsdtAmount(38_880_000));
         assert!(quote.0 > MIN_WITHDRAWAL_FEE.0);
     }
 

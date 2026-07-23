@@ -55,6 +55,18 @@ pub struct GasBounds {
 }
 
 impl GasBounds {
+    /// Total gas *units* this op provisions (the three `*_gas_limit`/`*_gas`
+    /// fields; excludes the two wei price fields). This is the figure a fee
+    /// quote must cover to pay for the op on-chain.
+    #[must_use]
+    pub fn total_gas_units(&self) -> u128 {
+        self.verification_gas_limit
+            .saturating_add(self.call_gas_limit)
+            .saturating_add(self.pre_verification_gas)
+    }
+}
+
+impl GasBounds {
     /// Sized for THIS module's specific deploy-and-sweep op shape (one
     /// `ERC1967Proxy` CREATE2 deploy + `SimpleAccount.initialize` + one
     /// `execute`-wrapped ERC-20 `transfer`) on a devnet/anvil-class chain.
@@ -1031,5 +1043,18 @@ mod tests {
                 p.max_fee_per_gas
             );
         }
+    }
+
+    #[test]
+    fn withdrawal_gas_units_matches_the_batch_of_one_builder_bound() {
+        // The fee quote (in -common) charges for WITHDRAWAL_GAS_UNITS; the builder
+        // (here) provisions GasBounds::withdrawal_batch(1, false). A single
+        // withdrawal is quoted before its batch is composed, so the only safe
+        // quote figure is the batch-of-1 total. Tie them together so they can
+        // never silently drift (this exact drift caused a 2.4x under-charge).
+        assert_eq!(
+            fedimint_usdt_common::WITHDRAWAL_GAS_UNITS,
+            GasBounds::withdrawal_batch(1, false).total_gas_units(),
+        );
     }
 }
