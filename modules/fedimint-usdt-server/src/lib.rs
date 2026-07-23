@@ -1466,6 +1466,15 @@ impl ServerModule for Usdt {
         .await;
         dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
             .await;
+        info!(
+            target: "usdt",
+            %out_point,
+            recipient = %withdrawal.recipient,
+            amount = withdrawal.amount.0,
+            max_fee = withdrawal.max_fee.0,
+            requested_block,
+            "withdrawal queued (awaiting batch trigger)"
+        );
 
         Ok(TransactionItemAmounts {
             amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(withdrawal.amount.0)),
@@ -2336,6 +2345,15 @@ impl Usdt {
                             } else {
                                 UsdtAmount(0)
                             };
+                            debug!(
+                                target: "usdt",
+                                ?op_hash,
+                                success = receipt.success,
+                                block = receipt.block,
+                                swept = swept.0,
+                                purpose = ?record.purpose,
+                                "UserOp receipt observed on-chain, proposing threshold confirmation"
+                            );
                             user_op_confirmed_proposals
                                 .lock()
                                 .expect("not poisoned")
@@ -2801,10 +2819,16 @@ impl Usdt {
             .await
             .collect()
             .await;
-        if pending
+        if let Some((PendingUserOpKey(op_hash), _)) = pending
             .iter()
-            .any(|(_, p)| matches!(p.purpose, UserOpPurpose::Withdraw { .. }))
+            .find(|(_, p)| matches!(p.purpose, UserOpPurpose::Withdraw { .. }))
         {
+            debug!(
+                target: "usdt",
+                ?op_hash,
+                state = "Pending",
+                "withdrawal batch trigger blocked: a Withdraw op is already in-flight (awaiting/undergoing MPC signing)"
+            );
             return true;
         }
 
@@ -2813,9 +2837,19 @@ impl Usdt {
             .await
             .collect()
             .await;
-        submitted
+        if let Some((SubmittedUserOpKey(op_hash), _)) = submitted
             .iter()
-            .any(|(_, s)| matches!(s.purpose, UserOpPurpose::Withdraw { .. }))
+            .find(|(_, s)| matches!(s.purpose, UserOpPurpose::Withdraw { .. }))
+        {
+            debug!(
+                target: "usdt",
+                ?op_hash,
+                state = "Submitted",
+                "withdrawal batch trigger blocked: a Withdraw op is already in-flight (signed, awaiting on-chain confirmation)"
+            );
+            return true;
+        }
+        false
     }
 
     /// `true` if a `DeployAndSweep`-purpose `UserOp` for exactly this
@@ -2934,6 +2968,16 @@ impl Usdt {
             consensus_block_count >= oldest_requested_block + batch_interval_blocks();
         let enough_items = queued.len() >= BATCH_MAX_ITEMS;
         if !waited_long_enough && !enough_items {
+            debug!(
+                target: "usdt",
+                queued = queued.len(),
+                consensus_block_count,
+                oldest_requested_block,
+                interval_blocks = batch_interval_blocks(),
+                fires_at_block = oldest_requested_block + batch_interval_blocks(),
+                batch_max_items = BATCH_MAX_ITEMS,
+                "withdrawal batch waiting for interval (or item threshold)"
+            );
             return;
         }
 
@@ -2989,6 +3033,15 @@ impl Usdt {
             .iter()
             .fold(0u64, |acc, (_, w)| acc.saturating_add(w.amount.0));
         if pool.balance.0 < batch_total {
+            info!(
+                target: "usdt",
+                queued = queued.len(),
+                batch_total,
+                pool_balance = pool.balance.0,
+                shortfall = batch_total.saturating_sub(pool.balance.0),
+                pool_account = %pool.account,
+                "withdrawal batch waiting for pool funding (batch total exceeds pool balance); accelerating sweeps"
+            );
             // ACCELERATE SWEEP: the pool cannot yet cover the queued
             // withdrawals. Rather than passively wait for each backing
             // deposit's own credit-triggered sweep, actively (re)trigger a
@@ -3001,6 +3054,35 @@ impl Usdt {
             return;
         }
 
+        self.build_and_enqueue_withdrawal_batch(
+            dbtx,
+            &queued,
+            &pool,
+            batch_total,
+            consensus_block_count,
+            enough_items,
+        )
+        .await;
+    }
+
+    /// Builds the single `Withdraw`-purpose `executeBatch` `UserOp` from the
+    /// (already sorted, truncated, and pool-covered) `queued` withdrawals,
+    /// enqueues it as a `PendingUserOp`, flips each withdrawal to
+    /// `WithdrawalState::Signing`, and starts its MPC signing session. Split
+    /// out of [`Usdt::maybe_trigger_withdrawal_batch`] purely to keep that
+    /// method's decision logic readable; every input is a consensus-DB value
+    /// or config, so this remains a pure, byte-identical function of consensus
+    /// state on every guardian (see the caller's determinism note). `trigger`
+    /// (`enough_items`) is diagnostic-only, feeding the log line's cause.
+    async fn build_and_enqueue_withdrawal_batch(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        queued: &[(OutPoint, UsdtWithdrawalV0)],
+        pool: &PoolState,
+        batch_total: u64,
+        consensus_block_count: u64,
+        enough_items: bool,
+    ) {
         let outpoints: Vec<OutPoint> = queued.iter().map(|(o, _)| *o).collect();
         let withdrawals: Vec<(fedimint_usdt_common::EvmAddress, UsdtAmount)> = queued
             .iter()
@@ -3049,6 +3131,17 @@ impl Usdt {
             )
             .await;
         }
+
+        info!(
+            target: "usdt",
+            ?op_hash,
+            count = outpoints.len(),
+            batch_total,
+            nonce = pool.nonce,
+            needs_deploy,
+            trigger = if enough_items { "item-threshold" } else { "interval" },
+            "withdrawal batch built (PendingUserOp), starting MPC signing session"
+        );
 
         let digest = eth_signed_message_hash(op_hash);
         self.start_session(dbtx, SigningPurpose::UserOp(op_hash), digest, 0)
@@ -3272,6 +3365,26 @@ impl Usdt {
                 dbtx.insert_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
                     .await;
             }
+        }
+
+        if obs.success {
+            info!(
+                target: "usdt",
+                count = outpoints.len(),
+                paid_out = obs.swept.0,
+                block = obs.block,
+                pool_balance_after = pool.balance.0,
+                new_pool_nonce = pool.nonce,
+                "withdrawal batch CONFIRMED on-chain; withdrawals settled"
+            );
+        } else {
+            warn!(
+                target: "usdt",
+                count = outpoints.len(),
+                block = obs.block,
+                new_pool_nonce = pool.nonce,
+                "withdrawal batch REVERTED on-chain; withdrawals returned to Queued for retry (pool balance untouched)"
+            );
         }
     }
 
