@@ -405,7 +405,7 @@ impl AlloyEvmRpc {
 const STATIC_USDT_PER_ETH_E6: u64 = 3_000_000_000;
 
 /// Recent-block window scanned by [`AlloyEvmRpc::get_user_op_receipt`]'s
-/// `eth_getLogs` for a `UserOperationEvent`. A UserOp confirms within a few
+/// `eth_getLogs` for a `UserOperationEvent`. A `UserOp` confirms within a few
 /// blocks of submission, so a small window suffices; kept small (~2000 blocks,
 /// ~7h on mainnet) to stay within even restrictive RPC providers' getLogs
 /// block-range caps -- scanning from block 0 (the whole chain) is rejected by
