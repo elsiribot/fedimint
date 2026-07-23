@@ -44,21 +44,21 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
-    DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
-    SIGNING_SESSION_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
-    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
+    POOL_STATE_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT,
+    USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
     BootstrapObservation, BootstrapState, CheckDepositRequest, CheckDepositResponse,
-    DepositObservation, DepositStatusRequest, DepositStatusResponse, FeeVote,
-    MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse,
-    SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
-    UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
-    UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
-    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse,
-    derive_deposit_account, derive_pool_account, evm_address, pool_salt, signing_session_id,
-    withdrawal_fee_quote,
+    DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation, DepositStatusRequest,
+    DepositStatusResponse, FeeVote, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem,
+    PoolStateResponse, SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
+    UsdtConsensusItem, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
+    UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
+    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
+    WithdrawalStatusResponse, deposit_fee_quote, derive_deposit_account, derive_pool_account,
+    evm_address, pool_salt, signing_session_id, withdrawal_fee_quote,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -1370,6 +1370,22 @@ impl ServerModule for Usdt {
         }
     }
 
+    /// Claims (a portion of) a `credited` deposit, funding
+    /// `input.amount - input.fee` (in [`USDT_UNIT`]) into the submitting
+    /// transaction. `input.fee` must clear the federation's current
+    /// fee-vote-median-derived deposit quote
+    /// ([`fedimint_usdt_common::deposit_fee_quote`]), mirroring
+    /// `process_output`'s `max_fee`/[`withdrawal_fee_quote`] check; the fee
+    /// stays credited-but-unissued and is later swept into the pool as
+    /// federation fee revenue (Task 3).
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of `(input, prior consensus DB state, config)`: reads
+    /// only the fee-vote median (`Usdt::fee_vote_median`) -- no RPC, no
+    /// wall-clock, no `our_peer_id`. Every guardian processing the same
+    /// ordered input against the same prior DB state computes the identical
+    /// `Ok`/`Err` and the identical `DepositRecordKey` write.
     async fn process_input<'a, 'b, 'c>(
         &'a self,
         dbtx: &mut DatabaseTransaction<'c>,
@@ -1390,6 +1406,35 @@ impl ServerModule for Usdt {
                 requested: input.amount,
             });
         }
+
+        // Mirrors `process_output`'s `median`/`quote` handling exactly,
+        // modulo the error type: `UsdtInputError` has no `NoFeeQuoteAvailable`/
+        // `FeeQuoteOverflow` analog (only `DepositFeeInsufficient`), so an
+        // absent-or-overflowing quote is represented as an effectively
+        // infinite `quote` (`UsdtAmount(u64::MAX)`) fed into the SAME
+        // `DepositFeeInsufficient` check below. No finite `input.fee` can
+        // ever clear `u64::MAX`, so -- exactly like `process_output`
+        // unconditionally rejecting with `NoFeeQuoteAvailable` when
+        // `median` is `None` -- a deposit can never be claimed before the
+        // federation has a working fee quote, regardless of the fee
+        // offered.
+        let median = self.fee_vote_median(dbtx).await;
+        let quote = median
+            .and_then(|median| deposit_fee_quote(&median))
+            .unwrap_or(UsdtAmount(u64::MAX));
+        if input.fee.0 < quote.0 {
+            return Err(UsdtInputError::DepositFeeInsufficient {
+                quote,
+                offered: input.fee,
+            });
+        }
+        if input.amount.0 <= input.fee.0 {
+            return Err(UsdtInputError::FeeExceedsAmount {
+                amount: input.amount,
+                fee: input.fee,
+            });
+        }
+
         // `saturating_add` (Phase 9, Task 1 hardening, N1): `claimed` is
         // already bounded above by `credited` (a real, finite on-chain
         // balance) via the `available` check just above, so this can never
@@ -1397,7 +1442,11 @@ impl ServerModule for Usdt {
         // safer than a deterministic panic on the (unreachable in practice)
         // chance of a `u64` overflow, and saturation is exactly as
         // reproducible across guardians as a raw `+` would be (still a pure
-        // function of the two operands).
+        // function of the two operands). Note `claimed` advances by the
+        // FULL `input.amount` (not `amount - fee`): the fee's USDT remains
+        // part of this deposit's credited-but-unissued balance until the
+        // sweep pulls the whole thing into the pool, at which point it
+        // becomes federation fee revenue (see `audit`'s doc comment).
         record.claimed = UsdtAmount(record.claimed.0.saturating_add(input.amount.0));
         dbtx.insert_entry(&DepositRecordKey(input.account), &record)
             .await;
@@ -1405,7 +1454,7 @@ impl ServerModule for Usdt {
         Ok(InputMeta {
             amount: TransactionItemAmounts {
                 amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(input.amount.0)),
-                fees: Amounts::ZERO,
+                fees: Amounts::new_custom(USDT_UNIT, Amount::from_msats(input.fee.0)),
             },
             pub_key: record.claim_pk,
         })
@@ -1760,7 +1809,36 @@ impl ServerModule for Usdt {
 
                     Ok(WithdrawFeeQuoteResponse {
                         max_fee,
-                        valid_blocks: WITHDRAW_QUOTE_VALID_BLOCKS,
+                        valid_blocks: FEE_QUOTE_VALID_BLOCKS,
+                    })
+                }
+            },
+            api_endpoint! {
+                DEPOSIT_FEE_QUOTE_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, _req: DepositFeeQuoteRequest| -> DepositFeeQuoteResponse {
+                    // Read-only, mirrors `WITHDRAW_FEE_QUOTE_ENDPOINT` exactly:
+                    // the quote is derived entirely from the consensus-agreed
+                    // `FeeVote` median, so any guardian answers identically.
+                    // Before any `FeeVote` has landed, `fee` reports `0` (a
+                    // sentinel meaning "no quote yet") rather than erroring --
+                    // `process_input` is what actually enforces rejection in
+                    // that case (via `DepositFeeInsufficient` with an
+                    // effectively-infinite quote); a `0` quote here can never
+                    // be used to claim a deposit for free, since any `fee`
+                    // (even `0`) still needs `process_input`'s own median
+                    // lookup to succeed at the point the transaction lands.
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+
+                    let median = module.fee_vote_median(&mut dbtx.to_ref_nc()).await;
+                    let fee = median
+                        .and_then(|median| deposit_fee_quote(&median))
+                        .unwrap_or(UsdtAmount(0));
+
+                    Ok(DepositFeeQuoteResponse {
+                        fee,
+                        valid_blocks: FEE_QUOTE_VALID_BLOCKS,
                     })
                 }
             },
@@ -1801,13 +1879,13 @@ impl ServerModule for Usdt {
 }
 
 /// Advisory (non-enforced) number of further guardian-observed EVM blocks a
-/// `withdraw_fee_quote` response should be treated as valid for before
-/// re-querying, since the fee-vote-median-derived quote can move as
-/// guardians' individual `FeeVote`s change. Not read by any consensus
-/// decision -- `process_output` always re-derives the quote fresh from the
-/// median at the block it processes the output, regardless of how stale a
-/// client's cached quote is.
-const WITHDRAW_QUOTE_VALID_BLOCKS: u64 = 50;
+/// `withdraw_fee_quote`/`deposit_fee_quote` response should be treated as
+/// valid for before re-querying, since the fee-vote-median-derived quote can
+/// move as guardians' individual `FeeVote`s change. Not read by any
+/// consensus decision -- `process_output`/`process_input` always re-derive
+/// the quote fresh from the median at the point they process the item,
+/// regardless of how stale a client's cached quote is.
+const FEE_QUOTE_VALID_BLOCKS: u64 = 50;
 
 impl Usdt {
     /// Create new module instance, spawning the background block-count
@@ -5869,11 +5947,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn process_input_claims_credited_deposit_and_guards_against_double_claim() {
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
         let account = EvmAddress([0x55; 20]);
         let claim_pk = test_pubkey(0xee);
+
+        // A `FeeVote` median must exist for `process_input` to quote a
+        // deposit fee at all (mirrors `process_output_debits_and_enqueues_
+        // withdrawal` seeding a median before withdrawing).
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let fee = deposit_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
 
         {
             let mut dbtx = db.begin_transaction().await;
@@ -5881,7 +5966,7 @@ mod tests {
                 &DepositRecordKey(account),
                 &DepositRecord {
                     claim_pk,
-                    credited: UsdtAmount(5_000_000),
+                    credited: UsdtAmount(500_000_000),
                     claimed: UsdtAmount(0),
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
@@ -5892,14 +5977,18 @@ mod tests {
             dbtx.commit_tx().await;
         }
 
-        // First claim of 2M succeeds, funding USDT_UNIT and bumping `claimed`.
+        // First claim of 200M (paying exactly the quoted fee) succeeds,
+        // funding USDT_UNIT and bumping `claimed` by the FULL amount (the
+        // fee stays credited-but-unissued until the sweep, per
+        // `process_input`'s doc comment).
         let mut dbtx = db.begin_transaction().await;
         let meta = module
             .process_input(
                 &mut dbtx.to_ref_nc(),
                 &UsdtInput::V0(UsdtInputV0 {
                     account,
-                    amount: UsdtAmount(2_000_000),
+                    amount: UsdtAmount(200_000_000),
+                    fee,
                 }),
                 test_in_point(),
             )
@@ -5907,9 +5996,14 @@ mod tests {
             .expect("first claim within credited balance must succeed");
         assert_eq!(
             meta.amount.amounts,
-            Amounts::new_custom(USDT_UNIT, Amount::from_msats(2_000_000))
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(200_000_000)),
+            "amounts is the FULL/gross claimed amount, mirroring process_output's \
+             amounts -- FundingVerifier nets the separate `fees` pool"
         );
-        assert_eq!(meta.amount.fees, Amounts::ZERO);
+        assert_eq!(
+            meta.amount.fees,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(fee.0))
+        );
         assert_eq!(meta.pub_key, claim_pk);
         dbtx.commit_tx().await;
 
@@ -5919,16 +6013,17 @@ mod tests {
             .get_value(&DepositRecordKey(account))
             .await
             .expect("record still exists");
-        assert_eq!(record.claimed, UsdtAmount(2_000_000));
+        assert_eq!(record.claimed, UsdtAmount(200_000_000));
 
-        // Second claim of 2M succeeds (4M of 5M now claimed).
+        // Second claim of 200M succeeds (400M of 500M now claimed).
         let mut dbtx = db.begin_transaction().await;
         module
             .process_input(
                 &mut dbtx.to_ref_nc(),
                 &UsdtInput::V0(UsdtInputV0 {
                     account,
-                    amount: UsdtAmount(2_000_000),
+                    amount: UsdtAmount(200_000_000),
+                    fee,
                 }),
                 test_in_point(),
             )
@@ -5942,16 +6037,18 @@ mod tests {
             .get_value(&DepositRecordKey(account))
             .await
             .expect("record still exists");
-        assert_eq!(record.claimed, UsdtAmount(4_000_000));
+        assert_eq!(record.claimed, UsdtAmount(400_000_000));
 
-        // Third claim of 2M exceeds the remaining 1M: double-claim/over-claim guard.
+        // Third claim of 200M exceeds the remaining 100M: double-claim/over-claim
+        // guard.
         let mut dbtx = db.begin_transaction().await;
         let err = module
             .process_input(
                 &mut dbtx.to_ref_nc(),
                 &UsdtInput::V0(UsdtInputV0 {
                     account,
-                    amount: UsdtAmount(2_000_000),
+                    amount: UsdtAmount(200_000_000),
+                    fee,
                 }),
                 test_in_point(),
             )
@@ -5960,8 +6057,8 @@ mod tests {
         assert_eq!(
             err,
             UsdtInputError::InsufficientCredit {
-                available: UsdtAmount(1_000_000),
-                requested: UsdtAmount(2_000_000),
+                available: UsdtAmount(100_000_000),
+                requested: UsdtAmount(200_000_000),
             }
         );
 
@@ -5971,7 +6068,180 @@ mod tests {
             .get_value(&DepositRecordKey(account))
             .await
             .expect("record still exists");
-        assert_eq!(record.claimed, UsdtAmount(4_000_000));
+        assert_eq!(record.claimed, UsdtAmount(400_000_000));
+    }
+
+    #[tokio::test]
+    async fn process_input_rejects_deposit_fee_below_quote() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([0x57; 20]);
+        let claim_pk = test_pubkey(0xef);
+
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let quote = deposit_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(500_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::V0(UsdtInputV0 {
+                    account,
+                    amount: UsdtAmount(200_000_000),
+                    fee: UsdtAmount(quote.0 - 1),
+                }),
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UsdtInputError::DepositFeeInsufficient {
+                quote,
+                offered: UsdtAmount(quote.0 - 1),
+            }
+        );
+
+        // Rejected claim must not have bumped `claimed`.
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record still exists");
+        assert_eq!(record.claimed, UsdtAmount(0));
+    }
+
+    #[tokio::test]
+    async fn process_input_rejects_fee_gte_amount() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([0x58; 20]);
+        let claim_pk = test_pubkey(0xf0);
+
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let quote = deposit_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(500_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // `amount == fee` exactly: the deposit would fund nothing after the
+        // fee, so it must be rejected rather than silently minting zero
+        // e-cash.
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::V0(UsdtInputV0 {
+                    account,
+                    amount: quote,
+                    fee: quote,
+                }),
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UsdtInputError::FeeExceedsAmount {
+                amount: quote,
+                fee: quote,
+            }
+        );
+
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record still exists");
+        assert_eq!(record.claimed, UsdtAmount(0));
+    }
+
+    #[tokio::test]
+    async fn process_input_rejects_when_no_fee_median_exists() {
+        // Mirrors `process_output_rejects_when_no_fee_median_exists`
+        // exactly: even an enormous offered `fee` cannot clear an absent
+        // median, since `process_input` substitutes an effectively-infinite
+        // quote (`UsdtAmount(u64::MAX)`) when `fee_vote_median` is `None`.
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([0x59; 20]);
+        let claim_pk = test_pubkey(0xf1);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(500_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::V0(UsdtInputV0 {
+                    account,
+                    amount: UsdtAmount(200_000_000),
+                    fee: UsdtAmount(u64::MAX - 1),
+                }),
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UsdtInputError::DepositFeeInsufficient {
+                quote: UsdtAmount(u64::MAX),
+                offered: UsdtAmount(u64::MAX - 1),
+            }
+        );
+
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record still exists");
+        assert_eq!(record.claimed, UsdtAmount(0));
     }
 
     #[tokio::test]
@@ -5987,6 +6257,7 @@ mod tests {
                 &UsdtInput::V0(UsdtInputV0 {
                     account,
                     amount: UsdtAmount(1),
+                    fee: UsdtAmount(0),
                 }),
                 test_in_point(),
             )

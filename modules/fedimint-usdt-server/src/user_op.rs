@@ -1057,4 +1057,17 @@ mod tests {
             GasBounds::withdrawal_batch(1, false).total_gas_units(),
         );
     }
+
+    #[test]
+    fn sweep_gas_units_matches_the_deploy_and_sweep_builder_bound() {
+        // Mirrors `withdrawal_gas_units_matches_the_batch_of_one_builder_bound`:
+        // the deposit fee quote (in -common) charges for `SWEEP_GAS_UNITS`;
+        // the builder (here) provisions `GasBounds::DEPLOY_AND_SWEEP_DEVNET`
+        // for the deploy+sweep that every deposit claim ultimately requires.
+        // Tie them together so they can never silently drift.
+        assert_eq!(
+            fedimint_usdt_common::SWEEP_GAS_UNITS,
+            GasBounds::DEPLOY_AND_SWEEP_DEVNET.total_gas_units(),
+        );
+    }
 }
