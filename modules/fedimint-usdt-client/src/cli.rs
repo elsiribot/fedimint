@@ -29,6 +29,10 @@ enum Opts {
     /// (the smallest on-chain USDT unit, 1e-6 USDT) -- the minimum `max_fee`
     /// a `withdraw` of `amount` must offer right now.
     FeeQuote { amount: u64 },
+    /// Report the federation's current deposit fee quote -- the minimum
+    /// `fee` a `claim` must offer right now to cover the federation's
+    /// deploy+sweep gas cost of a credited deposit.
+    DepositFeeQuote,
     /// Fetch the current withdrawal fee quote, submit a withdrawal of
     /// `amount` (the smallest on-chain USDT unit) to `recipient` (a
     /// 20-byte, optionally `0x`-prefixed hex EVM address), and print the
@@ -79,10 +83,18 @@ pub(crate) async fn handle_cli_command(
         Opts::CheckDeposit { claim_pk } => json(usdt.check_deposit(claim_pk).await?),
         Opts::DepositStatus { claim_pk } => json(usdt.deposit_status(claim_pk).await?),
         Opts::Claim { claim_pk } => {
+            // Best-effort display value: the fee actually charged is
+            // determined by `claim`'s own internal quote fetch
+            // (`UsdtClientModule::submit_claim`), moments after this one --
+            // the two agree unless the consensus-agreed `FeeVote` median
+            // changes in between, which is rare within a single command
+            // invocation.
+            let quote = usdt.deposit_fee_quote().await?;
             let claimed = usdt.claim(claim_pk).await?;
-            json(serde_json::json!({ "claimed": claimed.0 }))
+            json(serde_json::json!({ "claimed": claimed.0, "fee": quote.fee.0 }))
         }
         Opts::FeeQuote { amount } => json(usdt.withdraw_fee_quote(UsdtAmount(amount)).await?),
+        Opts::DepositFeeQuote => json(usdt.deposit_fee_quote().await?),
         Opts::Withdraw { recipient, amount } => {
             let amount = UsdtAmount(amount);
             let quote = usdt.withdraw_fee_quote(amount).await?;
@@ -175,6 +187,14 @@ mod tests {
         assert!(matches!(
             Opts::try_parse_from(["usdt", "fee-quote", "1000000"]).expect("parses"),
             Opts::FeeQuote { amount: 1_000_000 }
+        ));
+    }
+
+    #[test]
+    fn parses_deposit_fee_quote() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "deposit-fee-quote"]).expect("parses"),
+            Opts::DepositFeeQuote
         ));
     }
 

@@ -39,10 +39,10 @@ use fedimint_derive_secret::{ChildId, DerivableSecret};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
-    BootstrapState, CheckDepositResponse, DepositStatusResponse, EvmAddress, KIND,
-    PoolStateResponse, SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
-    UsdtInput, UsdtInputV0, UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse,
-    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse,
+    BootstrapState, CheckDepositResponse, DepositFeeQuoteResponse, DepositStatusResponse,
+    EvmAddress, KIND, PoolStateResponse, SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount,
+    UsdtCommonInit, UsdtInput, UsdtInputV0, UsdtModuleTypes, UsdtOutput, UsdtOutputV0,
+    UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -138,6 +138,10 @@ pub enum UsdtOperationMeta {
     Claim {
         account: EvmAddress,
         amount: UsdtAmount,
+        /// The deposit fee charged (per [`UsdtClientModule::deposit_fee_quote`]
+        /// at submission time), mirroring [`Self::Withdraw`]'s `max_fee`. The
+        /// e-cash actually issued to the claimant is `amount - fee`.
+        fee: UsdtAmount,
     },
     /// Phase 8, Task 1: the DEBIT/QUEUE half of a withdrawal only -- no
     /// state machine is attached (see [`UsdtClientModule::withdraw`]), so
@@ -164,14 +168,23 @@ impl ClientModule for UsdtClientModule {
         }
     }
 
-    // The usdt module charges no client-side fee on claim inputs (mirroring
-    // the server's `process_input`, which always returns `fees:
-    // Amounts::ZERO`): the transaction-balancing framework calls this for
-    // every input in a transaction being built (`Client::finalize_and_submit_
-    // transaction` sums `input_fee`/`output_fee` across all modules involved
-    // to compute the primary module's balancing output), not only when this
-    // module happens to be the primary one, so it must return `Some` for the
-    // only real input variant (`UsdtInput::V0`) rather than `unreachable!()`.
+    // A claim input DOES charge a real deposit fee (see `Self::submit_claim`),
+    // but it is never reported through this trait method: unlike
+    // `output_fee` below, whose `max_fee` must be ADDED on top of the
+    // withdrawal output's own `amounts` for the transaction-balancing
+    // framework to fund it correctly, a claim input's fee is baked directly
+    // into its own `ClientInput.amounts`, which `submit_claim` already sets
+    // to the NET `amount - fee` (mirroring the server's `process_input`,
+    // which declares the input GROSS -- `amounts: amount, fees: fee` -- so
+    // the two sides balance in `USDT_UNIT`: `amount >= (amount - fee) +
+    // fee`). Reporting `fee` again here would double-count it and starve the
+    // primary module's minted change by `fee`. The transaction-balancing
+    // framework calls this for every input in a transaction being built
+    // (`Client::finalize_and_submit_transaction` sums `input_fee`/
+    // `output_fee` across all modules involved to compute the primary
+    // module's balancing output), not only when this module happens to be
+    // the primary one, so it must return `Some` for the only real input
+    // variant (`UsdtInput::V0`) rather than `unreachable!()`.
     fn input_fee(
         &self,
         _amount: &Amounts,
@@ -553,7 +566,9 @@ impl UsdtClientModule {
     /// [`Self::deposit_status`] (no polling, unlike [`Self::check_and_claim`])
     /// and, if there is a nonzero claimable balance, submits the claim
     /// transaction using the keypair [`Self::allocate_deposit`] persisted for
-    /// `claim_pk`. Returns the claimed amount.
+    /// `claim_pk`. Returns the claimed (gross, on-chain-credited) amount --
+    /// the e-cash actually issued is this minus the deposit fee charged by
+    /// [`Self::submit_claim`] (see [`Self::deposit_fee_quote`]).
     ///
     /// Callers should have already called [`Self::check_deposit`] (to enqueue
     /// the deposit-checker task) and waited for the federation to observe and
@@ -576,6 +591,16 @@ impl UsdtClientModule {
             .await?;
 
         Ok(status.claimable)
+    }
+
+    /// Reports the federation's current deposit fee quote: the minimum `fee`
+    /// a `UsdtInput::V0` claiming a credited deposit must offer right now
+    /// (mirroring [`Self::withdraw_fee_quote`]). Thin wrapper around
+    /// [`UsdtFederationApi::deposit_fee_quote`] (threshold-agreement --
+    /// every guardian answers identically, since the quote is derived from
+    /// consensus DB).
+    pub async fn deposit_fee_quote(&self) -> anyhow::Result<DepositFeeQuoteResponse> {
+        Ok(self.module_api.deposit_fee_quote().await?)
     }
 
     /// Asks the federation to start watching `claim_keypair`'s deposit
@@ -614,29 +639,32 @@ impl UsdtClientModule {
             backoff = (backoff * 2).min(CHECK_AND_CLAIM_MAX_BACKOFF);
         };
 
-        self.submit_claim(claim_keypair, account, claimable).await
+        self.submit_claim(claim_keypair, account, claimable).await?;
+
+        Ok(())
     }
 
     /// Builds and submits the transaction claiming `amount` from `account`,
     /// funding it with `claim_keypair`. Shared by [`Self::check_and_claim`]
     /// (which polls until an amount is claimable) and [`Self::claim`] (which
-    /// takes a single already-known claimable amount).
+    /// takes a single already-known claimable amount). Returns the deposit
+    /// fee charged (per [`Self::deposit_fee_quote`]).
     ///
     /// The claimed funds are absorbed directly into the transaction's
     /// implicit funding, which the USDT-`mintv2` primary module (routed to by
     /// `USDT_UNIT`) balances by minting e-cash notes; no explicit output is
-    /// added here.
+    /// added here. The e-cash minted is the NET `amount - fee` (see
+    /// [`Self::claim_input`]).
     async fn submit_claim(
         &self,
         claim_keypair: &Keypair,
         account: EvmAddress,
         amount: UsdtAmount,
-    ) -> anyhow::Result<()> {
-        let input = ClientInput {
-            input: UsdtInput::V0(UsdtInputV0 { account, amount }),
-            keys: vec![*claim_keypair],
-            amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0)),
-        };
+    ) -> anyhow::Result<UsdtAmount> {
+        let quote = self.deposit_fee_quote().await?;
+        let fee = quote.fee;
+
+        let input = Self::claim_input(claim_keypair, account, amount, fee)?;
 
         let operation_id = OperationId::new_random();
         let tx = TransactionBuilder::new().with_inputs(
@@ -649,7 +677,11 @@ impl UsdtClientModule {
             .finalize_and_submit_transaction(
                 operation_id,
                 KIND.as_str(),
-                move |_range| UsdtOperationMeta::Claim { account, amount },
+                move |_range| UsdtOperationMeta::Claim {
+                    account,
+                    amount,
+                    fee,
+                },
                 tx,
             )
             .await?;
@@ -672,7 +704,49 @@ impl UsdtClientModule {
             )
             .await?;
 
-        Ok(())
+        Ok(fee)
+    }
+
+    /// Builds the `ClientInput` claiming `amount` from `account` with
+    /// `claim_keypair`, charging `fee` (per [`Self::deposit_fee_quote`]) via
+    /// NET issuance rather than an explicit [`ClientModule::input_fee`] (see
+    /// that trait method's doc comment on this module's impl for why): the
+    /// input's own [`UsdtInputV0::fee`] carries the fee the server verifies
+    /// against its own quote, while `amounts` is set to `amount - fee` so
+    /// the USDT-`mintv2` primary module mints exactly that much e-cash. The
+    /// server's `process_input` declares the input GROSS (`amounts: amount,
+    /// fees: fee`), so the two sides balance in `USDT_UNIT`.
+    ///
+    /// A pure, synchronous helper (no network/DB access) so the guard and
+    /// the resulting `ClientInput` are unit-testable without a live
+    /// federation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` if `fee` would consume all or more of `amount`
+    /// (mirroring the server's `UsdtInputError::FeeExceedsAmount`
+    /// rejection, but caught locally before ever building/submitting the
+    /// transaction, mirroring how `fedimint-wallet-client` skips
+    /// uneconomical peg-ins below the deposit fee).
+    fn claim_input(
+        claim_keypair: &Keypair,
+        account: EvmAddress,
+        amount: UsdtAmount,
+        fee: UsdtAmount,
+    ) -> anyhow::Result<ClientInput<UsdtInput>> {
+        if amount.0 <= fee.0 {
+            bail!("deposit {amount} does not cover the {fee} deposit fee");
+        }
+
+        Ok(ClientInput {
+            input: UsdtInput::V0(UsdtInputV0 {
+                account,
+                amount,
+                fee,
+            }),
+            keys: vec![*claim_keypair],
+            amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0 - fee.0)),
+        })
     }
 
     /// Reports the federation's current withdrawal fee quote: the minimum
@@ -921,7 +995,71 @@ impl ClientModuleInit for UsdtClientInit {
 mod tests {
     use fedimint_derive_secret::DerivableSecret;
 
-    use super::UsdtClientModule;
+    use super::{
+        Amount, Amounts, EvmAddress, Keypair, SECP256K1, USDT_UNIT, UsdtAmount, UsdtClientModule,
+        UsdtInput,
+    };
+
+    /// Deterministic test keypair (mirrors
+    /// [`UsdtClientModule::claim_keypair_static`]'s derivation, but with an
+    /// arbitrary fixed seed -- this test needs *a* keypair, not a
+    /// particular one).
+    fn test_keypair() -> Keypair {
+        DerivableSecret::new_root(b"usdt-claim-input-test-seed", b"salt").to_secp_key(SECP256K1)
+    }
+
+    /// [`UsdtClientModule::claim_input`] must set the input's own `fee`
+    /// field from the quote, and declare the NET `amount - fee` as its
+    /// `ClientInput.amounts` -- not the gross `amount` -- so the
+    /// USDT-`mintv2` primary module mints exactly `amount - fee` and the
+    /// transaction balances against the server's GROSS `process_input`
+    /// declaration (`amounts: amount, fees: fee`).
+    #[test]
+    fn claim_input_sets_fee_and_net_amounts() {
+        let keypair = test_keypair();
+        let account = EvmAddress([0x11; 20]);
+        let amount = UsdtAmount(1_000_000);
+        let fee = UsdtAmount(100_000);
+
+        let input = UsdtClientModule::claim_input(&keypair, account, amount, fee)
+            .expect("amount comfortably exceeds fee");
+
+        match input.input {
+            UsdtInput::V0(v0) => {
+                assert_eq!(v0.account, account);
+                assert_eq!(v0.amount, amount);
+                assert_eq!(v0.fee, fee);
+            }
+            UsdtInput::Default { .. } => panic!("claim_input must build a V0 input"),
+        }
+        assert_eq!(input.keys, vec![keypair]);
+        assert_eq!(
+            input.amounts,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0 - fee.0)),
+            "ClientInput.amounts must be the NET amount, not the gross claimed amount"
+        );
+    }
+
+    /// An uneconomical deposit (the fee would consume all or more of the
+    /// claimed amount) must be rejected locally, before ever building or
+    /// submitting a transaction -- mirroring the server's
+    /// `UsdtInputError::FeeExceedsAmount` rejection and
+    /// `fedimint-wallet-client`'s uneconomical-peg-in guard.
+    #[test]
+    fn claim_input_rejects_uneconomical_deposit() {
+        let keypair = test_keypair();
+        let account = EvmAddress([0x22; 20]);
+
+        // fee == amount.
+        let err =
+            UsdtClientModule::claim_input(&keypair, account, UsdtAmount(500), UsdtAmount(500))
+                .expect_err("fee equal to amount must be rejected");
+        assert!(err.to_string().contains("deposit fee"));
+
+        // fee > amount.
+        UsdtClientModule::claim_input(&keypair, account, UsdtAmount(500), UsdtAmount(600))
+            .expect_err("fee exceeding amount must be rejected");
+    }
 
     /// The deposit claim-key derivation must be deterministic from the seed:
     /// the same module root secret and index always yields the same key, and

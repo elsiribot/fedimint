@@ -6,15 +6,15 @@ use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::{OutPoint, PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
-    DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT,
-    SIGNING_SESSION_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
-    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
+    POOL_STATE_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT,
+    USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
-    CheckDepositRequest, CheckDepositResponse, DepositStatusRequest, DepositStatusResponse,
-    PoolStateResponse, SigningSessionId, StatusResponse, UsdtAmount, UserOpStatusRequest,
-    UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
-    WithdrawalStatusRequest, WithdrawalStatusResponse,
+    CheckDepositRequest, CheckDepositResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse,
+    DepositStatusRequest, DepositStatusResponse, PoolStateResponse, SigningSessionId,
+    StatusResponse, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
+    WithdrawFeeQuoteResponse, WithdrawalStatusRequest, WithdrawalStatusResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -90,6 +90,13 @@ pub trait UsdtFederationApi {
         &self,
         amount: UsdtAmount,
     ) -> FederationResult<WithdrawFeeQuoteResponse>;
+
+    /// Reports the federation's current deposit fee quote, mirroring
+    /// [`Self::withdraw_fee_quote`]. Threshold-agreement
+    /// (`request_current_consensus`): the quote is derived entirely from
+    /// the consensus-agreed `FeeVote` median, so any guardian answers
+    /// identically.
+    async fn deposit_fee_quote(&self) -> FederationResult<DepositFeeQuoteResponse>;
 
     /// Reports the consensus-agreed lifecycle stage of a queued withdrawal,
     /// identified by the `OutPoint` of the `UsdtOutput::V0` that enqueued it
@@ -218,6 +225,14 @@ where
         self.request_current_consensus(
             WITHDRAW_FEE_QUOTE_ENDPOINT.to_string(),
             ApiRequestErased::new(WithdrawFeeQuoteRequest { amount }),
+        )
+        .await
+    }
+
+    async fn deposit_fee_quote(&self) -> FederationResult<DepositFeeQuoteResponse> {
+        self.request_current_consensus(
+            DEPOSIT_FEE_QUOTE_ENDPOINT.to_string(),
+            ApiRequestErased::new(DepositFeeQuoteRequest),
         )
         .await
     }
