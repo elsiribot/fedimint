@@ -929,4 +929,107 @@ mod tests {
             .expect_err("a mismatched digest must not recover to owner");
         assert!(err.to_string().contains("neither recovery id"));
     }
+
+    // ---- GasBounds::with_median_fees (mainnet gas-pricing regression) ----
+    // These guard the on-chain wedge bug: the sweep/withdrawal ops hardcoded a
+    // 30 gwei `max_fee_per_gas`, which on a cheap-gas mainnet over-provisioned
+    // the broadcaster-fronted EntryPoint prefund (~200x) beyond a modestly
+    // funded broadcaster's balance -- so nothing ever confirmed. The anvil
+    // suite (zero gas price) structurally could not catch it.
+
+    #[test]
+    fn with_median_fees_replaces_the_devnet_constant_with_the_median() {
+        let base = GasBounds::DEPLOY_AND_SWEEP_DEVNET;
+        assert_eq!(
+            base.max_fee_per_gas, 30_000_000_000,
+            "devnet default is 30 gwei"
+        );
+        // A realistic mainnet median (5 gwei) x2 headroom = 10 gwei, REPLACING
+        // the 30 gwei constant.
+        let priced = base.with_median_fees(Some(5_000_000_000));
+        assert_eq!(priced.max_fee_per_gas, 10_000_000_000);
+        assert_ne!(priced.max_fee_per_gas, 30_000_000_000);
+        // Gas-LIMIT fields are untouched (only the fee is re-priced).
+        assert_eq!(priced.verification_gas_limit, base.verification_gas_limit);
+        assert_eq!(priced.call_gas_limit, base.call_gas_limit);
+        assert_eq!(priced.pre_verification_gas, base.pre_verification_gas);
+        // Same for the withdrawal-batch bounds.
+        assert_eq!(
+            GasBounds::withdrawal_batch(3, false)
+                .with_median_fees(Some(5_000_000_000))
+                .max_fee_per_gas,
+            10_000_000_000
+        );
+    }
+
+    #[test]
+    fn with_median_fees_floors_a_low_or_absent_median() {
+        let floor = 1_000_000_000; // 1 gwei
+        // No fee vote yet -> floor (still includable).
+        assert_eq!(
+            GasBounds::DEPLOY_AND_SWEEP_DEVNET
+                .with_median_fees(None)
+                .max_fee_per_gas,
+            floor
+        );
+        // Cheap mainnet base fee (0.14 gwei) x2 = 0.28 gwei -> clamped up to 1 gwei.
+        assert_eq!(
+            GasBounds::DEPLOY_AND_SWEEP_DEVNET
+                .with_median_fees(Some(140_000_000))
+                .max_fee_per_gas,
+            floor
+        );
+    }
+
+    #[test]
+    fn with_median_fees_caps_a_spiked_or_byzantine_median() {
+        // 500 gwei x2 = 1000 gwei -> clamped to the 200 gwei ceiling, so a
+        // spiked/byzantine-voted median cannot blow up the prefund.
+        assert_eq!(
+            GasBounds::DEPLOY_AND_SWEEP_DEVNET
+                .with_median_fees(Some(500_000_000_000))
+                .max_fee_per_gas,
+            200_000_000_000
+        );
+    }
+
+    #[test]
+    fn with_median_fees_keeps_the_prefund_affordable_on_a_cheap_mainnet() {
+        // The exact regression: at a 1 gwei median the prefund the broadcaster
+        // fronts (need = totalGas * maxFeePerGas, x1.5 margin -- see
+        // rpc.rs::submit_user_ops) is a tiny fraction of an ETH, where the 30
+        // gwei constant produced ~0.036 ETH (which exceeded the test
+        // broadcaster's ~0.0165 ETH and wedged everything).
+        let priced = GasBounds::DEPLOY_AND_SWEEP_DEVNET.with_median_fees(Some(1_000_000_000));
+        let total_gas =
+            priced.verification_gas_limit + priced.call_gas_limit + priced.pre_verification_gas;
+        let need = total_gas * priced.max_fee_per_gas;
+        let need_with_margin = need + need / 2;
+        assert!(
+            need_with_margin <= 5_000_000_000_000_000, // 0.005 ETH
+            "prefund {need_with_margin} wei must stay well under 0.005 ETH on a cheap mainnet"
+        );
+        // ...and the old 30 gwei constant would have fronted >10x more.
+        let devnet_need = total_gas * GasBounds::DEPLOY_AND_SWEEP_DEVNET.max_fee_per_gas;
+        assert!(devnet_need > need * 10);
+    }
+
+    #[test]
+    fn with_median_fees_priority_never_exceeds_max_fee() {
+        for median in [
+            None,
+            Some(0),
+            Some(140_000_000),
+            Some(5_000_000_000),
+            Some(999_000_000_000),
+        ] {
+            let p = GasBounds::DEPLOY_AND_SWEEP_DEVNET.with_median_fees(median);
+            assert!(
+                p.max_priority_fee_per_gas <= p.max_fee_per_gas,
+                "priority {} must not exceed max_fee {} (median {median:?})",
+                p.max_priority_fee_per_gas,
+                p.max_fee_per_gas
+            );
+        }
+    }
 }

@@ -21,8 +21,9 @@ use fedimint_core::envs::{
     FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV,
     FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
     FM_USDT_CHAIN_ID_ENV, FM_USDT_CONFIRMATION_DEPTH_ENV, FM_USDT_CONTRACT_ENV,
-    FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV, FM_USDT_EVM_RPC_URL_ENV,
-    FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, is_env_var_set_opt, is_running_in_test_env,
+    FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV, FM_USDT_EVM_RPC_API_KEY_ENV,
+    FM_USDT_EVM_RPC_URL_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, is_env_var_set_opt,
+    is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -453,6 +454,10 @@ impl ServerModuleInit for UsdtInit {
                 description: "Overrides the EVM RPC URL for this guardian at runtime, taking priority over the configured `evm_rpc_url`.",
             },
             EnvVarDoc {
+                name: FM_USDT_EVM_RPC_API_KEY_ENV,
+                description: "Optional per-guardian API key appended as the final path segment of the EVM RPC URL (Alchemy/Infura-style). Keeps the secret key out of the URL config. An archive-capable provider is required on a real chain for UserOp-receipt observation.",
+            },
+            EnvVarDoc {
                 name: FM_USDT_CONTRACT_ENV,
                 description: "Overrides the default instance's `usdt_contract` config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.",
             },
@@ -514,6 +519,16 @@ impl ServerModuleInit for UsdtInit {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| cfg.private.local.evm_rpc_url.clone());
+            // Optional API key appended as the RPC URL's final path segment
+            // (Alchemy/Infura/... style), so the secret key can live in its own
+            // env var rather than baked into the URL. No-op when unset.
+            let evm_rpc_url = match std::env::var(FM_USDT_EVM_RPC_API_KEY_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+            {
+                Some(key) => format!("{}/{key}", evm_rpc_url.trim_end_matches('/')),
+                None => evm_rpc_url,
+            };
             let mut rpc = AlloyEvmRpc::new(&evm_rpc_url)?
                 .with_entry_point(cfg.consensus.entry_point)
                 .with_price_feed(
@@ -6972,6 +6987,18 @@ mod tests {
                 UserOpPurpose::DeployAndSweep { source: account }
             );
             assert_eq!(record.op.sender, account);
+            // Gas-pricing regression guard (the mainnet on-chain wedge): with
+            // no `FeeVote` in this federation the median is absent, so the op
+            // must be priced at the median-fee FLOOR (1 gwei) via
+            // `GasBounds::with_median_fees`, NOT the 30 gwei devnet constant
+            // that over-provisioned the broadcaster prefund on mainnet. This
+            // asserts the sweep trigger actually threads the consensus median
+            // into the op (not just that `with_median_fees` works in isolation).
+            assert_eq!(
+                record.op.max_fee_per_gas, 1_000_000_000,
+                "sweep op must be priced from the consensus gas median (floored to 1 gwei here), not the 30 gwei devnet constant"
+            );
+            assert_ne!(record.op.max_fee_per_gas, 30_000_000_000);
             if let Some(expected) = op_hash {
                 assert_eq!(
                     *hash, expected,
