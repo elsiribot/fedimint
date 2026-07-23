@@ -54,10 +54,10 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::{Context as _, bail};
 use fedimint_client::ClientHandleArc;
+use fedimint_core::PeerId;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
 use fedimint_core::runtime::{Instant, sleep};
-use fedimint_core::{Amount, PeerId};
 use fedimint_mint_client::MintClientInit;
 use fedimint_mint_server::MintInit;
 use fedimint_mintv2_client::MintClientInit as Mintv2ClientInit;
@@ -455,6 +455,27 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
     // Derive the deposit account and prefund its EntryPoint deposit too.
     // Part C: wait for the readiness state machine to report Ready first.
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+
+    // Wait for a live `FeeVote` median to exist (mirrors `withdraw_e2e.rs`'s
+    // identical wait): `process_input` rejects a claim with
+    // `DepositFeeInsufficient` before any median exists.
+    let deposit_fee_deadline = Instant::now() + Duration::from_secs(30);
+    let deposit_fee = loop {
+        let quote = usdt.deposit_fee_quote().await?;
+        if quote.fee.0 != 0 {
+            break quote.fee;
+        }
+        if Instant::now() >= deposit_fee_deadline {
+            bail!("deposit_fee_quote never converged to a nonzero quote before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    };
+    // This is an early snapshot, not the exact fee that will be charged (the
+    // real anvil gas price can drift between this read and the claim actually
+    // being processed) -- fund with a 2x margin and read the actual net e-cash
+    // minted below rather than asserting an exact predicted value (mirrors
+    // `withdraw_e2e.rs`'s identical handling).
+
     let (claim_keypair, deposit_account) = usdt.allocate_deposit().await?;
     assert_eq!(
         evm_rpc.get_code_len(deposit_account).await?,
@@ -473,7 +494,12 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
 
     // Fund the deposit account with the NON-STANDARD USDT ONLY (void transfer),
     // 512-aligned exactly like `withdraw_e2e.rs` (`5_120_000 == 512 * 10_000`).
-    let deposit_amount = UsdtAmount(5_120_000);
+    // `min_net_deposit_amount` is the minimum NET e-cash this test needs for the
+    // later withdrawal; the on-chain `deposit_amount` funds that PLUS a 2x
+    // margin over the early `deposit_fee` snapshot above (Task 3/4 of the
+    // deposit-fee plan).
+    let min_net_deposit_amount = UsdtAmount(5_120_000);
+    let deposit_amount = UsdtAmount(min_net_deposit_amount.0 + deposit_fee.0 * 2);
     common::transfer_nonstandard_from_account_1(
         &anvil,
         stack.usdt,
@@ -484,19 +510,28 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
     .context("failed to fund the counterfactual deposit account with non-standard USDT")?;
     mine_empty_blocks(&anvil, 5).await?;
 
-    // Check + claim: mints `deposit_amount` of USDT_UNIT e-cash.
+    // Check + claim: mints `deposit_amount` minus the deposit fee ACTUALLY
+    // charged (which may differ slightly from the early `deposit_fee` snapshot
+    // above). Read the resulting balance directly rather than asserting an
+    // exact value predicted from a possibly-stale quote.
     usdt.check_and_claim(&claim_keypair, Duration::from_secs(120))
         .await?;
     let claimed_deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if client.get_balance_for_unit(USDT_UNIT).await? == Amount::from_msats(deposit_amount.0) {
-            break;
+    let net_deposit_amount = loop {
+        let balance = client.get_balance_for_unit(USDT_UNIT).await?;
+        if balance.msats > 0 {
+            break UsdtAmount(balance.msats);
         }
         if Instant::now() >= claimed_deadline {
             bail!("USDT e-cash was never minted before the deadline");
         }
         sleep(Duration::from_millis(300)).await;
-    }
+    };
+    assert!(
+        net_deposit_amount.0 >= min_net_deposit_amount.0,
+        "the claimed e-cash balance ({net_deposit_amount}) must comfortably cover the minimum \
+         needed for the later withdrawal ({min_net_deposit_amount})"
+    );
 
     // The deploy-and-sweep pipeline sweeps the deposit to the pool (void
     // transfer under `execute`) -- poll to convergence on every guardian.
@@ -545,10 +580,11 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
         "amount + max_fee must be 512-aligned so the withdrawal burns notes with no \
          denomination-rounding dust"
     );
-    if amount.0 + max_fee.0 > deposit_amount.0 {
+    if amount.0 + max_fee.0 > net_deposit_amount.0 {
         bail!(
-            "chosen amount ({amount}) + max_fee ({max_fee}) exceeds deposit_amount \
-             ({deposit_amount}) -- the live fee quote came back higher than expected"
+            "chosen amount ({amount}) + max_fee ({max_fee}) exceeds the spendable \
+             net_deposit_amount ({net_deposit_amount}) -- the live fee quote came back higher \
+             than expected"
         );
     }
 

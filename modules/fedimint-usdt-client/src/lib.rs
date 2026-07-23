@@ -104,6 +104,19 @@ pub struct RecoverySummary {
     pub accounts: Vec<RecoveredAccount>,
 }
 
+/// Result of a single [`UsdtClientModule::claim`] call: the gross
+/// (on-chain-credited) amount claimed and the deposit fee actually charged
+/// against it (per [`UsdtClientModule::deposit_fee_quote`] at submission
+/// time), so callers can report the real e-cash issued (`claimed - fee`)
+/// without re-fetching a possibly-since-changed quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ClaimResult {
+    /// The gross (on-chain-credited) amount claimed.
+    pub claimed: UsdtAmount,
+    /// The deposit fee charged against `claimed` (see [`UsdtInputV0::fee`]).
+    pub fee: UsdtAmount,
+}
+
 /// A single deposit account rediscovered by
 /// [`UsdtClientModule::recover_deposits`].
 #[derive(Debug, Clone, Serialize)]
@@ -566,15 +579,15 @@ impl UsdtClientModule {
     /// [`Self::deposit_status`] (no polling, unlike [`Self::check_and_claim`])
     /// and, if there is a nonzero claimable balance, submits the claim
     /// transaction using the keypair [`Self::allocate_deposit`] persisted for
-    /// `claim_pk`. Returns the claimed (gross, on-chain-credited) amount --
-    /// the e-cash actually issued is this minus the deposit fee charged by
-    /// [`Self::submit_claim`] (see [`Self::deposit_fee_quote`]).
+    /// `claim_pk`. Returns a [`ClaimResult`] carrying both the claimed
+    /// (gross, on-chain-credited) amount and the deposit fee actually
+    /// charged against it -- the e-cash issued is `claimed - fee`.
     ///
     /// Callers should have already called [`Self::check_deposit`] (to enqueue
     /// the deposit-checker task) and waited for the federation to observe and
     /// credit the on-chain transfer; use [`Self::deposit_status`] to poll for
     /// that.
-    pub async fn claim(&self, claim_pk: secp256k1::PublicKey) -> anyhow::Result<UsdtAmount> {
+    pub async fn claim(&self, claim_pk: secp256k1::PublicKey) -> anyhow::Result<ClaimResult> {
         let (account, claim_keypair) = self.load_claim_keypair(&claim_pk).await?;
         let status = self.module_api.deposit_status(claim_pk).await?;
 
@@ -587,10 +600,14 @@ impl UsdtClientModule {
             );
         }
 
-        self.submit_claim(&claim_keypair, account, status.claimable)
+        let fee = self
+            .submit_claim(&claim_keypair, account, status.claimable)
             .await?;
 
-        Ok(status.claimable)
+        Ok(ClaimResult {
+            claimed: status.claimable,
+            fee,
+        })
     }
 
     /// Reports the federation's current deposit fee quote: the minimum `fee`

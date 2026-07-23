@@ -52,16 +52,20 @@
 //! **New for this test -- dynamic 512-alignment.** This module's convention
 //! (see `tests.rs`) is that every e-cash amount must be a 512-msat multiple
 //! (`mintv2`'s smallest client denomination, avoiding denomination-rounding
-//! dust that would break exact-equality assertions): the claim mints exactly
-//! `deposit_amount`, and each withdrawal burns `amount + max_fee`, which must
-//! itself land on a 512 multiple. `tests.rs` hardcodes this against a
-//! *scripted* `MockEvmRpc` fee vote; this test drives a REAL node with a REAL
-//! (anvil-default, decaying-over-idle-blocks) gas price, so instead of
-//! assuming a fixed `quote % 512` remainder, it reads the federation's live
-//! `withdraw_fee_quote`, derives `max_fee` from it (with a margin -- see
-//! below), and pads a target `amount` up to whatever multiple of 512 makes
-//! `amount + max_fee` land exactly on one, regardless of the real quote's
-//! value.
+//! dust that would break exact-equality assertions): the claim mints
+//! `deposit_amount` minus the deposit fee actually charged at claim time (read
+//! directly into `net_deposit_amount` rather than predicted -- see below), and
+//! each withdrawal burns `amount + max_fee`, which must itself land on a 512
+//! multiple. `tests.rs` hardcodes this against a *scripted* `MockEvmRpc` fee
+//! vote; this test drives a REAL node with a REAL (anvil-default,
+//! decaying-over-idle-blocks) gas price -- for BOTH the deposit and withdrawal
+//! fees -- so instead of assuming a fixed `quote % 512` remainder, it reads
+//! the federation's live `deposit_fee_quote`/`withdraw_fee_quote`, funds/pads
+//! generously over an early snapshot of each (a live quote can drift between
+//! being read and the corresponding transaction actually being processed),
+//! and derives the withdrawal's `amount + max_fee` to land exactly on a 512
+//! multiple relative to the REAL `net_deposit_amount` observed after the
+//! claim settles.
 //!
 //! Slow (real anvil + real DKG + TWO real cggmp21 threshold-ECDSA MPC
 //! sessions -- the sweep, then the withdrawal batch); intentionally run in
@@ -78,8 +82,8 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::{Context as _, bail};
 use fedimint_client::ClientHandleArc;
+use fedimint_core::PeerId;
 use fedimint_core::runtime::{Instant, sleep};
-use fedimint_core::{Amount, PeerId};
 use fedimint_mintv2_client::MintClientInit as Mintv2ClientInit;
 use fedimint_mintv2_common::KIND as MINTV2_KIND;
 use fedimint_mintv2_common::config::MintGenParams;
@@ -247,6 +251,33 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
     // deployed stack + funded broadcaster) before allocating -- the client
     // gates `allocate_deposit` on it.
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+
+    // Wait for a live `FeeVote` median to exist (the guardians' 1s poller reads
+    // the real anvil gas price, so this converges quickly, but not instantly):
+    // `process_input` rejects a claim with `DepositFeeInsufficient` before any
+    // median exists (the quote endpoint reports a `0` sentinel until then),
+    // mirroring step 9 below's identical wait for `withdraw_fee_quote`.
+    let deposit_fee_deadline = Instant::now() + Duration::from_secs(30);
+    let deposit_fee = loop {
+        let quote = usdt.deposit_fee_quote().await?;
+        if quote.fee.0 != 0 {
+            break quote.fee;
+        }
+        if Instant::now() >= deposit_fee_deadline {
+            bail!("deposit_fee_quote never converged to a nonzero quote before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    };
+    // This is an early snapshot, not the exact fee that will be charged: unlike
+    // `tests.rs`'s scripted `MockEvmRpc` fee, this test drives a REAL node with a
+    // REAL (anvil-default, decaying-over-idle-blocks) gas price, and several
+    // blocks (the confirmation mining below, plus `check_and_claim`'s own
+    // consensus round) elapse between this read and the claim actually being
+    // processed -- so the fee actually charged can differ from `deposit_fee`
+    // above. A 2x margin (funding well beyond this snapshot) absorbs that drift
+    // without needing to predict the exact eventual fee (mirrors step 9's own
+    // margin over its live, non-scripted `withdraw_fee_quote`).
+
     let (claim_keypair, deposit_account) = usdt.allocate_deposit().await?;
     assert_eq!(
         evm_rpc.get_code_len(deposit_account).await?,
@@ -267,34 +298,48 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
     //    funding transfer (the same instant-mine confirmation-depth workaround
     //    `deploy_and_sweep_e2e.rs` documents in detail).
     //
-    //    512-msat-aligned (Task-1/tests.rs convention): the claim below mints
-    //    EXACTLY `deposit_amount` as e-cash notes, and it must comfortably cover
-    //    the later withdrawal's `amount + max_fee` (also 512-aligned -- see step
-    //    9's comment). `5_120_000 == 512 * 10_000`.
-    let deposit_amount = UsdtAmount(5_120_000);
+    //    `min_net_deposit_amount` is the minimum NET e-cash this test needs for
+    //    the later withdrawal (`5_120_000 == 512 * 10_000`, 512-msat-aligned per
+    //    the Task-1/tests.rs convention); the on-chain `deposit_amount` funds
+    //    that PLUS a 2x margin over the early `deposit_fee` snapshot (see above)
+    //    so the claim comfortably clears whatever the REAL fee turns out to be.
+    let min_net_deposit_amount = UsdtAmount(5_120_000);
+    let deposit_amount = UsdtAmount(min_net_deposit_amount.0 + deposit_fee.0 * 2);
     common::transfer_erc20_from_account_1(&anvil, stack.usdt, deposit_account, deposit_amount)
         .await
         .context("failed to fund the counterfactual deposit account with USDT")?;
     mine_empty_blocks(&anvil, 5).await?;
 
-    // 7. Check + claim: mints `deposit_amount` of USDT_UNIT e-cash into the
-    //    client's spendable balance (needed to fund the withdrawal below).
+    // 7. Check + claim: mints `deposit_amount` minus the deposit fee ACTUALLY
+    //    charged (which may differ slightly from the early `deposit_fee` snapshot
+    //    above -- see this file's module doc comment) into the client's spendable
+    //    balance. Read the resulting balance directly rather than asserting an
+    //    exact value predicted from a possibly-stale quote.
     usdt.check_and_claim(&claim_keypair, Duration::from_secs(120))
         .await?;
     let claimed_deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if client.get_balance_for_unit(USDT_UNIT).await? == Amount::from_msats(deposit_amount.0) {
-            break;
+    let net_deposit_amount = loop {
+        let balance = client.get_balance_for_unit(USDT_UNIT).await?;
+        if balance.msats > 0 {
+            break UsdtAmount(balance.msats);
         }
         if Instant::now() >= claimed_deadline {
             bail!("USDT e-cash was never minted before the deadline");
         }
         sleep(Duration::from_millis(300)).await;
-    }
+    };
+    assert!(
+        net_deposit_amount.0 >= min_net_deposit_amount.0,
+        "the claimed e-cash balance ({net_deposit_amount}) must comfortably cover the minimum \
+         needed for the later withdrawal ({min_net_deposit_amount})"
+    );
 
     // 8. The automatic deploy-and-sweep pipeline (Phase 7) deploys the deposit
     //    account and sweeps it to the pool via a real MPC-signed UserOp -- poll to
-    //    convergence on every guardian, exactly like `deploy_and_sweep_e2e.rs`.
+    //    convergence on every guardian, exactly like `deploy_and_sweep_e2e.rs`. The
+    //    pool receives the FULL on-chain `deposit_amount` (the deposit fee's USDT
+    //    stays credited-but-unissued until the sweep, then becomes pool surplus --
+    //    see `process_input`'s doc comment).
     for &peer in &peers {
         let deadline = Instant::now() + Duration::from_secs(600);
         loop {
@@ -375,10 +420,11 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
         "amount + max_fee must be 512-aligned so the withdrawal burns notes with no \
          denomination-rounding dust"
     );
-    if amount.0 + max_fee.0 > deposit_amount.0 {
+    if amount.0 + max_fee.0 > net_deposit_amount.0 {
         bail!(
-            "chosen amount ({amount}) + max_fee ({max_fee}) exceeds deposit_amount \
-             ({deposit_amount}) -- the live fee quote came back higher than expected"
+            "chosen amount ({amount}) + max_fee ({max_fee}) exceeds the spendable \
+             net_deposit_amount ({net_deposit_amount}) -- the live fee quote came back higher \
+             than expected"
         );
     }
 

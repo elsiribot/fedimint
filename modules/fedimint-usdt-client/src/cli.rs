@@ -83,15 +83,11 @@ pub(crate) async fn handle_cli_command(
         Opts::CheckDeposit { claim_pk } => json(usdt.check_deposit(claim_pk).await?),
         Opts::DepositStatus { claim_pk } => json(usdt.deposit_status(claim_pk).await?),
         Opts::Claim { claim_pk } => {
-            // Best-effort display value: the fee actually charged is
-            // determined by `claim`'s own internal quote fetch
-            // (`UsdtClientModule::submit_claim`), moments after this one --
-            // the two agree unless the consensus-agreed `FeeVote` median
-            // changes in between, which is rare within a single command
-            // invocation.
-            let quote = usdt.deposit_fee_quote().await?;
-            let claimed = usdt.claim(claim_pk).await?;
-            json(serde_json::json!({ "claimed": claimed.0, "fee": quote.fee.0 }))
+            let result = usdt.claim(claim_pk).await?;
+            json(serde_json::json!({
+                "claimed": result.claimed.0,
+                "fee": result.fee.0,
+            }))
         }
         Opts::FeeQuote { amount } => json(usdt.withdraw_fee_quote(UsdtAmount(amount)).await?),
         Opts::DepositFeeQuote => json(usdt.deposit_fee_quote().await?),

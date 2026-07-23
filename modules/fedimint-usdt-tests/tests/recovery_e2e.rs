@@ -113,11 +113,34 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     );
     common::await_usdt_ready(&usdt1, Duration::from_secs(60)).await?;
 
+    // Wait for a `FeeVote` median to exist (the guardians' 1s poller ticks
+    // always vote, even the mock's zero-cost default -- see
+    // `deposit_fee_quote`'s floor at `MIN_DEPOSIT_FEE`) before relying on it
+    // below: `process_input` rejects a claim with `DepositFeeInsufficient`
+    // before any median exists (the quote endpoint reports a `0` sentinel
+    // until then), mirroring how the withdrawal e2e tests wait for
+    // `withdraw_fee_quote` to converge first.
+    let fee_deadline = Instant::now() + Duration::from_secs(30);
+    let deposit_fee = loop {
+        let quote = usdt1.deposit_fee_quote().await?;
+        if quote.fee.0 > 0 {
+            break quote.fee;
+        }
+        if Instant::now() >= fee_deadline {
+            bail!("deposit_fee_quote never converged to a nonzero quote before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    };
+
     let (claim_keypair, account) = usdt1.allocate_deposit().await?;
 
-    // A multiple of 512 msat (mintv2's smallest client denomination) so the
-    // claimed amount is exactly representable as e-cash with no rounding dust.
-    let deposit_amount = UsdtAmount(2_560_000);
+    // The claim mints the NET `net_deposit_amount` (a multiple of 512 msat --
+    // mintv2's smallest client denomination -- so it's exactly representable
+    // as e-cash with no rounding dust); the on-chain deposit must therefore
+    // fund `net_deposit_amount + deposit_fee` (the fee is deducted at claim
+    // time -- Task 3/4 of the deposit-fee plan).
+    let net_deposit_amount = UsdtAmount(2_560_000);
+    let deposit_amount = UsdtAmount(net_deposit_amount.0 + deposit_fee.0);
     mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
     usdt1.check_deposit(claim_keypair.public_key()).await?;
 
@@ -157,24 +180,29 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
 
     // Recovery re-stored the claim key, so the existing single-shot `claim`
     // path works on the second client with only the recovered public key.
-    let claimed = usdt2.claim(recovered.claim_pk).await?;
-    assert_eq!(claimed, deposit_amount);
+    // `claim` returns both the gross claimed amount and the deposit fee
+    // actually charged against it (Task 5 cleanup: threading the real charged
+    // fee through `ClaimResult` rather than a separately re-fetched quote).
+    let result = usdt2.claim(recovered.claim_pk).await?;
+    assert_eq!(result.claimed, deposit_amount);
+    assert_eq!(result.fee, deposit_fee);
 
-    // The claimed USDT e-cash lands in the second client's `USDT_UNIT`
-    // balance. Issuance is asynchronous even after the claim tx is accepted,
-    // so poll with a timeout.
+    // The claimed USDT e-cash (net of the deposit fee) lands in the second
+    // client's `USDT_UNIT` balance. Issuance is asynchronous even after the
+    // claim tx is accepted, so poll with a timeout.
     let poll_deadline = Instant::now() + Duration::from_secs(30);
     let balance = loop {
         let balance = client2.get_balance_for_unit(USDT_UNIT).await?;
-        if balance == Amount::from_msats(deposit_amount.0) || Instant::now() >= poll_deadline {
+        if balance == Amount::from_msats(net_deposit_amount.0) || Instant::now() >= poll_deadline {
             break balance;
         }
         sleep(Duration::from_millis(200)).await;
     };
     assert_eq!(
         balance,
-        Amount::from_msats(deposit_amount.0),
-        "the recovered deposit must be claimable into USDT_UNIT e-cash on the seed-only client"
+        Amount::from_msats(net_deposit_amount.0),
+        "the recovered deposit must be claimable into USDT_UNIT e-cash (minus the deposit fee) \
+         on the seed-only client"
     );
 
     // A subsequent `allocate_deposit` on the recovered client must not collide

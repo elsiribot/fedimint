@@ -204,6 +204,30 @@ async fn main() -> anyhow::Result<()> {
             fedimint_core::runtime::sleep(Duration::from_secs(2)).await;
         }
 
+        // Wait for a live `FeeVote` median to exist (the guardians' 1s poller
+        // reads the real anvil gas price): `process_input` rejects a claim
+        // with `DepositFeeInsufficient` before any median exists (the quote
+        // endpoint reports a `0` sentinel until then), mirroring
+        // `withdraw_e2e.rs`'s identical wait.
+        info!("Polling deposit-fee-quote until a nonzero quote is available...");
+        let fee_deadline = fedimint_core::time::now() + Duration::from_secs(60);
+        let deposit_fee = loop {
+            let quote = cmd!(client, "module", "usdt", "deposit-fee-quote")
+                .out_json()
+                .await?;
+            let fee = quote["fee"]
+                .as_u64()
+                .context("deposit-fee-quote response missing fee")?;
+            if fee > 0 {
+                break fee;
+            }
+            ensure!(
+                fedimint_core::time::now() < fee_deadline,
+                "deposit-fee-quote never converged to a nonzero quote before the deadline"
+            );
+            fedimint_core::runtime::sleep(Duration::from_secs(1)).await;
+        };
+
         info!("Deriving a deposit address...");
         let deposit_address = cmd!(client, "module", "usdt", "deposit-address")
             .out_json()
@@ -222,12 +246,15 @@ async fn main() -> anyhow::Result<()> {
         // the automatic deploy-and-sweep UserOp sent FROM this account.
 
         info!(%account, "Transferring USDT to the deposit address on-chain...");
-        // Must be a multiple of the `mintv2` denomination granularity (512
-        // msats) so the whole claimed amount mints into e-cash notes with no
-        // sub-denomination dust remainder (2_048_000 = 4000 * 512); combined
-        // with `FM_DISABLE_BASE_FEES` above, the issued balance then equals the
-        // deposit exactly.
-        let transfer_amount = UsdtAmount(2_048_000);
+        // The claim mints the NET `net_transfer_amount` -- must be a multiple of
+        // the `mintv2` denomination granularity (512 msats) so it mints into
+        // e-cash notes with no sub-denomination dust remainder (2_048_000 = 4000
+        // * 512); combined with `FM_DISABLE_BASE_FEES` above, the issued balance
+        // then equals `net_transfer_amount` exactly. The on-chain
+        // `transfer_amount` funds `net_transfer_amount + deposit_fee` (the fee
+        // deducted at claim time -- Task 3/4 of the deposit-fee plan).
+        let net_transfer_amount = UsdtAmount(2_048_000);
+        let transfer_amount = UsdtAmount(net_transfer_amount.0 + deposit_fee);
         transfer_erc20_from_account_1(&anvil, token, account, transfer_amount).await?;
 
         info!("Mining past confirmation_depth...");
@@ -276,25 +303,27 @@ async fn main() -> anyhow::Result<()> {
         // the CLI `claim` above returns, the e-cash notes are issued and
         // persisted; the balance is therefore observable immediately. A short
         // poll is kept only to absorb any per-process client-load latency.
-        info!("Verifying the USDT-denominated e-cash balance equals the transfer...");
+        info!(
+            "Verifying the USDT-denominated e-cash balance equals the transfer minus the deposit fee..."
+        );
         let balance_deadline = fedimint_core::time::now() + Duration::from_secs(30);
         let balance = loop {
             let balance = usdt_ecash_balance_msats(&client).await?;
-            if balance == transfer_amount.0 {
+            if balance == net_transfer_amount.0 {
                 break balance;
             }
             ensure!(
                 fedimint_core::time::now() < balance_deadline,
-                "USDT e-cash balance ({balance} msats) never reached the transferred amount \
+                "USDT e-cash balance ({balance} msats) never reached the net transferred amount \
                  ({} msats) before the deadline",
-                transfer_amount.0
+                net_transfer_amount.0
             );
             fedimint_core::runtime::sleep(Duration::from_secs(1)).await;
         };
         ensure!(
-            balance == transfer_amount.0,
-            "USDT e-cash balance ({balance} msats) != transferred amount ({} msats)",
-            transfer_amount.0
+            balance == net_transfer_amount.0,
+            "USDT e-cash balance ({balance} msats) != net transferred amount ({} msats)",
+            net_transfer_amount.0
         );
 
         info!("Verifying a second claim of the same (already fully-claimed) deposit fails...");
@@ -347,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
             fedimint_core::runtime::sleep(Duration::from_secs(2)).await;
         }
 
-        // Withdraw well under the claimed balance (`transfer_amount`,
+        // Withdraw well under the claimed (net) balance (`net_transfer_amount`,
         // 2_048_000), leaving room for the federation's withdrawal fee: the
         // `withdraw` CLI fetches the fee quote itself and burns `amount +
         // max_fee` of e-cash, so the burn must not exceed the balance. 1_024_000
