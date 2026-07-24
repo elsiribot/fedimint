@@ -147,11 +147,20 @@ impl Bitcoind {
                 .require_network(bitcoin::Network::Regtest)
                 .expect("Devimint always runs in regtest");
             debug!(target: LOG_DEVIMINT, blocks_num=blocks, %address, "Mining blocks to address");
-            block_in_place(|| {
-                client
-                    .generate_to_address(blocks, &address)
-                    .context("Failed to generate blocks")
-            })?;
+            // Mine in small chunks: on slow machines/filesystems regtest
+            // mining can take ~1s per block, and a single
+            // `generate_to_address(101)` call would exceed the RPC client's
+            // HTTP timeout even though bitcoind keeps mining just fine.
+            let mut remaining = blocks;
+            while remaining > 0 {
+                let chunk = remaining.min(10);
+                block_in_place(|| {
+                    client
+                        .generate_to_address(chunk, &address)
+                        .context("Failed to generate blocks")
+                })?;
+                remaining -= chunk;
+            }
             trace!(target: LOG_DEVIMINT, blocks_num=blocks, %address, "Mining blocks to address complete");
         }
 
