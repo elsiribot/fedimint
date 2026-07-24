@@ -51,14 +51,14 @@ use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_
 use fedimint_usdt_common::{
     BootstrapObservation, BootstrapState, CheckDepositRequest, CheckDepositResponse,
     DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation, DepositStatusRequest,
-    DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES, MODULE_CONSENSUS_VERSION,
-    MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse, SigningSessionId, StatusResponse,
-    USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtInput, UsdtInputError,
-    UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome, UserOpStatus,
-    UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
-    WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse, deposit_fee_quote,
-    derive_deposit_account, derive_pool_account, evm_address, pool_salt, signing_session_id,
-    withdrawal_fee_quote,
+    DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES, MAX_PENDING_CHECKS,
+    MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse,
+    SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
+    UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
+    UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
+    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse,
+    deposit_fee_quote, derive_deposit_account, derive_pool_account, evm_address, pool_salt,
+    signing_session_id, withdrawal_fee_quote,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -2159,13 +2159,21 @@ impl Usdt {
     /// `consensus_proposal` to drain into `UsdtConsensusItem::Deposit`
     /// proposals.
     ///
-    /// Like [`Usdt::spawn_block_count_poller`], this task only *reads* the
-    /// module DB (via `db.begin_transaction_nc()`) and never commits writes
-    /// to it: fedimint server-module background tasks must not commit
-    /// writes to the module DB outside the consensus flow. All
-    /// `PendingCheck` writes happen in the check-deposit API handler and in
-    /// [`Usdt::credit_deposit`] (via `process_consensus_item`), never from a
-    /// background task.
+    /// The scan itself only *reads* the module DB (via
+    /// `db.begin_transaction_nc()`), mirroring
+    /// [`Usdt::spawn_block_count_poller`]: no consensus-relevant write may
+    /// happen outside the consensus flow. `PendingCheck` inserts still only
+    /// ever happen in the check-deposit API handler; `PendingCheck` removal
+    /// on a credited deposit still only happens in [`Usdt::credit_deposit`]
+    /// (via `process_consensus_item`).
+    ///
+    /// After the read-only scan, this task additionally opens a SEPARATE,
+    /// committable local transaction and runs [`gc_expired_pending_checks`]
+    /// on it (security finding 13). This is safe despite the "no writes
+    /// outside consensus" rule above because `PendingCheck` is guardian-local,
+    /// non-consensus state -- see that function's doc comment for the full
+    /// argument -- so this is the one guardian-local write this task
+    /// performs, deliberately kept out of the read-only scan itself.
     fn spawn_deposit_checker(task_group: &TaskGroup, handles: DepositCheckerHandles) {
         let DepositCheckerHandles {
             db,
@@ -2197,6 +2205,26 @@ impl Usdt {
                     .lock()
                     .expect("not poisoned")
                     .extend(observations);
+
+                // GC (security finding 13): a separate, committable local
+                // transaction -- deliberately not part of the read-only scan
+                // above. See `gc_expired_pending_checks`'s doc comment for why
+                // this guardian-local write needs no consensus agreement.
+                let mut gc_dbtx = db.begin_transaction().await;
+                let removed = gc_expired_pending_checks(
+                    &mut gc_dbtx.to_ref_nc(),
+                    check_ttl_blocks,
+                    num_peers,
+                )
+                .await;
+                gc_dbtx.commit_tx().await;
+                if removed > 0 {
+                    debug!(
+                        target: "usdt",
+                        removed,
+                        "garbage-collected expired PendingChecks"
+                    );
+                }
 
                 fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
                     1
@@ -3405,11 +3433,31 @@ impl Usdt {
     /// untouched.
     ///
     /// The response only ever carries `account` (deterministic from
-    /// `claim_pk`), never whether this call is what enqueued the
-    /// `PendingCheck`: that is guardian-local state and would let honest
-    /// guardians return different responses to the same request, breaking
-    /// the threshold-identical response requirement of
-    /// `request_current_consensus`.
+    /// `claim_pk`) and `ready` (deterministic from consensus DB via
+    /// [`Usdt::bootstrap_state`]), never whether this call is what enqueued
+    /// the `PendingCheck` or whether a cap suppressed the insert: that is
+    /// guardian-local state and would let honest guardians return different
+    /// responses to the same request, breaking the threshold-identical
+    /// response requirement of `request_current_consensus`.
+    ///
+    /// # Readiness gate (security finding 13, r2 facet)
+    ///
+    /// If the federation is not yet [`BootstrapState::Ready`], no
+    /// `PendingCheck` is stored at all: funding a deposit account before the
+    /// federation's infra (EntryPoint/factory/impl) is confirmed ready would
+    /// let a caller strand funds in an account the federation cannot yet
+    /// sweep. `bootstrap_state` is a pure function of consensus DB, so this
+    /// gate is identical on every guardian at the same consensus position.
+    ///
+    /// # Cap (security finding 13)
+    ///
+    /// Before inserting a NEW `PendingCheck`, this counts the existing
+    /// `PendingCheck` table and, at [`MAX_PENDING_CHECKS`], skips the insert
+    /// (logging a warning) rather than growing the table further --
+    /// `check_deposit` is unauthenticated and each distinct `claim_pk` derives
+    /// a distinct account, so without a cap this table could grow without
+    /// bound. The cap is enforced purely guardian-locally and, per the
+    /// determinism note above, never changes the response shape.
     async fn handle_check_deposit(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -3422,8 +3470,32 @@ impl Usdt {
             &claim_pk,
         );
 
+        let ready = self.bootstrap_state(dbtx).await == BootstrapState::Ready;
+        if !ready {
+            return CheckDepositResponse {
+                account,
+                ready: false,
+            };
+        }
+
         if dbtx.get_value(&PendingCheckKey(account)).await.is_some() {
-            return CheckDepositResponse { account };
+            return CheckDepositResponse { account, ready };
+        }
+
+        let pending_count: u64 = dbtx
+            .find_by_prefix(&PendingCheckPrefix)
+            .await
+            .count()
+            .await
+            .try_into()
+            .unwrap_or(u64::MAX);
+        if pending_count >= MAX_PENDING_CHECKS {
+            warn!(
+                target: "usdt",
+                count = pending_count,
+                "PendingCheck cap reached; not storing new check"
+            );
+            return CheckDepositResponse { account, ready };
         }
 
         let requested_at_block = self.consensus_block_count(dbtx).await;
@@ -3436,7 +3508,7 @@ impl Usdt {
         )
         .await;
 
-        CheckDepositResponse { account }
+        CheckDepositResponse { account, ready }
     }
 
     /// Reports `claim_pk`'s deposit account state: `claimable` is
@@ -4257,9 +4329,12 @@ async fn fee_vote_median(dbtx: &mut DatabaseTransaction<'_>) -> Option<FeeVote> 
 /// EVM head, so that every honest guardian computes an identical observation
 /// for the same deposit and can reach agreement on it.
 ///
-/// TTL-expired `PendingCheck`s are skipped (not deleted): garbage-collecting
-/// them is deferred, since deleting from a read-only scan would violate the
-/// pure-reader constraint above.
+/// TTL-expired `PendingCheck`s are skipped (not deleted): deleting them here
+/// would violate the pure-reader constraint above. Garbage collection of
+/// expired checks instead happens in a separate, committable local
+/// transaction opened by the deposit-checker task right after it calls this
+/// function (see [`Usdt::spawn_deposit_checker`] and
+/// [`gc_expired_pending_checks`]; security finding 13).
 async fn scan_pending_deposits(
     dbtx: &mut DatabaseTransaction<'_>,
     evm_rpc: &DynServerEvmRpc,
@@ -4280,8 +4355,9 @@ async fn scan_pending_deposits(
 
     let mut observations = Vec::new();
     for (PendingCheckKey(account), check) in pending {
-        // Phase 9: stale expired PendingChecks are skipped here but not yet
-        // garbage-collected.
+        // Skipped (not deleted) here -- see this function's doc comment for
+        // why, and `gc_expired_pending_checks` for where the deletion
+        // actually happens.
         if check.requested_at_block + check_ttl_blocks < ccount {
             continue;
         }
@@ -4322,6 +4398,49 @@ async fn scan_pending_deposits(
     }
 
     observations
+}
+
+/// Deletes every guardian-local [`PendingCheck`] whose TTL has elapsed
+/// (security finding 13), using the exact same expiry predicate
+/// [`scan_pending_deposits`] uses to *skip* (but not delete) expired checks,
+/// so the two stay consistent.
+///
+/// Guardian-local, non-consensus cleanup: `PendingCheck` is guardian-local
+/// state -- see [`Usdt::credit_deposit`]'s own local `remove_entry` for the
+/// same key, whose doc comment notes a guardian lacking a `PendingCheck`
+/// simply no-ops the removal and is not read to derive anything
+/// consensus-relevant. Deleting expired entries here therefore needs no
+/// federation agreement and cannot cause divergence: an honest guardian that
+/// GC'd (or never had) a `PendingCheck` for an account still correctly
+/// applies a threshold-agreed deposit credit for it.
+///
+/// Takes a **committable** `dbtx`, unlike [`scan_pending_deposits`]'s
+/// read-only one -- callers must commit a dedicated transaction for this
+/// call, kept separate from the read-only scan (see
+/// [`Usdt::spawn_deposit_checker`]). Returns the number of entries removed,
+/// for logging/tests.
+async fn gc_expired_pending_checks(
+    dbtx: &mut DatabaseTransaction<'_>,
+    check_ttl_blocks: u64,
+    num_peers: NumPeers,
+) -> usize {
+    let ccount = consensus_block_count(dbtx, num_peers).await;
+
+    let pending: Vec<(PendingCheckKey, PendingCheck)> = dbtx
+        .find_by_prefix(&PendingCheckPrefix)
+        .await
+        .collect()
+        .await;
+
+    let mut removed = 0usize;
+    for (key, check) in pending {
+        if check.requested_at_block + check_ttl_blocks < ccount {
+            dbtx.remove_entry(&key).await;
+            removed += 1;
+        }
+    }
+
+    removed
 }
 
 #[cfg(test)]
@@ -5780,13 +5899,83 @@ mod tests {
             "expired pending check must not be proposed"
         );
 
-        // The expired PendingCheck must NOT have been deleted: removal of
-        // stale expired entries is deferred to Phase 9 (see
-        // `scan_pending_deposits`'s doc comment).
+        // The expired PendingCheck must NOT have been deleted by the scan
+        // itself: removal of stale expired entries happens in the SEPARATE
+        // `gc_expired_pending_checks` (see `scan_pending_deposits`'s doc
+        // comment, and `expired_pending_checks_are_deleted` below for that
+        // function's own coverage).
         let mut dbtx = db.begin_transaction_nc().await;
         assert!(
             dbtx.get_value(&PendingCheckKey(account)).await.is_some(),
             "the read-only scan must not delete the PendingCheck"
+        );
+    }
+
+    /// Security finding 13: `gc_expired_pending_checks` deletes exactly the
+    /// `PendingCheck`s whose TTL has elapsed (the same predicate
+    /// `scan_pending_deposits` uses to skip them), leaving non-expired ones
+    /// untouched.
+    #[tokio::test]
+    async fn expired_pending_checks_are_deleted() {
+        let num_peers = 4u16;
+        let check_ttl_blocks = 10u64;
+        let ccount = 1_000u64;
+        let expired_account = EvmAddress([0x55; 20]);
+        let live_account = EvmAddress([0x66; 20]);
+        let claim_pk = test_pubkey(0xee);
+
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+        seed_block_count_votes(&db, num_peers, ccount).await;
+        {
+            let mut dbtx = db.begin_transaction().await;
+            // Expired: requested_at_block(0) + ttl(10) = 10 < ccount(1000).
+            dbtx.insert_entry(
+                &PendingCheckKey(expired_account),
+                &PendingCheck {
+                    claim_pk,
+                    requested_at_block: 0,
+                },
+            )
+            .await;
+            // Not expired: requested_at_block(995) + ttl(10) = 1005 >= ccount(1000).
+            dbtx.insert_entry(
+                &PendingCheckKey(live_account),
+                &PendingCheck {
+                    claim_pk,
+                    requested_at_block: 995,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let num_peers = (0..num_peers)
+            .map(PeerId::from)
+            .collect::<Vec<_>>()
+            .to_num_peers();
+
+        let mut dbtx = db.begin_transaction().await;
+        let removed =
+            gc_expired_pending_checks(&mut dbtx.to_ref_nc(), check_ttl_blocks, num_peers).await;
+        dbtx.commit_tx().await;
+
+        assert_eq!(removed, 1);
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert!(
+            dbtx.get_value(&PendingCheckKey(expired_account))
+                .await
+                .is_none(),
+            "the expired PendingCheck must be removed"
+        );
+        assert!(
+            dbtx.get_value(&PendingCheckKey(live_account))
+                .await
+                .is_some(),
+            "the non-expired PendingCheck must survive"
         );
     }
 
@@ -6744,7 +6933,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_deposit_enqueues_pending_check_and_is_idempotent() {
-        let module = test_module_with_block_count(4, 0).await;
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let db = module.db_for_test();
         let claim_pk = test_pubkey(0x01);
         let expected_account = fedimint_usdt_common::derive_deposit_account(
@@ -6754,6 +6943,14 @@ mod tests {
             &claim_pk,
         );
 
+        // Reach BootstrapState::Ready first (security finding 13's readiness
+        // gate): otherwise handle_check_deposit refuses to enqueue anything.
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            vote_bootstrap(&module, &mut dbtx.to_ref_nc(), p, ready_observation()).await;
+        }
+        dbtx.commit_tx().await;
+
         // First call: derives the account and enqueues a PendingCheck.
         let mut dbtx = db.begin_transaction().await;
         let response = module
@@ -6762,6 +6959,7 @@ mod tests {
         dbtx.commit_tx().await;
 
         assert_eq!(response.account, expected_account);
+        assert!(response.ready, "federation was voted to Ready above");
 
         let pending = db
             .begin_transaction_nc()
@@ -6804,6 +7002,7 @@ mod tests {
         dbtx.commit_tx().await;
 
         assert_eq!(response2.account, expected_account);
+        assert!(response2.ready);
 
         let pending_after_second_call = db
             .begin_transaction_nc()
@@ -6812,6 +7011,117 @@ mod tests {
             .await
             .expect("PendingCheck must still be present");
         assert_eq!(pending_after_second_call, pending);
+    }
+
+    /// Security finding 13 (r2 facet): before the federation reaches
+    /// `BootstrapState::Ready`, `handle_check_deposit` must refuse to enqueue
+    /// a `PendingCheck` -- funding an account before the federation can sweep
+    /// it would strand funds -- and must report `ready: false` so the caller
+    /// knows nothing was enqueued.
+    #[tokio::test]
+    async fn check_deposit_rejected_before_ready() {
+        let module = test_module_with_block_count(4, 0).await; // no bootstrap votes cast
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x10);
+        let expected_account = fedimint_usdt_common::derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+
+        let mut dbtx = db.begin_transaction().await;
+        let response = module
+            .handle_check_deposit(&mut dbtx.to_ref_nc(), claim_pk)
+            .await;
+        dbtx.commit_tx().await;
+
+        assert_eq!(
+            response.account, expected_account,
+            "account is a pure function of claim_pk + config, unaffected by readiness"
+        );
+        assert!(!response.ready);
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert!(
+            dbtx.get_value(&PendingCheckKey(expected_account))
+                .await
+                .is_none(),
+            "no PendingCheck may be stored before the federation is Ready"
+        );
+    }
+
+    /// Security finding 13: once `PendingCheckPrefix` holds
+    /// `MAX_PENDING_CHECKS` entries, `handle_check_deposit` must not insert
+    /// another one for a brand-new distinct account -- but must still return
+    /// a normal, well-formed (deterministic) response rather than encoding
+    /// the cap into it.
+    #[tokio::test]
+    async fn check_deposit_capped_at_max() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        // Reach BootstrapState::Ready: the cap only matters on the insert
+        // path, which is only reached once ready.
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            vote_bootstrap(&module, &mut dbtx.to_ref_nc(), p, ready_observation()).await;
+        }
+        dbtx.commit_tx().await;
+
+        // Seed the table up to the cap with distinct accounts.
+        let filler_claim_pk = test_pubkey(0x11);
+        let mut dbtx = db.begin_transaction().await;
+        for i in 0..MAX_PENDING_CHECKS {
+            let mut bytes = [0u8; 20];
+            bytes[12..20].copy_from_slice(&i.to_be_bytes());
+            dbtx.insert_new_entry(
+                &PendingCheckKey(EvmAddress(bytes)),
+                &PendingCheck {
+                    claim_pk: filler_claim_pk,
+                    requested_at_block: 0,
+                },
+            )
+            .await;
+        }
+        dbtx.commit_tx().await;
+
+        let claim_pk = test_pubkey(0x12);
+        let expected_account = fedimint_usdt_common::derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+
+        let mut dbtx = db.begin_transaction().await;
+        let response = module
+            .handle_check_deposit(&mut dbtx.to_ref_nc(), claim_pk)
+            .await;
+        dbtx.commit_tx().await;
+
+        assert_eq!(response.account, expected_account);
+        assert!(response.ready, "cap must not affect the ready computation");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert!(
+            dbtx.get_value(&PendingCheckKey(expected_account))
+                .await
+                .is_none(),
+            "at the cap, a new distinct account's PendingCheck must not be stored"
+        );
+
+        let count: u64 = dbtx
+            .find_by_prefix(&PendingCheckPrefix)
+            .await
+            .count()
+            .await
+            .try_into()
+            .unwrap_or(u64::MAX);
+        assert_eq!(
+            count, MAX_PENDING_CHECKS,
+            "the table must stay exactly at the cap, not grow past it"
+        );
     }
 
     #[tokio::test]
