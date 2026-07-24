@@ -1186,6 +1186,29 @@ impl ServerModule for Usdt {
                 Ok(())
             }
             UsdtConsensusItem::Deposit(obs) => {
+                // Security finding 14: self-authenticate BEFORE storing the
+                // vote, not only later inside `credit_deposit` (which runs
+                // only once threshold-many IDENTICAL votes accumulate). A
+                // pure function of `obs` and this module's consensus config
+                // (`group_public_key`/`account_factory`/
+                // `simple_account_impl`), so every honest guardian computes
+                // the same result. Returning `Err` here makes a malformed
+                // observation non-state-changing, so it is never persisted
+                // as a `DepositObservationVoteKey` and never retained in
+                // consensus history -- otherwise a Byzantine guardian could
+                // bloat the vote table forever with fresh random accounts
+                // that never reach threshold (see
+                // `security-review/14-low-junk-consensus-votes-db-bloat.md`).
+                ensure!(
+                    fedimint_usdt_common::derive_deposit_account(
+                        &self.cfg.consensus.group_public_key,
+                        self.cfg.consensus.account_factory,
+                        self.cfg.consensus.simple_account_impl,
+                        &obs.claim_pk,
+                    ) == obs.account,
+                    "deposit observation claim_pk does not derive its account"
+                );
+
                 // Store this peer's vote; redundancy guard (unbounded-history rule).
                 let key = DepositObservationVoteKey(obs.account, peer_id);
                 if dbtx.insert_entry(&key, &obs).await.as_ref() == Some(&obs) {
@@ -1228,6 +1251,22 @@ impl ServerModule for Usdt {
                 // (redundancy guard, unbounded-history rule), tally only
                 // EXACTLY-matching votes (full-field `PartialEq` on
                 // `UserOpConfirmedObservation`), and apply at threshold.
+                //
+                // Security finding 14: before storing, require `op_hash` to
+                // correspond to a real `SubmittedUserOp` -- a pure
+                // consensus-DB read, so every honest guardian computes the
+                // same result. A confirmation vote for an op nobody
+                // submitted is meaningless, and without this check a
+                // Byzantine guardian could bloat `UserOpConfirmedVote`
+                // forever with fresh random op hashes that never reach
+                // threshold (mirrors the `Deposit` arm's `claim_pk`
+                // self-authentication fix; see
+                // `security-review/14-low-junk-consensus-votes-db-bloat.md`).
+                ensure!(
+                    dbtx.get_value(&SubmittedUserOpKey(op_hash)).await.is_some(),
+                    "UserOpConfirmed vote for an op that was never submitted"
+                );
+
                 let obs = UserOpConfirmedObservation {
                     success,
                     block,
@@ -4918,6 +4957,57 @@ mod tests {
         assert!(err.to_string().contains("redundant"));
     }
 
+    /// **Security finding 14.** A `Deposit` observation whose `claim_pk`
+    /// does NOT derive `account` must be rejected with `Err` BEFORE the
+    /// vote is stored, so a Byzantine guardian cannot bloat
+    /// `DepositObservationVote` with junk observations for random accounts
+    /// that never reach threshold (that check previously ran only inside
+    /// `credit_deposit`, i.e. only after threshold-many identical votes).
+    #[tokio::test]
+    async fn deposit_vote_with_mismatched_claim_pk_is_rejected() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0xcc);
+        // `account` is derived from a DIFFERENT claim_pk, so `obs.claim_pk`
+        // (below) does not derive it.
+        let other_claim_pk = test_pubkey(0xdd);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &other_claim_pk,
+        );
+
+        let obs = DepositObservation {
+            account,
+            balance: UsdtAmount(1_000_000),
+            block: 10,
+            claim_pk,
+        };
+        let mut dbtx = db.begin_transaction().await;
+
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::Deposit(obs.clone()),
+                PeerId::from(0),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("claim_pk"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&DepositObservationVoteKey(account, PeerId::from(0)))
+                .await
+                .is_none(),
+            "malformed observation must not be stored as a vote"
+        );
+    }
+
     /// Regression test for the consensus-safety fix: a guardian that never
     /// saw the `check_deposit` API call (so has NO local [`PendingCheck`]
     /// for this account — e.g. a momentarily-slow guardian that a client's
@@ -4996,6 +5086,16 @@ mod tests {
     /// attacker-chosen claim key onto someone else's deposit account).
     #[tokio::test]
     async fn deposit_with_mismatched_claim_pk_is_rejected() {
+        // Security finding 14 (Task 2.2) moved this self-authentication
+        // check from `credit_deposit` (threshold time) to the very top of
+        // the `Deposit` arm of `process_consensus_item`, so a mismatched
+        // `claim_pk`/`account` pairing is now rejected on the FIRST vote --
+        // it can no longer accumulate below-threshold votes at all. This
+        // test now covers `credit_deposit`'s own check directly (called
+        // out-of-band, bypassing `process_consensus_item`) as the
+        // defense-in-depth path the brief asked to keep; see
+        // `deposit_vote_with_mismatched_claim_pk_is_rejected` for the
+        // arm-level, vote-storage-time coverage of the same finding.
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let db = module.db_for_test();
         let claim_pk = test_pubkey(0x43);
@@ -5007,32 +5107,22 @@ mod tests {
             block: 50,
             claim_pk,
         };
-        let mut dbtx = db.begin_transaction().await;
 
-        // First two votes just accumulate below threshold, no error yet.
-        for p in [0u16, 1] {
-            module
+        // Every vote for this malformed observation is rejected immediately
+        // -- it never reaches the vote table, so it can never accumulate
+        // towards threshold.
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            let err = module
                 .process_consensus_item(
                     &mut dbtx.to_ref_nc(),
                     UsdtConsensusItem::Deposit(obs.clone()),
                     PeerId::from(p),
                 )
                 .await
-                .unwrap();
+                .unwrap_err();
+            assert!(err.to_string().contains("does not derive its account"));
         }
-
-        // Third vote reaches threshold and triggers `credit_deposit`, which
-        // must reject the mismatched claim_pk/account pairing.
-        let err = module
-            .process_consensus_item(
-                &mut dbtx.to_ref_nc(),
-                UsdtConsensusItem::Deposit(obs.clone()),
-                PeerId::from(2),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("does not derive its account"));
-
         assert!(
             dbtx.to_ref_nc()
                 .get_value(&DepositRecordKey(wrong_account))
@@ -5040,6 +5130,24 @@ mod tests {
                 .is_none(),
             "no DepositRecord must be created for a self-authentication failure"
         );
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .find_by_prefix(&DepositObservationVoteAccountPrefix(wrong_account))
+                .await
+                .count()
+                .await,
+            0,
+            "a malformed observation must never be stored as a vote"
+        );
+
+        // Defense-in-depth: `credit_deposit` itself still rejects the same
+        // mismatch if ever reached directly (e.g. in a future code path
+        // that calls it other than via the arm-level check above).
+        let err = module
+            .credit_deposit(&mut dbtx.to_ref_nc(), &obs)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not derive its account"));
     }
 
     /// Sets up a fresh in-memory DB with `BlockCountVote`s from a majority of
@@ -8511,18 +8619,23 @@ mod tests {
             "vote prefix must be cleared once confirmed"
         );
 
-        // `apply_user_op_confirmed` clears the ENTIRE vote prefix once
-        // threshold is reached (mirroring `credit_deposit`'s
-        // `DepositObservationVoteAccountPrefix` clear), so re-delivering a
-        // vote a peer already cast is no longer rejected as "redundant" --
-        // the stored entry is gone, so it is processed as a fresh vote
-        // towards a new round. It must NOT, on its own, re-trigger
-        // `apply_user_op_confirmed` (only 1 of the 3 needed votes is now
-        // present).
+        // `apply_user_op_confirmed` clears the ENTIRE vote prefix AND the
+        // `SubmittedUserOp` itself once threshold is reached (mirroring
+        // `credit_deposit`'s `DepositObservationVoteAccountPrefix` clear).
+        // Security finding 14 (Task 2.2) requires every `UserOpConfirmed`
+        // vote to correspond to a live `SubmittedUserOp`, so a vote
+        // re-delivered for this op AFTER it has already been fully applied
+        // and cleared is now rejected outright (not silently accepted as a
+        // "fresh" below-threshold vote for an op that no longer exists) --
+        // it must not be stored, and it must NOT re-trigger
+        // `apply_user_op_confirmed` or touch `PoolState`.
         module
             .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(0))
             .await
-            .expect("a vote cast after the prefix was cleared is a fresh vote, not redundant");
+            .expect_err(
+                "a vote for an op already applied and cleared must be rejected, not treated as \
+                 a fresh vote",
+            );
         let pool_still_single_credit = dbtx
             .to_ref_nc()
             .get_value(&PoolStateKey)
@@ -8531,7 +8644,7 @@ mod tests {
         assert_eq!(
             pool_still_single_credit.balance,
             UsdtAmount(4_000_000),
-            "a single fresh vote below threshold must not re-credit the pool"
+            "a rejected post-application vote must not re-credit the pool"
         );
 
         // Stronger replay-safety property, exercised directly:
@@ -8571,6 +8684,95 @@ mod tests {
             record_after.swept,
             UsdtAmount(4_000_000),
             "a replayed apply must not double-advance swept"
+        );
+    }
+
+    /// **Security finding 14.** A `UserOpConfirmed` vote for an `op_hash`
+    /// that was never submitted (no `SubmittedUserOp` record) must be
+    /// rejected with `Err` BEFORE the vote is stored, so a Byzantine
+    /// guardian cannot bloat `UserOpConfirmedVote` with junk confirmations
+    /// for random op hashes that never reach threshold. A well-formed vote
+    /// for a real submitted op must still store normally (not
+    /// over-rejected).
+    #[tokio::test]
+    async fn userop_confirmed_vote_for_unknown_op_is_rejected() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let unknown_op_hash = [0x77; 32];
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash: unknown_op_hash,
+            success: true,
+            block: 20,
+            swept: UsdtAmount(1_000_000),
+        };
+
+        // Positive-control fixture (a REAL submitted op), inserted and
+        // committed BEFORE the long-lived `dbtx` below is opened so it is
+        // visible within that snapshot.
+        let known_op_hash = [0x78; 32];
+        let source = EvmAddress([0x79; 20]);
+        {
+            let mut setup = db.begin_transaction().await;
+            let mut sample = sample_unsigned_user_op_for_test();
+            sample.sender = source;
+            setup
+                .insert_new_entry(
+                    &SubmittedUserOpKey(known_op_hash),
+                    &SubmittedUserOp {
+                        signed: fedimint_usdt_common::user_op::SignedUserOp {
+                            unsigned: sample,
+                            signature: vec![0xaa; 65],
+                        },
+                        purpose: UserOpPurpose::DeployAndSweep { source },
+                        submitted_block: 3,
+                    },
+                )
+                .await;
+            setup.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+
+        let err = module
+            .process_consensus_item(&mut dbtx.to_ref_nc(), obs, PeerId::from(0))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("never submitted") || err.to_string().contains("submitted"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&UserOpConfirmedVoteKey(unknown_op_hash, PeerId::from(0)))
+                .await
+                .is_none(),
+            "vote for an unknown op must not be stored"
+        );
+
+        // Positive control: a well-formed vote for the REAL submitted op
+        // (fixture set up above) must still store (not over-rejected by
+        // this change).
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::UserOpConfirmed {
+                    op_hash: known_op_hash,
+                    success: true,
+                    block: 20,
+                    swept: UsdtAmount(1_000_000),
+                },
+                PeerId::from(0),
+            )
+            .await
+            .expect("a vote for a known submitted op must still store");
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&UserOpConfirmedVoteKey(known_op_hash, PeerId::from(0)))
+                .await
+                .is_some(),
+            "well-formed vote for a known op must be stored"
         );
     }
 
