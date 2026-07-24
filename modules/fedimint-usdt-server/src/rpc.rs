@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use alloy::eips::BlockId;
 use alloy::network::TransactionBuilder as _;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{Filter, TransactionRequest};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
+use alloy::sol_types::SolEvent as _;
 use alloy::transports::http::reqwest;
 use anyhow::Context as _;
 use fedimint_core::util::FmtCompactAnyhow as _;
@@ -177,6 +178,14 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
     /// The most recent block number the underlying node has synced to.
     async fn get_block_number(&self) -> anyhow::Result<u64>;
 
+    /// The canonical block hash of `block` (security findings 04/12): used by
+    /// the deposit scanner to bind a
+    /// [`fedimint_usdt_common::DepositObservation`] to a specific fork, so
+    /// observations read on different forks at the same height cannot
+    /// aggregate toward a threshold credit. `Err` if `block` is unknown to
+    /// the node (e.g. beyond its head) or the node is unreachable.
+    async fn get_block_hash(&self, block: u64) -> anyhow::Result<[u8; 32]>;
+
     /// The ERC-20 `balanceOf(holder)` for `token`, evaluated *as of*
     /// `at_block` (not "latest") so callers can read a stable, confirmed
     /// balance regardless of how far the node has since advanced.
@@ -292,10 +301,18 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
     /// [`Self::get_user_op_receipt`] for that.
     async fn submit_user_ops(&self, ops: Vec<SignedUserOp>) -> anyhow::Result<()>;
 
-    /// Looks up the `EntryPoint`'s `UserOperationEvent` for `user_op_hash`
-    /// (via `eth_getLogs`, filtered on the event's indexed `userOpHash`
-    /// topic), returning `None` if the op has not (yet, or ever) been
-    /// included on-chain.
+    /// Returns the authoritative on-chain outcome of `user_op_hash`, or
+    /// `None` if the op has not (yet, or ever) been included on-chain.
+    ///
+    /// Security finding 15 (op facet): the bundler's
+    /// `eth_getUserOperationReceipt` is treated only as a HINT to locate the
+    /// inclusion block; the returned `{success, block, block_hash}` are read
+    /// from the configured `EntryPoint`'s own `UserOperationEvent` log
+    /// (fetched via a single-block `eth_getLogs` filtered on the event's
+    /// indexed `userOpHash` topic and the `EntryPoint` address), which is the
+    /// source of truth. If the bundler claims inclusion but no matching
+    /// `EntryPoint` log is found at that block, this returns `None` (mismatch
+    /// -> do not confirm) rather than trusting the bundler.
     async fn get_user_op_receipt(
         &self,
         user_op_hash: [u8; 32],
@@ -555,6 +572,16 @@ impl IServerEvmRpc for AlloyEvmRpc {
 
     async fn get_block_number(&self) -> anyhow::Result<u64> {
         Ok(self.provider.get_block_number().await?)
+    }
+
+    async fn get_block_hash(&self, block: u64) -> anyhow::Result<[u8; 32]> {
+        let b = self
+            .provider
+            .get_block(BlockId::number(block))
+            .await
+            .with_context(|| format!("eth_getBlockByNumber({block}) failed"))?
+            .with_context(|| format!("block {block} not found (beyond node head?)"))?;
+        Ok(b.header.hash.0)
     }
 
     async fn get_erc20_balance(
@@ -949,15 +976,15 @@ impl IServerEvmRpc for AlloyEvmRpc {
         &self,
         user_op_hash: [u8; 32],
     ) -> anyhow::Result<Option<UserOpReceipt>> {
-        // Query the bundler for the op's receipt DIRECTLY by its hash (ERC-4337
-        // `eth_getUserOperationReceipt`), rather than scanning `EntryPoint`
-        // event logs. The op is identified by its consensus `userOpHash`, so
-        // every guardian queries the same key and gets the same on-chain result
-        // -- and this sidesteps the `eth_getLogs` block-range + archive limits
-        // that free RPC tiers impose (as little as a 10-50 block range, and old
-        // blocks paywalled), which made a log-scan approach unworkable on a real
-        // chain. Requires a bundler-capable RPC (Alchemy/Infura/QuickNode/...
-        // expose this method on their standard endpoint). `None` until mined.
+        // Step 1 (HINT ONLY): query the bundler for the op's receipt DIRECTLY
+        // by its hash (ERC-4337 `eth_getUserOperationReceipt`) to cheaply
+        // locate the inclusion block. The op is identified by its consensus
+        // `userOpHash`, so every guardian queries the same key -- and this
+        // sidesteps the `eth_getLogs` block-range + archive limits that free
+        // RPC tiers impose (as little as a 10-50 block range, and old blocks
+        // paywalled) by then scanning only that SINGLE block below. Requires a
+        // bundler-capable RPC (Alchemy/Infura/QuickNode/... expose this method
+        // on their standard endpoint). `None` until mined.
         let op_hash_hex = format!("0x{}", alloy::hex::encode(user_op_hash));
         let resp: Option<BundlerUserOpReceipt> = self
             .provider
@@ -968,26 +995,86 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .await
             .context("eth_getUserOperationReceipt failed")?;
 
-        let Some(receipt) = resp else {
+        let Some(hint) = resp else {
             return Ok(None);
         };
-        let actual_gas_cost = u64::try_from(receipt.actual_gas_cost).unwrap_or(u64::MAX);
-        let block = u64::try_from(receipt.receipt.block_number)
+        let actual_gas_cost = u64::try_from(hint.actual_gas_cost).unwrap_or(u64::MAX);
+        let hint_block = u64::try_from(hint.receipt.block_number)
             .context("UserOp receipt blockNumber overflows u64")?;
-        Ok(Some(UserOpReceipt {
-            success: receipt.success,
-            block,
-            actual_gas_cost_wei: UsdtAmount(actual_gas_cost),
-        }))
+
+        // Step 2 (AUTHORITATIVE, security finding 15 op facet): independently
+        // verify the outcome via the configured `EntryPoint`'s own
+        // `UserOperationEvent` log, read with a SINGLE-block `eth_getLogs`
+        // (fromBlock == toBlock == the bundler-hinted block, so the free-tier
+        // range/archive limits do not bite) filtered on the EntryPoint address
+        // and the event's indexed `userOpHash` topic. `{success, block,
+        // block_hash}` all come from this log -- never from the bundler hint --
+        // so a lying/compromised bundler cannot fabricate a settlement.
+        let entry_point = self.entry_point.context(
+            "AlloyEvmRpc::get_user_op_receipt requires an EntryPoint address (see \
+             Self::with_entry_point)",
+        )?;
+        let entry_point_addr = Address::from(entry_point.0);
+        let filter = Filter::new()
+            .address(entry_point_addr)
+            .from_block(hint_block)
+            .to_block(hint_block)
+            .event_signature(UserOperationEvent::SIGNATURE_HASH)
+            .topic1(B256::from(user_op_hash));
+        let logs = self
+            .provider
+            .get_logs(&filter)
+            .await
+            .context("eth_getLogs UserOperationEvent cross-check failed")?;
+
+        for log in logs {
+            // Belt-and-suspenders: the filter already constrains address +
+            // topic0 + topic1, but re-verify the EntryPoint address and the
+            // decoded indexed `userOpHash` before trusting the event.
+            if log.inner.address != entry_point_addr {
+                continue;
+            }
+            let Ok(decoded) = UserOperationEvent::decode_log(&log.inner) else {
+                continue;
+            };
+            if decoded.data.userOpHash != B256::from(user_op_hash) {
+                continue;
+            }
+            let (Some(block_hash), Some(block)) = (log.block_hash, log.block_number) else {
+                // A pending/uncled log with no block identity: cannot bind to
+                // a fork, so treat as not-yet-confirmed.
+                continue;
+            };
+            return Ok(Some(UserOpReceipt {
+                success: decoded.data.success,
+                block,
+                block_hash: block_hash.0,
+                actual_gas_cost_wei: UsdtAmount(actual_gas_cost),
+            }));
+        }
+
+        // The bundler claimed inclusion but the authoritative EntryPoint log is
+        // absent (or mismatched) at that block -- do NOT confirm on the
+        // bundler's word alone (security finding 15). Retried next tick.
+        warn!(
+            target: "usdt",
+            ?user_op_hash,
+            hint_block,
+            "bundler receipt present but no matching EntryPoint UserOperationEvent log; \
+             treating as unconfirmed"
+        );
+        Ok(None)
     }
 }
 
 /// Subset of an ERC-4337 `eth_getUserOperationReceipt` response the module
-/// needs (see [`AlloyEvmRpc::get_user_op_receipt`]). Hex-string numbers decode
-/// via `alloy`'s `U256` serde.
+/// needs as a HINT to locate the inclusion block (see
+/// [`AlloyEvmRpc::get_user_op_receipt`]); the authoritative `success`/block/
+/// block-hash come from the `EntryPoint` log cross-check, so the bundler's own
+/// `success` flag is deliberately NOT deserialized/trusted here. Hex-string
+/// numbers decode via `alloy`'s `U256` serde.
 #[derive(Debug, serde::Deserialize)]
 struct BundlerUserOpReceipt {
-    success: bool,
     #[serde(rename = "actualGasCost")]
     actual_gas_cost: U256,
     receipt: BundlerInnerReceipt,

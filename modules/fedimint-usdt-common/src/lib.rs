@@ -38,7 +38,22 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// changed). Neither type is a stored consensus-DB record (they are computed
 /// on the fly from the `FeeVote` table on every call), so no
 /// `get_database_migrations` entry/snapshot is needed for this bump.
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 4);
+///
+/// Bumped to `0.4` (sec-06 hardening): `FeeVoteKey`'s stored value changed
+/// from a bare `FeeVote` to `StoredFeeVote` (adds a `recorded_block`
+/// freshness stamp), a consensus-DB record shape change handled by
+/// `migrate_db_v0`.
+///
+/// Bumped to `0.5` (sec-04/12/15 hardening): [`DepositObservation`],
+/// [`UserOpReceipt`](user_op::UserOpReceipt), the server's
+/// `UserOpConfirmedObservation`, and the [`UsdtConsensusItem::UserOpConfirmed`]
+/// consensus item all gained a `block_hash` field binding an observation to a
+/// canonical fork (so reorg-divergent votes no longer aggregate). The two
+/// affected vote tables (`DepositObservationVote`, `UserOpConfirmedVote`) are
+/// transient and re-formed every scan/submit tick, so `migrate_db_v1` DROPS
+/// their old-shape rows rather than rewriting them (mirroring
+/// `migrate_db_v0`).
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 5);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
@@ -759,6 +774,15 @@ pub struct DepositObservation {
     pub account: EvmAddress,
     pub balance: UsdtAmount,
     pub block: u64,
+    /// The canonical hash of [`Self::block`] (security findings 04/12/15):
+    /// the deposit scanner reads it via `IServerEvmRpc::get_block_hash` for
+    /// the exact block it read the balance at, so an observation is bound to
+    /// a specific fork. Because the vote tally counts only FULLY-equal
+    /// observations, two guardians observing the same account/balance/height
+    /// on DIFFERENT forks produce non-equal votes that never aggregate to a
+    /// threshold credit -- closing the "stale pre-reorg vote completes a
+    /// threshold on a non-canonical fork" gap.
+    pub block_hash: [u8; 32],
     pub claim_pk: secp256k1::PublicKey,
 }
 
@@ -1298,6 +1322,13 @@ pub enum UsdtConsensusItem {
         op_hash: [u8; 32],
         success: bool,
         block: u64,
+        /// The canonical hash of `block` (security findings 04/15), read from
+        /// the authoritative `EntryPoint` `UserOperationEvent` log via
+        /// `IServerEvmRpc::get_user_op_receipt`. Part of the full-field
+        /// equality tally, so two guardians observing the same op on
+        /// different forks at the same height produce non-equal votes that
+        /// never aggregate toward the confirmation threshold.
+        block_hash: [u8; 32],
         swept: UsdtAmount,
     },
     /// One guardian's vote on the current EVM fee market and USDT/ETH
@@ -1741,6 +1772,7 @@ mod tests {
             account: EvmAddress([9; 20]),
             balance: UsdtAmount(1_000_000),
             block: 42,
+            block_hash: [0xAB; 32],
             claim_pk,
         });
         let bytes = item.consensus_encode_to_vec();
@@ -1788,6 +1820,7 @@ mod tests {
             op_hash: [6; 32],
             success: true,
             block: 77,
+            block_hash: [0xCD; 32],
             swept: UsdtAmount(1_234_000),
         };
         let bytes = item.consensus_encode_to_vec();
