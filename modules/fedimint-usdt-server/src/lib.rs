@@ -5019,6 +5019,28 @@ impl Usdt {
                     dbtx.remove_entry(&SubmittedUserOpKey(op_hash)).await;
                     dbtx.remove_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
                         .await;
+                    // RBF-nonce cleanup (security finding 03): every withdrawal
+                    // covered by this (sender, nonce) is now terminal-`Failed`,
+                    // so the WHOLE replacement chain at that nonce is dead. If
+                    // this op was itself a replacement, earlier `superseded`
+                    // predecessors (and any still-signing sibling) linger in the
+                    // DB; `withdraw_batch_in_flight` counts any Submitted
+                    // `Withdraw` op IGNORING `superseded`, so an orphaned
+                    // predecessor would make it return `true` forever and wedge
+                    // ALL future withdrawal batches. Tear down the entire chain
+                    // (Submitted/Pending ops + votes + signing sessions) with the
+                    // same helper the confirmation path uses -- `op_hash` was
+                    // already removed above, so pass it as the `except`. The
+                    // covered withdrawals stay `Failed` and their
+                    // `UnclaimedWithdrawal`s are left intact for the Phase 6.1
+                    // refund. Deterministic: reads only the committed DB.
+                    self.purge_user_op_nonce_chain(
+                        dbtx,
+                        submitted.signed.unsigned.sender,
+                        submitted.signed.unsigned.nonce,
+                        op_hash,
+                    )
+                    .await;
                     warn!(
                         target: "usdt",
                         ?op_hash,
@@ -5027,7 +5049,7 @@ impl Usdt {
                         ceiling,
                         "withdrawal batch reprice exceeds the covered withdrawals' committed \
                          max_fee; marking them Failed (refundable in Phase 6.1) and clearing the \
-                         stuck op"
+                         stuck op + its whole replacement chain"
                     );
                     return Ok(());
                 }
@@ -14722,6 +14744,161 @@ mod tests {
         assert!(
             pending_withdraw_ops(&mut dbtx.to_ref_nc()).await.is_empty(),
             "no replacement is enqueued when over the ceiling"
+        );
+    }
+
+    /// **Task 5.2, step 3 (regression, security finding 03).** When the op that
+    /// goes over the ceiling is ITSELF a replacement (a superseded predecessor
+    /// `A` shares its `(sender, nonce)`), the over-ceiling handling must tear
+    /// down the WHOLE chain -- not just the current op. Otherwise the orphaned
+    /// `A` (which `withdraw_batch_in_flight` counts, ignoring `superseded`)
+    /// wedges every future withdrawal batch permanently. Asserts: after the
+    /// over-ceiling apply NO Submitted `Withdraw` op remains at that nonce,
+    /// `withdraw_batch_in_flight` is `false`, and a later `Queued` withdrawal
+    /// can batch again. This is the exact gap the plain over-ceiling test
+    /// (`reprice_over_user_max_fee_marks_withdrawals_failed`) does not cover.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn over_ceiling_reprice_of_a_replacement_purges_the_whole_chain() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let ha = [0xa1; 32]; // superseded predecessor (orphan risk)
+        let hb = [0xb2; 32]; // current op, over-ceiling on reprice
+        let out1 = test_out_point(1); // covered by the (A->B) batch
+        let out2 = test_out_point(2); // later, still Queued behind the wedge
+        let total = UsdtAmount(1_000_000);
+
+        // High enough for BOTH the ReplaceUserOp timeout gate and the later
+        // withdrawal-batch interval, regardless of their relative sizes.
+        seed_block_count_votes(
+            db,
+            4,
+            batch_interval_blocks() + submitted_op_timeout_blocks() + 1,
+        )
+        .await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(10_000_000),
+                    nonce: 5,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out1),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc1; 20]),
+                    amount: total,
+                    // LOW ceiling: below the repriced op's gas cost, so B goes
+                    // over the ceiling.
+                    max_fee: UsdtAmount(50_000_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out1), &WithdrawalState::Signing(hb))
+                .await;
+            // A (superseded) and B (live, the current op) share the SAME
+            // (sender, nonce) -- a real replacement chain.
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(ha),
+                &submitted_withdraw_op(vec![out1], total, 100_000_000_000, 2_000_000_000, 0, true),
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(hb),
+                &submitted_withdraw_op(vec![out1], total, 110_000_000_000, 2_200_000_000, 0, false),
+            )
+            .await;
+            // A later withdrawal stuck Queued behind the batch.
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out2),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc2; 20]),
+                    amount: UsdtAmount(500_000),
+                    max_fee: UsdtAmount(300_000_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out2), &WithdrawalState::Queued)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Reprice the current op B -- goes over the ceiling.
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::ReplaceUserOp { op_hash: hb },
+                PeerId::from(0),
+            )
+            .await
+            .expect("over-ceiling reprice is a state change (Failed), returns Ok");
+
+        // out1 is terminal-Failed, its UnclaimedWithdrawal KEPT (Phase 6.1).
+        assert_eq!(
+            dbtx.to_ref_nc().get_value(&WithdrawalStateKey(out1)).await,
+            Some(WithdrawalState::Failed {
+                reason: "gas exceeds committed max_fee".to_string()
+            })
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&UnclaimedWithdrawalKey(out1))
+                .await
+                .is_some(),
+            "UnclaimedWithdrawal must be KEPT for the Phase 6.1 refund"
+        );
+
+        // The WHOLE chain is gone -- both B (current) AND the superseded
+        // predecessor A. This is the fix: without the chain purge, A would
+        // linger and wedge every future batch.
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(hb))
+                .await
+                .is_none(),
+            "the current op B must be removed"
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(ha))
+                .await
+                .is_none(),
+            "the superseded predecessor A must be purged with the whole chain"
+        );
+        assert!(
+            !module.withdraw_batch_in_flight(&mut dbtx.to_ref_nc()).await,
+            "no Withdraw op is in flight once the chain is purged"
+        );
+
+        // The previously-wedged out2 can now batch again.
+        dbtx.commit_tx().await;
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+            .await;
+        let new_ops = pending_withdraw_ops(&mut dbtx.to_ref_nc()).await;
+        assert_eq!(
+            new_ops.len(),
+            1,
+            "the previously-wedged out2 must now batch: {new_ops:?}"
+        );
+        let UserOpPurpose::Withdraw { outpoints } = &new_ops[0].1.purpose else {
+            panic!("must be a Withdraw op");
+        };
+        assert_eq!(
+            outpoints,
+            &vec![out2],
+            "only the still-Queued out2 batches; the Failed out1 does not"
         );
     }
 
