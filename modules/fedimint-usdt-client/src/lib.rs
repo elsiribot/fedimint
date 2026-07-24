@@ -42,7 +42,7 @@ use fedimint_usdt_common::{
     BootstrapState, CheckDepositResponse, DepositFeeQuoteResponse, DepositStatusResponse,
     EvmAddress, KIND, PoolStateResponse, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
     UsdtInput, UsdtInputV0, UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse,
-    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse,
+    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse, usdt_amount,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,26 @@ const AWAIT_WITHDRAWAL_CONFIRMED_MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// claim keys from any future key type derived from the same module root
 /// secret.
 const DEPOSIT_CLAIM_KEY_CHILD: ChildId = ChildId(0);
+
+/// Shared by [`UsdtClientModule::deposit_fee_quote`]/
+/// [`UsdtClientModule::withdraw_fee_quote`] (misc #4, finding 06's
+/// client-confusion facet): the exact message a caller sees when the
+/// federation has no `FeeVote` median yet (or the quote overflowed).
+const FEE_QUOTE_UNAVAILABLE_MESSAGE: &str =
+    "fee quote not available yet (federation has no current fee estimate); try again shortly";
+
+/// Bails with [`FEE_QUOTE_UNAVAILABLE_MESSAGE`] unless `available`,
+/// otherwise passes `quote` through unchanged. Factored out of
+/// [`UsdtClientModule::deposit_fee_quote`]/
+/// [`UsdtClientModule::withdraw_fee_quote`] into a pure, synchronous
+/// function so the availability guard is unit-testable without a live
+/// federation/`DynModuleApi`.
+fn ensure_fee_quote_available<T>(quote: T, available: bool) -> anyhow::Result<T> {
+    if !available {
+        bail!(FEE_QUOTE_UNAVAILABLE_MESSAGE);
+    }
+    Ok(quote)
+}
 
 #[derive(Debug)]
 pub struct UsdtClientModule {
@@ -227,7 +247,7 @@ impl ClientModule for UsdtClientModule {
         match output {
             UsdtOutput::V0(withdrawal) => Some(Amounts::new_custom(
                 USDT_UNIT,
-                Amount::from_msats(withdrawal.max_fee.0),
+                usdt_amount(withdrawal.max_fee),
             )),
             UsdtOutput::Default { .. } => None,
         }
@@ -573,8 +593,22 @@ impl UsdtClientModule {
     /// [`UsdtFederationApi::deposit_fee_quote`] (threshold-agreement --
     /// every guardian answers identically, since the quote is derived from
     /// consensus DB).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` if the response's `available` is `false` (misc #4,
+    /// finding 06's client-confusion facet): the federation has no
+    /// `FeeVote` median yet (or the quote overflowed), so the response's
+    /// `fee` is a non-authoritative `UsdtAmount(0)` placeholder that MUST
+    /// NOT be submitted against. Every caller of this wrapper (`claim` via
+    /// [`Self::submit_claim`], `fedimint-cli`'s `deposit-fee-quote`/`claim`)
+    /// therefore inherits this bail rather than silently claiming for `0`
+    /// fee and hitting `process_input`'s `NoFeeQuoteAvailable` rejection
+    /// later.
     pub async fn deposit_fee_quote(&self) -> anyhow::Result<DepositFeeQuoteResponse> {
-        Ok(self.module_api.deposit_fee_quote().await?)
+        let quote = self.module_api.deposit_fee_quote().await?;
+        let available = quote.available;
+        ensure_fee_quote_available(quote, available)
     }
 
     /// Asks the federation to start watching `claim_keypair`'s deposit
@@ -726,7 +760,7 @@ impl UsdtClientModule {
                 fee,
             }),
             keys: vec![*claim_keypair],
-            amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0 - fee.0)),
+            amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(UsdtAmount(amount.0 - fee.0))),
         })
     }
 
@@ -735,11 +769,19 @@ impl UsdtClientModule {
     /// Task 1). Thin wrapper around [`UsdtFederationApi::withdraw_fee_quote`]
     /// (threshold-agreement -- every guardian answers identically, since the
     /// quote is derived from consensus DB).
+    ///
+    /// # Errors
+    ///
+    /// Mirrors [`Self::deposit_fee_quote`]'s `available` handling: returns
+    /// an `Err` rather than a `UsdtAmount(0)` placeholder when the
+    /// federation has no fresh quote yet.
     pub async fn withdraw_fee_quote(
         &self,
         amount: UsdtAmount,
     ) -> anyhow::Result<WithdrawFeeQuoteResponse> {
-        Ok(self.module_api.withdraw_fee_quote(amount).await?)
+        let quote = self.module_api.withdraw_fee_quote(amount).await?;
+        let available = quote.available;
+        ensure_fee_quote_available(quote, available)
     }
 
     /// The `OutPoint` of the withdrawal output enqueued by a call to
@@ -864,7 +906,7 @@ impl UsdtClientModule {
                 amount,
                 max_fee,
             }),
-            amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0)),
+            amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(amount)),
         }]);
         let output = self.client_ctx.make_client_outputs(output);
 
@@ -977,8 +1019,8 @@ mod tests {
     use fedimint_derive_secret::DerivableSecret;
 
     use super::{
-        Amount, Amounts, EvmAddress, Keypair, SECP256K1, USDT_UNIT, UsdtAmount, UsdtClientModule,
-        UsdtInput,
+        Amount, Amounts, EvmAddress, FEE_QUOTE_UNAVAILABLE_MESSAGE, Keypair, SECP256K1, USDT_UNIT,
+        UsdtAmount, UsdtClientModule, UsdtInput, ensure_fee_quote_available,
     };
 
     /// Deterministic test keypair (mirrors
@@ -1019,6 +1061,28 @@ mod tests {
             Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0 - fee.0)),
             "ClientInput.amounts must be the NET amount, not the gross claimed amount"
         );
+    }
+
+    /// (misc #4, finding 06's client-confusion facet.)
+    /// `ensure_fee_quote_available` backs both
+    /// [`UsdtClientModule::deposit_fee_quote`] and [`UsdtClientModule::withdraw_fee_quote`]: `available: false` must bail
+    /// with [`FEE_QUOTE_UNAVAILABLE_MESSAGE`] rather than silently handing
+    /// the caller a `UsdtAmount(0)` placeholder quote.
+    #[test]
+    fn ensure_fee_quote_available_bails_when_unavailable() {
+        let err = ensure_fee_quote_available(UsdtAmount(0), false)
+            .expect_err("unavailable quote must bail");
+        assert_eq!(err.to_string(), FEE_QUOTE_UNAVAILABLE_MESSAGE);
+    }
+
+    /// Positive control: a real (`available: true`) quote passes through
+    /// unchanged -- the availability guard must not perturb the quote value
+    /// itself.
+    #[test]
+    fn ensure_fee_quote_available_passes_through_when_available() {
+        let quote = UsdtAmount(38_880_000);
+        let passed = ensure_fee_quote_available(quote, true).expect("available quote must pass");
+        assert_eq!(passed, quote);
     }
 
     /// An uneconomical deposit (the fee would consume all or more of the

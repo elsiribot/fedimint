@@ -977,7 +977,7 @@ impl IServerEvmRpc for AlloyEvmRpc {
         Ok(Some(UserOpReceipt {
             success: receipt.success,
             block,
-            actual_cost_usdt: UsdtAmount(actual_gas_cost),
+            actual_gas_cost_wei: UsdtAmount(actual_gas_cost),
         }))
     }
 }
