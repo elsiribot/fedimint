@@ -324,6 +324,10 @@ pub async fn run(
         network: server_opts.bitcoin_network,
         available_modules: module_init_registry.kinds(),
         default_modules: module_init_registry.default_modules(),
+        available_module_params: fedimint_server::config::build_module_params_registry(
+            &module_init_registry,
+            &module_init_registry.kinds(),
+        ),
     };
 
     let db = Database::new(
@@ -437,6 +441,8 @@ pub fn default_modules() -> ServerModuleInitRegistry {
 
     server_gens.attach(LightningInit);
     server_gens.attach(fedimint_lnv2_server::LightningInit);
+
+    server_gens.attach(fedimint_usdt_server::UsdtInit::default());
 
     if !is_env_var_set(FM_DISABLE_META_MODULE_ENV) {
         server_gens.attach(MetaInit);

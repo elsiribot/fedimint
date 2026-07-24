@@ -66,6 +66,11 @@ function reconnect_test() {
 }
 export -f reconnect_test
 
+function anvil_smoke_test() {
+  fm-run-test "${FUNCNAME[0]}" ./scripts/tests/anvil-smoke-test.sh
+}
+export -f anvil_smoke_test
+
 function ln_reconnect_test() {
   fm-run-test "${FUNCNAME[0]}" ./scripts/tests/lightning-reconnect-test.sh
 }
@@ -417,6 +422,7 @@ tests_to_run_in_parallel+=(
   "latency_fm_pay"
   "latency_restore"
   "reconnect_test"
+  "anvil_smoke_test"
   "ln_reconnect_test"
   "gw_reboot_test"
   "gw_config_test_lnd"

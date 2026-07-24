@@ -9,7 +9,9 @@ use tokio::join;
 use tracing::{debug, info};
 
 use crate::LightningNode;
-use crate::external::{Bitcoind, Esplora, Lnd, NamedGateway, open_channels_between_gateways};
+use crate::external::{
+    Anvil, Bitcoind, Esplora, Lnd, NamedGateway, open_channels_between_gateways,
+};
 use crate::federation::{Client, Federation};
 use crate::gatewayd::Gatewayd;
 use crate::recurringd::Recurringd;
@@ -36,6 +38,7 @@ pub struct DevFed {
     pub gw_ldk: Gatewayd,
     pub gw_ldk_second: Gatewayd,
     pub esplora: Esplora,
+    pub anvil: Anvil,
     pub recurringd: Recurringd,
     pub recurringdv2: Recurringdv2,
 }
@@ -50,6 +53,7 @@ impl DevFed {
             gw_ldk,
             gw_ldk_second,
             esplora,
+            anvil,
             recurringd,
             recurringdv2,
         } = self;
@@ -61,6 +65,7 @@ impl DevFed {
             spawn_drop(fed),
             spawn_drop(lnd),
             spawn_drop(esplora),
+            spawn_drop(anvil),
             spawn_drop(bitcoind),
             spawn_drop(recurringd),
             spawn_drop(recurringdv2),
@@ -84,6 +89,7 @@ pub struct DevJitFed {
     gw_ldk: JitArc<Gatewayd>,
     gw_ldk_second: JitArc<Gatewayd>,
     esplora: JitArc<Esplora>,
+    anvil: JitArc<Anvil>,
     recurringd: JitArc<Recurringd>,
     recurringdv2: JitArc<Recurringdv2>,
     start_time: std::time::SystemTime,
@@ -143,6 +149,17 @@ impl DevJitFed {
                 let esplora = Esplora::new(&process_mgr, bitcoind).await?;
                 info!(target: LOG_DEVIMINT, elapsed_ms = %start_time.elapsed()?.as_millis(), "Started esplora");
                 Ok(Arc::new(esplora))
+            }
+        });
+
+        let anvil = JitTryAnyhow::new_try({
+            let process_mgr = process_mgr.to_owned();
+            || async move {
+                debug!(target: LOG_DEVIMINT, "Starting anvil...");
+                let start_time = fedimint_core::time::now();
+                let anvil = Anvil::new(&process_mgr).await?;
+                info!(target: LOG_DEVIMINT, elapsed_ms = %start_time.elapsed()?.as_millis(), "Started anvil");
+                Ok(Arc::new(anvil))
             }
         });
 
@@ -411,6 +428,7 @@ impl DevJitFed {
             gw_ldk,
             gw_ldk_second,
             esplora,
+            anvil,
             recurringd,
             recurringdv2,
             start_time,
@@ -428,6 +446,9 @@ impl DevJitFed {
 
     pub async fn esplora(&self) -> anyhow::Result<&Esplora> {
         Ok(self.esplora.get_try().await?.deref())
+    }
+    pub async fn anvil(&self) -> anyhow::Result<&Anvil> {
+        Ok(self.anvil.get_try().await?.deref())
     }
     pub async fn lnd(&self) -> anyhow::Result<&Lnd> {
         Ok(self.lnd.get_try().await?.deref())
@@ -502,6 +523,7 @@ impl DevJitFed {
         let _ = self.gw_ldk_second_connected().await?;
         let _ = self.lnd().await?;
         let _ = self.esplora().await?;
+        let _ = self.anvil().await?;
         let _ = self.recurringd_connected().await?;
         let _ = self.recurringdv2().await?;
         let _ = self.fed_epoch_generated.get_try().await?;
@@ -526,6 +548,7 @@ impl DevJitFed {
             gw_ldk: self.gw_ldk().await?.to_owned(),
             gw_ldk_second: self.gw_ldk_second().await?.to_owned(),
             esplora: self.esplora().await?.to_owned(),
+            anvil: self.anvil().await?.to_owned(),
             recurringd: self.recurringd().await?.to_owned(),
             recurringdv2: self.recurringdv2().await?.to_owned(),
         })
@@ -538,6 +561,7 @@ impl DevJitFed {
             fed,
             gw_lnd,
             esplora,
+            anvil,
             gw_ldk,
             gw_ldk_second,
             recurringd,
@@ -552,6 +576,7 @@ impl DevJitFed {
             spawn_drop(fed),
             spawn_drop(lnd),
             spawn_drop(esplora),
+            spawn_drop(anvil),
             spawn_drop(bitcoind),
             spawn_drop(recurringd),
             spawn_drop(recurringdv2),
