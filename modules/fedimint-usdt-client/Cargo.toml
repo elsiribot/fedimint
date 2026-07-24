@@ -1,0 +1,40 @@
+[package]
+authors = { workspace = true }
+description = "fedimint-usdt-client is the client-side module for USDT-on-EVM peg-in/peg-out."
+edition = { workspace = true }
+license = { workspace = true }
+name = "fedimint-usdt-client"
+readme = { workspace = true }
+repository = { workspace = true }
+version = { workspace = true }
+
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "tokio_unstable"]
+
+[lib]
+name = "fedimint_usdt_client"
+path = "src/lib.rs"
+
+[features]
+cli = ["dep:clap"]
+default = []
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true, optional = true }
+erased-serde = { workspace = true }
+fedimint-api-client = { workspace = true }
+fedimint-client-module = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-derive-secret = { workspace = true }
+fedimint-usdt-common = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
