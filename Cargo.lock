@@ -6089,6 +6089,7 @@ dependencies = [
  "futures",
  "hex",
  "serde_json",
+ "strum 0.27.1",
  "tokio",
  "tracing",
 ]

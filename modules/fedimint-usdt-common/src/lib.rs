@@ -38,7 +38,7 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// changed). Neither type is a stored consensus-DB record (they are computed
 /// on the fly from the `FeeVote` table on every call), so no
 /// `get_database_migrations` entry/snapshot is needed for this bump.
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 3);
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 4);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
@@ -134,6 +134,34 @@ impl fmt::Display for FeeVote {
             self.max_fee_per_gas_wei, self.usdt_per_eth_e6
         )
     }
+}
+
+/// Sanity ceiling on an individual [`FeeVote::max_fee_per_gas_wei`] (security
+/// finding 06's bounds facet): `10_000` gwei (`10^13` wei). Real EVM gas
+/// prices sit many orders of magnitude below this even during extreme
+/// congestion; a vote above it can only be a misconfigured/malicious
+/// guardian, and letting it into the median risks
+/// [`UsdtInputError::FeeQuoteOverflow`]/[`UsdtOutputError::FeeQuoteOverflow`]
+/// turning into a federation-wide deposit/withdrawal `DoS` (the finding's
+/// `FeeQuoteOverflow`-as-DoS path).
+pub const MAX_SANE_MAX_FEE_PER_GAS_WEI: u64 = 10_000_000_000_000;
+
+/// Sanity ceiling on an individual [`FeeVote::usdt_per_eth_e6`] (security
+/// finding 06's bounds facet): `$1,000,000` per ETH, in the field's `10^-6`
+/// USD fixed-point (`1_000_000 * 10^6 == 10^12`). Mirrors
+/// [`MAX_SANE_MAX_FEE_PER_GAS_WEI`]'s rationale.
+pub const MAX_SANE_USDT_PER_ETH_E6: u64 = 1_000_000_000_000;
+
+/// Whether `vote`'s fields are both within the sane, non-zero ranges bounded
+/// by [`MAX_SANE_MAX_FEE_PER_GAS_WEI`]/[`MAX_SANE_USDT_PER_ETH_E6`] (security
+/// finding 06). `Usdt::process_consensus_item`'s `FeeVote` arm rejects (as a
+/// non-state-changing `Err`, never stored) any vote failing this check --
+/// pure function of `vote` alone, so every guardian rejects/accepts
+/// identically.
+#[must_use]
+pub fn fee_vote_in_sane_range(vote: &FeeVote) -> bool {
+    (1..=MAX_SANE_MAX_FEE_PER_GAS_WEI).contains(&vote.max_fee_per_gas_wei)
+        && (1..=MAX_SANE_USDT_PER_ETH_E6).contains(&vote.usdt_per_eth_e6)
 }
 
 /// Total gas-unit estimate for a single-transfer withdrawal `UserOp` (pool
@@ -1870,6 +1898,57 @@ mod tests {
                 .expect("UsdtConsensusItem::FeeVote should decode what it just encoded");
 
         assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn fee_vote_in_sane_range_accepts_realistic_and_boundary_values() {
+        // A realistic vote (30 gwei, $3000/ETH) is well within range.
+        assert!(fee_vote_in_sane_range(&FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        }));
+
+        // Both fields' exact ceilings are still sane (inclusive bound).
+        assert!(fee_vote_in_sane_range(&FeeVote {
+            max_fee_per_gas_wei: MAX_SANE_MAX_FEE_PER_GAS_WEI,
+            usdt_per_eth_e6: MAX_SANE_USDT_PER_ETH_E6,
+        }));
+
+        // Both fields' minimum sane value (1) is still sane (inclusive
+        // bound).
+        assert!(fee_vote_in_sane_range(&FeeVote {
+            max_fee_per_gas_wei: 1,
+            usdt_per_eth_e6: 1,
+        }));
+    }
+
+    #[test]
+    fn fee_vote_in_sane_range_rejects_zero_and_above_ceiling() {
+        let realistic = FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+
+        // Zero in either field (the "0-median" DoS variant of the finding).
+        assert!(!fee_vote_in_sane_range(&FeeVote {
+            max_fee_per_gas_wei: 0,
+            ..realistic
+        }));
+        assert!(!fee_vote_in_sane_range(&FeeVote {
+            usdt_per_eth_e6: 0,
+            ..realistic
+        }));
+
+        // One above the ceiling in either field (the extreme-vote DoS
+        // variant of the finding).
+        assert!(!fee_vote_in_sane_range(&FeeVote {
+            max_fee_per_gas_wei: MAX_SANE_MAX_FEE_PER_GAS_WEI + 1,
+            ..realistic
+        }));
+        assert!(!fee_vote_in_sane_range(&FeeVote {
+            usdt_per_eth_e6: MAX_SANE_USDT_PER_ETH_E6 + 1,
+            ..realistic
+        }));
     }
 
     #[test]

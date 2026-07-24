@@ -110,9 +110,25 @@ pub struct FeeVoteKey(pub PeerId);
 #[derive(Clone, Debug, Encodable, Decodable)]
 pub struct FeeVotePrefix;
 
+/// The value stored at [`FeeVoteKey`] (security finding 06's freshness
+/// facet): the peer's raw [`FeeVote`] plus the `consensus_block_count`
+/// (`Usdt::consensus_block_count`) at which it was recorded. `fee_vote_median`
+/// excludes votes whose `recorded_block` has fallen more than
+/// `FEE_VOTE_TTL_BLOCKS` behind the current consensus block count, so a
+/// guardian whose fee poller stops producing fresh observations ages out of
+/// the quorum instead of pinning a stale (or Byzantine) value forever.
+/// `recorded_block` is always stamped from `consensus_block_count(dbtx)` --
+/// never wall-clock -- so every honest guardian computes the identical value
+/// for the same ordered `FeeVote` item.
+#[derive(Clone, Copy, Debug, Encodable, Decodable, Eq, PartialEq, Hash, Serialize)]
+pub struct StoredFeeVote {
+    pub vote: FeeVote,
+    pub recorded_block: u64,
+}
+
 impl_db_record!(
     key = FeeVoteKey,
-    value = FeeVote,
+    value = StoredFeeVote,
     db_prefix = DbKeyPrefix::FeeVote,
 );
 impl_db_lookup!(key = FeeVoteKey, query_prefix = FeeVotePrefix);
@@ -1043,20 +1059,23 @@ mod tests {
     #[tokio::test]
     async fn fee_vote_round_trips() {
         let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
-        let vote = fedimint_usdt_common::FeeVote {
-            max_fee_per_gas_wei: 30_000_000_000,
-            usdt_per_eth_e6: 3_000_000_000,
+        let stored = StoredFeeVote {
+            vote: fedimint_usdt_common::FeeVote {
+                max_fee_per_gas_wei: 30_000_000_000,
+                usdt_per_eth_e6: 3_000_000_000,
+            },
+            recorded_block: 42,
         };
 
         let mut dbtx = db.begin_transaction().await;
-        dbtx.insert_new_entry(&FeeVoteKey(PeerId::from(1)), &vote)
+        dbtx.insert_new_entry(&FeeVoteKey(PeerId::from(1)), &stored)
             .await;
         dbtx.commit_tx().await;
 
         let mut dbtx = db.begin_transaction_nc().await;
         assert_eq!(
             dbtx.get_value(&FeeVoteKey(PeerId::from(1))).await,
-            Some(vote)
+            Some(stored)
         );
         assert_eq!(dbtx.find_by_prefix(&FeeVotePrefix).await.count().await, 1);
     }

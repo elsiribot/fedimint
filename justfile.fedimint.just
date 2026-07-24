@@ -134,6 +134,7 @@ test-db-migrations:
   just test-server-db-migrations fedimint-wallet-tests
   just test-server-db-migrations fedimint-server
   just test-server-db-migrations fedimint-gateway-server
+  just test-server-db-migrations fedimint-usdt-tests
 
 snapshot-db-migrations:
   just snapshot-client-db-migrations fedimint-mint-tests
@@ -144,6 +145,7 @@ snapshot-db-migrations:
   just snapshot-server-db-migrations fedimint-wallet-tests
   just snapshot-server-db-migrations fedimint-server
   just snapshot-server-db-migrations fedimint-gateway-server
+  just snapshot-server-db-migrations fedimint-usdt-tests
   just test-db-migrations
 
 # start mprocs with a dev federation setup. Default: 4 nodes, add `-n 1` argument to start only 1 node
