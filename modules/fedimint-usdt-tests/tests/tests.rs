@@ -1680,6 +1680,7 @@ mod fedimint_migration_tests {
                 },
                 purpose: UserOpPurpose::DeployAndSweep { source: account },
                 submitted_block: 1,
+                superseded: false,
             },
         )
         .await;
