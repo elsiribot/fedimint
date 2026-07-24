@@ -164,6 +164,11 @@ pub enum UsdtOperationMeta {
         recipient: EvmAddress,
         amount: UsdtAmount,
         max_fee: UsdtAmount,
+        /// Txid of the fedimint transaction that enqueued the withdrawal;
+        /// its `OutPoint { txid, out_idx: 0 }` keys `withdrawal_status`.
+        /// `None` only for entries logged before this field existed.
+        #[serde(default)]
+        txid: Option<fedimint_core::TransactionId>,
     },
 }
 
@@ -912,10 +917,11 @@ impl UsdtClientModule {
             .finalize_and_submit_transaction(
                 operation_id,
                 KIND.as_str(),
-                move |_range| UsdtOperationMeta::Withdraw {
+                move |range| UsdtOperationMeta::Withdraw {
                     recipient,
                     amount,
                     max_fee,
+                    txid: Some(range.txid()),
                 },
                 tx,
             )
