@@ -1,6 +1,7 @@
 use fedimint_core::Amount;
 use fedimint_core::config::FederationId;
 use fedimint_core::encoding::{Decodable, Encodable};
+use fedimint_core::invite_code::InviteCode;
 
 use crate::SpendableNote;
 
@@ -11,6 +12,9 @@ pub struct ECash(Vec<ECashField>);
 enum ECashField {
     Mint(FederationId),
     Note(SpendableNote),
+    /// Optional federation invite so a non-member recipient can join and
+    /// claim. Clients predating this variant skip it via the default field.
+    Invite(InviteCode),
     #[encodable_default]
     Default {
         variant: u64,
@@ -25,6 +29,20 @@ impl ECash {
                 .chain(notes.into_iter().map(ECashField::Note))
                 .collect(),
         )
+    }
+
+    /// Embeds a federation invite for join-then-claim by non-members.
+    #[must_use]
+    pub fn with_invite(mut self, invite: InviteCode) -> Self {
+        self.0.push(ECashField::Invite(invite));
+        self
+    }
+
+    pub fn invite(&self) -> Option<InviteCode> {
+        self.0.iter().find_map(|field| match field {
+            ECashField::Invite(invite) => Some(invite.clone()),
+            _ => None,
+        })
     }
 
     pub fn amount(&self) -> Amount {
