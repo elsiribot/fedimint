@@ -1523,9 +1523,8 @@ mod fedimint_migration_tests {
         DepositRecordKey, FeeVoteKey, FeeVotePrefix, HasEverBeenReadyKey, MpcRoundChunk,
         MpcRoundChunkKey, PendingCheck, PendingCheckKey, PendingUserOp, PendingUserOpKey,
         PoolState, PoolStateKey, SessionState, SigningPurpose, SigningSession, SigningSessionKey,
-        StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey, UsdtWithdrawalV0,
-        UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpPurpose, WithdrawalState,
-        WithdrawalStateKey,
+        StoredFeeVote, SubmittedUserOpKey, UsdtWithdrawalV0, UserOpConfirmedObservation,
+        UserOpConfirmedVoteKey, UserOpPurpose, WithdrawalState, WithdrawalStateKey,
     };
     use futures::StreamExt as _;
     use strum::IntoEnumIterator;
@@ -1671,19 +1670,30 @@ mod fedimint_migration_tests {
             },
         )
         .await;
-        dbtx.insert_new_entry(
-            &SubmittedUserOpKey(op_hash),
-            &SubmittedUserOp {
-                signed: SignedUserOp {
-                    unsigned: sample_unsigned_user_op(),
-                    signature: vec![0x71; 65],
-                },
-                purpose: UserOpPurpose::DeployAndSweep { source: account },
-                submitted_block: 1,
-                superseded: false,
-            },
-        )
-        .await;
+        // The pre-0.6 `SubmittedUserOp` shape, written RAW (like the vote tables
+        // above) rather than via the typed current API: `migrate_db_v2` upgrades
+        // a v1 row by APPENDING the `superseded` byte, so the frozen fixture row
+        // must NOT already carry it. Old three-field layout:
+        // `signed ++ purpose ++ submitted_block` (no `superseded`). Writing the
+        // typed struct here would embed `superseded: false` and make
+        // `migrate_db_v2`'s byte-append double-append `0x00` on regeneration ->
+        // trailing-bytes decode failure.
+        let signed = SignedUserOp {
+            unsigned: sample_unsigned_user_op(),
+            signature: vec![0x71; 65],
+        };
+        let mut old_submitted_key_bytes = vec![DbKeyPrefix::SubmittedUserOp as u8];
+        old_submitted_key_bytes
+            .extend_from_slice(&SubmittedUserOpKey(op_hash).consensus_encode_to_vec());
+        let mut old_submitted_value_bytes = Vec::new();
+        old_submitted_value_bytes.extend_from_slice(&signed.consensus_encode_to_vec());
+        old_submitted_value_bytes.extend_from_slice(
+            &UserOpPurpose::DeployAndSweep { source: account }.consensus_encode_to_vec(),
+        );
+        old_submitted_value_bytes.extend_from_slice(&1u64.consensus_encode_to_vec());
+        dbtx.raw_insert_bytes(&old_submitted_key_bytes, &old_submitted_value_bytes)
+            .await
+            .expect("DB error");
         dbtx.insert_new_entry(
             &PoolStateKey,
             &PoolState {
