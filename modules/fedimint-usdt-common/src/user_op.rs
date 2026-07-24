@@ -323,15 +323,17 @@ pub fn eth_signed_message_hash(user_op_hash: [u8; 32]) -> [u8; 32] {
 /// Plain data (no RPC/provider surface) so it can live in this WASM-safe
 /// crate even though only the server ever constructs one.
 ///
-/// `actual_cost_usdt` is, for now, `UserOperationEvent.actualGasCost`
-/// **verbatim, in wei** -- NOT actually USDT-denominated yet. This task's
-/// `AlloyEvmRpc::submit_user_ops` calls `handleOps` with an empty
-/// `paymasterAndData` (broadcaster-EOA-fronted ETH gas; see the Phase-7
-/// plan's paymaster-economics scope decision), so no USDT is charged for gas
-/// at all in this flow. The field is named/typed to match the master plan's
-/// eventual schema; Phase 8's token-paymaster wiring is expected to either
-/// populate a real USDT conversion here or replace this field once real
-/// paymaster economics land. Treat this as wei until then.
+/// `actual_gas_cost_wei` (renamed from `actual_cost_usdt`, misc #18 / finding
+/// 22's doc facet -- the old name falsely implied a USDT-denominated value)
+/// is `UserOperationEvent.actualGasCost` **verbatim, in wei**. No token
+/// paymaster is used: `AlloyEvmRpc::submit_user_ops` calls `handleOps` with
+/// an empty `paymasterAndData` (broadcaster-EOA-fronted ETH gas; see
+/// `security-review/22-low-broadcaster-eth-funding-no-reimbursement.md`), so
+/// no USDT is charged for gas in this flow at all -- deposit/withdrawal fees
+/// are collected separately, in USDT, by `process_input`/`process_output`,
+/// with no protocol-level conversion back into ETH reimbursement for the
+/// broadcaster. `UsdtAmount` is reused here only because it is a convenient
+/// `u64` newtype; the unit carried is wei, not USDT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserOpReceipt {
     /// Whether the `UserOp`'s `callData` execution succeeded (the
@@ -342,9 +344,10 @@ pub struct UserOpReceipt {
     pub success: bool,
     /// The block the `UserOperationEvent` was emitted in.
     pub block: u64,
-    /// See this struct's doc comment: currently the raw
-    /// `actualGasCost` wei value, not a true USDT amount.
-    pub actual_cost_usdt: UsdtAmount,
+    /// See this struct's doc comment: the raw `actualGasCost` **wei**
+    /// value (`UsdtAmount` reused only as a convenient `u64` newtype -- this
+    /// is NOT a USDT amount).
+    pub actual_gas_cost_wei: UsdtAmount,
 }
 
 #[cfg(test)]

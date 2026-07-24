@@ -451,7 +451,7 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
         UserOpReceipt {
             success: true,
             block: 42,
-            actual_cost_usdt: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
         },
     );
 
@@ -840,7 +840,7 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
         UserOpReceipt {
             success: true,
             block: 42,
-            actual_cost_usdt: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
         },
     );
     for &peer in &peers {
@@ -1142,7 +1142,7 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
         UserOpReceipt {
             success: true,
             block: 42,
-            actual_cost_usdt: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
         },
     );
     for &peer in &peers {
@@ -1300,7 +1300,7 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
         UserOpReceipt {
             success: true,
             block: 77,
-            actual_cost_usdt: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
         },
     );
 

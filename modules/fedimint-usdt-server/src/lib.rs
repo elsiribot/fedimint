@@ -33,7 +33,7 @@ use fedimint_core::module::{
 };
 use fedimint_core::task::TaskGroup;
 use fedimint_core::util::FmtCompactAnyhow as _;
-use fedimint_core::{Amount, InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, push_db_pair_items};
+use fedimint_core::{InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, push_db_pair_items};
 use fedimint_server_core::config::PeerHandleOps;
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
 use fedimint_server_core::{
@@ -58,8 +58,8 @@ use fedimint_usdt_common::{
     UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
     WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
     WithdrawalStatusResponse, deposit_fee_quote, deposit_salt, derive_deposit_account,
-    derive_pool_account, evm_address, pool_salt, signing_session_id, validate_usdt_params,
-    withdrawal_fee_quote,
+    derive_pool_account, evm_address, pool_salt, signing_session_id, usdt_amount,
+    validate_usdt_params, withdrawal_fee_quote,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -1553,8 +1553,8 @@ impl ServerModule for Usdt {
 
         Ok(InputMeta {
             amount: TransactionItemAmounts {
-                amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(input.amount.0)),
-                fees: Amounts::new_custom(USDT_UNIT, Amount::from_msats(input.fee.0)),
+                amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(input.amount)),
+                fees: Amounts::new_custom(USDT_UNIT, usdt_amount(input.fee)),
             },
             pub_key: record.claim_pk,
         })
@@ -1626,8 +1626,8 @@ impl ServerModule for Usdt {
         );
 
         Ok(TransactionItemAmounts {
-            amounts: Amounts::new_custom(USDT_UNIT, Amount::from_msats(withdrawal.amount.0)),
-            fees: Amounts::new_custom(USDT_UNIT, Amount::from_msats(withdrawal.max_fee.0)),
+            amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(withdrawal.amount)),
+            fees: Amounts::new_custom(USDT_UNIT, usdt_amount(withdrawal.max_fee)),
         })
     }
 
@@ -1833,56 +1833,32 @@ impl ServerModule for Usdt {
                     // entirely from the consensus-agreed `FeeVote` median,
                     // so any guardian answers identically
                     // (threshold-agreement via `request_current_consensus`,
-                    // mirroring `deposit_status`). Before any `FeeVote` has
-                    // landed, `max_fee` reports `0` (a sentinel meaning "no
-                    // quote yet", mirroring `deposit_status`'s
-                    // pre-credit-zeros shape) rather than erroring --
-                    // `process_output` is what actually enforces
-                    // `NoFeeQuoteAvailable`; a `0` quote here can never be
-                    // used to withdraw for free, since any `max_fee` (even
-                    // `0`) still needs `process_output`'s own median lookup
-                    // to succeed at the point the transaction lands.
+                    // mirroring `deposit_status`). See
+                    // `Usdt::handle_withdraw_fee_quote` for the
+                    // `available` semantics (misc #4).
                     let db = context.db();
                     let mut dbtx = db.begin_transaction_nc().await;
 
-                    let median = module.fee_vote_median(&mut dbtx.to_ref_nc()).await;
-                    let max_fee = median
-                        .and_then(|median| withdrawal_fee_quote(&median))
-                        .unwrap_or(UsdtAmount(0));
-
-                    Ok(WithdrawFeeQuoteResponse {
-                        max_fee,
-                        valid_blocks: FEE_QUOTE_VALID_BLOCKS,
-                    })
+                    Ok(module
+                        .handle_withdraw_fee_quote(&mut dbtx.to_ref_nc())
+                        .await)
                 }
             },
             api_endpoint! {
                 DEPOSIT_FEE_QUOTE_ENDPOINT,
                 ApiVersion::new(0, 0),
                 async |module: &Usdt, context, _req: DepositFeeQuoteRequest| -> DepositFeeQuoteResponse {
-                    // Read-only, mirrors `WITHDRAW_FEE_QUOTE_ENDPOINT` exactly:
-                    // the quote is derived entirely from the consensus-agreed
-                    // `FeeVote` median, so any guardian answers identically.
-                    // Before any `FeeVote` has landed, `fee` reports `0` (a
-                    // sentinel meaning "no quote yet") rather than erroring --
-                    // `process_input` is what actually enforces rejection in
-                    // that case (via `NoFeeQuoteAvailable`); a `0` quote here
-                    // can never be used to claim a deposit for free, since any
-                    // `fee` (even `0`) still needs `process_input`'s own
-                    // median lookup to succeed at the point the transaction
-                    // lands.
+                    // Read-only, mirrors `WITHDRAW_FEE_QUOTE_ENDPOINT`
+                    // exactly: the quote is derived entirely from the
+                    // consensus-agreed `FeeVote` median, so any guardian
+                    // answers identically. See `Usdt::handle_deposit_fee_quote`
+                    // for the `available` semantics (misc #4).
                     let db = context.db();
                     let mut dbtx = db.begin_transaction_nc().await;
 
-                    let median = module.fee_vote_median(&mut dbtx.to_ref_nc()).await;
-                    let fee = median
-                        .and_then(|median| deposit_fee_quote(&median))
-                        .unwrap_or(UsdtAmount(0));
-
-                    Ok(DepositFeeQuoteResponse {
-                        fee,
-                        valid_blocks: FEE_QUOTE_VALID_BLOCKS,
-                    })
+                    Ok(module
+                        .handle_deposit_fee_quote(&mut dbtx.to_ref_nc())
+                        .await)
                 }
             },
             api_endpoint! {
@@ -3955,6 +3931,55 @@ impl Usdt {
         WithdrawalStatusResponse { status }
     }
 
+    /// Reports the federation's current withdrawal fee quote (Phase 8, Task
+    /// 1): `max_fee` is the minimum fee a `UsdtOutput::V0` must offer right
+    /// now, derived entirely from the consensus-agreed `FeeVote` median, so
+    /// any guardian answers identically. Read-only.
+    ///
+    /// `available` (misc #4, finding 06's client-confusion facet) is `false`
+    /// when there is no `FeeVote` median yet, or the quote overflows -- in
+    /// that case `max_fee` is a non-authoritative `UsdtAmount(0)`
+    /// placeholder, distinct from a real free quote. `process_output` is
+    /// what actually enforces `NoFeeQuoteAvailable`/`FeeQuoteOverflow` at
+    /// submission time regardless of what this endpoint reports, so
+    /// `available: false` here can never itself be used to withdraw for
+    /// free -- it exists purely so callers can avoid submitting against a
+    /// placeholder quote. When `available` is `true`, `max_fee` is
+    /// byte-identical to what this endpoint computed before `available`
+    /// existed.
+    async fn handle_withdraw_fee_quote(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+    ) -> WithdrawFeeQuoteResponse {
+        let median = self.fee_vote_median(dbtx).await;
+        let quote = median.and_then(|median| withdrawal_fee_quote(&median));
+
+        WithdrawFeeQuoteResponse {
+            max_fee: quote.unwrap_or(UsdtAmount(0)),
+            valid_blocks: FEE_QUOTE_VALID_BLOCKS,
+            available: quote.is_some(),
+        }
+    }
+
+    /// Reports the federation's current deposit fee quote, mirroring
+    /// [`Self::handle_withdraw_fee_quote`] exactly (including the
+    /// `available` semantics): `fee` is the minimum fee a `UsdtInput::V0`
+    /// must offer right now, derived entirely from the consensus-agreed
+    /// `FeeVote` median.
+    async fn handle_deposit_fee_quote(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+    ) -> DepositFeeQuoteResponse {
+        let median = self.fee_vote_median(dbtx).await;
+        let quote = median.and_then(|median| deposit_fee_quote(&median));
+
+        DepositFeeQuoteResponse {
+            fee: quote.unwrap_or(UsdtAmount(0)),
+            valid_blocks: FEE_QUOTE_VALID_BLOCKS,
+            available: quote.is_some(),
+        }
+    }
+
     /// Processes one `MpcRound` chunk consensus item (the body of
     /// `process_consensus_item`'s `MpcRound` arm, extracted so that method
     /// stays under the line limit).
@@ -4836,7 +4861,7 @@ async fn gc_expired_pending_checks(
 #[cfg(test)]
 mod tests {
     use fedimint_core::bitcoin::Network;
-    use fedimint_core::{BitcoinHash, PeerId, TransactionId};
+    use fedimint_core::{Amount, BitcoinHash, PeerId, TransactionId};
     use fedimint_usdt_common::{EvmAddress, UsdtInputV0};
 
     use super::*;
@@ -7385,6 +7410,73 @@ mod tests {
         );
     }
 
+    /// (misc #4, finding 06's client-confusion facet.) With no `FeeVote`
+    /// stored at all, both fee-quote handlers must report `available: false`
+    /// and a `UsdtAmount(0)` placeholder -- NOT a sentinel a caller could
+    /// mistake for a real, free quote.
+    #[tokio::test]
+    async fn fee_quote_unavailable_when_no_median() {
+        let module = test_module_with_block_count(4, 0).await;
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        assert_eq!(module.fee_vote_median(&mut dbtx.to_ref_nc()).await, None);
+
+        let withdraw_quote = module
+            .handle_withdraw_fee_quote(&mut dbtx.to_ref_nc())
+            .await;
+        assert!(!withdraw_quote.available);
+        assert_eq!(withdraw_quote.max_fee, UsdtAmount(0));
+        assert_eq!(withdraw_quote.valid_blocks, FEE_QUOTE_VALID_BLOCKS);
+
+        let deposit_quote = module.handle_deposit_fee_quote(&mut dbtx.to_ref_nc()).await;
+        assert!(!deposit_quote.available);
+        assert_eq!(deposit_quote.fee, UsdtAmount(0));
+        assert_eq!(deposit_quote.valid_blocks, FEE_QUOTE_VALID_BLOCKS);
+    }
+
+    /// Positive control (guardrail: behavior-neutral except `available`):
+    /// once a median exists, both handlers must report `available: true`
+    /// with a `max_fee`/`fee` numerically IDENTICAL to calling
+    /// `withdrawal_fee_quote`/`deposit_fee_quote` directly against that same
+    /// median -- the fee math itself must not change.
+    #[tokio::test]
+    async fn fee_quote_available_and_unchanged_when_median_exists() {
+        let module = test_module_with_block_count(4, 0).await;
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+        let vote = sample_fee_vote();
+
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(vote),
+                PeerId::from(0u16),
+            )
+            .await
+            .expect("first vote must succeed");
+
+        let median = module
+            .fee_vote_median(&mut dbtx.to_ref_nc())
+            .await
+            .expect("a single stored vote is its own median");
+        assert_eq!(median, vote);
+
+        let expected_max_fee =
+            withdrawal_fee_quote(&median).expect("sample_fee_vote must produce a quote");
+        let withdraw_quote = module
+            .handle_withdraw_fee_quote(&mut dbtx.to_ref_nc())
+            .await;
+        assert!(withdraw_quote.available);
+        assert_eq!(withdraw_quote.max_fee, expected_max_fee);
+        assert_eq!(withdraw_quote.valid_blocks, FEE_QUOTE_VALID_BLOCKS);
+
+        let expected_fee =
+            deposit_fee_quote(&median).expect("sample_fee_vote must produce a quote");
+        let deposit_quote = module.handle_deposit_fee_quote(&mut dbtx.to_ref_nc()).await;
+        assert!(deposit_quote.available);
+        assert_eq!(deposit_quote.fee, expected_fee);
+        assert_eq!(deposit_quote.valid_blocks, FEE_QUOTE_VALID_BLOCKS);
+    }
+
     #[tokio::test]
     async fn fee_vote_redundancy_guard_rejects_exact_repeat_but_allows_a_change() {
         let module = test_module_with_block_count(4, 0).await;
@@ -9300,7 +9392,7 @@ mod tests {
         let receipt = UserOpReceipt {
             success: true,
             block: 42,
-            actual_cost_usdt: fedimint_usdt_common::UsdtAmount(1_000),
+            actual_gas_cost_wei: fedimint_usdt_common::UsdtAmount(1_000),
         };
         mock.set_user_op_receipt(user_op_hash, receipt);
         assert_eq!(
@@ -11883,7 +11975,7 @@ mod tests {
                 fedimint_usdt_common::user_op::UserOpReceipt {
                     success: true,
                     block: 42,
-                    actual_cost_usdt: UsdtAmount(0),
+                    actual_gas_cost_wei: UsdtAmount(0),
                 },
             );
         }
@@ -11986,7 +12078,7 @@ mod tests {
             fedimint_usdt_common::user_op::UserOpReceipt {
                 success: true,
                 block: 7,
-                actual_cost_usdt: UsdtAmount(0),
+                actual_gas_cost_wei: UsdtAmount(0),
             },
         );
 

@@ -8,7 +8,7 @@ use config::UsdtClientConfig;
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{AmountUnit, CommonModuleInit, ModuleCommon, ModuleConsensusVersion};
-use fedimint_core::{OutPoint, plugin_types_trait_impl_common, secp256k1};
+use fedimint_core::{Amount, OutPoint, plugin_types_trait_impl_common, secp256k1};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
@@ -32,7 +32,13 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 ///
 /// Bumped to `0.2` (sec-13 hardening): [`CheckDepositResponse`] gained a
 /// `ready` field (the `check_deposit` API response's wire shape changed).
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 2);
+///
+/// Bumped to `0.3` (sec-misc #4/06-facet): [`WithdrawFeeQuoteResponse`] and
+/// [`DepositFeeQuoteResponse`] gained an `available` field (their wire shape
+/// changed). Neither type is a stored consensus-DB record (they are computed
+/// on the fly from the `FeeVote` table on every call), so no
+/// `get_database_migrations` entry/snapshot is needed for this bump.
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 3);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
@@ -95,6 +101,21 @@ impl fmt::Display for UsdtAmount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+/// Moves a [`UsdtAmount`] through the core [`Amount`] API (custom
+/// [`USDT_UNIT`](fedimint_core::module::AmountUnit) == this module's own
+/// smallest on-chain unit, 10^-6 USDT -- NOT satoshis/msats). `Amount`'s
+/// underlying representation happens to be called `from_msats`/`.msats`
+/// (mirroring core Bitcoin usage elsewhere in Fedimint), but every value
+/// flowing through it in this module is USDT, never millisatoshis. Centralize
+/// the conversion here (misc #3) rather than spelling
+/// `Amount::from_msats(x.0)` at each call site, where the "msats" name reads
+/// as a unit mismatch to reviewers unfamiliar with the custom-unit
+/// convention.
+#[must_use]
+pub fn usdt_amount(a: UsdtAmount) -> Amount {
+    Amount::from_msats(a.0)
 }
 
 /// A federation member's vote on the current EVM fee market and USDT/ETH
@@ -469,8 +490,13 @@ pub fn deposit_salt(claim_pk: &secp256k1::PublicKey) -> [u8; 32] {
 ///
 /// - `owner = evm_address(group_public_key)` -- a single DKG group key owns
 ///   *every* deposit account (differentiated only by `salt`), so one MPC key
-///   signs every sweep, and (since it's an ERC-4337 smart account) the token
-///   paymaster pays gas in USDT, so a deposit address never needs ETH.
+///   signs every sweep. No token paymaster is used (see
+///   `security-review/22-low-broadcaster-eth-funding-no-reimbursement.md`): the
+///   federation's broadcaster EOA fronts ETH to the `EntryPoint` to pay for
+///   each deploy+sweep `UserOp`'s gas, so a deposit account itself never needs
+///   to hold ETH -- but that ETH is never reimbursed on-chain from the USDT
+///   fees the module collects; operators must keep the broadcaster funded out
+///   of band.
 /// - `salt = keccak256(DEPOSIT_ADDRESS_DOMAIN ‖ claim_pk.serialize())`
 ///   (compressed, 33-byte).
 /// - `initCode = ERC1967Proxy_creationCode ‖ abi.encode(simple_account_impl,
@@ -923,10 +949,19 @@ pub struct WithdrawFeeQuoteRequest {
 /// (fee-vote-median-derived quotes can move as guardians' `FeeVote`s
 /// change), a fixed, non-consensus advisory hint rather than an enforced
 /// on-chain expiry.
+///
+/// `available` (misc #4, finding 06's client-confusion facet) is `false`
+/// when the federation has no fee-vote median yet (or the quote overflows):
+/// in that case `max_fee` is `UsdtAmount(0)`, a placeholder that MUST NOT be
+/// treated as a real quote -- do not submit a withdrawal against it. When
+/// `available` is `true`, `max_fee` is the real fee-vote-median-derived
+/// quote, byte-identical to what this endpoint returned before `available`
+/// existed.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct WithdrawFeeQuoteResponse {
     pub max_fee: UsdtAmount,
     pub valid_blocks: u64,
+    pub available: bool,
 }
 
 /// Request for the current deposit fee quote, mirroring
@@ -944,10 +979,17 @@ pub struct DepositFeeQuoteRequest;
 /// valid for before re-querying (fee-vote-median-derived quotes can move as
 /// guardians' `FeeVote`s change), a fixed, non-consensus advisory hint
 /// rather than an enforced on-chain expiry.
+///
+/// `available` (misc #4, finding 06's client-confusion facet) mirrors
+/// [`WithdrawFeeQuoteResponse::available`]: `false` when there is no fee-vote
+/// median yet (or the quote overflows), in which case `fee` is a
+/// non-authoritative `UsdtAmount(0)` placeholder -- do not submit a claim
+/// against it.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct DepositFeeQuoteResponse {
     pub fee: UsdtAmount,
     pub valid_blocks: u64,
+    pub available: bool,
 }
 
 /// Request for the current [`WithdrawalStatus`] of a withdrawal, identified
@@ -1452,6 +1494,16 @@ mod tests {
             .expect("EvmAddress should decode what it just encoded");
 
         assert_eq!(address, decoded);
+    }
+
+    #[test]
+    fn usdt_amount_roundtrips() {
+        // (misc #3) `usdt_amount` is a pure relabeling of the smallest
+        // on-chain USDT unit into core's `Amount` (custom `USDT_UNIT`); the
+        // numeric value must survive untouched.
+        for n in [0, 1, 10_000, 200_000_000, u64::MAX] {
+            assert_eq!(usdt_amount(UsdtAmount(n)).msats, n);
+        }
     }
 
     #[test]
