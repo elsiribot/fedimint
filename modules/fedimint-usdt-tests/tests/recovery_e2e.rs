@@ -113,17 +113,21 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     );
     common::await_usdt_ready(&usdt1, Duration::from_secs(60)).await?;
 
-    // Wait for a `FeeVote` median to exist (the guardians' 1s poller ticks
-    // always vote, even the mock's zero-cost default -- see
-    // `deposit_fee_quote`'s floor at `MIN_DEPOSIT_FEE`) before relying on it
-    // below: `process_input` rejects a claim with `DepositFeeInsufficient`
-    // before any median exists (the quote endpoint reports a `0` sentinel
-    // until then), mirroring how the withdrawal e2e tests wait for
-    // `withdraw_fee_quote` to converge first.
+    // Wait for a `FeeVote` median to exist before relying on it below.
+    // `MockEvmRpc`'s default `FeeVote` is now sane and nonzero (see
+    // `common::mock::State::default`), but the guardians' 1s poller ticks +
+    // consensus still need real wall-clock time to converge on a median after
+    // boot, and `deposit_fee_quote` returns an `Err` (not a placeholder `Ok`)
+    // until one exists (security finding 06's client-confusion facet) -- so
+    // this retries PAST the `Err`, not just past an `Ok` with a zero fee.
+    // `process_input` would otherwise reject a claim with
+    // `DepositFeeInsufficient` before any median exists, mirroring how the
+    // withdrawal e2e tests wait for `withdraw_fee_quote` to converge first.
     let fee_deadline = Instant::now() + Duration::from_secs(30);
     let deposit_fee = loop {
-        let quote = usdt1.deposit_fee_quote().await?;
-        if quote.fee.0 > 0 {
+        if let Ok(quote) = usdt1.deposit_fee_quote().await
+            && quote.fee.0 > 0
+        {
             break quote.fee;
         }
         if Instant::now() >= fee_deadline {

@@ -55,9 +55,21 @@ impl Default for State {
             factory_addresses: HashMap::new(),
             factory_account_implementations: HashMap::new(),
             broadcaster_eth_balance: None,
+            // A sane, nonzero default (1 gwei max fee, 3000 USDT/ETH), NOT the
+            // previous all-zero `FeeVote`: after security finding 06, consensus's
+            // `FeeVote` arm rejects out-of-range votes via
+            // `fedimint_usdt_common::fee_vote_in_sane_range` (both fields must be
+            // `>= 1`), so an all-zero vote is never accepted into consensus and no
+            // `fee_vote_median` ever forms -- every deposit/withdrawal fee quote
+            // would stay permanently unavailable for any test that never calls
+            // `set_fee_estimate`. Real guardians always read a genuinely nonzero
+            // fee from a live EVM node, so this mirrors production and lets every
+            // mock federation form a valid median by default; tests that
+            // specifically want "no median yet" behavior can still script that by
+            // calling `set_fee_estimate` with an out-of-range vote.
             fee: FeeVote {
-                max_fee_per_gas_wei: 0,
-                usdt_per_eth_e6: 0,
+                max_fee_per_gas_wei: 1_000_000_000,
+                usdt_per_eth_e6: 3_000_000_000,
             },
             sent_raw_transactions: Vec::new(),
             submitted_user_ops: Vec::new(),
@@ -79,7 +91,9 @@ pub struct MockEvmRpc {
 
 impl MockEvmRpc {
     /// Creates a `MockEvmRpc` with all state zeroed (chain id 0, block
-    /// number 0, no balances/code, a zeroed `FeeVote`).
+    /// number 0, no balances/code), except for a sane, nonzero default
+    /// `FeeVote` (see [`State::default`]) so a `fee_vote_median` forms out of
+    /// the box without every test having to script one.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
