@@ -938,6 +938,12 @@ impl ServerModuleInit for UsdtInit {
     /// [`UserOpConfirmedObservation`](crate::db::UserOpConfirmedObservation)
     /// gained a `block_hash` field. See [`migrate_db_v1`] for why this
     /// migration drops (rather than rewrites) the old-format vote rows.
+    ///
+    /// `DatabaseVersion(2)` (security finding 03):
+    /// [`SubmittedUserOp`](crate::db::SubmittedUserOp) gained a trailing
+    /// `superseded: bool` field (the reprice/replacement RBF-nonce-safety
+    /// flag). See [`migrate_db_v2`] for why this REWRITES (rather than drops)
+    /// the existing rows.
     fn get_database_migrations(
         &self,
     ) -> BTreeMap<DatabaseVersion, ServerModuleDbMigrationFn<Usdt>> {
@@ -950,6 +956,10 @@ impl ServerModuleInit for UsdtInit {
         migrations.insert(
             DatabaseVersion(1),
             Box::new(|ctx| migrate_db_v1(ctx).boxed()),
+        );
+        migrations.insert(
+            DatabaseVersion(2),
+            Box::new(|ctx| migrate_db_v2(ctx).boxed()),
         );
         migrations
     }
@@ -1008,6 +1018,46 @@ async fn migrate_db_v1(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> a
         .raw_remove_by_prefix(&[DbKeyPrefix::UserOpConfirmedVote as u8])
         .await
         .expect("DB error");
+    Ok(())
+}
+
+/// Migrates [`SubmittedUserOp`](crate::db::SubmittedUserOp)'s value shape for
+/// the `superseded: bool` field added in `MODULE_CONSENSUS_VERSION` 0.6
+/// (security finding 03's reprice/replacement RBF-nonce-safety flag).
+///
+/// Unlike [`migrate_db_v0`]/[`migrate_db_v1`] (which DROP transient,
+/// re-proposed vote tables), `SubmittedUserOp` is NOT transient: it is the
+/// sole record of a federation-agreed-signed op awaiting on-chain
+/// confirmation -- a withdrawal whose e-cash was already burned, or a sweep
+/// pulling deposits into the pool. Dropping it would strand those funds. So
+/// this REWRITES each existing row in place instead.
+///
+/// The rewrite is a byte-append: `superseded` is the LAST field of the
+/// struct, and a struct's `Encodable` is just its fields concatenated in
+/// declaration order, so a pre-0.6 row's bytes are exactly the new encoding
+/// MINUS the trailing `superseded`. Appending `Encodable`-for-`bool`'s
+/// single-byte encoding of `false` (`0x00`) therefore yields a valid 0.6 row
+/// that decodes with `superseded == false` -- the correct default (a row that
+/// pre-dates the replacement machinery has never been superseded). Reads the
+/// raw rows first (releasing the read borrow) before re-inserting, so the
+/// mutation does not alias the scan.
+async fn migrate_db_v2(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> anyhow::Result<()> {
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = ctx
+        .dbtx()
+        .raw_find_by_prefix(&[DbKeyPrefix::SubmittedUserOp as u8])
+        .await
+        .expect("DB error")
+        .collect()
+        .await;
+    for (key, mut value) in entries {
+        // Append `superseded: false` (bool `false` encodes to the single byte
+        // `0x00`).
+        value.push(0u8);
+        ctx.dbtx()
+            .raw_insert_bytes(&key, &value)
+            .await
+            .expect("DB error");
+    }
     Ok(())
 }
 
@@ -1286,6 +1336,11 @@ impl ServerModule for Usdt {
         // consensus-DB write.
         items.extend(self.propose_timed_out_rotations(dbtx, &sessions).await);
 
+        // Propose a reprice/replacement for any `SubmittedUserOp` that has
+        // gone unconfirmed past `submitted_op_timeout_blocks()` (security
+        // finding 03). Read-only; no consensus-DB write.
+        items.extend(self.propose_replace_user_ops(dbtx).await);
+
         for (session_id, session) in sessions {
             if !session.signers.contains(&self.our_peer_id) {
                 continue;
@@ -1542,6 +1597,9 @@ impl ServerModule for Usdt {
             UsdtConsensusItem::MpcRound(item) => self.process_mpc_round(dbtx, item, peer_id).await,
             UsdtConsensusItem::RotateSigning { session_id } => {
                 self.process_rotate_signing(dbtx, session_id).await
+            }
+            UsdtConsensusItem::ReplaceUserOp { op_hash } => {
+                self.process_replace_user_op(dbtx, op_hash).await
             }
             UsdtConsensusItem::MpcSignature {
                 session_id,
@@ -3818,6 +3876,7 @@ impl Usdt {
     /// below relies on -- a late, independently-threshold-crossing
     /// duplicate vote for the same mismatch must replay as a complete
     /// no-op, never double-mutate any counter.
+    #[allow(clippy::too_many_lines)]
     async fn apply_user_op_confirmed(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -3964,6 +4023,27 @@ impl Usdt {
         dbtx.remove_entry(&SubmittedUserOpKey(op_hash)).await;
         dbtx.remove_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
             .await;
+
+        // RBF-nonce cleanup (security finding 03): this op landed on-chain, so
+        // the `EntryPoint` consumed its `(sender, nonce)` -- no sibling in its
+        // replacement chain (a superseded predecessor, or a still-signing
+        // higher-fee successor) can ever land at the same nonce. Remove the
+        // whole chain now, so (a) settlement is exactly-once (a late confirm of
+        // a sibling finds no `SubmittedUserOp` and is rejected), and (b) the
+        // in-flight guards stop blocking new batches/sweeps at the now-advanced
+        // nonce. Runs for BOTH success and revert: a `UserOpConfirmed`
+        // observation only ever exists for an op the `EntryPoint` actually
+        // included, so the nonce is spent either way (see
+        // `apply_withdraw_confirmed`'s doc comment). Must run BEFORE the
+        // success-only re-sweep retrigger below, so the freed nonce is clear
+        // when the next sweep is built.
+        self.purge_user_op_nonce_chain(
+            dbtx,
+            submitted.signed.unsigned.sender,
+            submitted.signed.unsigned.nonce,
+            op_hash,
+        )
+        .await;
 
         // Re-trigger AFTER the op is cleared from the in-flight tables, so
         // `maybe_trigger_sweep`'s per-account in-flight guard no longer sees
@@ -4662,6 +4742,9 @@ impl Usdt {
                 // `SubmittedUserOp::purpose`'s doc comment.
                 purpose: pending.purpose,
                 submitted_block,
+                // A freshly-finalized op is never superseded (security finding
+                // 03); only `process_replace_user_op` ever sets this.
+                superseded: false,
             },
         )
         .await;
@@ -4733,6 +4816,360 @@ impl Usdt {
             }
         }
         items
+    }
+
+    /// Proposes a [`UsdtConsensusItem::ReplaceUserOp`] for every
+    /// `SubmittedUserOp` that has gone unconfirmed past
+    /// [`submitted_op_timeout_blocks`] (security finding 03), so
+    /// `process_consensus_item` times it out and rebuilds it at a higher fee
+    /// under the SAME `EntryPoint` `(sender, nonce)`. Mirrors
+    /// [`Usdt::propose_timed_out_rotations`] exactly: a deterministic,
+    /// consensus-DB-only judgement (via `consensus_block_count`, never
+    /// wall-clock), proposed by every guardian, signer or not. Read-only:
+    /// makes no consensus-DB write.
+    ///
+    /// Already-`superseded` ops are skipped -- they have already been replaced
+    /// and are kept only so a late confirmation of them still settles (the
+    /// RBF-nonce safety invariant); re-timing them out would rebuild a THIRD
+    /// op at the same nonce needlessly. The `process_replace_user_op` arm's
+    /// own guards (existence, not-superseded, re-checked timeout) are what
+    /// actually enforce exactly-once replacement.
+    async fn propose_replace_user_ops(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+    ) -> Vec<UsdtConsensusItem> {
+        let ccount = self.consensus_block_count(dbtx).await;
+        let submitted: Vec<(SubmittedUserOpKey, SubmittedUserOp)> = dbtx
+            .find_by_prefix(&SubmittedUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        let mut items = Vec::new();
+        for (SubmittedUserOpKey(op_hash), s) in submitted {
+            if s.superseded {
+                continue;
+            }
+            if ccount
+                > s.submitted_block
+                    .saturating_add(submitted_op_timeout_blocks())
+            {
+                items.push(UsdtConsensusItem::ReplaceUserOp { op_hash });
+            }
+        }
+        items
+    }
+
+    /// Processes one [`UsdtConsensusItem::ReplaceUserOp`] (security finding
+    /// 03): times out a stuck/underpriced `SubmittedUserOp` and REPLACES it
+    /// with a higher-fee op at the SAME `EntryPoint` `(sender, nonce)`, so the
+    /// old and replacement ops are mutually exclusive on-chain (the
+    /// `EntryPoint` includes at most one op per `(sender, nonce)`).
+    ///
+    /// # RBF-nonce safety (the double-execution guard)
+    ///
+    /// The OLD op is marked `superseded` and KEPT, not removed: if it actually
+    /// landed on-chain, a late `UserOpConfirmed` vote for its hash still passes
+    /// the existence check in `process_consensus_item` and settles. Because the
+    /// replacement is the old op with ONLY its two fee fields bumped, the two
+    /// share byte-identical `call_data`/`sender`/`nonce`/`init_code`, and
+    /// settlement is a pure function of `purpose` + the confirmed op's own
+    /// calldata -- so whichever of the chain confirms settles identically. The
+    /// moment any member confirms, [`Usdt::purge_user_op_nonce_chain`] removes
+    /// the whole `(sender, nonce)` chain, so settlement is exactly-once.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of the item, prior consensus-DB state (the
+    /// `SubmittedUserOp`, its covered `UnclaimedWithdrawal`s, and the fee-vote
+    /// median), and config -- byte-identical on every guardian, signer or not,
+    /// independent of `our_peer_id`. The reprice fee comes from the consensus
+    /// `fee_vote_median` (a consensus value), NEVER a guardian-local RPC read:
+    /// the fee is part of the signed `userOpHash`, so every guardian MUST build
+    /// the identical replacement op. Both no-op gates (`ensure!`/`bail!`) read
+    /// only consensus state, so a premature/duplicate/already-superseded
+    /// replace is rejected identically everywhere, upholding the
+    /// unbounded-history rule (a non-state-changing item returns `Err`, exactly
+    /// like [`Usdt::process_rotate_signing`]).
+    #[allow(clippy::too_many_lines)]
+    async fn process_replace_user_op(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        op_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let submitted = dbtx
+            .get_value(&SubmittedUserOpKey(op_hash))
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!("ReplaceUserOp for an unknown/already-cleared SubmittedUserOp")
+            })?;
+
+        // Non-state-changing gates (mirror `process_rotate_signing`): a
+        // superseded op is already replaced; a not-yet-timed-out op must not be
+        // repriced prematurely. Re-checking the timeout here (not just at
+        // proposal time) is the deterministic gate every guardian re-evaluates.
+        ensure!(
+            !submitted.superseded,
+            "ReplaceUserOp for an already-superseded op"
+        );
+        let ccount = self.consensus_block_count(dbtx).await;
+        ensure!(
+            ccount
+                > submitted
+                    .submitted_block
+                    .saturating_add(submitted_op_timeout_blocks()),
+            "ReplaceUserOp for an op that has not timed out"
+        );
+
+        // Reprice from the consensus fee median (deterministic). Without one we
+        // cannot build a fresh, correctly-priced replacement -- leave the op
+        // as-is (non-state-changing) and let a later round retry once a median
+        // exists (mirrors `maybe_trigger_sweep`'s defer-on-no-median).
+        let median = self.fee_vote_median(dbtx).await.ok_or_else(|| {
+            anyhow::anyhow!("ReplaceUserOp deferred: no fee median to reprice from")
+        })?;
+
+        let old = submitted.signed.unsigned.clone();
+
+        // Fresh median-derived fee (2x headroom, clamped) -- the SAME formula
+        // the builders use -- then bumped >= 10% over the OLD op's fees so a
+        // bundler prefers the replacement (ERC-4337 mempool replacement rule).
+        // The `GasBounds` receiver is a throwaway: `with_median_fees` only
+        // touches the two fee fields.
+        let priced =
+            GasBounds::DEPLOY_AND_SWEEP_DEVNET.with_median_fees(Some(median.max_fee_per_gas_wei));
+        let new_max_fee_per_gas = priced
+            .max_fee_per_gas
+            .max(bump_10_percent(old.max_fee_per_gas));
+        let new_max_priority_fee_per_gas = priced
+            .max_priority_fee_per_gas
+            .max(bump_10_percent(old.max_priority_fee_per_gas))
+            .min(new_max_fee_per_gas);
+
+        // The replacement is the OLD op with ONLY the two fee fields bumped:
+        // its calldata/nonce/sender/init_code/gas-limits stay byte-identical,
+        // which is what makes settling on whichever confirms produce identical
+        // accounting (RBF-nonce safety).
+        let mut new_op = old.clone();
+        new_op.max_fee_per_gas = new_max_fee_per_gas;
+        new_op.max_priority_fee_per_gas = new_max_priority_fee_per_gas;
+
+        // The broadcaster-fronted prefund the replacement will cost, in wei,
+        // priced from the op's ACTUAL (already-2x-headroom) fee fields.
+        let total_gas_units = old
+            .verification_gas_limit
+            .saturating_add(old.call_gas_limit)
+            .saturating_add(u128::try_from(old.pre_verification_gas).unwrap_or(u128::MAX));
+        let gas_cost_wei = total_gas_units.saturating_mul(new_max_fee_per_gas);
+
+        match &submitted.purpose {
+            UserOpPurpose::Withdraw { outpoints } => {
+                // Ceiling = the sum of the covered withdrawals' committed
+                // `max_fee` (what the users agreed to pay). If the repriced op
+                // would cost more USDT than that, DON'T replace: terminal-fail
+                // every covered withdrawal (Phase 6.1 turns `Failed` into an
+                // e-cash refund), leave each `UnclaimedWithdrawal` for that
+                // refund, and remove the stuck op (+ its votes).
+                let mut ceiling: u64 = 0;
+                for &out_point in outpoints {
+                    if let Some(w) = dbtx.get_value(&UnclaimedWithdrawalKey(out_point)).await {
+                        ceiling = ceiling.saturating_add(w.max_fee.0);
+                    }
+                }
+                let over_ceiling = match fedimint_usdt_common::wei_gas_cost_to_usdt(
+                    gas_cost_wei,
+                    median.usdt_per_eth_e6,
+                ) {
+                    Some(cost) => cost.0 > ceiling,
+                    // An overflowing (byzantine/degenerate) rate is treated
+                    // as unaffordable rather than silently letting an
+                    // unbounded prefund through.
+                    None => true,
+                };
+                if over_ceiling {
+                    for &out_point in outpoints {
+                        dbtx.insert_entry(
+                            &WithdrawalStateKey(out_point),
+                            &WithdrawalState::Failed {
+                                reason: "gas exceeds committed max_fee".to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    dbtx.remove_entry(&SubmittedUserOpKey(op_hash)).await;
+                    dbtx.remove_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
+                        .await;
+                    warn!(
+                        target: "usdt",
+                        ?op_hash,
+                        count = outpoints.len(),
+                        gas_cost_wei,
+                        ceiling,
+                        "withdrawal batch reprice exceeds the covered withdrawals' committed \
+                         max_fee; marking them Failed (refundable in Phase 6.1) and clearing the \
+                         stuck op"
+                    );
+                    return Ok(());
+                }
+            }
+            UserOpPurpose::DeployAndSweep { .. } => {
+                // A sweep's deposit funds are safe on-chain (still
+                // `credited - swept`); there is no refund concept. If the
+                // repriced fee would exceed the config gas ceiling, DON'T
+                // replace -- leave the op as-is (non-state-changing) and warn.
+                if new_max_fee_per_gas > SWEEP_MAX_FEE_PER_GAS_WEI {
+                    warn!(
+                        target: "usdt",
+                        ?op_hash,
+                        new_max_fee_per_gas,
+                        ceiling_wei = SWEEP_MAX_FEE_PER_GAS_WEI,
+                        "sweep reprice exceeds the gas ceiling; leaving the op stuck (deposit \
+                         funds are safe on-chain, no refund needed)"
+                    );
+                    bail!("sweep reprice exceeds the gas ceiling; leaving op stuck");
+                }
+            }
+        }
+
+        // Within ceiling: enqueue the replacement + start its signing session,
+        // then mark the OLD op superseded (kept live so a late confirm of it
+        // still settles -- RBF-nonce safety).
+        let new_hash = user_op_hash(
+            &new_op,
+            self.cfg.consensus.entry_point,
+            self.cfg.consensus.chain_id,
+        );
+        // Defensive idempotency: never clobber an already-enqueued replacement
+        // (a fresh `new_hash` makes this unreachable on the honest path).
+        ensure!(
+            dbtx.get_value(&PendingUserOpKey(new_hash)).await.is_none()
+                && dbtx
+                    .get_value(&SubmittedUserOpKey(new_hash))
+                    .await
+                    .is_none(),
+            "ReplaceUserOp replacement op is already enqueued"
+        );
+
+        dbtx.insert_entry(
+            &PendingUserOpKey(new_hash),
+            &PendingUserOp {
+                op: new_op,
+                purpose: submitted.purpose.clone(),
+                created_block: ccount,
+            },
+        )
+        .await;
+
+        // Re-tag the covered withdrawals to the replacement's hash (they were
+        // `Submitted(old_hash)`); mirrors the build path's `Signing(op_hash)`
+        // tag. Purely informational -- `apply_withdraw_confirmed` settles by
+        // `outpoints` (from the op's purpose), not by this hash.
+        if let UserOpPurpose::Withdraw { outpoints } = &submitted.purpose {
+            for &out_point in outpoints {
+                dbtx.insert_entry(
+                    &WithdrawalStateKey(out_point),
+                    &WithdrawalState::Signing(new_hash),
+                )
+                .await;
+            }
+        }
+
+        let mut superseded_old = submitted.clone();
+        superseded_old.superseded = true;
+        dbtx.insert_entry(&SubmittedUserOpKey(op_hash), &superseded_old)
+            .await;
+
+        info!(
+            target: "usdt",
+            ?op_hash,
+            ?new_hash,
+            new_max_fee_per_gas,
+            old_max_fee_per_gas = old.max_fee_per_gas,
+            purpose = ?submitted.purpose,
+            "SubmittedUserOp timed out; enqueued higher-fee replacement at the same \
+             (sender, nonce), old op kept superseded for RBF-nonce safety"
+        );
+
+        let digest = eth_signed_message_hash(new_hash);
+        self.start_session(dbtx, SigningPurpose::UserOp(new_hash), digest, 0)
+            .await;
+
+        Ok(())
+    }
+
+    /// Removes the entire in-flight `(sender, nonce)` replacement chain EXCEPT
+    /// `except_hash` (the just-confirmed op, whose own removal the caller
+    /// handles), the RBF-nonce cleanup for security finding 03. The
+    /// `EntryPoint` includes at most one op per `(sender, nonce)`, so once one
+    /// member has confirmed (success OR revert -- either consumed the on-chain
+    /// nonce), no sibling can ever land; leaving them would keep the in-flight
+    /// guards blocking new batches/sweeps and risk a later spurious
+    /// timeout/replace acting on a dead nonce. Removes matching
+    /// `SubmittedUserOp`s (+ their confirmation votes) AND `PendingUserOp`s
+    /// still mid-signing (+ their signing sessions and round chunks). Read
+    /// `sender`/`nonce` from each record's own op. Deterministic: scans
+    /// committed consensus tables only.
+    async fn purge_user_op_nonce_chain(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        sender: fedimint_usdt_common::EvmAddress,
+        nonce: alloy::primitives::U256,
+        except_hash: [u8; 32],
+    ) {
+        let submitted: Vec<(SubmittedUserOpKey, SubmittedUserOp)> = dbtx
+            .find_by_prefix(&SubmittedUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        for (SubmittedUserOpKey(hash), s) in submitted {
+            if hash == except_hash {
+                continue;
+            }
+            if s.signed.unsigned.sender == sender && s.signed.unsigned.nonce == nonce {
+                dbtx.remove_entry(&SubmittedUserOpKey(hash)).await;
+                dbtx.remove_by_prefix(&UserOpConfirmedVoteOpPrefix(hash))
+                    .await;
+            }
+        }
+
+        let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        for (PendingUserOpKey(hash), p) in pending {
+            if hash == except_hash {
+                continue;
+            }
+            if p.op.sender == sender && p.op.nonce == nonce {
+                dbtx.remove_entry(&PendingUserOpKey(hash)).await;
+                self.remove_signing_sessions_for_op(dbtx, hash).await;
+            }
+        }
+    }
+
+    /// Removes every `SigningSession` (all attempts) whose purpose is
+    /// `SigningPurpose::UserOp(op_hash)`, plus its round chunks -- used by
+    /// [`Usdt::purge_user_op_nonce_chain`] to tear down a replacement chain
+    /// member that was still mid-signing when a sibling confirmed, so its
+    /// orphaned session does not rotate/retry forever (an unbounded
+    /// consensus-DB churn) trying to finalize an op whose nonce is already
+    /// spent. Deterministic: scans the committed `SigningSession` table.
+    async fn remove_signing_sessions_for_op(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        op_hash: [u8; 32],
+    ) {
+        let sessions: Vec<(SigningSessionKey, SigningSession)> = dbtx
+            .find_by_prefix(&SigningSessionPrefix)
+            .await
+            .collect()
+            .await;
+        for (SigningSessionKey(id), session) in sessions {
+            if session.purpose == SigningPurpose::UserOp(op_hash) {
+                dbtx.remove_entry(&SigningSessionKey(id)).await;
+                dbtx.remove_by_prefix(&MpcRoundChunkSessionPrefix(id)).await;
+            }
+        }
     }
 
     /// Starts (idempotently) a threshold-ECDSA signing session over `digest`
@@ -4931,6 +5368,45 @@ fn chunk_payload(payload: &[u8]) -> Vec<Vec<u8>> {
 /// a test federation's guardians).
 fn timeout_blocks() -> u64 {
     if is_running_in_test_env() { 2 } else { 50 }
+}
+
+/// The number of consensus blocks a `SubmittedUserOp` may remain unconfirmed
+/// (past its `submitted_block`) before [`Usdt::propose_replace_user_ops`]
+/// proposes timing it out and replacing it at a higher fee (security finding
+/// 03). Mirrors [`timeout_blocks`]'s test-scaling exactly: small under
+/// `is_running_in_test_env()` so tests don't have to wait for 25 real
+/// consensus blocks, and (like `timeout_blocks`) an otherwise-arbitrary
+/// safety margin with no consensus-correctness requirement beyond "every
+/// guardian computes the same one" (which `is_running_in_test_env()` does,
+/// being a pure function of the process environment, identical across a test
+/// federation's guardians). Chosen larger than [`timeout_blocks`] in
+/// production (25 vs. a signing session's own 50) is deliberate: a submitted
+/// op should be given a generous window for on-chain inclusion before being
+/// repriced.
+fn submitted_op_timeout_blocks() -> u64 {
+    if is_running_in_test_env() { 2 } else { 25 }
+}
+
+/// Ceiling on a REPRICED sweep (`DeployAndSweep`) op's `max_fee_per_gas`
+/// (security finding 03): matches `GasBounds::OP_FEE_CEILING_WEI` (200 gwei),
+/// the same cap [`GasBounds::with_median_fees`] clamps a median-derived fee
+/// to. A sweep whose 10%-bumped replacement fee would exceed this is NOT
+/// replaced -- its deposit funds are safe on-chain (still `credited - swept`),
+/// so there is no refund concept and nothing to fail; the op is simply left
+/// as-is (see [`Usdt::process_replace_user_op`]'s `DeployAndSweep` arm). This
+/// bounds how far repeated repricings can ratchet a stuck sweep's
+/// broadcaster-fronted prefund.
+const SWEEP_MAX_FEE_PER_GAS_WEI: u128 = 200_000_000_000;
+
+/// Bumps a fee field by >= 10% (ceiling-rounded), the ERC-4337 mempool
+/// replacement rule a repriced op must clear so a bundler prefers it over the
+/// op it supersedes (security finding 03). Ceiling-rounding guarantees the
+/// result is STRICTLY greater than `fee` for any `fee >= 1` (a real op's fee
+/// is always floored at 1 gwei), so the replacement is never merely equal to
+/// the original. `saturating_add` keeps it panic-free at the `u128` ceiling
+/// (unreachable in practice, and the sweep/withdraw ceilings bite first).
+fn bump_10_percent(fee: u128) -> u128 {
+    fee.saturating_add(fee.div_ceil(10))
 }
 
 /// The number of consensus blocks the OLDEST currently-`Queued` withdrawal
@@ -10400,6 +10876,7 @@ mod tests {
                     },
                     purpose: UserOpPurpose::DeployAndSweep { source },
                     submitted_block: 3,
+                    superseded: false,
                 },
             )
             .await;
@@ -10593,6 +11070,7 @@ mod tests {
                         },
                         purpose: UserOpPurpose::DeployAndSweep { source },
                         submitted_block: 3,
+                        superseded: false,
                     },
                 )
                 .await;
@@ -10682,6 +11160,7 @@ mod tests {
                     },
                     purpose: UserOpPurpose::DeployAndSweep { source },
                     submitted_block: 3,
+                    superseded: false,
                 },
             )
             .await;
@@ -10784,6 +11263,7 @@ mod tests {
                     },
                     purpose: pending.purpose,
                     submitted_block: 3,
+                    superseded: false,
                 },
             )
             .await;
@@ -11985,6 +12465,7 @@ mod tests {
                         outpoints: outpoints.clone(),
                     },
                     submitted_block: 5,
+                    superseded: false,
                 },
             )
             .await;
@@ -12114,6 +12595,7 @@ mod tests {
                         outpoints: vec![out_point],
                     },
                     submitted_block: 5,
+                    superseded: false,
                 },
             )
             .await;
@@ -12283,6 +12765,7 @@ mod tests {
                     outpoints: vec![out_point],
                 },
                 submitted_block: 1,
+                superseded: false,
             },
         )
         .await;
@@ -12412,6 +12895,7 @@ mod tests {
                 },
                 purpose: UserOpPurpose::DeployAndSweep { source: account },
                 submitted_block: 1,
+                superseded: false,
             },
         )
         .await;
@@ -12622,6 +13106,7 @@ mod tests {
                         source: malformed_sweep_source,
                     },
                     submitted_block: 1,
+                    superseded: false,
                 },
             )
             .await;
@@ -12636,6 +13121,7 @@ mod tests {
                         outpoints: vec![malformed_withdraw_out],
                     },
                     submitted_block: 1,
+                    superseded: false,
                 },
             )
             .await;
@@ -12650,6 +13136,7 @@ mod tests {
                         source: good_source,
                     },
                     submitted_block: 1,
+                    superseded: false,
                 },
             )
             .await;
@@ -12799,6 +13286,7 @@ mod tests {
                         source: hung_source,
                     },
                     submitted_block: 1,
+                    superseded: false,
                 },
             )
             .await;
@@ -12813,6 +13301,7 @@ mod tests {
                         source: prompt_source,
                     },
                     submitted_block: 1,
+                    superseded: false,
                 },
             )
             .await;
@@ -12919,6 +13408,7 @@ mod tests {
                     },
                     purpose: UserOpPurpose::DeployAndSweep { source },
                     submitted_block: 1,
+                    superseded: false,
                 },
             )
             .await;
@@ -13050,6 +13540,7 @@ mod tests {
                         outpoints: vec![out_point],
                     },
                     submitted_block: 1,
+                    superseded: false,
                 },
             )
             .await;
@@ -13195,6 +13686,7 @@ mod tests {
                     },
                     purpose: UserOpPurpose::DeployAndSweep { source },
                     submitted_block: 1,
+                    superseded: false,
                 },
             )
             .await;
@@ -13276,6 +13768,7 @@ mod tests {
                     },
                     purpose: UserOpPurpose::DeployAndSweep { source },
                     submitted_block: 1,
+                    superseded: false,
                 },
             )
             .await;
@@ -13384,6 +13877,7 @@ mod tests {
                         },
                         purpose: UserOpPurpose::DeployAndSweep { source },
                         submitted_block: 1,
+                        superseded: false,
                     },
                 )
                 .await;
@@ -13587,6 +14081,637 @@ mod tests {
                 .expect("matching-hash quorum credits")
                 .credited,
             UsdtAmount(2_000_000)
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 5 Task 5.2 (security finding 03): submitted-UserOp timeout +
+    // reprice/replacement, RBF-nonce-safe.
+    // ---------------------------------------------------------------------
+
+    /// A `Withdraw`-purpose `SubmittedUserOp` covering `outpoints`, whose op
+    /// decodes to `total`, with explicitly-set fee fields (so the reprice
+    /// bump/ceiling can be exercised precisely) and `submitted_block`.
+    fn submitted_withdraw_op(
+        outpoints: Vec<OutPoint>,
+        total: UsdtAmount,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+        submitted_block: u64,
+        superseded: bool,
+    ) -> SubmittedUserOp {
+        let mut op = real_withdraw_op_for_test(total);
+        op.max_fee_per_gas = max_fee_per_gas;
+        op.max_priority_fee_per_gas = max_priority_fee_per_gas;
+        SubmittedUserOp {
+            signed: fedimint_usdt_common::user_op::SignedUserOp {
+                unsigned: op,
+                signature: vec![0xdd; 65],
+            },
+            purpose: UserOpPurpose::Withdraw { outpoints },
+            submitted_block,
+            superseded,
+        }
+    }
+
+    /// Collects every `Withdraw`-purpose `PendingUserOp` and its record.
+    async fn pending_withdraw_ops(
+        dbtx: &mut DatabaseTransaction<'_>,
+    ) -> Vec<([u8; 32], PendingUserOp)> {
+        let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        pending
+            .into_iter()
+            .filter(|(_, p)| matches!(p.purpose, UserOpPurpose::Withdraw { .. }))
+            .map(|(PendingUserOpKey(h), p)| (h, p))
+            .collect()
+    }
+
+    /// **Task 5.2, step 1.** A stuck (non-superseded) `SubmittedUserOp` past
+    /// `submitted_op_timeout_blocks()` is proposed for replacement and, on
+    /// apply, is REPLACED by a fresh `PendingUserOp` + signing session at the
+    /// SAME `(sender, nonce)` with a fee >= 10% higher; the old op is marked
+    /// `superseded` and KEPT (RBF-nonce safety).
+    #[tokio::test]
+    async fn underpriced_submitted_op_is_replaced_after_timeout() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let ha = [0xa1; 32];
+        let out1 = test_out_point(1);
+        let total = UsdtAmount(1_000_000);
+        // Old op priced HIGH (100 gwei) so the >=10% bump path dominates the
+        // fresh-median price and the assertion isolates the RBF rule.
+        let old_fee = 100_000_000_000u128;
+
+        // ccount strictly past the timeout (read the fn directly rather than
+        // assuming the test-env value; plain `cargo test` does not set NEXTEST).
+        seed_block_count_votes(db, 4, submitted_op_timeout_blocks() + 1).await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await; // fresh median at block 10
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out1),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc1; 20]),
+                    amount: total,
+                    // Generous ceiling: comfortably above the repriced op's
+                    // ~118.8M-unit USDT gas cost, so this replaces (not fails).
+                    max_fee: UsdtAmount(300_000_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out1), &WithdrawalState::Submitted(ha))
+                .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(ha),
+                &submitted_withdraw_op(vec![out1], total, old_fee, 2_000_000_000, 0, false),
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // The timed-out op is proposed for replacement.
+        let mut dbtx = db.begin_transaction().await;
+        let proposal = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert!(
+            proposal.contains(&UsdtConsensusItem::ReplaceUserOp { op_hash: ha }),
+            "consensus_proposal must propose ReplaceUserOp for the timed-out op: {proposal:?}"
+        );
+
+        // Applying it replaces the op.
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::ReplaceUserOp { op_hash: ha },
+                PeerId::from(0),
+            )
+            .await
+            .expect("ReplaceUserOp for a timed-out op must process cleanly");
+
+        // Old op kept, now superseded.
+        let old = dbtx
+            .to_ref_nc()
+            .get_value(&SubmittedUserOpKey(ha))
+            .await
+            .expect("superseded old op is KEPT for RBF-nonce safety");
+        assert!(old.superseded, "old op must be marked superseded");
+
+        // Exactly one fresh replacement PendingUserOp at the SAME (sender,
+        // nonce), fee >= 10% higher.
+        let mut new_ops = pending_withdraw_ops(&mut dbtx.to_ref_nc()).await;
+        assert_eq!(new_ops.len(), 1, "exactly one replacement must be enqueued");
+        let (new_hash, new_pending) = new_ops.pop().expect("len == 1");
+        assert_ne!(new_hash, ha, "the replacement has a fresh op_hash");
+        assert_eq!(new_pending.op.sender, old.signed.unsigned.sender);
+        assert_eq!(new_pending.op.nonce, old.signed.unsigned.nonce);
+        assert_eq!(
+            new_pending.op.max_fee_per_gas, 110_000_000_000,
+            "replacement fee is exactly the 10% bump over the old 100 gwei"
+        );
+        assert!(
+            new_pending.op.max_fee_per_gas * 10 >= old_fee * 11,
+            "replacement fee must be at least 10% above the old op's fee"
+        );
+        // Identical calldata: settlement is a pure function of purpose +
+        // calldata, so either op settles identically (RBF-nonce safety).
+        assert_eq!(new_pending.op.call_data, old.signed.unsigned.call_data);
+
+        // A signing session was started for the replacement, and the covered
+        // withdrawal was re-tagged to it.
+        let session_id = signing_session_id(&eth_signed_message_hash(new_hash), 0);
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SigningSessionKey(session_id))
+                .await
+                .is_some(),
+            "a signing session must be started for the replacement"
+        );
+        assert_eq!(
+            dbtx.to_ref_nc().get_value(&WithdrawalStateKey(out1)).await,
+            Some(WithdrawalState::Signing(new_hash))
+        );
+    }
+
+    /// **Task 5.2, step 2.** A stuck+replaced withdrawal batch no longer
+    /// wedges ALL withdrawals: once the batch confirms (via EITHER hash in the
+    /// chain), its covered withdrawals settle and a later-queued withdrawal
+    /// can be batched again (the global-wedge regression is gone).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn withdrawal_batch_no_longer_wedges_all_withdrawals() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let ha = [0xa1; 32]; // old (superseded)
+        let hb = [0xb2; 32]; // live replacement
+        let out1 = test_out_point(1);
+        let out2 = test_out_point(2); // later, still Queued
+        let total = UsdtAmount(1_000_000);
+
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(10_000_000),
+                    nonce: 5,
+                },
+            )
+            .await;
+            // The in-flight batch (chain A superseded + B live) covering out1.
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out1),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc1; 20]),
+                    amount: total,
+                    max_fee: UsdtAmount(300_000_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out1), &WithdrawalState::Signing(hb))
+                .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(ha),
+                &submitted_withdraw_op(vec![out1], total, 100_000_000_000, 2_000_000_000, 0, true),
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(hb),
+                &submitted_withdraw_op(vec![out1], total, 110_000_000_000, 2_200_000_000, 8, false),
+            )
+            .await;
+            // A later withdrawal that has been stuck in Queued behind the batch.
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out2),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc2; 20]),
+                    amount: UsdtAmount(500_000),
+                    max_fee: UsdtAmount(300_000_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out2), &WithdrawalState::Queued)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // The replacement (B) confirms.
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .apply_user_op_confirmed(
+                &mut dbtx.to_ref_nc(),
+                hb,
+                &UserOpConfirmedObservation {
+                    success: true,
+                    block: 99,
+                    block_hash: [0u8; 32],
+                    swept: total,
+                },
+            )
+            .await;
+
+        // out1 settled; the whole chain (A too) is gone; no Withdraw op is
+        // in flight any more.
+        assert_eq!(
+            dbtx.to_ref_nc().get_value(&WithdrawalStateKey(out1)).await,
+            Some(WithdrawalState::Confirmed { block: 99 })
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(ha))
+                .await
+                .is_none(),
+            "the superseded predecessor must be purged with the chain"
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(hb))
+                .await
+                .is_none()
+        );
+
+        // Now a later batch can be built for out2 (wedge gone). Commit the
+        // confirmation, advance past the interval, and trigger.
+        dbtx.commit_tx().await;
+        seed_block_count_votes(db, 4, batch_interval_blocks() + 1).await;
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+            .await;
+        let new_ops = pending_withdraw_ops(&mut dbtx.to_ref_nc()).await;
+        assert_eq!(
+            new_ops.len(),
+            1,
+            "the previously-wedged out2 must now batch: {new_ops:?}"
+        );
+        let UserOpPurpose::Withdraw { outpoints } = &new_ops[0].1.purpose else {
+            panic!("must be a Withdraw op");
+        };
+        assert_eq!(outpoints, &vec![out2]);
+    }
+
+    /// **Task 5.2, step 3.** When the repriced batch's gas would exceed the
+    /// covered withdrawals' committed `max_fee` ceiling, the op is NOT
+    /// replaced: every covered withdrawal becomes terminal `Failed`, its
+    /// `UnclaimedWithdrawal` is KEPT (for the Phase 6.1 refund), and the stuck
+    /// `SubmittedUserOp` is removed.
+    #[tokio::test]
+    async fn reprice_over_user_max_fee_marks_withdrawals_failed() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let ha = [0xa1; 32];
+        let out1 = test_out_point(1);
+        let total = UsdtAmount(1_000_000);
+
+        seed_block_count_votes(db, 4, submitted_op_timeout_blocks() + 1).await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out1),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc1; 20]),
+                    amount: total,
+                    // LOW ceiling: below the repriced op's ~118.8M-unit gas
+                    // cost, so the reprice cannot proceed.
+                    max_fee: UsdtAmount(50_000_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out1), &WithdrawalState::Submitted(ha))
+                .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(ha),
+                &submitted_withdraw_op(vec![out1], total, 100_000_000_000, 2_000_000_000, 0, false),
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::ReplaceUserOp { op_hash: ha },
+                PeerId::from(0),
+            )
+            .await
+            .expect("over-ceiling reprice is a state change (Failed), returns Ok");
+
+        assert_eq!(
+            dbtx.to_ref_nc().get_value(&WithdrawalStateKey(out1)).await,
+            Some(WithdrawalState::Failed {
+                reason: "gas exceeds committed max_fee".to_string()
+            })
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&UnclaimedWithdrawalKey(out1))
+                .await
+                .is_some(),
+            "UnclaimedWithdrawal must be KEPT for the Phase 6.1 refund"
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(ha))
+                .await
+                .is_none(),
+            "the stuck op must be removed"
+        );
+        assert!(
+            pending_withdraw_ops(&mut dbtx.to_ref_nc()).await.is_empty(),
+            "no replacement is enqueued when over the ceiling"
+        );
+    }
+
+    /// **Task 5.2, step 4 (the crux).** A late confirmation of the OLD op (A)
+    /// after it was replaced by B: A settles the withdrawals EXACTLY ONCE and
+    /// B's `SubmittedUserOp` (same nonce) is removed with the chain; a
+    /// subsequent confirmation vote for B is rejected (its `SubmittedUserOp`
+    /// is gone), so there is no double-settle.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn late_old_op_confirmation_settles_and_cleans_replacement() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let ha = [0xa1; 32]; // old, superseded, but it is the one that landed
+        let hb = [0xb2; 32]; // replacement, never lands (nonce consumed by A)
+        let out1 = test_out_point(1);
+        let out2 = test_out_point(2);
+        let outpoints = vec![out1, out2];
+        let total = UsdtAmount(3_000_000);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(5_000_000),
+                    nonce: 7,
+                },
+            )
+            .await;
+            for &o in &outpoints {
+                dbtx.insert_new_entry(
+                    &UnclaimedWithdrawalKey(o),
+                    &UsdtWithdrawalV0 {
+                        recipient: EvmAddress([0xc1; 20]),
+                        amount: UsdtAmount(1_500_000),
+                        max_fee: UsdtAmount(300_000_000),
+                        requested_block: 0,
+                    },
+                )
+                .await;
+                dbtx.insert_new_entry(&WithdrawalStateKey(o), &WithdrawalState::Signing(hb))
+                    .await;
+            }
+            // A (superseded) and B (live) share the SAME (sender, nonce) and
+            // identical calldata (both decode to `total`).
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(ha),
+                &submitted_withdraw_op(
+                    outpoints.clone(),
+                    total,
+                    100_000_000_000,
+                    2_000_000_000,
+                    0,
+                    true,
+                ),
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(hb),
+                &submitted_withdraw_op(
+                    outpoints.clone(),
+                    total,
+                    110_000_000_000,
+                    2_200_000_000,
+                    8,
+                    false,
+                ),
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // A late UserOpConfirmed for the OLD op A reaches threshold.
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash: ha,
+            success: true,
+            block: 99,
+            block_hash: [0u8; 32],
+            swept: total,
+        };
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                .await
+                .expect("a UserOpConfirmed vote for the (existing) old op A processes cleanly");
+        }
+
+        // Withdrawals settled exactly once; pool debited once.
+        for &o in &outpoints {
+            assert_eq!(
+                dbtx.to_ref_nc().get_value(&WithdrawalStateKey(o)).await,
+                Some(WithdrawalState::Confirmed { block: 99 })
+            );
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&UnclaimedWithdrawalKey(o))
+                    .await
+                    .is_none()
+            );
+        }
+        let pool = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState present");
+        assert_eq!(pool.balance, UsdtAmount(5_000_000 - total.0));
+        assert_eq!(pool.nonce, 8);
+
+        // Both A and B are gone -- the whole (sender, nonce) chain was purged.
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(ha))
+                .await
+                .is_none()
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(hb))
+                .await
+                .is_none(),
+            "the replacement B must be purged with the confirmed chain"
+        );
+
+        // A subsequent confirmation vote for B is rejected (no SubmittedUserOp
+        // backs it), so there is NO double-settle.
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::UserOpConfirmed {
+                    op_hash: hb,
+                    success: true,
+                    block: 99,
+                    block_hash: [0u8; 32],
+                    swept: total,
+                },
+                PeerId::from(0),
+            )
+            .await
+            .expect_err("a confirm vote for the purged replacement B must be rejected");
+        assert!(
+            err.to_string().contains("never submitted"),
+            "rejection must be the Task 2.2 existence check: {err}"
+        );
+        let pool_after = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState present");
+        assert_eq!(
+            pool_after.balance,
+            UsdtAmount(5_000_000 - total.0),
+            "the pool must not be double-debited"
+        );
+    }
+
+    /// **Task 5.2, step 5.** A `DeployAndSweep` reprice whose bumped fee would
+    /// exceed the config gas ceiling is NOT replaced: the op is left as-is
+    /// (funds are safe on-chain in the deposit account -- no refund concept),
+    /// and the item is non-state-changing (`Err`).
+    #[tokio::test]
+    async fn sweep_reprice_over_ceiling_leaves_op_stuck_no_refund() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let ha = [0xa1; 32];
+        let source = EvmAddress([0x51; 20]);
+        // 199 gwei bumps to 218.9 gwei > the 200 gwei ceiling.
+        let old_fee = 199_000_000_000u128;
+
+        seed_block_count_votes(db, 4, submitted_op_timeout_blocks() + 1).await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        {
+            let mut op = real_deploy_and_sweep_op_for_test(source, UsdtAmount(1_000_000));
+            op.max_fee_per_gas = old_fee;
+            op.max_priority_fee_per_gas = 5_000_000_000;
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(ha),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: op,
+                        signature: vec![0xcc; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep { source },
+                    submitted_block: 0,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::ReplaceUserOp { op_hash: ha },
+                PeerId::from(0),
+            )
+            .await
+            .expect_err("an over-ceiling sweep reprice is non-state-changing (Err)");
+        assert!(
+            err.to_string().contains("gas ceiling"),
+            "rejection must be the sweep gas-ceiling guard: {err}"
+        );
+
+        // Op left as-is: still present, still NOT superseded, no replacement.
+        let still = dbtx
+            .to_ref_nc()
+            .get_value(&SubmittedUserOpKey(ha))
+            .await
+            .expect("the stuck sweep op is left in place");
+        assert!(!still.superseded, "the op must not be marked superseded");
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .find_by_prefix(&PendingUserOpPrefix)
+                .await
+                .count()
+                .await,
+            0,
+            "no replacement is enqueued"
+        );
+    }
+
+    /// **Task 5.2, migration.** `migrate_db_v2` REWRITES (does not drop) each
+    /// pre-0.6 `SubmittedUserOp` row by appending the default `superseded:
+    /// false`, so an in-flight signed op survives the upgrade and decodes with
+    /// the field defaulted. Verifies the byte-append the migration performs at
+    /// the encoding level (the migration itself is a `raw_insert_bytes` of
+    /// exactly this transform).
+    #[tokio::test]
+    async fn migrate_v2_appends_superseded_false_and_round_trips() {
+        use fedimint_core::encoding::{Decodable, Encodable};
+
+        // The pre-0.6 row shape: the same struct MINUS the trailing
+        // `superseded` field. Encoding a struct is its fields concatenated in
+        // order, so the old bytes are exactly the new encoding without the
+        // final bool.
+        #[derive(Encodable)]
+        struct OldSubmittedUserOp {
+            signed: fedimint_usdt_common::user_op::SignedUserOp,
+            purpose: UserOpPurpose,
+            submitted_block: u64,
+        }
+
+        let signed = fedimint_usdt_common::user_op::SignedUserOp {
+            unsigned: real_withdraw_op_for_test(UsdtAmount(1_234_567)),
+            signature: vec![0x7a; 65],
+        };
+        let old = OldSubmittedUserOp {
+            signed: signed.clone(),
+            purpose: UserOpPurpose::Withdraw {
+                outpoints: vec![test_out_point(3)],
+            },
+            submitted_block: 42,
+        };
+
+        let mut old_bytes = old.consensus_encode_to_vec();
+        // The exact transform `migrate_db_v2` applies to each raw value.
+        old_bytes.push(0u8);
+
+        let decoded = SubmittedUserOp::consensus_decode_whole(
+            &old_bytes,
+            &fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        )
+        .expect("a migrated (byte-appended) row must decode as a 0.6 SubmittedUserOp");
+
+        assert_eq!(decoded.signed, signed);
+        assert_eq!(decoded.submitted_block, 42);
+        assert!(
+            !decoded.superseded,
+            "a migrated pre-0.6 row must default superseded to false"
         );
     }
 }

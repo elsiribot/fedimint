@@ -53,7 +53,7 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// transient and re-formed every scan/submit tick, so `migrate_db_v1` DROPS
 /// their old-shape rows rather than rewriting them (mirroring
 /// `migrate_db_v0`).
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 5);
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 6);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
@@ -270,6 +270,34 @@ fn gas_cost_fee_quote(gas_units: u128, median: &FeeVote, floor_raw: u64) -> Opti
         .max(u128::from(floor_raw));
 
     u64::try_from(fee).ok().map(UsdtAmount)
+}
+
+/// Converts a raw wei gas cost (`total_gas_units * max_fee_per_gas_wei`) into
+/// its USDT-equivalent (in [`UsdtAmount`]'s 1e-6-USDT unit) at the given
+/// `usdt_per_eth_e6` exchange rate: `gas_cost_wei * usdt_per_eth_e6 / 1e18`,
+/// ceiling-rounded so the caller is never left undercharged by integer
+/// truncation. Returns `None` on `u128` overflow or a `u64`-overflowing
+/// result (an extreme, e.g. byzantine-voted, median) rather than wrapping.
+///
+/// Used by the reprice/replacement path (security finding 03,
+/// `fedimint_usdt_server::Usdt::process_replace_user_op`) to price a rebuilt
+/// op's fronted `EntryPoint` prefund against the fee ceiling the covered
+/// withdrawals committed (the sum of their `max_fee`s). Unlike
+/// [`gas_cost_fee_quote`], it applies NO buffer and NO floor: it prices the
+/// op's ACTUAL fronted cost (whose `max_fee_per_gas` already carries the
+/// builders' 2x headroom) against an already-committed ceiling. A pure
+/// function of its args alone (no RPC, no wall-clock, no `our_peer_id`), so
+/// every guardian computes byte-identical output from the same
+/// consensus-agreed median.
+#[must_use]
+pub fn wei_gas_cost_to_usdt(gas_cost_wei: u128, usdt_per_eth_e6: u64) -> Option<UsdtAmount> {
+    const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
+
+    let numerator = gas_cost_wei.checked_mul(u128::from(usdt_per_eth_e6))?;
+    let usdt = numerator
+        .checked_add(WEI_PER_ETH - 1)?
+        .checked_div(WEI_PER_ETH)?;
+    u64::try_from(usdt).ok().map(UsdtAmount)
 }
 
 /// Computes the minimum USDT fee (in [`UsdtAmount`]'s smallest on-chain
@@ -1360,6 +1388,24 @@ pub enum UsdtConsensusItem {
     /// from this guardian's local, guardian-LOCAL read-only EVM RPC + config
     /// (never itself a consensus decision).
     BootstrapObservation(BootstrapObservation),
+    /// Time out and replace a stuck/underpriced `SubmittedUserOp` (security
+    /// finding 03). Proposed by `consensus_proposal` for any NON-superseded
+    /// `SubmittedUserOp` whose `submitted_block` has fallen more than
+    /// `submitted_op_timeout_blocks()` behind the consensus block count (a
+    /// deterministic, consensus-DB-only judgement -- never wall-clock -- so
+    /// every guardian agrees), mirroring [`Self::RotateSigning`]'s
+    /// timed-out-session detection. Processing it
+    /// (`fedimint_usdt_server::Usdt::process_replace_user_op`) is a pure
+    /// function of the item, prior consensus DB state (the `SubmittedUserOp`,
+    /// its covered `UnclaimedWithdrawal`s, and the fee-vote median), and
+    /// config: it re-checks the timeout as a deterministic gate, then rebuilds
+    /// the SAME logical op at the SAME `EntryPoint` `(sender, nonce)` with
+    /// FRESH fees from the consensus median (bumped >= 10% over the old op
+    /// so a bundler prefers the replacement), enqueues it as a fresh
+    /// `PendingUserOp` + signing session, and marks the OLD op `superseded`
+    /// (kept live so a late confirmation of it still settles -- the RBF-nonce
+    /// safety point). Byte-identical on every guardian, signer or not.
+    ReplaceUserOp { op_hash: [u8; 32] },
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -1875,6 +1921,34 @@ mod tests {
                 .expect("UsdtConsensusItem::RotateSigning should decode what it just encoded");
 
         assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn test_usdt_consensus_item_replace_user_op_round_trips_through_consensus_encoding() {
+        let item = UsdtConsensusItem::ReplaceUserOp {
+            op_hash: [0x2b; 32],
+        };
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("UsdtConsensusItem::ReplaceUserOp should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn wei_gas_cost_to_usdt_matches_hand_computation_and_overflows_to_none() {
+        // 360_000 gas * 66 gwei = 2.376e16 wei; at 3000 USDT/ETH
+        // (usdt_per_eth_e6 = 3e9) that is 2.376e16 * 3e9 / 1e18 = 71_280_000
+        // raw USDT units (1e-6 USDT each).
+        let gas_cost_wei = 360_000u128 * 66_000_000_000u128;
+        assert_eq!(
+            wei_gas_cost_to_usdt(gas_cost_wei, 3_000_000_000),
+            Some(UsdtAmount(71_280_000))
+        );
+        // A degenerate/byzantine rate that overflows u128 yields None (never a
+        // wrapped value).
+        assert_eq!(wei_gas_cost_to_usdt(u128::MAX, u64::MAX), None);
     }
 
     #[test]
