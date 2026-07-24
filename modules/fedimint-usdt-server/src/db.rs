@@ -419,8 +419,25 @@ pub struct SubmittedUserOp {
     pub signed: SignedUserOp,
     pub purpose: UserOpPurpose,
     /// The consensus block count as of this op's federation-agreed
-    /// signature -- diagnostic bookkeeping only.
+    /// signature -- the timeout anchor the reprice/replacement path
+    /// (`Usdt::process_replace_user_op`, security finding 03) compares against
+    /// `consensus_block_count`.
     pub submitted_block: u64,
+    /// `true` once this op has been timed out and REPLACED by a
+    /// higher-fee op at the SAME `EntryPoint` `(sender, nonce)` (security
+    /// finding 03). Added in `MODULE_CONSENSUS_VERSION` 0.6 (defaults `false`
+    /// for pre-0.6 rows via `migrate_db_v2`). A superseded op is deliberately
+    /// KEPT (not removed) so that, since the old and replacement ops are
+    /// mutually exclusive on-chain (the `EntryPoint` includes at most one op
+    /// per `(sender, nonce)`), a LATE confirmation of the old op still passes
+    /// the `UserOpConfirmed` existence check and settles exactly once -- the
+    /// RBF-nonce safety invariant. It is excluded from further timeout/replace
+    /// (`Usdt::propose_replace_user_ops`) but STILL counts as in-flight for
+    /// the batch/sweep guards (its purpose is unchanged), so a new batch/sweep
+    /// is never built at a nonce whose replacement chain is still live. The
+    /// whole chain for a `(sender, nonce)` is removed together the moment any
+    /// member confirms (`Usdt::purge_user_op_nonce_chain`).
+    pub superseded: bool,
 }
 
 #[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
@@ -950,6 +967,7 @@ mod tests {
             },
             purpose: purpose.clone(),
             submitted_block: 8,
+            superseded: false,
         };
 
         let mut dbtx = db.begin_transaction().await;
@@ -989,6 +1007,7 @@ mod tests {
                 source: EvmAddress([0x51; 20]),
             },
             submitted_block: 43,
+            superseded: false,
         };
 
         let mut dbtx = db.begin_transaction().await;
