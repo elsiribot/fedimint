@@ -173,7 +173,9 @@ async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint(
         account_factory,
         simple_account_impl,
         check_ttl_blocks: 10_000,
-        broadcaster_min_balance_wei: 0,
+        // Must be > 0 (sec-17 config validation); the broadcaster is the
+        // anvil-funded account, so any low value is trivially satisfied.
+        broadcaster_min_balance_wei: 1,
         // No Chainlink on anvil: all-zero disables the feed and falls back
         // to `AlloyEvmRpc::STATIC_USDT_PER_ETH_E6` (see Task 4 of the
         // ETH/USD price-feed plan).

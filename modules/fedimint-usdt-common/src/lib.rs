@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use anyhow::Context as _;
+use anyhow::{Context as _, ensure};
 use config::UsdtClientConfig;
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -1059,6 +1059,115 @@ impl Default for UsdtGenParams {
     }
 }
 
+/// EVM chain ids treated as local/dev/test networks (anvil, hardhat,
+/// ganache). Params targeting these chains skip the production-only safety
+/// checks in [`validate_usdt_params`] (minimum confirmation depth,
+/// non-placeholder contract addresses) since a dev federation intentionally
+/// runs with the compiled-in placeholder/fast-confirmation defaults.
+fn is_dev_chain(chain_id: u64) -> bool {
+    matches!(chain_id, 31337 | 1337)
+}
+
+/// Minimum `confirmation_depth` required on a non-dev chain unless the
+/// operator explicitly acknowledges the risk via
+/// [`FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV`]. Chosen conservatively
+/// (comparable to an hour of Ethereum mainnet blocks); operators of other
+/// chains should override the env acknowledgement per their own chain's
+/// reorg characteristics.
+pub const MIN_PROD_CONFIRMATION_DEPTH: u64 = 6;
+
+/// Sanity ceiling for `broadcaster_min_balance_wei`: 10 ETH. Far above any
+/// sane per-guardian gas float; guards against a fat-fingered config value
+/// that would make the broadcaster-funded readiness condition unreachable.
+pub const MAX_BROADCASTER_MIN_BALANCE_WEI: u64 = 10_000_000_000_000_000_000;
+
+/// Validates a [`UsdtGenParams`] for safety before it is baked into consensus
+/// config. Called from both config-gen paths
+/// ([`crate`]-external: `trusted_dealer_gen`/`dkg::distributed_gen` in
+/// `fedimint-usdt-server`) *and* from every guardian's `validate_config`, so
+/// an unsafe config is rejected both at generation time and defensively by
+/// every guardian thereafter.
+///
+/// Deliberately permissive of the compiled-in anvil/hardhat dev defaults
+/// ([`is_dev_chain`]) so dev/test federations are never broken by this
+/// check; strict for any other `chain_id`. `confirmation_depth == 0` is
+/// rejected unconditionally, even on dev chains, since it provides no
+/// protection against chain reorgs whatsoever.
+///
+/// # Errors
+///
+/// Returns `Err` with a human-readable reason if `confirmation_depth` is
+/// `0`; if `chain_id` is not a known dev chain and `confirmation_depth` is
+/// below [`MIN_PROD_CONFIRMATION_DEPTH`] without the unsafe-ack env var set;
+/// if `chain_id` is not a known dev chain and any of `usdt_contract`,
+/// `entry_point`, `account_factory`, or `simple_account_impl` is the
+/// placeholder zero address; if `price_feed_max_staleness_secs` is outside
+/// `1..=86_400`; or if `broadcaster_min_balance_wei` is `0` or exceeds
+/// [`MAX_BROADCASTER_MIN_BALANCE_WEI`].
+pub fn validate_usdt_params(p: &UsdtGenParams) -> anyhow::Result<()> {
+    ensure!(
+        p.confirmation_depth >= 1,
+        "confirmation_depth must be >= 1 (0 provides no protection against chain reorgs)"
+    );
+
+    if !is_dev_chain(p.chain_id) {
+        let unsafe_low_depth_ack =
+            std::env::var(fedimint_core::envs::FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV)
+                .as_deref()
+                == Ok("1");
+        ensure!(
+            p.confirmation_depth >= MIN_PROD_CONFIRMATION_DEPTH || unsafe_low_depth_ack,
+            "confirmation_depth ({}) is below the minimum safe depth ({MIN_PROD_CONFIRMATION_DEPTH}) \
+             for non-dev chain_id {}; set \
+             {}=1 to acknowledge and override",
+            p.confirmation_depth,
+            p.chain_id,
+            fedimint_core::envs::FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV,
+        );
+
+        let placeholder = EvmAddress([0u8; 20]);
+        ensure!(
+            p.usdt_contract != placeholder,
+            "usdt_contract must not be the placeholder zero address on non-dev chain_id {}",
+            p.chain_id
+        );
+        ensure!(
+            p.entry_point != placeholder,
+            "entry_point must not be the placeholder zero address on non-dev chain_id {}",
+            p.chain_id
+        );
+        ensure!(
+            p.account_factory != placeholder,
+            "account_factory must not be the placeholder zero address on non-dev chain_id {}",
+            p.chain_id
+        );
+        ensure!(
+            p.simple_account_impl != placeholder,
+            "simple_account_impl must not be the placeholder zero address on non-dev chain_id {}",
+            p.chain_id
+        );
+    }
+
+    ensure!(
+        (1..=86_400).contains(&p.price_feed_max_staleness_secs),
+        "price_feed_max_staleness_secs ({}) must be between 1 and 86400",
+        p.price_feed_max_staleness_secs
+    );
+
+    ensure!(
+        p.broadcaster_min_balance_wei > 0,
+        "broadcaster_min_balance_wei must be > 0 (0 would make every broadcaster read as \
+         \"funded\" regardless of its actual on-chain balance)"
+    );
+    ensure!(
+        p.broadcaster_min_balance_wei <= MAX_BROADCASTER_MIN_BALANCE_WEI,
+        "broadcaster_min_balance_wei ({}) exceeds the sanity ceiling ({MAX_BROADCASTER_MIN_BALANCE_WEI})",
+        p.broadcaster_min_balance_wei
+    );
+
+    Ok(())
+}
+
 /// Non-transaction items that will be submitted to consensus
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub enum UsdtConsensusItem {
@@ -1997,5 +2106,164 @@ mod tests {
         };
         let quote = withdrawal_fee_quote(&median).expect("plausible fee spike must not overflow");
         assert!(quote.0 > 0);
+    }
+
+    /// Serializes tests that touch
+    /// [`fedimint_core::envs::FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV`],
+    /// a process-wide env var, so they cannot race against each other under
+    /// `cargo test`'s default parallel-test execution (no other test in this
+    /// crate reads or writes this specific var, so guarding just these
+    /// suffices).
+    static UNSAFE_LOW_DEPTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that sets
+    /// [`fedimint_core::envs::FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV`] for
+    /// the guard's lifetime and always clears it on drop (including on test
+    /// panic), so a failing assertion never leaks the override into a later
+    /// test.
+    struct UnsafeLowDepthAckGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl UnsafeLowDepthAckGuard {
+        fn set() -> Self {
+            let lock = UNSAFE_LOW_DEPTH_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: serialized by `UNSAFE_LOW_DEPTH_ENV_LOCK` above; no
+            // other thread reads/writes this var concurrently.
+            unsafe {
+                std::env::set_var(
+                    fedimint_core::envs::FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV,
+                    "1",
+                );
+            }
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for UnsafeLowDepthAckGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `set` above.
+            unsafe {
+                std::env::remove_var(
+                    fedimint_core::envs::FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV,
+                );
+            }
+        }
+    }
+
+    fn valid_prod_params() -> UsdtGenParams {
+        UsdtGenParams {
+            usdt_contract: EvmAddress([0xab; 20]),
+            chain_id: 1,
+            confirmation_depth: MIN_PROD_CONFIRMATION_DEPTH,
+            entry_point: EvmAddress([0xcd; 20]),
+            account_factory: EvmAddress([0xce; 20]),
+            simple_account_impl: EvmAddress([0xcf; 20]),
+            check_ttl_blocks: 10_000,
+            broadcaster_min_balance_wei: 50_000_000_000_000_000,
+            eth_usd_price_feed: EvmAddress([0xd0; 20]),
+            price_feed_max_staleness_secs: 14_400,
+        }
+    }
+
+    #[test]
+    fn validate_usdt_params_accepts_dev_defaults() {
+        // The compiled-in `UsdtGenParams::default()` targets anvil
+        // (chain_id 31337, depth 1, placeholder zero addresses) -- this must
+        // never be rejected, or every dev/test federation breaks.
+        validate_usdt_params(&UsdtGenParams::default())
+            .expect("compiled-in dev defaults must validate");
+    }
+
+    #[test]
+    fn validate_usdt_params_rejects_zero_confirmation_depth() {
+        // Unconditional -- even a dev chain must not accept depth 0.
+        let dev = UsdtGenParams {
+            confirmation_depth: 0,
+            ..UsdtGenParams::default()
+        };
+        assert!(validate_usdt_params(&dev).is_err());
+
+        let mut prod = valid_prod_params();
+        prod.confirmation_depth = 0;
+        assert!(validate_usdt_params(&prod).is_err());
+    }
+
+    #[test]
+    fn validate_usdt_params_rejects_low_depth_on_prod_chain() {
+        let _guard_absence = UNSAFE_LOW_DEPTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized by the lock above.
+        unsafe {
+            std::env::remove_var(fedimint_core::envs::FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV);
+        }
+
+        let mut params = valid_prod_params();
+        params.confirmation_depth = 1;
+        let err = validate_usdt_params(&params)
+            .expect_err("depth 1 on chain_id 1 must be rejected without the unsafe ack");
+        assert!(err.to_string().contains("confirmation_depth"));
+    }
+
+    #[test]
+    fn validate_usdt_params_accepts_low_depth_on_prod_chain_with_unsafe_ack() {
+        let _guard = UnsafeLowDepthAckGuard::set();
+
+        let mut params = valid_prod_params();
+        params.confirmation_depth = 1;
+        validate_usdt_params(&params)
+            .expect("depth 1 must be accepted once the unsafe-low-depth env ack is set");
+    }
+
+    #[test]
+    fn validate_usdt_params_rejects_zero_addresses_on_prod_chain() {
+        let zero = EvmAddress([0u8; 20]);
+
+        let mut usdt_contract_zero = valid_prod_params();
+        usdt_contract_zero.usdt_contract = zero;
+        assert!(validate_usdt_params(&usdt_contract_zero).is_err());
+
+        let mut entry_point_zero = valid_prod_params();
+        entry_point_zero.entry_point = zero;
+        assert!(validate_usdt_params(&entry_point_zero).is_err());
+
+        let mut account_factory_zero = valid_prod_params();
+        account_factory_zero.account_factory = zero;
+        assert!(validate_usdt_params(&account_factory_zero).is_err());
+
+        let mut simple_account_impl_zero = valid_prod_params();
+        simple_account_impl_zero.simple_account_impl = zero;
+        assert!(validate_usdt_params(&simple_account_impl_zero).is_err());
+
+        // Same placeholders are fine on a dev chain.
+        let dev_zero = UsdtGenParams::default();
+        assert_eq!(dev_zero.usdt_contract, zero);
+        validate_usdt_params(&dev_zero).expect("zero addresses are fine on a dev chain");
+    }
+
+    #[test]
+    fn validate_usdt_params_bounds_staleness_and_min_balance() {
+        let mut zero_staleness = valid_prod_params();
+        zero_staleness.price_feed_max_staleness_secs = 0;
+        assert!(validate_usdt_params(&zero_staleness).is_err());
+
+        let mut huge_staleness = valid_prod_params();
+        huge_staleness.price_feed_max_staleness_secs = 86_401;
+        assert!(validate_usdt_params(&huge_staleness).is_err());
+
+        let mut zero_balance = valid_prod_params();
+        zero_balance.broadcaster_min_balance_wei = 0;
+        assert!(validate_usdt_params(&zero_balance).is_err());
+
+        let mut huge_balance = valid_prod_params();
+        huge_balance.broadcaster_min_balance_wei = MAX_BROADCASTER_MIN_BALANCE_WEI + 1;
+        assert!(validate_usdt_params(&huge_balance).is_err());
+
+        let mut at_ceiling = valid_prod_params();
+        at_ceiling.broadcaster_min_balance_wei = MAX_BROADCASTER_MIN_BALANCE_WEI;
+        validate_usdt_params(&at_ceiling).expect("exactly at the ceiling must be accepted");
     }
 }

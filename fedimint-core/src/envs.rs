@@ -116,6 +116,17 @@ pub const FM_USDT_CONFIRMATION_DEPTH_ENV: &str = "FM_USDT_CONFIRMATION_DEPTH";
 /// hold that much. Gas cost itself is unaffected.
 pub const FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV: &str = "FM_USDT_BROADCASTER_MIN_BALANCE_WEI";
 
+/// Explicit operator acknowledgement to run a non-dev `chain_id` with a
+/// below-minimum `confirmation_depth`.
+///
+/// Compared against the module's minimum safe production depth
+/// (`fedimint_usdt_common::MIN_PROD_CONFIRMATION_DEPTH`). Unset (or any value
+/// other than `"1"`) means the low depth is rejected at config-gen/validation
+/// time (sec-17 hardening) -- set to `"1"` only when the operator has
+/// deliberately chosen a lower depth for their chain's reorg
+/// characteristics.
+pub const FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV: &str = "FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH";
+
 /// Env var to override the `mintv2` module's `amount_unit` config-gen param
 /// (a decimal [`crate::module::AmountUnit`] id, e.g. `1` for
 /// `fedimint_usdt_common::USDT_UNIT`).
