@@ -29,7 +29,10 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// item was removed from `UsdtConsensusItem` and `SigningPurpose` lost its
 /// debug-only variant -- both consensus-encoded types changed shape, so old
 /// and new binaries can no longer agree on the wire format.
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 1);
+///
+/// Bumped to `0.2` (sec-13 hardening): [`CheckDepositResponse`] gained a
+/// `ready` field (the `check_deposit` API response's wire shape changed).
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 2);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
@@ -655,6 +658,16 @@ const _: () = assert!(
      literal above to match"
 );
 
+/// Hard cap on the number of guardian-local `PendingCheck` records a single
+/// guardian will store at once (security finding 13). `check_deposit` is
+/// unauthenticated and each distinct `claim_pk` derives a distinct account,
+/// so without a cap an attacker could cheaply grow this table without bound.
+/// Once the cap is reached, `Usdt::handle_check_deposit` stops inserting NEW
+/// `PendingCheck`s (logging a warning) but still returns its normal
+/// deterministic [`CheckDepositResponse`] -- the cap is never reflected in
+/// the response itself (see that struct's doc comment for why).
+pub const MAX_PENDING_CHECKS: u64 = 10_000;
+
 /// One chunk of one guardian's message for a single round of a signing
 /// session's cggmp21 state machine. A round's full per-peer payload can
 /// exceed Fedimint's `AlephBFT` unit byte limit, so it is split into
@@ -805,17 +818,28 @@ pub struct CheckDepositRequest {
     pub claim_pk: secp256k1::PublicKey,
 }
 
-/// Response to [`CheckDepositRequest`]: the derived deposit account.
+/// Response to [`CheckDepositRequest`]: the derived deposit account, plus
+/// `ready` -- whether the federation's consensus-agreed `bootstrap_state` is
+/// `Ready` right now (security finding 13's r2 facet). `account` is always
+/// populated (a pure function of `claim_pk` + config), but if `ready` is
+/// `false` the guardian did NOT enqueue a `PendingCheck` for it: funding an
+/// account before the federation can sweep it would strand funds, so callers
+/// must wait for `ready` before depositing.
 ///
 /// Deliberately does not report whether this call is what enqueued the
-/// guardian-local check: that is guardian-local state (some guardians may
-/// already have a `PendingCheck` enqueued for this account, others
-/// may not), so including it here would let honest guardians return
+/// guardian-local check, nor whether a `PendingCheck` cap
+/// ([`MAX_PENDING_CHECKS`]) caused this guardian to skip storing one: that is
+/// guardian-local state (some guardians may already have a `PendingCheck`
+/// enqueued for this account, others may not, and the per-guardian pending
+/// count differs), so including it here would let honest guardians return
 /// different responses to the same request, breaking the threshold-identical
-/// response requirement of `request_current_consensus`.
+/// response requirement of `request_current_consensus`. `ready`, by
+/// contrast, is a pure function of consensus DB (`bootstrap_state`), so it is
+/// identical on every guardian at the same consensus position.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct CheckDepositResponse {
     pub account: EvmAddress,
+    pub ready: bool,
 }
 
 /// Request for the current credited/claimed/claimable state of `claim_pk`'s

@@ -15,7 +15,9 @@ enum Opts {
     /// (`claim_pk`) needed by `check-deposit`/`deposit-status`/`claim`.
     DepositAddress,
     /// Ask the federation to start watching `claim_pk`'s deposit address for
-    /// incoming USDT transfers.
+    /// incoming USDT transfers. If the federation is not yet ready (`ready:
+    /// false` in the response), no guardian starts watching -- retry once
+    /// bootstrap completes.
     CheckDeposit { claim_pk: secp256k1::PublicKey },
     /// Report the credited/claimed/claimable state of `claim_pk`'s deposit
     /// account.
@@ -80,7 +82,23 @@ pub(crate) async fn handle_cli_command(
                 "account": account.to_string(),
             }))
         }
-        Opts::CheckDeposit { claim_pk } => json(usdt.check_deposit(claim_pk).await?),
+        Opts::CheckDeposit { claim_pk } => {
+            let response = usdt.check_deposit(claim_pk).await?;
+            if response.ready {
+                json(response)
+            } else {
+                // Security finding 13, r2 facet: the federation was not
+                // ready, so no guardian enqueued a `PendingCheck` -- make
+                // that explicit rather than implying the deposit is being
+                // watched.
+                json(serde_json::json!({
+                    "account": response.account.to_string(),
+                    "ready": false,
+                    "message": "federation infrastructure not ready yet; try again after \
+                                bootstrap completes",
+                }))
+            }
+        }
         Opts::DepositStatus { claim_pk } => json(usdt.deposit_status(claim_pk).await?),
         Opts::Claim { claim_pk } => {
             let result = usdt.claim(claim_pk).await?;
