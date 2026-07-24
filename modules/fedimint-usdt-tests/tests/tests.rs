@@ -125,14 +125,19 @@ async fn client_deposit_address_matches_common_derivation() -> anyhow::Result<()
         secp256k1::Keypair::new(secp256k1::SECP256K1, &mut secp256k1::rand::thread_rng());
     let claim_pk = claim_keypair.public_key();
 
-    // `fixtures()` never overrides `UsdtGenParams::default()`'s placeholder
-    // `account_factory`/`simple_account_impl` (both `EvmAddress([0; 20])`;
-    // see `fedimint_usdt_server::UsdtInit::default_config_gen_params`), so
-    // that's what the federation's `UsdtClientConfig` actually carries here.
+    // `account_factory`/`simple_account_impl` are NOT `UsdtGenParams::
+    // default()`'s raw placeholder `EvmAddress([0; 20])`: config-gen
+    // deterministically self-deploys/derives both from `entry_point` (see
+    // `fedimint_usdt_server`'s `derive_account_factory`/
+    // `derive_simple_account_impl`), so read the federation's actual values
+    // straight off the client config instead of assuming the placeholder --
+    // this is a derivation-parity test, not a config-gen test, so it must
+    // feed `derive_deposit_account` whatever the federation actually agreed
+    // on rather than a stale hard-coded guess.
     let expected = fedimint_usdt_common::derive_deposit_account(
         &group_public_key,
-        EvmAddress([0u8; 20]),
-        EvmAddress([0u8; 20]),
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
         &claim_pk,
     );
     let actual = usdt.deposit_address(&claim_pk);
@@ -205,18 +210,23 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     // 1. Derive a deposit address.
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
 
-    // 1b. Wait for a `FeeVote` median to exist (the guardians' 1s poller ticks
-    //     always vote, even the mock's zero-cost default -- see
-    //     `deposit_fee_quote`'s floor at `MIN_DEPOSIT_FEE`), mirroring how the
-    //     withdrawal tests wait for `withdraw_fee_quote` to converge before
-    //     relying on it. `process_input` rejects a claim with
-    //     `DepositFeeInsufficient` before any median exists (the quote
-    //     endpoint reports a `0` sentinel until then), so this must converge
-    //     to a NONZERO value before the claim below.
+    // 1b. Wait for a `FeeVote` median to exist. `MockEvmRpc`'s default
+    //     `FeeVote` is now sane and nonzero (see `common::mock::State::
+    //     default`), but the guardians' 1s poller ticks + consensus still need
+    //     real wall-clock time to converge on a median after boot, and
+    //     `deposit_fee_quote` returns an `Err` (not a placeholder `Ok`) until
+    //     one exists (security finding 06's client-confusion facet) -- so this
+    //     retries PAST the `Err`, not just past an `Ok` with a zero fee,
+    //     mirroring
+    // `deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance`'s
+    //     own wait. `process_input` would otherwise reject a claim with
+    //     `DepositFeeInsufficient` before any median exists, so this must
+    //     converge to a NONZERO value before the claim below.
     let fee_deadline = Instant::now() + Duration::from_secs(30);
     let deposit_fee = loop {
-        let quote = usdt.deposit_fee_quote().await?;
-        if quote.fee.0 > 0 {
+        if let Ok(quote) = usdt.deposit_fee_quote().await
+            && quote.fee.0 > 0
+        {
             break quote.fee;
         }
         if Instant::now() >= fee_deadline {
@@ -364,15 +374,15 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
     mock.set_block_number(100);
     // Security finding 02 (Task 4.3): `maybe_trigger_sweep` now defers any
     // sweep until it can price `deposit_fee_quote`, which requires a fresh,
-    // *sane* `FeeVote` median (`fee_vote_in_sane_range` rejects the
-    // `MockEvmRpc` default all-zero reading outright, so without this the
-    // fee-estimate poller's vote would never even be accepted into
-    // consensus). Script a low (but sane, non-zero) estimate up front so the
-    // guardians' pollers converge on a median well before the deposit below
-    // is credited; low enough that its `deposit_fee_quote` stays well under
-    // `deposit_amount` (a high gas price here would make this
-    // otherwise-ordinary deposit dust under the finding-02 gate, which is
-    // not what this test is about).
+    // *sane* `FeeVote` median (`fee_vote_in_sane_range` would reject an
+    // out-of-range vote outright, so an unscripted/invalid reading would
+    // never even be accepted into consensus). Script a low (but sane,
+    // non-zero) estimate up front, overriding `MockEvmRpc`'s own sane nonzero
+    // default, so the guardians' pollers converge on a median well before the
+    // deposit below is credited; low enough that its `deposit_fee_quote`
+    // stays well under `deposit_amount` (a high gas price here would make
+    // this otherwise-ordinary deposit dust under the finding-02 gate, which
+    // is not what this test is about).
     let scripted_fee = FeeVote {
         max_fee_per_gas_wei: 100_000_000,
         usdt_per_eth_e6: 3_000_000_000,
@@ -635,11 +645,17 @@ async fn withdrawal_status_reports_unknown_then_queued() -> anyhow::Result<()> {
     );
 
     // Wait for the fee-vote median quote to converge (needed for a valid
-    // `max_fee`).
+    // `max_fee`). Retries PAST an `Err` (not just past a stale/zero `Ok`):
+    // `withdraw_fee_quote` returns `Err` until a `FeeVote` median exists
+    // (security finding 06's client-confusion facet), and the guardians' 1s
+    // poller ticks + consensus still need real wall-clock time after boot to
+    // converge on one, even with `MockEvmRpc`'s sane nonzero default
+    // `FeeVote`.
     let quote_deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let quote = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await?;
-        if quote.max_fee == expected_quote {
+        if let Ok(quote) = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await
+            && quote.max_fee == expected_quote
+        {
             break;
         }
         if Instant::now() >= quote_deadline {
@@ -772,18 +788,17 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
 
     // 1. Wait for the fee-vote median to be populated (guardians vote on their 1s
     //    poller ticks), then assert `withdraw_fee_quote` is identical across every
-    //    guardian and equals the pure-function quote.
+    //    guardian and equals the pure-function quote. Retries PAST an `Err` (not
+    //    just past a stale/zero `Ok`): `withdraw_fee_quote` returns `Err` until a
+    //    `FeeVote` median exists (security finding 06's client-confusion facet).
     let quote_deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let quote = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await?;
-        if quote.max_fee == expected_quote {
-            break;
+        match usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await {
+            Ok(quote) if quote.max_fee == expected_quote => break,
+            _ => {}
         }
         if Instant::now() >= quote_deadline {
-            bail!(
-                "withdraw_fee_quote never converged to {expected_quote} (last {})",
-                quote.max_fee
-            );
+            bail!("withdraw_fee_quote never converged to {expected_quote} before the deadline");
         }
         sleep(Duration::from_millis(300)).await;
     }
@@ -1095,11 +1110,17 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
     let non_signer = PeerId::from(3); // signer_subset(0) is the fixed {0,1,2}
 
     // 0. Wait for the fee-vote median quote to converge (needed to compute a valid
-    //    `max_fee` below), mirroring the Task-1 test's own step 1.
+    //    `max_fee` below), mirroring the Task-1 test's own step 1. Retries PAST an
+    //    `Err` (not just past a stale/zero `Ok`): `withdraw_fee_quote` returns
+    //    `Err` until a `FeeVote` median exists (security finding 06's
+    //    client-confusion facet), and the guardians' 1s poller ticks + consensus
+    //    still need real wall-clock time after boot to converge on one, even with
+    //    `MockEvmRpc`'s sane nonzero default `FeeVote`.
     let quote_deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let quote = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await?;
-        if quote.max_fee == expected_quote {
+        if let Ok(quote) = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await
+            && quote.max_fee == expected_quote
+        {
             break;
         }
         if Instant::now() >= quote_deadline {
