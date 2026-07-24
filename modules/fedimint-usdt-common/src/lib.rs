@@ -616,6 +616,45 @@ pub fn signing_session_id(digest: &[u8; 32], attempt: u32) -> SigningSessionId {
 /// item envelope and encoding overhead.
 pub const MPC_ROUND_CHUNK_SIZE: usize = 30_000;
 
+/// Ceiling, in bytes, on one signer's reassembled per-round payload (the sum
+/// of ALL of that signer's chunks for one `(session, round)`) that
+/// `process_mpc_round` will accept before rejecting further chunks from that
+/// peer (security finding 11: an unbounded chunk count/size otherwise lets a
+/// Byzantine selected signer bloat the consensus DB with up to `u16::MAX`
+/// accepted chunks per round). Real cggmp21 rounds top out at roughly 63 KB
+/// (round 2's per-peer message; see [`MPC_ROUND_CHUNK_SIZE`]'s doc comment),
+/// so 512 KiB leaves generous headroom for protocol/party-count growth while
+/// still bounding a malicious peer's worst-case per-round contribution to a
+/// modest, fixed amount of consensus-DB growth. Pinned against a real signing
+/// round's actual size by
+/// `fedimint_usdt_server::real_signing_round_fits_chunk_budget` (a drift
+/// guard: if that test fails, this constant is too small and must be raised,
+/// not the test loosened).
+pub const MAX_MPC_ROUND_BYTES: usize = 512 * 1024;
+
+/// Maximum number of [`MPC_ROUND_CHUNK_SIZE`]-sized chunks a single `(session,
+/// round, peer)` may be split into: `ceil(MAX_MPC_ROUND_BYTES /
+/// MPC_ROUND_CHUNK_SIZE)`. Bounding `chunk_count` itself (not just each
+/// chunk's `payload` length) is what actually caps a Byzantine peer's chunk
+/// count -- `MpcRoundItem.chunk`/`chunk_count` are `u16`, so without this a
+/// peer could otherwise propose up to `u16::MAX` distinct chunk indices for
+/// one round.
+///
+/// Written as a literal (18 at the current 30 KB chunk size / 512 KiB
+/// ceiling) rather than a `const fn` -- primitive `usize -> u16` conversion
+/// is not yet usable in a `const` context on stable Rust (`TryFrom` is not a
+/// const trait) -- but the `const _: ()` assertion immediately below
+/// recomputes the same value with `usize` arithmetic and fails to compile if
+/// [`MAX_MPC_ROUND_BYTES`] or [`MPC_ROUND_CHUNK_SIZE`] change without this
+/// constant being updated to match, so the two can never silently drift.
+pub const MAX_MPC_CHUNKS: u16 = 18;
+
+const _: () = assert!(
+    MAX_MPC_CHUNKS as usize == MAX_MPC_ROUND_BYTES.div_ceil(MPC_ROUND_CHUNK_SIZE),
+    "MAX_MPC_CHUNKS is out of sync with MAX_MPC_ROUND_BYTES / MPC_ROUND_CHUNK_SIZE -- update the \
+     literal above to match"
+);
+
 /// One chunk of one guardian's message for a single round of a signing
 /// session's cggmp21 state machine. A round's full per-peer payload can
 /// exceed Fedimint's `AlephBFT` unit byte limit, so it is split into

@@ -51,13 +51,14 @@ use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_
 use fedimint_usdt_common::{
     BootstrapObservation, BootstrapState, CheckDepositRequest, CheckDepositResponse,
     DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation, DepositStatusRequest,
-    DepositStatusResponse, FeeVote, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem,
-    PoolStateResponse, SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
-    UsdtConsensusItem, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
-    UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
-    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
-    WithdrawalStatusResponse, deposit_fee_quote, derive_deposit_account, derive_pool_account,
-    evm_address, pool_salt, signing_session_id, withdrawal_fee_quote,
+    DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES, MODULE_CONSENSUS_VERSION,
+    MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse, SigningSessionId, StatusResponse,
+    USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtInput, UsdtInputError,
+    UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome, UserOpStatus,
+    UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
+    WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse, deposit_fee_quote,
+    derive_deposit_account, derive_pool_account, evm_address, pool_salt, signing_session_id,
+    withdrawal_fee_quote,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -70,10 +71,11 @@ use crate::db::{
     DepositObservationVoteAccountPrefix, DepositObservationVoteKey, DepositObservationVotePrefix,
     DepositRecord, DepositRecordKey, DepositRecordPrefix, FeeVoteKey, FeeVotePrefix,
     HasEverBeenReadyKey, HasEverBeenReadyPrefix, LastSweepBlockKey, LastSweepBlockPrefix,
-    MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix, MpcRoundChunkSessionRoundPrefix,
-    PendingCheck, PendingCheckKey, PendingCheckPrefix, PendingUserOp, PendingUserOpKey,
-    PendingUserOpPrefix, PoolState, PoolStateKey, PoolStatePrefix, SessionState, SigningPurpose,
-    SigningSession, SigningSessionKey, SigningSessionPrefix, SubmittedUserOp, SubmittedUserOpKey,
+    MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix, MpcRoundChunkSessionPrefix,
+    MpcRoundChunkSessionRoundPeerPrefix, MpcRoundChunkSessionRoundPrefix, PendingCheck,
+    PendingCheckKey, PendingCheckPrefix, PendingUserOp, PendingUserOpKey, PendingUserOpPrefix,
+    PoolState, PoolStateKey, PoolStatePrefix, SessionState, SigningPurpose, SigningSession,
+    SigningSessionKey, SigningSessionPrefix, SubmittedUserOp, SubmittedUserOpKey,
     SubmittedUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
     UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
     UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalState, WithdrawalStateKey,
@@ -3469,6 +3471,7 @@ impl Usdt {
     /// guardian-LOCAL and MUST NOT feed either. Reassembly (concatenating a
     /// peer's chunks `0..C` in ascending index) is likewise a pure function of
     /// the consensus DB, so every signer reassembles identical payloads.
+    #[allow(clippy::too_many_lines)]
     async fn process_mpc_round(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -3499,6 +3502,45 @@ impl Usdt {
         ensure!(
             chunk_count >= 1 && chunk < chunk_count,
             "MpcRound with an out-of-range chunk index or a zero chunk count"
+        );
+
+        // Sec-11 hardening: bound a single chunk's size and a round's chunk
+        // count BEFORE touching the DB, so a Byzantine selected signer cannot
+        // use an oversized payload or an inflated `chunk_count` (up to
+        // `u16::MAX`) to bloat the consensus DB.
+        ensure!(
+            payload.len() <= MPC_ROUND_CHUNK_SIZE,
+            "MpcRound chunk payload exceeds MPC_ROUND_CHUNK_SIZE"
+        );
+        ensure!(
+            chunk_count <= MAX_MPC_CHUNKS,
+            "MpcRound chunk_count exceeds MAX_MPC_CHUNKS"
+        );
+
+        // Sec-11 hardening: this peer's OWN prior chunks for this
+        // (session, round) must agree on `chunk_count` (a peer cannot
+        // silently change how many chunks it claims to be sending partway
+        // through), and their cumulative bytes plus this chunk must stay
+        // under MAX_MPC_ROUND_BYTES. Read only THIS peer's chunks (not the
+        // whole round) -- cheaper, and all that either check needs.
+        let existing_peer_chunks: Vec<(MpcRoundChunkKey, MpcRoundChunk)> = dbtx
+            .find_by_prefix(&MpcRoundChunkSessionRoundPeerPrefix(
+                session_id, round, peer_id,
+            ))
+            .await
+            .collect()
+            .await;
+        let mut stored_bytes: usize = 0;
+        for (_, existing) in &existing_peer_chunks {
+            ensure!(
+                existing.count == chunk_count,
+                "MpcRound chunk_count inconsistent with prior chunks from this peer"
+            );
+            stored_bytes = stored_bytes.saturating_add(existing.bytes.len());
+        }
+        ensure!(
+            stored_bytes.saturating_add(payload.len()) <= MAX_MPC_ROUND_BYTES,
+            "MpcRound cumulative bytes exceed MAX_MPC_ROUND_BYTES"
         );
 
         // Redundancy guard (unbounded-history rule): a repeat chunk for the
@@ -3569,27 +3611,67 @@ impl Usdt {
             // Guardian-LOCAL, signer-only: reassemble each signer's full
             // payload and feed it to this guardian's off-thread state machine;
             // if it then finishes, stash the assembled signature. Never touches
-            // the consensus DB or the `Ok`/`Err` decision.
+            // the consensus DB or the `Ok`/`Err` decision -- so a problem here
+            // must be handled by skipping the local submission, NOT by
+            // returning `Err` (that would roll back this transaction's
+            // already-committed, deterministic round-advance write above and
+            // desync this guardian's DB from a non-signer's).
             if session.signers.contains(&self.our_peer_id) {
-                let mut payloads = Vec::with_capacity(signers.len());
-                for peer in &signers {
-                    let peer_chunks = chunks_by_peer
-                        .get(peer)
-                        .expect("every signer was just confirmed complete");
-                    let mut reassembled = Vec::new();
-                    for idx in 0..u16::try_from(peer_chunks.len()).expect("chunk count fits in u16")
-                    {
-                        reassembled.extend_from_slice(
-                            &peer_chunks
-                                .get(&idx)
-                                .expect("chunks 0..len were just confirmed present")
-                                .bytes,
-                        );
+                // Sec-11 defense in depth: insert-time per-peer byte caps
+                // already make this unreachable, but pre-compute each
+                // signer's total reassembled length and refuse to allocate
+                // if one ever exceeds MAX_MPC_ROUND_BYTES anyway, rather than
+                // trusting stored chunk metadata blindly.
+                let peer_totals: BTreeMap<PeerId, usize> = signers
+                    .iter()
+                    .map(|peer| {
+                        let peer_chunks = chunks_by_peer
+                            .get(peer)
+                            .expect("every signer was just confirmed complete");
+                        (
+                            *peer,
+                            peer_chunks.values().map(|c| c.bytes.len()).sum::<usize>(),
+                        )
+                    })
+                    .collect();
+
+                if let Some((oversized_peer, total_len)) = peer_totals
+                    .iter()
+                    .map(|(&peer, &total_len)| (peer, total_len))
+                    .find(|&(_, total_len)| total_len > MAX_MPC_ROUND_BYTES)
+                {
+                    warn!(
+                        target: "usdt",
+                        ?session_id,
+                        round = advanced.round,
+                        peer = ?oversized_peer,
+                        total_len,
+                        "reassembled MpcRound payload exceeds MAX_MPC_ROUND_BYTES; skipping \
+                         local signer submission for this round (insert-time caps should make \
+                         this unreachable)"
+                    );
+                } else {
+                    let mut payloads = Vec::with_capacity(signers.len());
+                    for peer in &signers {
+                        let peer_chunks = chunks_by_peer
+                            .get(peer)
+                            .expect("every signer was just confirmed complete");
+                        let mut reassembled = Vec::with_capacity(peer_totals[peer]);
+                        for idx in
+                            0..u16::try_from(peer_chunks.len()).expect("chunk count fits in u16")
+                        {
+                            reassembled.extend_from_slice(
+                                &peer_chunks
+                                    .get(&idx)
+                                    .expect("chunks 0..len were just confirmed present")
+                                    .bytes,
+                            );
+                        }
+                        payloads.push(reassembled);
                     }
-                    payloads.push(reassembled);
+                    self.advance_local_signer(session_id, advanced.round, payloads)
+                        .await;
                 }
-                self.advance_local_signer(session_id, advanced.round, payloads)
-                    .await;
             }
         }
 
@@ -3639,6 +3721,13 @@ impl Usdt {
         let mut failed = session.clone();
         failed.state = SessionState::Failed;
         dbtx.insert_entry(&SigningSessionKey(session_id), &failed)
+            .await;
+
+        // Sec-11 hardening: a failed attempt's `MpcRoundChunk` records serve
+        // no further purpose -- GC them all (every round, every peer) in one
+        // sweep so they don't linger in the consensus DB across attempts.
+        // Deterministic: every guardian sweeps the identical prefix.
+        dbtx.remove_by_prefix(&MpcRoundChunkSessionPrefix(session_id))
             .await;
 
         self.start_session(dbtx, session.purpose, session.digest, session.attempt + 1)
@@ -3767,6 +3856,15 @@ impl Usdt {
         )
         .await;
         dbtx.remove_entry(&PendingUserOpKey(op_hash)).await;
+
+        // Sec-11 hardening: this session is now Completed and its chunks
+        // will never be read again -- GC them all (every round, every peer)
+        // in one sweep, mirroring `process_rotate_signing`'s GC of a
+        // failed attempt's chunks. Deterministic: every guardian sweeps the
+        // identical prefix.
+        dbtx.remove_by_prefix(&MpcRoundChunkSessionPrefix(session_id))
+            .await;
+
         info!(
             target: "usdt",
             ?op_hash,
@@ -5240,7 +5338,9 @@ mod tests {
     /// guardian sees identically. This test proves exactly that: honest
     /// peers 0 and 1 complete round 0 normally (their chunks are stored and
     /// independently verified complete), the Byzantine peer 2 sends a
-    /// single chunk claiming `chunk_count = 250` and stops there, the round
+    /// single chunk claiming `chunk_count = 5` (comfortably under
+    /// `MAX_MPC_CHUNKS`, sec-11's cap on a syntactically well-formed but
+    /// hostile count -- see [`MAX_MPC_CHUNKS`]) and stops there, the round
     /// consequently never advances (`signers.iter().all(peer_complete)`
     /// requires ALL signers, honest or not), and the resulting stall
     /// recovers via the same generic timeout+rotation path proven above --
@@ -5324,20 +5424,22 @@ mod tests {
             ),
         ];
         // The BYZANTINE signer (peer 2, a genuine member of attempt 0's
-        // subset) sends exactly one chunk claiming a wildly inconsistent
-        // `chunk_count` of 250, then withholds the rest -- this is a
-        // self-inflicted stall (`0..250` can never all be present), not a
+        // subset) sends exactly one chunk claiming an inconsistent
+        // `chunk_count` of 5, then withholds the rest -- this is a
+        // self-inflicted stall (`0..5` can never all be present), not a
         // crash or a consensus-divergence: `process_mpc_round`'s explicit
-        // range check (`chunk_count >= 1 && chunk < chunk_count`) accepts
-        // this item as well-formed (0 < 250), exactly as it must accept any
-        // syntactically valid but semantically hostile chunk count.
+        // range check (`chunk_count >= 1 && chunk < chunk_count`) and sec-11's
+        // `chunk_count <= MAX_MPC_CHUNKS` cap both accept this item as
+        // well-formed (0 < 5 <= MAX_MPC_CHUNKS), exactly as they must accept
+        // any syntactically valid but semantically hostile chunk count that
+        // stays within the federation-wide cap.
         let byzantine_item = (
             PeerId::from(2),
             MpcRoundItem {
                 session_id: attempt0_id,
                 round: 0,
                 chunk: 0,
-                chunk_count: 250,
+                chunk_count: 5,
                 payload: vec![0xCC],
             },
         );
@@ -5377,7 +5479,7 @@ mod tests {
         }
 
         // ...but the round never advances, on every guardian identically:
-        // the Byzantine peer's declared 250 chunks are never all present, so
+        // the Byzantine peer's declared 5 chunks are never all present, so
         // `signers.iter().all(peer_complete)` is false federation-wide, even
         // though 2 of 3 signers are individually complete.
         for &peer in &peers {
@@ -7301,6 +7403,690 @@ mod tests {
              itself is genuinely valid: {:?}",
             session.state
         );
+    }
+
+    /// Sec-11 hardening: `process_mpc_round` must reject, BEFORE persisting
+    /// anything, any chunk that violates the receive-side bounds a Byzantine
+    /// selected signer could otherwise abuse (unbounded chunk size, chunk
+    /// count, or a `chunk_count` that changes mid-stream for the same peer).
+    /// Driven directly via `process_consensus_item` against a real
+    /// `InProgress` `SigningSession` the peer is a member of (mirrors
+    /// `timed_out_detects_stalled_session_via_consensus_block_count`'s
+    /// synthetic-session-construction style; a full cggmp21 run is not
+    /// needed to exercise these purely-DB-and-item-shaped guards).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mpc_round_rejects_oversized_and_inconsistent_chunks() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let session_id = signing_session_id(&[42; 32], 0);
+        let session = SigningSession {
+            purpose: SigningPurpose::UserOp([42; 32]),
+            digest: [42; 32],
+            signers: vec![PeerId::from(0), PeerId::from(1), PeerId::from(2)],
+            round: 0,
+            state: SessionState::InProgress,
+            attempt: 0,
+            last_progress_block: 0,
+        };
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(&SigningSessionKey(session_id), &session)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // (a) A chunk whose payload exceeds `MPC_ROUND_CHUNK_SIZE` is
+        // rejected, and nothing is persisted for it.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let item = MpcRoundItem {
+                session_id,
+                round: 0,
+                chunk: 0,
+                chunk_count: 1,
+                payload: vec![0u8; MPC_ROUND_CHUNK_SIZE + 1],
+            };
+            let err = module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::MpcRound(item),
+                    PeerId::from(1),
+                )
+                .await
+                .expect_err("an oversized chunk payload must be rejected");
+            dbtx.commit_tx().await;
+            assert!(
+                err.to_string().contains("MPC_ROUND_CHUNK_SIZE"),
+                "unexpected error: {err}"
+            );
+
+            let mut dbtx = db.begin_transaction_nc().await;
+            assert!(
+                dbtx.to_ref_nc()
+                    .find_by_prefix(&MpcRoundChunkSessionRoundPeerPrefix(
+                        session_id,
+                        0,
+                        PeerId::from(1)
+                    ))
+                    .await
+                    .collect::<Vec<_>>()
+                    .await
+                    .is_empty(),
+                "a rejected oversized chunk must not be persisted"
+            );
+        }
+
+        // (b) A peer's first chunk fixes its `chunk_count`; a later chunk
+        // from the SAME peer for the SAME round with a DIFFERENT
+        // `chunk_count` is rejected, even though it is individually
+        // well-formed.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let first = MpcRoundItem {
+                session_id,
+                round: 0,
+                chunk: 0,
+                chunk_count: 2,
+                payload: vec![1, 2, 3],
+            };
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::MpcRound(first),
+                    PeerId::from(0),
+                )
+                .await
+                .expect("the first, well-formed chunk from peer 0 must be accepted");
+            dbtx.commit_tx().await;
+
+            let mut dbtx = db.begin_transaction().await;
+            let inconsistent = MpcRoundItem {
+                session_id,
+                round: 0,
+                chunk: 1,
+                chunk_count: 3,
+                payload: vec![4, 5, 6],
+            };
+            let err = module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::MpcRound(inconsistent),
+                    PeerId::from(0),
+                )
+                .await
+                .expect_err(
+                    "a chunk_count that differs from this peer's prior chunks must be rejected",
+                );
+            dbtx.commit_tx().await;
+            assert!(
+                err.to_string().contains("chunk_count inconsistent"),
+                "unexpected error: {err}"
+            );
+        }
+
+        // (c) `chunk_count` above `MAX_MPC_CHUNKS` is rejected outright, even
+        // as a peer's very first chunk.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let item = MpcRoundItem {
+                session_id,
+                round: 0,
+                chunk: 0,
+                chunk_count: MAX_MPC_CHUNKS + 1,
+                payload: Vec::new(),
+            };
+            let err = module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::MpcRound(item),
+                    PeerId::from(2),
+                )
+                .await
+                .expect_err("a chunk_count above MAX_MPC_CHUNKS must be rejected");
+            dbtx.commit_tx().await;
+            assert!(
+                err.to_string().contains("MAX_MPC_CHUNKS"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// Sec-11 hardening: a `(session, round, peer)`'s cumulative stored bytes
+    /// (across ALL of that peer's individually-`MPC_ROUND_CHUNK_SIZE`-sized
+    /// chunks) must never be allowed to exceed `MAX_MPC_ROUND_BYTES`, even
+    /// though `MAX_MPC_CHUNKS` alone would otherwise permit it (chunks need
+    /// not be maximally sized).
+    #[tokio::test]
+    async fn mpc_round_rejects_cumulative_bytes_beyond_max_round_bytes() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let session_id = signing_session_id(&[43; 32], 0);
+        let session = SigningSession {
+            purpose: SigningPurpose::UserOp([43; 32]),
+            digest: [43; 32],
+            signers: vec![PeerId::from(0), PeerId::from(1), PeerId::from(2)],
+            round: 0,
+            state: SessionState::InProgress,
+            attempt: 0,
+            last_progress_block: 0,
+        };
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(&SigningSessionKey(session_id), &session)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // A `chunk_count` large enough that MAX_MPC_CHUNKS alone would allow
+        // it, but each chunk sized so the running total blows past
+        // `MAX_MPC_ROUND_BYTES` well before `chunk_count` chunks are sent.
+        let per_chunk = MPC_ROUND_CHUNK_SIZE;
+        let chunk_count = MAX_MPC_CHUNKS;
+        let chunks_until_over_budget =
+            u16::try_from(MAX_MPC_ROUND_BYTES / per_chunk + 1).expect("fits in u16");
+        assert!(
+            chunks_until_over_budget <= chunk_count,
+            "test assumption: the budget must be exhausted before chunk_count chunks arrive"
+        );
+
+        for chunk in 0..chunks_until_over_budget {
+            let mut dbtx = db.begin_transaction().await;
+            let item = MpcRoundItem {
+                session_id,
+                round: 0,
+                chunk,
+                chunk_count,
+                payload: vec![0u8; per_chunk],
+            };
+            let result = module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::MpcRound(item),
+                    PeerId::from(1),
+                )
+                .await;
+            dbtx.commit_tx().await;
+
+            if chunk + 1 == chunks_until_over_budget {
+                let err = result.expect_err(
+                    "the chunk that pushes cumulative bytes past MAX_MPC_ROUND_BYTES must be rejected",
+                );
+                assert!(
+                    err.to_string().contains("MAX_MPC_ROUND_BYTES"),
+                    "unexpected error: {err}"
+                );
+            } else {
+                result.expect("chunks within the byte budget must be accepted");
+            }
+        }
+    }
+
+    /// Sec-11 hardening: finished (completed or failed/rotated) signing
+    /// attempts must not leave their `MpcRoundChunk` records behind in the
+    /// consensus DB. Drives a real `MpcRound` signing loop (mirrors
+    /// `mpc_round_consensus_drives_signing_to_completion`) so genuine chunks
+    /// exist to be GC'd, then exercises BOTH GC triggers: a timed-out
+    /// session's chunks are swept by `process_rotate_signing`, and a
+    /// completed session's chunks are swept by `process_mpc_signature`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn mpc_chunks_are_gced_on_rotate_and_complete() {
+        use sha2::{Digest as _, Sha256};
+
+        const N: u16 = 4;
+        let peers: Vec<PeerId> = (0..N).map(PeerId::from).collect();
+        let num_peers = peers.to_num_peers();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(
+            &peers,
+            &args,
+            &fedimint_usdt_common::UsdtGenParams::default(),
+        );
+
+        let mut modules: BTreeMap<PeerId, Usdt> = BTreeMap::new();
+        for &peer in &peers {
+            let cfg = server_cfgs[&peer]
+                .clone()
+                .to_typed::<UsdtConfig>()
+                .expect("config was just generated by the same configgen");
+            let db = fedimint_core::db::Database::new(
+                fedimint_core::db::mem_impl::MemDatabase::new(),
+                fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+            );
+            modules.insert(
+                peer,
+                Usdt::new_for_test(cfg, MockEvmRpc::default().into_dyn(), db, peer, num_peers),
+            );
+        }
+
+        // --- Scenario 1: rotate-on-timeout GC. --------------------------
+        let digest_a: [u8; 32] = Sha256::digest(b"usdt sec-11 gc test session A").into();
+        let op_hash_a: [u8; 32] = Sha256::digest(b"usdt sec-11 gc test session A op_hash").into();
+        let session_id_a = fedimint_usdt_common::signing_session_id(&digest_a, 0);
+        let purpose_a = SigningPurpose::UserOp(op_hash_a);
+
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .start_session(&mut dbtx.to_ref_nc(), purpose_a.clone(), digest_a, 0)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Drive round 0's real MpcRound chunk exchange so genuine chunks
+        // land in the DB, without waiting for full completion.
+        {
+            let mut proposed: Vec<(PeerId, MpcRoundItem)> = Vec::new();
+            for (&peer, module) in &modules {
+                let mut dbtx = module.db_for_test().begin_transaction().await;
+                let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+                dbtx.commit_tx().await;
+                for item in items {
+                    if let UsdtConsensusItem::MpcRound(mpc) = item
+                        && mpc.session_id == session_id_a
+                    {
+                        proposed.push((peer, mpc));
+                    }
+                }
+            }
+            assert!(
+                !proposed.is_empty(),
+                "round 0 must produce at least one MpcRound chunk to GC"
+            );
+            for (proposer, item) in &proposed {
+                for module in modules.values() {
+                    let mut dbtx = module.db_for_test().begin_transaction().await;
+                    module
+                        .process_consensus_item(
+                            &mut dbtx.to_ref_nc(),
+                            UsdtConsensusItem::MpcRound(item.clone()),
+                            *proposer,
+                        )
+                        .await
+                        .expect("every genuinely-proposed MpcRound item must process cleanly");
+                    dbtx.commit_tx().await;
+                }
+            }
+        }
+
+        // Sanity: chunks for session A are genuinely present before rotation.
+        {
+            let mut dbtx = modules[&peers[0]]
+                .db_for_test()
+                .begin_transaction_nc()
+                .await;
+            let before: Vec<_> = dbtx
+                .to_ref_nc()
+                .find_by_prefix(&MpcRoundChunkSessionPrefix(session_id_a))
+                .await
+                .collect()
+                .await;
+            assert!(
+                !before.is_empty(),
+                "sanity: session A must have stored chunks before GC"
+            );
+        }
+
+        // Push every guardian's block count far enough past the timeout
+        // threshold that `RotateSigning` is accepted, then process it on
+        // every guardian (as ordered consensus would).
+        for module in modules.values() {
+            let db = module.db_for_test();
+            seed_block_count_votes(db, N, timeout_blocks() + 1).await;
+        }
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .process_rotate_signing(&mut dbtx.to_ref_nc(), session_id_a)
+                .await
+                .expect("the timed-out session must accept RotateSigning");
+            dbtx.commit_tx().await;
+        }
+
+        for &peer in &peers {
+            let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
+            let remaining: Vec<_> = dbtx
+                .to_ref_nc()
+                .find_by_prefix(&MpcRoundChunkSessionPrefix(session_id_a))
+                .await
+                .collect()
+                .await;
+            assert!(
+                remaining.is_empty(),
+                "guardian {peer}: rotating a timed-out session must GC ALL of its chunks, \
+                 found {remaining:?}"
+            );
+        }
+
+        // --- Scenario 2: complete-on-signature GC. -----------------------
+        let digest_b: [u8; 32] = Sha256::digest(b"usdt sec-11 gc test session B").into();
+        let op_hash_b: [u8; 32] = Sha256::digest(b"usdt sec-11 gc test session B op_hash").into();
+        let session_id_b = fedimint_usdt_common::signing_session_id(&digest_b, 0);
+        let purpose_b = SigningPurpose::UserOp(op_hash_b);
+
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PendingUserOpKey(op_hash_b),
+                &PendingUserOp {
+                    op: sample_unsigned_user_op_for_test(),
+                    purpose: UserOpPurpose::DeployAndSweep {
+                        source: EvmAddress([0x72; 20]),
+                    },
+                    created_block: 0,
+                },
+            )
+            .await;
+            module
+                .start_session(&mut dbtx.to_ref_nc(), purpose_b.clone(), digest_b, 0)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut consensus_rounds = 0u32;
+        let mut captured_mpc_signature: Option<(PeerId, UsdtConsensusItem)> = None;
+        loop {
+            let mut proposed: Vec<(PeerId, MpcRoundItem)> = Vec::new();
+            for (&peer, module) in &modules {
+                let mut dbtx = module.db_for_test().begin_transaction().await;
+                let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+                dbtx.commit_tx().await;
+                for item in items {
+                    match item {
+                        UsdtConsensusItem::MpcRound(mpc) if mpc.session_id == session_id_b => {
+                            proposed.push((peer, mpc));
+                        }
+                        UsdtConsensusItem::MpcSignature {
+                            session_id: sid, ..
+                        } if sid == session_id_b && captured_mpc_signature.is_none() => {
+                            captured_mpc_signature = Some((peer, item));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if proposed.is_empty() {
+                break;
+            }
+
+            proposed.sort_by(|(a, ia), (b, ib)| {
+                (a, ia.session_id.0, ia.round, ia.chunk).cmp(&(
+                    b,
+                    ib.session_id.0,
+                    ib.round,
+                    ib.chunk,
+                ))
+            });
+
+            for (proposer, item) in &proposed {
+                for module in modules.values() {
+                    let mut dbtx = module.db_for_test().begin_transaction().await;
+                    module
+                        .process_consensus_item(
+                            &mut dbtx.to_ref_nc(),
+                            UsdtConsensusItem::MpcRound(item.clone()),
+                            *proposer,
+                        )
+                        .await
+                        .expect("every proposed MpcRound item must process cleanly");
+                    dbtx.commit_tx().await;
+                }
+            }
+
+            consensus_rounds += 1;
+            assert!(consensus_rounds < 1_000, "signing failed to converge");
+        }
+
+        let (proposer_peer, mpc_signature_item) =
+            captured_mpc_signature.expect("a finished signer must propose an MpcSignature item");
+
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    mpc_signature_item.clone(),
+                    proposer_peer,
+                )
+                .await
+                .expect("MpcSignature must process cleanly on every guardian");
+            dbtx.commit_tx().await;
+        }
+
+        for &peer in &peers {
+            let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
+            let remaining: Vec<_> = dbtx
+                .to_ref_nc()
+                .find_by_prefix(&MpcRoundChunkSessionPrefix(session_id_b))
+                .await
+                .collect()
+                .await;
+            assert!(
+                remaining.is_empty(),
+                "guardian {peer}: completing a session must GC ALL of its chunks, found \
+                 {remaining:?}"
+            );
+        }
+    }
+
+    /// Sec-11 drift guard (misc #21): pins `MAX_MPC_ROUND_BYTES` against the
+    /// actual size of REAL cggmp21 signing rounds over the two real
+    /// production-shaped payloads this module ever signs -- a
+    /// deploy-and-sweep `UserOp` and a 20-item withdrawal-batch `UserOp`,
+    /// built with the SAME builders/hashing `Usdt::maybe_trigger_sweep`/
+    /// `Usdt::build_and_enqueue_withdrawal_batch` use in production. If this
+    /// test ever fails, `MAX_MPC_ROUND_BYTES` is too small for reality and
+    /// must be RAISED (with an updated doc comment explaining why), not this
+    /// test loosened.
+    ///
+    /// Threshold-ECDSA signs a fixed-size 32-byte digest, so in principle
+    /// the round-message sizes should be identical regardless of what
+    /// produced that digest -- this test exists to catch a future change
+    /// (larger party count, protocol upgrade, etc.) that breaks that
+    /// assumption for either of this module's two real op shapes, not
+    /// because the two are expected to differ from each other today.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn real_signing_round_fits_chunk_budget() {
+        const N: u16 = 4;
+        let peers: Vec<PeerId> = (0..N).map(PeerId::from).collect();
+        let num_peers = peers.to_num_peers();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(
+            &peers,
+            &args,
+            &fedimint_usdt_common::UsdtGenParams::default(),
+        );
+
+        let mut modules: BTreeMap<PeerId, Usdt> = BTreeMap::new();
+        for &peer in &peers {
+            let cfg = server_cfgs[&peer]
+                .clone()
+                .to_typed::<UsdtConfig>()
+                .expect("config was just generated by the same configgen");
+            let db = fedimint_core::db::Database::new(
+                fedimint_core::db::mem_impl::MemDatabase::new(),
+                fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+            );
+            modules.insert(
+                peer,
+                Usdt::new_for_test(cfg, MockEvmRpc::default().into_dyn(), db, peer, num_peers),
+            );
+        }
+
+        let cfg0 = server_cfgs[&peers[0]]
+            .clone()
+            .to_typed::<UsdtConfig>()
+            .expect("valid config");
+        let entry_point = cfg0.consensus.entry_point;
+        let chain_id = cfg0.consensus.chain_id;
+        let account_factory = cfg0.consensus.account_factory;
+        let usdt_contract = cfg0.consensus.usdt_contract;
+        let simple_account_impl = cfg0.consensus.simple_account_impl;
+        let pool = derive_pool_account(
+            &cfg0.consensus.group_public_key,
+            account_factory,
+            simple_account_impl,
+        );
+        let owner = evm_address(&cfg0.consensus.group_public_key);
+
+        let claim_secret =
+            secp256k1::SecretKey::from_slice(&[0x33; 32]).expect("nonzero byte is a valid scalar");
+        let claim_pk = claim_secret.public_key(secp256k1::SECP256K1);
+        let deposit_account = derive_deposit_account(
+            &cfg0.consensus.group_public_key,
+            account_factory,
+            simple_account_impl,
+            &claim_pk,
+        );
+
+        // A real deploy-and-sweep sweep op, built exactly as
+        // `Usdt::maybe_trigger_sweep` builds it in production.
+        let deploy_and_sweep_op =
+            crate::user_op::build_deploy_and_sweep_userop(DeployAndSweepParams {
+                account_factory,
+                usdt_contract,
+                deposit_account,
+                owner,
+                claim_pk,
+                amount: UsdtAmount(1_500_000),
+                pool,
+                nonce: alloy::primitives::U256::ZERO,
+                needs_deploy: true,
+                paymaster_and_data: Vec::new(),
+                gas_bounds: GasBounds::DEPLOY_AND_SWEEP_DEVNET,
+            });
+
+        // A real 20-item withdrawal-batch op, built exactly as
+        // `Usdt::build_and_enqueue_withdrawal_batch` builds it in
+        // production.
+        let withdrawals: Vec<(fedimint_usdt_common::EvmAddress, UsdtAmount)> = (0u8..20)
+            .map(|i| (EvmAddress([i; 20]), UsdtAmount(1_000_000 + u64::from(i))))
+            .collect();
+        let withdrawal_batch_op =
+            crate::user_op::build_withdrawal_batch_userop(WithdrawalBatchParams {
+                account_factory,
+                usdt_contract,
+                pool,
+                owner,
+                withdrawals,
+                nonce: alloy::primitives::U256::from(3u64),
+                needs_deploy: false,
+                paymaster_and_data: Vec::new(),
+                gas_bounds: GasBounds::withdrawal_batch(20, false),
+            });
+
+        for (label, op) in [
+            ("deploy-and-sweep", deploy_and_sweep_op),
+            ("20-item withdrawal-batch", withdrawal_batch_op),
+        ] {
+            let op_hash = user_op_hash(&op, entry_point, chain_id);
+            let digest = eth_signed_message_hash(op_hash);
+            let session_id = signing_session_id(&digest, 0);
+            let purpose = SigningPurpose::UserOp(op_hash);
+
+            for module in modules.values() {
+                let mut dbtx = module.db_for_test().begin_transaction().await;
+                module
+                    .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest, 0)
+                    .await;
+                dbtx.commit_tx().await;
+            }
+
+            let mut consensus_rounds = 0u32;
+            loop {
+                let mut proposed: Vec<(PeerId, MpcRoundItem)> = Vec::new();
+                for (&peer, module) in &modules {
+                    let mut dbtx = module.db_for_test().begin_transaction().await;
+                    let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+                    dbtx.commit_tx().await;
+                    for item in items {
+                        if let UsdtConsensusItem::MpcRound(mpc) = item
+                            && mpc.session_id == session_id
+                        {
+                            proposed.push((peer, mpc));
+                        }
+                    }
+                }
+
+                if proposed.is_empty() {
+                    break;
+                }
+
+                proposed.sort_by(|(a, ia), (b, ib)| {
+                    (a, ia.session_id.0, ia.round, ia.chunk).cmp(&(
+                        b,
+                        ib.session_id.0,
+                        ib.round,
+                        ib.chunk,
+                    ))
+                });
+
+                for (proposer, item) in &proposed {
+                    for module in modules.values() {
+                        let mut dbtx = module.db_for_test().begin_transaction().await;
+                        module
+                            .process_consensus_item(
+                                &mut dbtx.to_ref_nc(),
+                                UsdtConsensusItem::MpcRound(item.clone()),
+                                *proposer,
+                            )
+                            .await
+                            .expect("every proposed MpcRound item must process cleanly");
+                        dbtx.commit_tx().await;
+                    }
+                }
+
+                consensus_rounds += 1;
+                assert!(consensus_rounds < 1_000, "signing failed to converge");
+            }
+            assert!(
+                consensus_rounds >= 1,
+                "{label}: signing must have taken at least one consensus round"
+            );
+
+            // Every round's every peer's reassembled payload (summed across
+            // that peer's chunks) must fit under MAX_MPC_ROUND_BYTES -- read
+            // straight from one guardian's consensus DB, before any GC has a
+            // chance to run (this test never processes an MpcSignature/
+            // RotateSigning item).
+            let mut per_peer_round_bytes: BTreeMap<(u16, PeerId), usize> = BTreeMap::new();
+            let mut dbtx = modules[&peers[0]]
+                .db_for_test()
+                .begin_transaction_nc()
+                .await;
+            let all_chunks: Vec<(MpcRoundChunkKey, MpcRoundChunk)> = dbtx
+                .to_ref_nc()
+                .find_by_prefix(&MpcRoundChunkSessionPrefix(session_id))
+                .await
+                .collect()
+                .await;
+            assert!(
+                !all_chunks.is_empty(),
+                "{label}: at least one chunk must have been stored"
+            );
+            for (MpcRoundChunkKey(_, round, peer, _), value) in all_chunks {
+                *per_peer_round_bytes.entry((round, peer)).or_insert(0) += value.bytes.len();
+            }
+
+            let max_bytes = per_peer_round_bytes.values().copied().max().unwrap_or(0);
+            assert!(
+                max_bytes <= MAX_MPC_ROUND_BYTES,
+                "{label}: a real signing round's max per-peer reassembled payload ({max_bytes} \
+                 bytes) exceeds MAX_MPC_ROUND_BYTES ({MAX_MPC_ROUND_BYTES} bytes) -- raise the \
+                 constant to match reality"
+            );
+        }
     }
 
     /// Phase 7 Task 4: `MockEvmRpc::submit_user_ops`/`get_user_op_receipt`

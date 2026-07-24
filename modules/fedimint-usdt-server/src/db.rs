@@ -291,16 +291,25 @@ pub struct MpcRoundChunk {
 }
 
 /// One chunk of one peer's payload for a single round of a signing session,
-/// keyed `(session, round, peer, chunk)`. The field order makes all three of
-/// [`MpcRoundChunkPrefix`], [`MpcRoundChunkSessionRoundPrefix`], and
+/// keyed `(session, round, peer, chunk)`. The field order makes all four of
+/// [`MpcRoundChunkPrefix`], [`MpcRoundChunkSessionPrefix`],
+/// [`MpcRoundChunkSessionRoundPrefix`], and
 /// [`MpcRoundChunkSessionRoundPeerPrefix`] valid byte-prefixes (mirroring
 /// [`DepositObservationVoteKey`]'s dual-prefix pattern, extended to a
-/// three-level prefix hierarchy).
+/// four-level prefix hierarchy).
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash)]
 pub struct MpcRoundChunkKey(pub SigningSessionId, pub u16, pub PeerId, pub u16);
 
 #[derive(Debug, Clone, Encodable, Decodable)]
 pub struct MpcRoundChunkPrefix;
+
+/// Every round's every peer's every chunk for one session (security finding
+/// 11's GC hook): `process_rotate_signing` and `process_mpc_signature`
+/// `remove_by_prefix` this once their session fails/completes, so a finished
+/// or abandoned signing attempt's chunk records never linger in the
+/// consensus DB.
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct MpcRoundChunkSessionPrefix(pub SigningSessionId);
 
 /// Every peer's every chunk for one session's round.
 #[derive(Debug, Clone, Encodable, Decodable)]
@@ -318,6 +327,7 @@ impl_db_record!(
 impl_db_lookup!(
     key = MpcRoundChunkKey,
     query_prefix = MpcRoundChunkPrefix,
+    query_prefix = MpcRoundChunkSessionPrefix,
     query_prefix = MpcRoundChunkSessionRoundPrefix,
     query_prefix = MpcRoundChunkSessionRoundPeerPrefix,
 );
@@ -838,6 +848,17 @@ mod tests {
                 .iter()
                 .all(|(key, _)| key.0 == id && key.1 == 2 && key.2 == PeerId::from(0))
         );
+
+        // The whole-session prefix (all rounds, all peers) sees all 4 chunks
+        // inserted above -- this is what GC on rotate/complete sweeps in one
+        // shot.
+        let all_session_chunks: Vec<_> = dbtx
+            .find_by_prefix(&MpcRoundChunkSessionPrefix(id))
+            .await
+            .collect()
+            .await;
+        assert_eq!(all_session_chunks.len(), 4);
+        assert!(all_session_chunks.iter().all(|(key, _)| key.0 == id));
     }
 
     fn sample_unsigned_user_op() -> UnsignedUserOp {
