@@ -362,6 +362,22 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
     let usdt_contract = EvmAddress([0u8; 20]);
     mock.set_chain_id(31337);
     mock.set_block_number(100);
+    // Security finding 02 (Task 4.3): `maybe_trigger_sweep` now defers any
+    // sweep until it can price `deposit_fee_quote`, which requires a fresh,
+    // *sane* `FeeVote` median (`fee_vote_in_sane_range` rejects the
+    // `MockEvmRpc` default all-zero reading outright, so without this the
+    // fee-estimate poller's vote would never even be accepted into
+    // consensus). Script a low (but sane, non-zero) estimate up front so the
+    // guardians' pollers converge on a median well before the deposit below
+    // is credited; low enough that its `deposit_fee_quote` stays well under
+    // `deposit_amount` (a high gas price here would make this
+    // otherwise-ordinary deposit dust under the finding-02 gate, which is
+    // not what this test is about).
+    let scripted_fee = FeeVote {
+        max_fee_per_gas_wei: 100_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
 
     let fed = dual_mint_fixtures(mock.clone())
         .new_fed_builder(0)
@@ -389,6 +405,24 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
         usdt.config().simple_account_impl,
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+
+    // 1a. Wait for the scripted `FeeVote` to actually converge to a fresh
+    //     median before crediting the deposit below -- nothing re-triggers a
+    //     sweep for an account that only ever received a single credit, so
+    //     crediting before a median exists would strand this deposit
+    //     un-swept for the rest of the test. `deposit_fee_quote` itself
+    //     `Err`s (not a placeholder `Ok`) until a median is available, so
+    //     this retries past the `Err`, not just a zero `Ok`.
+    let fee_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if matches!(usdt.deposit_fee_quote().await, Ok(quote) if quote.fee.0 > 0) {
+            break;
+        }
+        if Instant::now() >= fee_deadline {
+            bail!("deposit_fee_quote never converged to a nonzero quote before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
 
     // 1. Allocate + fund a deposit; wait for it to be credited.
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
