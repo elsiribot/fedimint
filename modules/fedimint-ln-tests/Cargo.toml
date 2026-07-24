@@ -7,10 +7,6 @@ name = "fedimint-ln-tests"
 publish = false
 version = { workspace = true }
 
-[[test]]
-name = "fedimint_ln_tests"
-path = "tests/tests.rs"
-
 [dependencies]
 anyhow = { workspace = true }
 bitcoin_hashes = { workspace = true }
@@ -37,6 +33,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
+
+[[test]]
+name = "fedimint_ln_tests"
+path = "tests/tests.rs"
 
 [lints]
 workspace = true

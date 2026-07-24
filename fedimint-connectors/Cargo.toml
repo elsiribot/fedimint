@@ -11,6 +11,10 @@ version = { workspace = true }
 [package.metadata.cargo-udeps.ignore]
 development = ["tokio-test"]
 
+[lib]
+name = "fedimint_connectors"
+path = "src/lib.rs"
+
 [features]
 tor = [
     "dep:strum",
@@ -20,10 +24,6 @@ tor = [
     "arti-client/rustls",
     "arti-client/onion-service-client",
 ]
-
-[lib]
-name = "fedimint_connectors"
-path = "src/lib.rs"
 
 [dependencies]
 anyhow = { workspace = true }

@@ -247,7 +247,7 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
         .context("failed to confirm EntryPoint.depositTo(deposit_account)")?;
 
     // Fund the deposit account with the NON-STANDARD USDT ONLY (no ETH). This
-    // drives `INonStandardUsdt::transfer` (void return) -- if alloy mis-handled
+    // drives `INonStandardUsdt::transfer` (void return) -- if alloy mishandled
     // the empty return, THIS call would already fail.
     let deposit_amount = UsdtAmount(4_000_000);
     common::transfer_nonstandard_from_account_1(

@@ -8,18 +8,13 @@ readme = { workspace = true }
 repository = { workspace = true }
 version = { workspace = true }
 
-[features]
-default = []
-unstable = []
-
 [lib]
 name = "tbs"
 path = "src/lib.rs"
 
-[[bench]]
-harness = false
-name = "tbs"
-path = "benches/tbs.rs"
+[features]
+default = []
+unstable = []
 
 [dependencies]
 bls12_381 = { workspace = true }
@@ -33,6 +28,11 @@ sha3 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+
+[[bench]]
+harness = false
+name = "tbs"
+path = "benches/tbs.rs"
 
 [lints]
 workspace = true

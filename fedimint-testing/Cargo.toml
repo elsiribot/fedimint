@@ -11,12 +11,12 @@ version = { workspace = true }
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "tokio_unstable"]
 
-[features]
-tor = ["fedimint-gateway-server/tor", "fedimint-gateway-common/tor"]
-
 [lib]
 name = "fedimint_testing"
 path = "src/lib.rs"
+
+[features]
+tor = ["fedimint-gateway-server/tor", "fedimint-gateway-common/tor"]
 
 [dependencies]
 anyhow = { workspace = true }
