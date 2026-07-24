@@ -1921,6 +1921,25 @@ mod fedimint_migration_tests {
                         ensure!(latch.is_some(), "HasEverBeenReady latch not read back");
                         info!("Validated HasEverBeenReady");
                     }
+                    DbKeyPrefix::WithdrawalBatchCap => {
+                        // Security finding 05 (poisoned-batch isolation): a
+                        // brand-new prefix added alongside this task, holding
+                        // only new `u32` data -- the v0 snapshot fixture
+                        // predates it and no migration writes to it, so it
+                        // must read back cleanly as EMPTY (not dropped/
+                        // rewritten, simply never populated pre-migration).
+                        let caps = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::WithdrawalBatchCapPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(
+                            caps.is_empty(),
+                            "WithdrawalBatchCap is a brand-new prefix; the pre-migration v0 \
+                             snapshot must not contain any rows for it"
+                        );
+                        info!("Validated WithdrawalBatchCap (new prefix, empty)");
+                    }
                 }
             }
 
