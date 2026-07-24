@@ -6,6 +6,7 @@ use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum_extra::extract::Form;
 use axum_extra::extract::cookie::CookieJar;
+use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
 use fedimint_core::core::ModuleKind;
 use fedimint_core::module::ApiAuth;
 use fedimint_server_core::setup_ui::DynSetupApi;
@@ -51,7 +52,7 @@ fn peer_list_section(
     federation_size: Option<u32>,
     cfg_federation_name: &Option<String>,
     cfg_base_fees_disabled: Option<bool>,
-    cfg_enabled_modules: &Option<BTreeSet<ModuleKind>>,
+    cfg_module_params: &Option<ServerModuleConfigGenParamsRegistry>,
     error: Option<&str>,
 ) -> Markup {
     let total_guardians = connected_peers.len() + 1;
@@ -87,7 +88,7 @@ fn peer_list_section(
                 @let has_settings = cfg_federation_name.is_some()
                     || federation_size.is_some()
                     || cfg_base_fees_disabled.is_some()
-                    || cfg_enabled_modules.is_some();
+                    || cfg_module_params.is_some();
 
                 form id="start-dkg-form" hx-post=(START_DKG_ROUTE) hx-target="#peer-list-section" hx-swap="outerHTML" {
                     @if let Some(error) = error {
@@ -107,9 +108,9 @@ fn peer_list_section(
                             " with base fees "
                             @if disabled { "disabled" } @else { "enabled" }
                         }
-                        @if let Some(modules) = cfg_enabled_modules {
+                        @if let Some(module_params) = cfg_module_params {
                             " and modules "
-                            (modules.iter().map(|m| m.as_str().to_owned()).collect::<Vec<_>>().join(", "))
+                            (module_params.kinds().iter().map(|m| m.as_str().to_owned()).collect::<Vec<_>>().join(", "))
                         }
                         "."
                     }
@@ -329,14 +330,23 @@ async fn setup_submit(
         None
     };
 
-    let enabled_modules = if input.is_lead {
-        let enabled: BTreeSet<ModuleKind> = input
+    // The setup form lets the leader select a set of module kinds via
+    // checkboxes. We materialize that selection into the module instance list
+    // (one instance per selected kind, carrying each module's default config gen
+    // params) by filtering the default params for all available modules. This
+    // preserves the canonical instance order and instance ids.
+    //
+    // NOTE: the current UI can only express a single instance per kind. Adding a
+    // second instance of the same kind (e.g. two mint instances) via the web UI
+    // is a follow-up; the instance list type already supports it.
+    let module_params = if input.is_lead {
+        let selected: BTreeSet<ModuleKind> = input
             .enabled_modules
             .into_iter()
             .map(|s| ModuleKind::clone_from_str(&s))
             .collect();
 
-        Some(enabled)
+        Some(state.api.available_module_params().select_kinds(&selected))
     } else {
         None
     };
@@ -372,7 +382,7 @@ async fn setup_submit(
             input.name,
             federation_name,
             disable_base_fees,
-            enabled_modules,
+            module_params,
             federation_size,
         )
         .await
@@ -435,7 +445,7 @@ async fn federation_setup(
     let federation_size = state.api.federation_size().await;
     let cfg_federation_name = state.api.cfg_federation_name().await;
     let cfg_base_fees_disabled = state.api.cfg_base_fees_disabled().await;
-    let cfg_enabled_modules = state.api.cfg_enabled_modules().await;
+    let cfg_module_params = state.api.cfg_module_params().await;
 
     let content = html! {
         p { "Share this with your fellow guardians." }
@@ -460,7 +470,7 @@ async fn federation_setup(
             (copiable_text(&our_connection_info))
         }
 
-        (peer_list_section(&connected_peers, federation_size, &cfg_federation_name, cfg_base_fees_disabled, &cfg_enabled_modules, None))
+        (peer_list_section(&connected_peers, federation_size, &cfg_federation_name, cfg_base_fees_disabled, &cfg_module_params, None))
 
         // QR Scanner Modal
         div class="modal fade" id="qrScannerModal" tabindex="-1" aria-labelledby="qrScannerModalLabel" aria-hidden="true" {
@@ -576,7 +586,7 @@ async fn post_add_setup_code(
     let federation_size = state.api.federation_size().await;
     let cfg_federation_name = state.api.cfg_federation_name().await;
     let cfg_base_fees_disabled = state.api.cfg_base_fees_disabled().await;
-    let cfg_enabled_modules = state.api.cfg_enabled_modules().await;
+    let cfg_module_params = state.api.cfg_module_params().await;
 
     Html(
         peer_list_section(
@@ -584,7 +594,7 @@ async fn post_add_setup_code(
             federation_size,
             &cfg_federation_name,
             cfg_base_fees_disabled,
-            &cfg_enabled_modules,
+            &cfg_module_params,
             error.as_ref().map(|e| e.to_string()).as_deref(),
         )
         .into_string(),
@@ -643,7 +653,7 @@ async fn post_start_dkg(
             let federation_size = state.api.federation_size().await;
             let cfg_federation_name = state.api.cfg_federation_name().await;
             let cfg_base_fees_disabled = state.api.cfg_base_fees_disabled().await;
-            let cfg_enabled_modules = state.api.cfg_enabled_modules().await;
+            let cfg_module_params = state.api.cfg_module_params().await;
 
             Html(
                 peer_list_section(
@@ -651,7 +661,7 @@ async fn post_start_dkg(
                     federation_size,
                     &cfg_federation_name,
                     cfg_base_fees_disabled,
-                    &cfg_enabled_modules,
+                    &cfg_module_params,
                     Some(&e.to_string()),
                 )
                 .into_string(),

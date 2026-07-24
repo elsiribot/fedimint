@@ -20,7 +20,11 @@ fn build_configs() -> (Vec<ServerModuleConfig>, ClientModuleConfig) {
         network: bitcoin::Network::Regtest,
         disable_base_fees: false,
     };
-    let mint_cfg = MintInit.trusted_dealer_gen(&peers, &args);
+    let mint_cfg = MintInit.trusted_dealer_gen(
+        &peers,
+        &args,
+        &fedimint_mint_common::config::MintGenParams::default(),
+    );
     let client_cfg = ClientModuleConfig::from_typed(
         0,
         MintInit::kind(),
@@ -32,6 +36,38 @@ fn build_configs() -> (Vec<ServerModuleConfig>, ClientModuleConfig) {
     .unwrap();
 
     (mint_cfg.into_values().collect(), client_cfg)
+}
+
+/// `trusted_dealer_gen` and `distributed_gen` must apply the same precedence
+/// between an explicit `params.fee_consensus()` and `disable_base_fees`.
+/// `disable_base_fees` is documented to be an override, so it must win even
+/// when the module params carry a non-zero `fee_consensus`.
+///
+/// `distributed_gen` requires a live P2P DKG harness to invoke end-to-end, so
+/// this test pins down `trusted_dealer_gen`'s behavior for the override case;
+/// the two code paths use byte-identical `fee_consensus` derivation logic.
+#[test_log::test]
+fn test_disable_base_fees_overrides_explicit_fee_consensus() {
+    let peers = (0..MINTS).map(PeerId::from).collect::<Vec<_>>();
+    let args = ConfigGenModuleArgs {
+        network: bitcoin::Network::Regtest,
+        disable_base_fees: true,
+    };
+    let non_zero_fee_consensus = FeeConsensus::new(1_000).expect("Relative fee is within range");
+    let params = fedimint_mint_common::config::MintGenParams::new(2, Some(non_zero_fee_consensus));
+
+    let mint_cfg = MintInit.trusted_dealer_gen(&peers, &args, &params);
+
+    for cfg in mint_cfg.values() {
+        assert_eq!(
+            cfg.to_typed::<MintConfig>()
+                .unwrap()
+                .consensus
+                .fee_consensus,
+            FeeConsensus::zero(),
+            "disable_base_fees must override an explicit non-zero fee_consensus"
+        );
+    }
 }
 
 #[test_log::test]

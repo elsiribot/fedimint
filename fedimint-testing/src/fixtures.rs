@@ -11,10 +11,12 @@ use fedimint_client::module_init::{
     ClientModuleInitRegistry, DynClientModuleInit, IClientModuleInit,
 };
 use fedimint_client::secret::RootSecretStrategy;
+use fedimint_core::config::ConfigGenModuleParams;
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::db::Database;
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::envs::BitcoinRpcConfig;
+use fedimint_core::module::serde_json;
 use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::util::SafeUrl;
 use fedimint_gateway_common::{ChainSource, LND_DEFAULT_TIME_PREF, LightningInfo, LightningMode};
@@ -29,6 +31,7 @@ use fedimint_server_bitcoin_rpc::esplora::EsploraClient;
 use fedimint_server_core::bitcoin_rpc::{DynServerBitcoinRpc, IServerBitcoinRpc};
 use fedimint_testing_core::test_dir;
 use rand::rngs::OsRng;
+use serde::Serialize;
 
 use crate::btc::BitcoinTest;
 use crate::btc::mock::FakeBitcoinTest;
@@ -54,6 +57,7 @@ pub struct Fixtures {
     fake_bitcoin_rpc: Option<DynBitcoindRpc>,
     server_bitcoin_rpc: DynServerBitcoinRpc,
     primary_module_kind: ModuleKind,
+    extra_module_instances: Vec<(ModuleKind, ConfigGenModuleParams)>,
 }
 
 impl Fixtures {
@@ -143,6 +147,7 @@ impl Fixtures {
             bitcoin,
             server_bitcoin_rpc: bitcoin_rpc_connection,
             primary_module_kind: IClientModuleInit::module_kind(&client),
+            extra_module_instances: Vec::new(),
         }
         .with_module(client, server)
     }
@@ -170,6 +175,24 @@ impl Fixtures {
         self
     }
 
+    /// Attach an extra instance of an already-registered module `kind`
+    /// (via [`Self::with_module`]/[`Self::new_primary`]), configured with its
+    /// own config-gen `params` rather than the module's default.
+    ///
+    /// Useful for standing up two instances of the same module kind with
+    /// different behavior, e.g. a second `mintv2` instance denominated in a
+    /// non-Bitcoin `AmountUnit` alongside the default Bitcoin mintv2
+    /// instance.
+    ///
+    /// # Panics
+    /// Panics if `params` cannot be serialized to JSON (a module bug).
+    pub fn with_extra_module_instance<T: Serialize>(mut self, kind: ModuleKind, params: T) -> Self {
+        let params = serde_json::to_value(params)
+            .unwrap_or_else(|err| panic!("Invalid config gen params for {kind}: {err}"));
+        self.extra_module_instances.push((kind, params));
+        self
+    }
+
     /// Starts a new federation with 3/4 peers online
     pub async fn new_fed_degraded(&self) -> FederationTest {
         self.new_fed_builder(1).build().await
@@ -183,13 +206,17 @@ impl Fixtures {
     /// Creates a new `FederationTestBuilder` that can be used to build up a
     /// `FederationTest` for module tests.
     pub fn new_fed_builder(&self, num_offline: u16) -> FederationTestBuilder {
-        FederationTestBuilder::new(
+        let mut builder = FederationTestBuilder::new(
             self.servers.clone(),
             self.clients.clone(),
             self.primary_module_kind.clone(),
             num_offline,
             self.server_bitcoin_rpc(),
-        )
+        );
+        for (kind, params) in &self.extra_module_instances {
+            builder = builder.with_extra_module_instance(kind.clone(), params.clone());
+        }
+        builder
     }
 
     /// Creates a new Gateway that can be used for module tests.
