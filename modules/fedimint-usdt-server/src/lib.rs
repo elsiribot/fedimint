@@ -3112,7 +3112,51 @@ impl Usdt {
         // affordable on a real chain. Deterministic: the median is a consensus
         // value, so every guardian builds the identical op (its
         // `max_fee_per_gas` is part of the signed `userOpHash`).
-        let median = self.fee_vote_median(dbtx).await;
+        //
+        // Security finding 02 (Task 4.3): without a fresh median (Task 4.2's
+        // quorum/freshness gate) the deploy+sweep cost cannot be priced at
+        // all, so the dust-economics gate below cannot be evaluated either --
+        // defer the sweep entirely rather than falling back to some
+        // unpriced/floor default. A later credit or the confirm-path
+        // retrigger re-calls this method once a median exists.
+        let Some(median) = self.fee_vote_median(dbtx).await else {
+            debug!(
+                target: "usdt",
+                account = ?account,
+                "no fee median; deferring sweep until it can be priced"
+            );
+            return;
+        };
+
+        // Maintainer decision (finding 02): never sweep a deposit account
+        // unless the amount credited to the user, net of the deploy+sweep
+        // gas fee it would cost the federation, is strictly positive. This
+        // does NOT touch `credited` -- the solvency/audit invariant is
+        // unchanged, sub-threshold dust simply sits on-chain unswept (and,
+        // via `process_input`'s identical `amount <= deposit_fee` check,
+        // unclaimable), costing the federation nothing. This is what stops
+        // an attacker from forcing a deploy+sweep the federation pays gas
+        // for by sending never-claimed dust to unlimited fresh deposit
+        // accounts.
+        let Some(sweep_fee) = fedimint_usdt_common::deposit_fee_quote(&median) else {
+            debug!(
+                target: "usdt",
+                account = ?account,
+                "deposit fee quote unavailable (overflow); deferring sweep"
+            );
+            return;
+        };
+        if remainder <= sweep_fee.0 {
+            debug!(
+                target: "usdt",
+                account = ?account,
+                remainder,
+                sweep_fee = sweep_fee.0,
+                "deposit remainder does not cover its deploy+sweep gas fee; not sweeping (dust)"
+            );
+            return;
+        }
+
         let owner = evm_address(&self.cfg.consensus.group_public_key);
         let params = DeployAndSweepParams {
             account_factory: self.cfg.consensus.account_factory,
@@ -3126,7 +3170,7 @@ impl Usdt {
             needs_deploy: record.nonce == 0,
             paymaster_and_data: Vec::new(),
             gas_bounds: GasBounds::DEPLOY_AND_SWEEP_DEVNET
-                .with_median_fees(median.map(|m| m.max_fee_per_gas_wei)),
+                .with_median_fees(Some(median.max_fee_per_gas_wei)),
         };
         let op = crate::user_op::build_deploy_and_sweep_userop(params);
         let op_hash = user_op_hash(
@@ -9809,6 +9853,22 @@ mod tests {
             claim_pk,
         };
 
+        // Security finding 02 (Task 4.3): `maybe_trigger_sweep` now defers
+        // any sweep until a fee median exists (it cannot economically gate
+        // an unpriceable op), so every guardian needs one FIRST. A low
+        // (0.1 gwei) median still 2x's below the 1 gwei op-fee floor, so
+        // this preserves the gas-pricing regression assertion below (floor,
+        // not the 30 gwei devnet constant) while quoting a deposit fee
+        // (~288_000, well under the 4_500_000 balance) that clears the new
+        // dust gate.
+        let low_fee_vote = fedimint_usdt_common::FeeVote {
+            max_fee_per_gas_wei: 100_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        for module in modules.values() {
+            seed_fee_votes(module.db_for_test(), N, low_fee_vote).await;
+        }
+
         // Every guardian independently processes the identical ordered
         // Deposit votes (threshold 3-of-4), triggering `maybe_trigger_sweep`.
         for module in modules.values() {
@@ -9847,9 +9907,9 @@ mod tests {
                 UserOpPurpose::DeployAndSweep { source: account }
             );
             assert_eq!(record.op.sender, account);
-            // Gas-pricing regression guard (the mainnet on-chain wedge): with
-            // no `FeeVote` in this federation the median is absent, so the op
-            // must be priced at the median-fee FLOOR (1 gwei) via
+            // Gas-pricing regression guard (the mainnet on-chain wedge): the
+            // seeded `low_fee_vote` median (0.1 gwei) 2x's to below the 1
+            // gwei op-fee floor, so the op must be priced at that FLOOR via
             // `GasBounds::with_median_fees`, NOT the 30 gwei devnet constant
             // that over-provisioned the broadcaster prefund on mainnet. This
             // asserts the sweep trigger actually threads the consensus median
@@ -10440,6 +10500,223 @@ mod tests {
         dbtx.commit_tx().await;
     }
 
+    /// Writes a `DepositRecord` for `account` with `credited` and `swept`
+    /// (`nonce`/`claimed`/`last_observed_block` all zero) -- the minimal
+    /// setup the dust-gate tests below need before calling
+    /// `maybe_trigger_sweep` directly.
+    async fn insert_deposit_record(
+        db: &Database,
+        account: EvmAddress,
+        claim_pk: secp256k1::PublicKey,
+        credited: UsdtAmount,
+    ) {
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &DepositRecordKey(account),
+            &DepositRecord {
+                claim_pk,
+                credited,
+                claimed: UsdtAmount(0),
+                last_observed_block: 0,
+                swept: UsdtAmount(0),
+                nonce: 0,
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security finding 02 (Task 4.3).** A deposit whose un-swept
+    /// remainder does not exceed its own deploy+sweep gas cost
+    /// (`deposit_fee_quote`) must NOT be swept: sweeping it would spend more
+    /// federation-fronted ETH than the deposit is worth, which is exactly
+    /// the dust-deposit gas-griefing drain the finding describes. The dust
+    /// is left on-chain (untouched, unswept) rather than pooled -- costing
+    /// the federation nothing. Covers both the exact boundary
+    /// (`remainder == sweep_fee`) and clearly-below-fee dust.
+    #[tokio::test]
+    async fn dust_below_sweep_fee_is_not_swept() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let sweep_fee = deposit_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
+
+        for (key_byte, label, credited) in [
+            (0xb1u8, "exactly the fee (boundary, not > )", sweep_fee),
+            (
+                0xb2u8,
+                "clearly below the fee",
+                UsdtAmount(sweep_fee.0 / 10),
+            ),
+            (0xb3u8, "one raw unit", UsdtAmount(1)),
+        ] {
+            let claim_pk = test_pubkey(key_byte);
+            let account = derive_deposit_account(
+                &module.cfg.consensus.group_public_key,
+                module.cfg.consensus.account_factory,
+                module.cfg.consensus.simple_account_impl,
+                &claim_pk,
+            );
+            insert_deposit_record(db, account, claim_pk, credited).await;
+
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+                .await;
+            assert!(
+                pending_deploy_and_sweeps(&mut dbtx.to_ref_nc(), account)
+                    .await
+                    .is_empty(),
+                "dust case ({label}) must not be swept: credited={}, sweep_fee={}",
+                credited.0,
+                sweep_fee.0
+            );
+            dbtx.commit_tx().await;
+        }
+    }
+
+    /// Positive control for `dust_below_sweep_fee_is_not_swept`: a deposit
+    /// whose remainder clearly exceeds `deposit_fee_quote` must still be
+    /// swept exactly as before -- the dust gate must not over-gate ordinary,
+    /// economically-worthwhile deposits.
+    #[tokio::test]
+    async fn deposit_above_fee_still_sweeps() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let sweep_fee = deposit_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
+
+        let claim_pk = test_pubkey(0xc7);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        let credited = UsdtAmount(sweep_fee.0 + 1);
+        insert_deposit_record(db, account, claim_pk, credited).await;
+
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+            .await;
+        let (_, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+        assert_eq!(
+            crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
+            credited,
+            "a net-positive deposit must still be swept for its full remainder"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security finding 02 (Task 4.3), no-median facet.** With no fresh
+    /// fee median at all (Task 4.2's quorum/freshness gate), the sweep
+    /// cannot be economically priced/gated, so it must be DEFERRED rather
+    /// than sweeping ungated (the pre-fix behavior, which floored to the 1
+    /// gwei devnet floor and swept anyway). Once a median later becomes
+    /// available, the very same un-swept remainder sweeps normally.
+    #[tokio::test]
+    async fn sweep_deferred_when_no_median() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        // Deliberately no `seed_fee_votes` call: no median exists yet.
+
+        let claim_pk = test_pubkey(0xd7);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        // Comfortably above any realistic fee quote, so this is unambiguously
+        // NOT a dust case -- the only reason to defer is the missing median.
+        let credited = UsdtAmount(100_000_000);
+        insert_deposit_record(db, account, claim_pk, credited).await;
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+                .await;
+            assert!(
+                pending_deploy_and_sweeps(&mut dbtx.to_ref_nc(), account)
+                    .await
+                    .is_empty(),
+                "without a fee median the sweep must be deferred, not priced at some fallback"
+            );
+            dbtx.commit_tx().await;
+        }
+
+        // A median now becomes available; a later retrigger (mirroring the
+        // confirm-path/next-credit retrigger) sweeps the same remainder.
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+            .await;
+        let (_, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+        assert_eq!(
+            crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
+            credited,
+            "once priceable, the deferred sweep proceeds for the full remainder"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security finding 02, adversarial (misc #14).** The finding's core
+    /// attack: many freshly-derived deposit accounts each receive a tiny
+    /// (1-raw-unit) dust credit and are never claimed. Before this fix,
+    /// EVERY one of these would have enqueued its own deploy-and-sweep
+    /// `PendingUserOp`, forcing the broadcaster to front ETH for each. After
+    /// the fix, none of them are economically sweepable, so ZERO
+    /// `DeployAndSweep` ops are ever created -- the drain is structurally
+    /// impossible, not just rate-limited.
+    #[tokio::test]
+    async fn many_dust_deposits_produce_zero_sweep_ops() {
+        const ATTACKER_ACCOUNTS: u8 = 50;
+
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        for i in 1..=ATTACKER_ACCOUNTS {
+            let claim_pk = test_pubkey(i);
+            let account = derive_deposit_account(
+                &module.cfg.consensus.group_public_key,
+                module.cfg.consensus.account_factory,
+                module.cfg.consensus.simple_account_impl,
+                &claim_pk,
+            );
+            let obs = DepositObservation {
+                account,
+                balance: UsdtAmount(1),
+                block: 10,
+                claim_pk,
+            };
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .credit_deposit(&mut dbtx.to_ref_nc(), &obs)
+                .await
+                .expect("crediting dust must not itself error");
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let pending_sweeps = dbtx
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .filter(|(_, p)| {
+                std::future::ready(matches!(p.purpose, UserOpPurpose::DeployAndSweep { .. }))
+            })
+            .count()
+            .await;
+        assert_eq!(
+            pending_sweeps, 0,
+            "{ATTACKER_ACCOUNTS} dust deposits (1 raw unit each) must produce ZERO \
+             DeployAndSweep ops"
+        );
+    }
+
     /// **Issue #6 (solvency).** A reused deposit address whose `credited`
     /// grows after an earlier, fixed-amount sweep must have the leftover
     /// (`credited - swept`) re-swept -- at the deposit account's advanced
@@ -10453,6 +10730,12 @@ mod tests {
     async fn re_sweep_moves_the_remainder_after_credited_grows() {
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
+        // Security finding 02 (Task 4.3): a fee median must exist and every
+        // remainder below must clear its `deposit_fee_quote` (86_400_000 for
+        // `sample_fee_vote`), so amounts here are scaled up from this test's
+        // pre-dust-gate 10/20 raw units to 100_000_000/200_000_000 (100/200
+        // USDT) -- comfortably net-positive, not dust.
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
         let account = EvmAddress([0xc1; 20]);
         let claim_pk = test_pubkey(0xc2);
 
@@ -10462,7 +10745,7 @@ mod tests {
                 &DepositRecordKey(account),
                 &DepositRecord {
                     claim_pk,
-                    credited: UsdtAmount(10),
+                    credited: UsdtAmount(100_000_000),
                     claimed: UsdtAmount(0),
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
@@ -10473,7 +10756,8 @@ mod tests {
             dbtx.commit_tx().await;
         }
 
-        // First sweep: full credited (10), nonce 0, deploying (initCode set).
+        // First sweep: full credited (100_000_000), nonce 0, deploying
+        // (initCode set).
         let op_hash_1 = {
             let mut dbtx = db.begin_transaction().await;
             module
@@ -10483,7 +10767,7 @@ mod tests {
             assert_eq!(op.nonce, alloy::primitives::U256::ZERO);
             assert_eq!(
                 crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
-                UsdtAmount(10)
+                UsdtAmount(100_000_000)
             );
             assert!(
                 !op.init_code.is_empty(),
@@ -10493,7 +10777,7 @@ mod tests {
             hash
         };
 
-        // Confirm the first sweep (swept 10).
+        // Confirm the first sweep (swept 100_000_000).
         promote_pending_to_submitted(db, op_hash_1).await;
         {
             let mut dbtx = db.begin_transaction().await;
@@ -10504,7 +10788,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 20,
-                        swept: UsdtAmount(10),
+                        swept: UsdtAmount(100_000_000),
                     },
                 )
                 .await;
@@ -10513,14 +10797,14 @@ mod tests {
                 .get_value(&DepositRecordKey(account))
                 .await
                 .expect("record present");
-            assert_eq!(record.swept, UsdtAmount(10));
+            assert_eq!(record.swept, UsdtAmount(100_000_000));
             assert_eq!(record.nonce, 1, "nonce advances on the confirmed sweep");
             let pool = dbtx
                 .to_ref_nc()
                 .get_value(&PoolStateKey)
                 .await
                 .expect("pool credited");
-            assert_eq!(pool.balance, UsdtAmount(10));
+            assert_eq!(pool.balance, UsdtAmount(100_000_000));
             // Remainder is now 0, so the success auto-retrigger enqueued nothing.
             assert!(
                 pending_deploy_and_sweeps(&mut dbtx.to_ref_nc(), account)
@@ -10531,7 +10815,7 @@ mod tests {
             dbtx.commit_tx().await;
         }
 
-        // A second deposit bumps credited to 20.
+        // A second deposit bumps credited to 200_000_000.
         {
             let mut dbtx = db.begin_transaction().await;
             let mut record = dbtx
@@ -10539,14 +10823,15 @@ mod tests {
                 .get_value(&DepositRecordKey(account))
                 .await
                 .expect("record present");
-            record.credited = UsdtAmount(20);
+            record.credited = UsdtAmount(200_000_000);
             dbtx.to_ref_nc()
                 .insert_entry(&DepositRecordKey(account), &record)
                 .await;
             dbtx.commit_tx().await;
         }
 
-        // Re-sweep: only the remainder (10), at nonce 1, WITHOUT redeploying.
+        // Re-sweep: only the remainder (100_000_000), at nonce 1, WITHOUT
+        // redeploying.
         let op_hash_2 = {
             let mut dbtx = db.begin_transaction().await;
             module
@@ -10557,7 +10842,7 @@ mod tests {
             assert_eq!(op.nonce, alloy::primitives::U256::from(1u64));
             assert_eq!(
                 crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
-                UsdtAmount(10),
+                UsdtAmount(100_000_000),
                 "re-sweep moves only the remainder, not the full credited"
             );
             assert!(
@@ -10568,7 +10853,7 @@ mod tests {
             hash
         };
 
-        // Confirm the re-sweep (swept another 10).
+        // Confirm the re-sweep (swept another 100_000_000).
         promote_pending_to_submitted(db, op_hash_2).await;
         {
             let mut dbtx = db.begin_transaction().await;
@@ -10579,7 +10864,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 30,
-                        swept: UsdtAmount(10),
+                        swept: UsdtAmount(100_000_000),
                     },
                 )
                 .await;
@@ -10588,14 +10873,14 @@ mod tests {
                 .get_value(&DepositRecordKey(account))
                 .await
                 .expect("record present");
-            assert_eq!(record.swept, UsdtAmount(20));
+            assert_eq!(record.swept, UsdtAmount(200_000_000));
             assert_eq!(record.nonce, 2);
             let pool = dbtx
                 .to_ref_nc()
                 .get_value(&PoolStateKey)
                 .await
                 .expect("pool present");
-            assert_eq!(pool.balance, UsdtAmount(20));
+            assert_eq!(pool.balance, UsdtAmount(200_000_000));
             dbtx.commit_tx().await;
         }
 
@@ -10625,6 +10910,11 @@ mod tests {
     async fn concurrent_sweep_of_the_same_account_is_serialized() {
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
+        // Security finding 02 (Task 4.3): scaled from 10/20 raw units (see
+        // `re_sweep_moves_the_remainder_after_credited_grows`) so every
+        // remainder here clears `deposit_fee_quote(&sample_fee_vote())`
+        // (86_400_000) and is not gated as dust.
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
         let account = EvmAddress([0xd1; 20]);
         let claim_pk = test_pubkey(0xd2);
 
@@ -10634,7 +10924,7 @@ mod tests {
                 &DepositRecordKey(account),
                 &DepositRecord {
                     claim_pk,
-                    credited: UsdtAmount(10),
+                    credited: UsdtAmount(100_000_000),
                     claimed: UsdtAmount(0),
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
@@ -10657,8 +10947,9 @@ mod tests {
             hash
         };
 
-        // credited grows to 20 while A is still in flight; re-triggering must
-        // NOT create a second op -- the per-account guard holds.
+        // credited grows to 200_000_000 while A is still in flight;
+        // re-triggering must NOT create a second op -- the per-account guard
+        // holds.
         {
             let mut dbtx = db.begin_transaction().await;
             let mut record = dbtx
@@ -10666,7 +10957,7 @@ mod tests {
                 .get_value(&DepositRecordKey(account))
                 .await
                 .expect("record present");
-            record.credited = UsdtAmount(20);
+            record.credited = UsdtAmount(200_000_000);
             dbtx.to_ref_nc()
                 .insert_entry(&DepositRecordKey(account), &record)
                 .await;
@@ -10681,8 +10972,9 @@ mod tests {
             dbtx.commit_tx().await;
         }
 
-        // Confirm A (swept 10). The success auto-retrigger now sweeps the
-        // remainder as op B: nonce 1, amount 10 -- exactly one in flight.
+        // Confirm A (swept 100_000_000). The success auto-retrigger now
+        // sweeps the remainder as op B: nonce 1, amount 100_000_000 --
+        // exactly one in flight.
         promote_pending_to_submitted(db, op_a).await;
         {
             let mut dbtx = db.begin_transaction().await;
@@ -10693,7 +10985,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 25,
-                        swept: UsdtAmount(10),
+                        swept: UsdtAmount(100_000_000),
                     },
                 )
                 .await;
@@ -10703,7 +10995,7 @@ mod tests {
             assert_eq!(op_b.nonce, alloy::primitives::U256::from(1u64));
             assert_eq!(
                 crate::user_op::decode_transfer_amount(&op_b).expect("decodes"),
-                UsdtAmount(10),
+                UsdtAmount(100_000_000),
                 "op B sweeps exactly the remainder that grew while A was in flight"
             );
             dbtx.commit_tx().await;
@@ -10721,6 +11013,11 @@ mod tests {
     async fn failed_sweep_advances_nonce_without_retrigger_or_double_credit() {
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
+        // Security finding 02 (Task 4.3): scaled from 10 raw units (see
+        // `re_sweep_moves_the_remainder_after_credited_grows`) so the
+        // remainder clears `deposit_fee_quote(&sample_fee_vote())`
+        // (86_400_000) and is not gated as dust.
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
         let account = EvmAddress([0xe1; 20]);
         let claim_pk = test_pubkey(0xe2);
 
@@ -10730,7 +11027,7 @@ mod tests {
                 &DepositRecordKey(account),
                 &DepositRecord {
                     claim_pk,
-                    credited: UsdtAmount(10),
+                    credited: UsdtAmount(100_000_000),
                     claimed: UsdtAmount(0),
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
@@ -10806,7 +11103,7 @@ mod tests {
             );
             assert_eq!(
                 crate::user_op::decode_transfer_amount(&op).expect("decodes"),
-                UsdtAmount(10)
+                UsdtAmount(100_000_000)
             );
             dbtx.commit_tx().await;
         }
