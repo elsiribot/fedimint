@@ -53,7 +53,13 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// transient and re-formed every scan/submit tick, so `migrate_db_v1` DROPS
 /// their old-shape rows rather than rewriting them (mirroring
 /// `migrate_db_v0`).
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 6);
+///
+/// Bumped to `0.7` (sec-05 hardening, poisoned-batch isolation): a brand-new
+/// consensus-DB record, `WithdrawalBatchCapKey(OutPoint) -> u32`, was added
+/// (server's `db.rs`). It is a new prefix holding only new data -- no
+/// existing stored value's shape changed -- so no `get_database_migrations`
+/// entry/snapshot was needed, only `dump_database` coverage.
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 7);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///

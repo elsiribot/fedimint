@@ -82,8 +82,8 @@ use crate::db::{
     StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix,
     UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
     UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
-    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalState, WithdrawalStateKey,
-    WithdrawalStatePrefix,
+    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalBatchCapKey, WithdrawalBatchCapPrefix,
+    WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -316,6 +316,16 @@ impl ModuleInit for UsdtInit {
                         (),
                         items,
                         "Has Ever Been Ready"
+                    );
+                }
+                DbKeyPrefix::WithdrawalBatchCap => {
+                    push_db_pair_items!(
+                        dbtx,
+                        WithdrawalBatchCapPrefix,
+                        WithdrawalBatchCapKey,
+                        u32,
+                        items,
+                        "Withdrawal Batch Caps"
                     );
                 }
             }
@@ -3597,6 +3607,21 @@ impl Usdt {
     /// guardian. `start_session`'s only `our_peer_id`-conditional part is
     /// the in-memory off-thread signer spawn, a guardian-local side effect
     /// (see its own doc comment).
+    /// Reads `out_point`'s [`WithdrawalBatchCapKey`] -- the maximum batch
+    /// size this withdrawal may next be included in (security finding 05,
+    /// poisoned-batch isolation) -- defaulting to [`BATCH_MAX_ITEMS`] when
+    /// absent (every withdrawal starts uncapped). Pure function of the
+    /// committed consensus DB; no RPC/wall-clock.
+    async fn withdrawal_batch_cap(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        out_point: OutPoint,
+    ) -> usize {
+        dbtx.get_value(&WithdrawalBatchCapKey(out_point))
+            .await
+            .map_or(BATCH_MAX_ITEMS, |cap| cap as usize)
+    }
+
     async fn maybe_trigger_withdrawal_batch(&self, dbtx: &mut DatabaseTransaction<'_>) {
         if self.withdraw_batch_in_flight(dbtx).await {
             return;
@@ -3656,6 +3681,25 @@ impl Usdt {
         // stays `Queued` and is picked up by the next batch (the in-flight
         // guard serializes batches, so nonces never collide).
         queued.truncate(BATCH_MAX_ITEMS);
+
+        // POISON-ISOLATION CAP (security finding 05): shrink the batch
+        // further to the smallest per-withdrawal `WithdrawalBatchCapKey`
+        // among the (already sorted, `BATCH_MAX_ITEMS`-windowed) candidates
+        // above. A withdrawal that shared a recently-failed batch of size
+        // `n` was left with a cap of `max(1, n / 2)` (see
+        // `Usdt::apply_withdraw_confirmed`'s doc comment); truncating the
+        // window to the window's minimum cap means a poisoned group can
+        // never be rebuilt at its old (failing) size -- it is forced to
+        // binary-split on every subsequent failure until it isolates down to
+        // a singleton. Reads only the sorted `queued` window + their
+        // committed `WithdrawalBatchCapKey` records (or the
+        // `BATCH_MAX_ITEMS` default when absent) -- deterministic, no
+        // RPC/wall-clock.
+        let mut effective_cap = BATCH_MAX_ITEMS;
+        for &(out_point, _) in &queued {
+            effective_cap = effective_cap.min(self.withdrawal_batch_cap(dbtx, out_point).await);
+        }
+        queued.truncate(effective_cap);
 
         let pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
             account: self.pool_account(),
@@ -4079,19 +4123,38 @@ impl Usdt {
     /// subtracting it -- see that method's doc comment for the solvency
     /// argument).
     ///
-    /// On `!success`: the DELIBERATE, solvent choice (documented per this
-    /// task's spec) is to revert every `outpoints` withdrawal back to
-    /// `WithdrawalState::Queued` -- NOT `Failed` -- so
-    /// `Usdt::maybe_trigger_withdrawal_batch` retries it in a later batch
-    /// (under a fresh, now-correct `PoolState.nonce`). `PoolState.balance`
-    /// is left untouched (nothing left the pool on-chain) and
-    /// `UnclaimedWithdrawal` is left in place (still a real, still-funded
-    /// obligation) -- a permanent `Failed` terminal state would need a
-    /// refund path this phase does not build, and would otherwise either
-    /// strand the user's already-burned e-cash unpaid (an actual loss to
-    /// them) or require re-issuing e-cash (a much larger, out-of-scope
-    /// change); retrying is simple, keeps the pool's on-chain and
-    /// consensus-DB `nonce` in lockstep, and never loses funds.
+    /// On `!success` (security finding 05, poisoned-batch isolation task):
+    /// `PoolState.balance` is left untouched either way (nothing left the
+    /// pool on-chain), but the per-outpoint state transition now depends on
+    /// how many withdrawals this failed batch covered (`n =
+    /// outpoints.len()`, read from the confirmed op's own committed
+    /// `purpose` -- deterministic, no RPC/wall-clock):
+    ///
+    /// - `n <= 1` (a singleton batch failed -- this withdrawal alone, isolated
+    ///   from every other queued withdrawal, still reverts): this IS the
+    ///   poisoned withdrawal. Move it to terminal `WithdrawalState::Failed {
+    ///   reason }` and remove its [`WithdrawalBatchCapKey`] (housekeeping).
+    ///   `UnclaimedWithdrawal` is left in place -- still a real, still-funded
+    ///   obligation -- for Phase 6.1's refund path to reissue e-cash against.
+    ///   It is NOT re-queued: re-queueing a batch that already failed alone
+    ///   would rebuild the byte-identical singleton forever (the original `DoS`
+    ///   this finding reports, just shrunk to size 1).
+    /// - `n > 1`: NOT the poison alone -- one or more of these `n` withdrawals
+    ///   fail together, but which one is unknown. Revert every covered outpoint
+    ///   to `WithdrawalState::Queued` (as before) AND set its
+    ///   [`WithdrawalBatchCapKey`] to `max(1, n / 2)` (integer halving).
+    ///   `Usdt::maybe_trigger_withdrawal_batch`'s `effective_cap` then caps the
+    ///   NEXT batch containing any of these withdrawals to that smaller size,
+    ///   deterministically binary-splitting the failing group on every
+    ///   subsequent failure until the poison lands alone in a singleton batch
+    ///   (the `n <= 1` case above) and honest members clear in a split that no
+    ///   longer contains it. The halving strictly decreases for any `n > 1` and
+    ///   floors at 1, so the isolation always terminates within `ceil(log2(n))`
+    ///   failed rounds.
+    ///
+    /// `UnclaimedWithdrawal` is left in place in both branches (still a
+    /// real, still-funded obligation); a permanent `Failed` terminal state's
+    /// refund is Phase 6.1's job, not this method's.
     ///
     /// `swept` (Phase 9 hardening, security finding 21): the AUTHORITATIVE
     /// amount to debit, computed by the caller
@@ -4121,16 +4184,53 @@ impl Usdt {
         }
         dbtx.insert_entry(&PoolStateKey, &pool).await;
 
-        for &out_point in outpoints {
-            if obs.success {
+        let n = outpoints.len();
+        // Security finding 05 (poisoned-batch isolation): halved (floor 1)
+        // cap for a >1-member failed batch, so the NEXT batch containing any
+        // of these withdrawals is capped smaller by
+        // `Usdt::maybe_trigger_withdrawal_batch`'s `effective_cap`. `n` is
+        // bounded by `BATCH_MAX_ITEMS` (a `usize` constant that trivially
+        // fits `u32`), so this conversion cannot fail.
+        let split_cap: u32 =
+            u32::try_from((n / 2).max(1)).expect("n <= BATCH_MAX_ITEMS, which fits in u32");
+
+        if obs.success {
+            for &out_point in outpoints {
                 dbtx.insert_entry(
                     &WithdrawalStateKey(out_point),
                     &WithdrawalState::Confirmed { block: obs.block },
                 )
                 .await;
                 dbtx.remove_entry(&UnclaimedWithdrawalKey(out_point)).await;
-            } else {
+                dbtx.remove_entry(&WithdrawalBatchCapKey(out_point)).await;
+            }
+        } else if n <= 1 {
+            // Isolated (singleton) failure: this withdrawal alone reverts
+            // even with no other withdrawal sharing its batch -- it IS the
+            // poison. Terminal, not re-queued (see the doc comment above for
+            // why re-queueing here would rebuild the identical failing
+            // singleton forever).
+            for &out_point in outpoints {
+                dbtx.insert_entry(
+                    &WithdrawalStateKey(out_point),
+                    &WithdrawalState::Failed {
+                        reason: "transfer reverts when isolated (recipient likely \
+                                 blacklisted/paused)"
+                            .to_string(),
+                    },
+                )
+                .await;
+                dbtx.remove_entry(&WithdrawalBatchCapKey(out_point)).await;
+            }
+        } else {
+            // Not yet isolated: re-queue every covered withdrawal, but cap
+            // the next batch that may include any of them to half this
+            // batch's size, deterministically splitting the failing group
+            // down towards singletons.
+            for &out_point in outpoints {
                 dbtx.insert_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+                    .await;
+                dbtx.insert_entry(&WithdrawalBatchCapKey(out_point), &split_cap)
                     .await;
             }
         }
@@ -4138,20 +4238,31 @@ impl Usdt {
         if obs.success {
             info!(
                 target: "usdt",
-                count = outpoints.len(),
+                count = n,
                 paid_out = swept.0,
                 block = obs.block,
                 pool_balance_after = pool.balance.0,
                 new_pool_nonce = pool.nonce,
                 "withdrawal batch CONFIRMED on-chain; withdrawals settled"
             );
+        } else if n <= 1 {
+            warn!(
+                target: "usdt",
+                count = n,
+                block = obs.block,
+                new_pool_nonce = pool.nonce,
+                "singleton withdrawal batch REVERTED on-chain in isolation; withdrawal marked \
+                 terminal Failed (refundable in Phase 6.1)"
+            );
         } else {
             warn!(
                 target: "usdt",
-                count = outpoints.len(),
+                count = n,
+                split_cap,
                 block = obs.block,
                 new_pool_nonce = pool.nonce,
-                "withdrawal batch REVERTED on-chain; withdrawals returned to Queued for retry (pool balance untouched)"
+                "withdrawal batch REVERTED on-chain; withdrawals returned to Queued with a \
+                 halved batch cap for isolation retry (pool balance untouched)"
             );
         }
     }
@@ -12568,23 +12679,36 @@ mod tests {
         );
     }
 
-    /// **Phase 8, Task 2.** A `!success` `Withdraw`-purpose confirmation
-    /// reverts its withdrawals back to `Queued` (for a later batch to
-    /// retry) rather than crediting/debiting anything -- but the pool's
-    /// `nonce` is STILL bumped, since a `UserOpConfirmed` observation only
-    /// ever exists for an op the `EntryPoint` actually validated/included
-    /// (see `Usdt::apply_withdraw_confirmed`'s doc comment).
+    /// **Phase 8, Task 2; updated Phase 9 Task 5.3 (security finding 05).**
+    /// A `!success` `Withdraw`-purpose confirmation covering MORE THAN ONE
+    /// withdrawal (`n = 2`, not yet isolated) reverts its withdrawals back
+    /// to `Queued` (for a later, capped-smaller batch to retry) rather than
+    /// crediting/debiting anything -- but the pool's `nonce` is STILL
+    /// bumped, since a `UserOpConfirmed` observation only ever exists for an
+    /// op the `EntryPoint` actually validated/included (see
+    /// `Usdt::apply_withdraw_confirmed`'s doc comment). Each covered
+    /// outpoint's `WithdrawalBatchCapKey` is set to `max(1, n / 2) == 1`.
+    /// The `n == 1` (singleton, terminal `Failed`) case is covered by
+    /// `single_member_failed_batch_is_terminal_failed`.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn user_op_confirmed_withdraw_purpose_failure_reverts_to_queued_but_still_bumps_nonce() {
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let db = module.db_for_test();
 
         let op_hash = [0xb2; 32];
-        let out_point = test_out_point(9);
-        let withdrawal = UsdtWithdrawalV0 {
+        let out_point_a = test_out_point(9);
+        let out_point_b = test_out_point(10);
+        let withdrawal_a = UsdtWithdrawalV0 {
             recipient: EvmAddress([0xd1; 20]),
             amount: UsdtAmount(1_500_000),
             max_fee: UsdtAmount(500),
+            requested_block: 0,
+        };
+        let withdrawal_b = UsdtWithdrawalV0 {
+            recipient: EvmAddress([0xd2; 20]),
+            amount: UsdtAmount(500_000),
+            max_fee: UsdtAmount(200),
             requested_block: 0,
         };
 
@@ -12599,13 +12723,17 @@ mod tests {
                 },
             )
             .await;
-            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_point), &withdrawal)
+            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_point_a), &withdrawal_a)
                 .await;
-            dbtx.insert_new_entry(
-                &WithdrawalStateKey(out_point),
-                &WithdrawalState::Signing(op_hash),
-            )
-            .await;
+            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_point_b), &withdrawal_b)
+                .await;
+            for &out_point in &[out_point_a, out_point_b] {
+                dbtx.insert_new_entry(
+                    &WithdrawalStateKey(out_point),
+                    &WithdrawalState::Signing(op_hash),
+                )
+                .await;
+            }
             dbtx.insert_new_entry(
                 &SubmittedUserOpKey(op_hash),
                 &SubmittedUserOp {
@@ -12614,7 +12742,7 @@ mod tests {
                         signature: vec![0xee; 65],
                     },
                     purpose: UserOpPurpose::Withdraw {
-                        outpoints: vec![out_point],
+                        outpoints: vec![out_point_a, out_point_b],
                     },
                     submitted_block: 5,
                     superseded: false,
@@ -12654,28 +12782,696 @@ mod tests {
             "the on-chain nonce is consumed even when the callData execution reverts"
         );
 
+        for (out_point, withdrawal) in [(out_point_a, &withdrawal_a), (out_point_b, &withdrawal_b)]
+        {
+            let state = dbtx
+                .to_ref_nc()
+                .get_value(&WithdrawalStateKey(out_point))
+                .await
+                .expect("WithdrawalState present");
+            assert_eq!(
+                state,
+                WithdrawalState::Queued,
+                "a not-yet-isolated (n>1) failed batch must revert its withdrawals to Queued \
+                 for retry"
+            );
+            assert_eq!(
+                dbtx.to_ref_nc()
+                    .get_value(&UnclaimedWithdrawalKey(out_point))
+                    .await,
+                Some(withdrawal.clone()),
+                "UnclaimedWithdrawal must survive a failed batch unchanged, for retry"
+            );
+            assert_eq!(
+                dbtx.to_ref_nc()
+                    .get_value(&WithdrawalBatchCapKey(out_point))
+                    .await,
+                Some(1),
+                "a failed n=2 batch must halve (floor 1) the retry cap for each covered outpoint"
+            );
+        }
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(op_hash))
+                .await
+                .is_none()
+        );
+    }
+
+    /// **Security finding 05 (poisoned-batch isolation).** A failed batch of
+    /// exactly ONE withdrawal (`n == 1`) means that withdrawal reverts even
+    /// in complete isolation from every other queued withdrawal -- it IS the
+    /// poison. It must go terminal `WithdrawalState::Failed`, NOT be
+    /// re-queued (re-queueing the identical singleton would rebuild the
+    /// exact same failing batch forever, the original `DoS`). Its
+    /// `UnclaimedWithdrawal` is kept (Phase 6.1 refunds it) and its
+    /// `WithdrawalBatchCapKey` is removed (terminal, never read again).
+    #[tokio::test]
+    async fn single_member_failed_batch_is_terminal_failed() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let op_hash = [0xb3; 32];
+        let out_point = test_out_point(11);
+        let withdrawal = UsdtWithdrawalV0 {
+            recipient: EvmAddress([0xf1; 20]),
+            amount: UsdtAmount(1_000_000),
+            max_fee: UsdtAmount(300),
+            requested_block: 0,
+        };
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(3_000_000),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_point), &withdrawal)
+                .await;
+            dbtx.insert_new_entry(
+                &WithdrawalStateKey(out_point),
+                &WithdrawalState::Signing(op_hash),
+            )
+            .await;
+            // Simulate an already-halved cap from a prior split, to prove
+            // the terminal path removes it (rather than leaving it to leak).
+            dbtx.insert_new_entry(&WithdrawalBatchCapKey(out_point), &1u32)
+                .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: sample_unsigned_user_op_for_test(),
+                        signature: vec![0xee; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: vec![out_point],
+                    },
+                    submitted_block: 5,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: false,
+            block: 101,
+            block_hash: [0u8; 32],
+            swept: UsdtAmount(0),
+        };
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                .await
+                .expect("vote processes cleanly");
+        }
+
         let state = dbtx
             .to_ref_nc()
             .get_value(&WithdrawalStateKey(out_point))
             .await
             .expect("WithdrawalState present");
-        assert_eq!(
-            state,
-            WithdrawalState::Queued,
-            "a failed batch must revert its withdrawals to Queued for retry"
+        assert!(
+            matches!(state, WithdrawalState::Failed { .. }),
+            "a failed singleton batch must isolate its withdrawal as terminal Failed, got {state:?}"
         );
         assert_eq!(
             dbtx.to_ref_nc()
                 .get_value(&UnclaimedWithdrawalKey(out_point))
                 .await,
             Some(withdrawal),
-            "UnclaimedWithdrawal must survive a failed batch unchanged, for retry"
+            "UnclaimedWithdrawal must be KEPT on terminal Failed, for the Phase 6.1 refund"
         );
-        assert!(
+        assert_eq!(
             dbtx.to_ref_nc()
-                .get_value(&SubmittedUserOpKey(op_hash))
+                .get_value(&WithdrawalBatchCapKey(out_point))
+                .await,
+            None,
+            "a terminal withdrawal's batch cap must be cleaned up"
+        );
+
+        let pool = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState present");
+        assert_eq!(
+            pool.balance,
+            UsdtAmount(3_000_000),
+            "a failed batch must not debit the pool"
+        );
+        assert_eq!(
+            pool.nonce, 1,
+            "the on-chain nonce is consumed even when the callData execution reverts"
+        );
+    }
+
+    /// **Security finding 05.** After a failed batch of `n = 4`, every
+    /// covered withdrawal's `WithdrawalBatchCapKey` becomes `max(1, 4/2) ==
+    /// 2`; the NEXT `maybe_trigger_withdrawal_batch` call must then build a
+    /// batch of size <= 2 for those withdrawals (not the full `n = 4`
+    /// again), proving `effective_cap` actually shrinks the trigger's batch.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn batch_cap_halves_on_failure_and_shrinks_batches() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let op_hash = [0xb4; 32];
+        let out_points: Vec<OutPoint> = (0..4).map(|i| test_out_point(20 + i)).collect();
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(40_000_000),
+                    nonce: 0,
+                },
+            )
+            .await;
+            for (i, &out_point) in out_points.iter().enumerate() {
+                let byte = u8::try_from(i).expect("small index fits u8");
+                dbtx.insert_new_entry(
+                    &UnclaimedWithdrawalKey(out_point),
+                    &UsdtWithdrawalV0 {
+                        recipient: EvmAddress([byte; 20]),
+                        amount: UsdtAmount(1_000_000),
+                        max_fee: UsdtAmount(1_000),
+                        requested_block: 0,
+                    },
+                )
+                .await;
+                dbtx.insert_new_entry(
+                    &WithdrawalStateKey(out_point),
+                    &WithdrawalState::Signing(op_hash),
+                )
+                .await;
+            }
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: sample_unsigned_user_op_for_test(),
+                        signature: vec![0xee; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: out_points.clone(),
+                    },
+                    submitted_block: 5,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: false,
+            block: 101,
+            block_hash: [0u8; 32],
+            swept: UsdtAmount(0),
+        };
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for p in [0u16, 1, 2] {
+                module
+                    .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                    .await
+                    .expect("vote processes cleanly");
+            }
+            dbtx.commit_tx().await;
+        }
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for &out_point in &out_points {
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalBatchCapKey(out_point))
+                        .await,
+                    Some(2),
+                    "n=4 failure must halve the cap to 2 for every covered outpoint"
+                );
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalStateKey(out_point))
+                        .await,
+                    Some(WithdrawalState::Queued)
+                );
+            }
+            dbtx.commit_tx().await;
+        }
+
+        // Item-threshold trigger needs an item count >= BATCH_MAX_ITEMS to
+        // fire immediately regardless of the interval, but only 4 items are
+        // queued here -- so advance the consensus block count past the
+        // interval instead.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let vote = batch_interval_blocks() + 1;
+            for p in 0..4u16 {
+                module
+                    .process_consensus_item(
+                        &mut dbtx.to_ref_nc(),
+                        UsdtConsensusItem::BlockCount(vote),
+                        PeerId::from(p),
+                    )
+                    .await
+                    .expect("block count vote succeeds");
+            }
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+            .await;
+        let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+            .to_ref_nc()
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        assert_eq!(pending.len(), 1, "the shrunk batch must still build");
+        let (_, record) = &pending[0];
+        let UserOpPurpose::Withdraw { outpoints } = &record.purpose else {
+            panic!("must be a Withdraw-purpose op");
+        };
+        assert!(
+            outpoints.len() <= 2,
+            "the effective cap (2) must shrink the next batch to at most 2 items, got {}",
+            outpoints.len()
+        );
+    }
+
+    /// **Security finding 05.** On a successful confirmation, every covered
+    /// withdrawal's `WithdrawalBatchCapKey` is removed (housekeeping), even
+    /// if a prior failed split had left it capped.
+    #[tokio::test]
+    async fn successful_batch_clears_caps() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let op_hash = [0xb5; 32];
+        let out_point = test_out_point(30);
+        let withdrawal = UsdtWithdrawalV0 {
+            recipient: EvmAddress([0x9a; 20]),
+            amount: UsdtAmount(1_000_000),
+            max_fee: UsdtAmount(1_000),
+            requested_block: 0,
+        };
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(3_000_000),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_point), &withdrawal)
+                .await;
+            dbtx.insert_new_entry(
+                &WithdrawalStateKey(out_point),
+                &WithdrawalState::Signing(op_hash),
+            )
+            .await;
+            // Simulate a prior failed split having left a cap of 1 behind.
+            dbtx.insert_new_entry(&WithdrawalBatchCapKey(out_point), &1u32)
+                .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_withdraw_op_for_test(withdrawal.amount),
+                        signature: vec![0xee; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: vec![out_point],
+                    },
+                    submitted_block: 5,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: true,
+            block: 101,
+            block_hash: [0u8; 32],
+            swept: withdrawal.amount,
+        };
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
                 .await
-                .is_none()
+                .expect("vote processes cleanly");
+        }
+
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .get_value(&WithdrawalStateKey(out_point))
+                .await,
+            Some(WithdrawalState::Confirmed { block: 101 })
+        );
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .get_value(&UnclaimedWithdrawalKey(out_point))
+                .await,
+            None,
+            "UnclaimedWithdrawal must be removed once confirmed"
+        );
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .get_value(&WithdrawalBatchCapKey(out_point))
+                .await,
+            None,
+            "a successfully confirmed withdrawal's batch cap must be cleared"
+        );
+    }
+
+    /// **Security finding 05 (poisoned-batch isolation), the finding's core
+    /// scenario.** One poisoned recipient among several honest ones must be
+    /// isolated -- not permanently wedge the whole withdrawal pipeline.
+    /// Drives `Usdt::apply_withdraw_confirmed` directly with SCRIPTED
+    /// success/failure per simulated batch (any batch containing the poison
+    /// fails; any batch without it succeeds), mirroring how repeated
+    /// on-chain `executeBatch` attempts would resolve, and asserts:
+    /// (a) the isolation actually TERMINATES (the poison reaches terminal
+    /// `Failed` within a bounded number of rounds, driven by the halving
+    /// cap), (b) every honest withdrawal reaches `Confirmed`, and (c) a
+    /// FRESH withdrawal queued afterwards is not permanently blocked (the
+    /// trigger's in-flight guard and cap machinery do not wedge on
+    /// unrelated, later withdrawals).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn poisoned_recipient_is_isolated_not_permanent_wedge() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let honest: Vec<OutPoint> = (0..3).map(|i| test_out_point(40 + i)).collect();
+        let poison = test_out_point(50);
+        let all: Vec<OutPoint> = honest
+            .iter()
+            .copied()
+            .chain(std::iter::once(poison))
+            .collect();
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(40_000_000),
+                    nonce: 0,
+                },
+            )
+            .await;
+            for (i, &out_point) in all.iter().enumerate() {
+                let byte = u8::try_from(i).expect("small index fits u8");
+                dbtx.insert_new_entry(
+                    &UnclaimedWithdrawalKey(out_point),
+                    &UsdtWithdrawalV0 {
+                        recipient: EvmAddress([byte; 20]),
+                        amount: UsdtAmount(1_000_000),
+                        max_fee: UsdtAmount(1_000),
+                        requested_block: 0,
+                    },
+                )
+                .await;
+                dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+                    .await;
+            }
+            dbtx.commit_tx().await;
+        }
+
+        // Round 1: the full batch of 4 (3 honest + poison) is attempted and
+        // fails (the poison reverts the whole `executeBatch`). Cap -> 2 for
+        // all 4.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_withdraw_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    &all,
+                    &UserOpConfirmedObservation {
+                        success: false,
+                        block: 10,
+                        block_hash: [0u8; 32],
+                        swept: UsdtAmount(0),
+                    },
+                    UsdtAmount(0),
+                )
+                .await;
+            dbtx.commit_tx().await;
+        }
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for &out_point in &all {
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalBatchCapKey(out_point))
+                        .await,
+                    Some(2),
+                    "round 1 (n=4) failure must halve the cap to 2"
+                );
+            }
+            dbtx.commit_tx().await;
+        }
+
+        // Round 2: split into two batches of 2 by sorted OutPoint (mirroring
+        // `effective_cap`'s window truncation). Whichever half contains the
+        // poison fails (cap -> 1 for its 2 members); the other half succeeds
+        // and settles.
+        let mut sorted_all = all.clone();
+        sorted_all.sort();
+        let (first_half, second_half) = sorted_all.split_at(2);
+        let poison_half: Vec<OutPoint> = if first_half.contains(&poison) {
+            first_half.to_vec()
+        } else {
+            second_half.to_vec()
+        };
+        let honest_half: Vec<OutPoint> = if first_half.contains(&poison) {
+            second_half.to_vec()
+        } else {
+            first_half.to_vec()
+        };
+        assert_eq!(poison_half.len(), 2);
+        assert_eq!(honest_half.len(), 2);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_withdraw_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    &honest_half,
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 11,
+                        block_hash: [0u8; 32],
+                        swept: UsdtAmount(2_000_000),
+                    },
+                    UsdtAmount(2_000_000),
+                )
+                .await;
+            module
+                .apply_withdraw_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    &poison_half,
+                    &UserOpConfirmedObservation {
+                        success: false,
+                        block: 11,
+                        block_hash: [0u8; 32],
+                        swept: UsdtAmount(0),
+                    },
+                    UsdtAmount(0),
+                )
+                .await;
+            dbtx.commit_tx().await;
+        }
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for &out_point in &honest_half {
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalStateKey(out_point))
+                        .await,
+                    Some(WithdrawalState::Confirmed { block: 11 }),
+                    "the honest half must settle once it lands in a batch without the poison"
+                );
+            }
+            for &out_point in &poison_half {
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalBatchCapKey(out_point))
+                        .await,
+                    Some(1),
+                    "round 2 (n=2) failure must halve the cap to 1 (floor)"
+                );
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalStateKey(out_point))
+                        .await,
+                    Some(WithdrawalState::Queued)
+                );
+            }
+            dbtx.commit_tx().await;
+        }
+
+        // Round 3: the poison half splits into two singletons. The poison
+        // itself fails alone (terminal Failed); the other member of that
+        // half is honest and succeeds alone.
+        let last_honest = *poison_half
+            .iter()
+            .find(|&&o| o != poison)
+            .expect("poison_half has exactly one non-poison member");
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_withdraw_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    &[last_honest],
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 12,
+                        block_hash: [0u8; 32],
+                        swept: UsdtAmount(1_000_000),
+                    },
+                    UsdtAmount(1_000_000),
+                )
+                .await;
+            module
+                .apply_withdraw_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    &[poison],
+                    &UserOpConfirmedObservation {
+                        success: false,
+                        block: 12,
+                        block_hash: [0u8; 32],
+                        swept: UsdtAmount(0),
+                    },
+                    UsdtAmount(0),
+                )
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Terminal assertions: all 3 honest withdrawals Confirmed, the
+        // poison terminal Failed, and no dangling caps anywhere.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for &out_point in &honest {
+                let state = dbtx
+                    .to_ref_nc()
+                    .get_value(&WithdrawalStateKey(out_point))
+                    .await
+                    .expect("WithdrawalState present");
+                assert!(
+                    matches!(state, WithdrawalState::Confirmed { block: 11 | 12 }),
+                    "every honest withdrawal must reach Confirmed, got {state:?}"
+                );
+                assert_eq!(
+                    dbtx.to_ref_nc()
+                        .get_value(&WithdrawalBatchCapKey(out_point))
+                        .await,
+                    None,
+                    "a settled withdrawal must not leave a dangling batch cap"
+                );
+            }
+            let poison_state = dbtx
+                .to_ref_nc()
+                .get_value(&WithdrawalStateKey(poison))
+                .await
+                .expect("WithdrawalState present");
+            assert!(
+                matches!(poison_state, WithdrawalState::Failed { .. }),
+                "the poison must reach terminal Failed, got {poison_state:?}"
+            );
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&UnclaimedWithdrawalKey(poison))
+                    .await
+                    .is_some(),
+                "the poison's UnclaimedWithdrawal must survive for the Phase 6.1 refund"
+            );
+            assert_eq!(
+                dbtx.to_ref_nc()
+                    .get_value(&WithdrawalBatchCapKey(poison))
+                    .await,
+                None,
+                "the terminal poison must not leave a dangling batch cap"
+            );
+            dbtx.commit_tx().await;
+        }
+
+        // Liveness: a FRESH honest withdrawal queued after all this is not
+        // permanently blocked -- the trigger builds a batch for it normally
+        // (no in-flight PendingUserOp/SubmittedUserOp lingers from the
+        // scripted rounds above, since this test drove
+        // `apply_withdraw_confirmed` directly rather than through the full
+        // signing/submission pipeline).
+        let fresh = test_out_point(60);
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(fresh),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0x77; 20]),
+                    amount: UsdtAmount(1_000_000),
+                    max_fee: UsdtAmount(1_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(fresh), &WithdrawalState::Queued)
+                .await;
+            let vote = batch_interval_blocks() + 1;
+            for p in 0..4u16 {
+                module
+                    .process_consensus_item(
+                        &mut dbtx.to_ref_nc(),
+                        UsdtConsensusItem::BlockCount(vote),
+                        PeerId::from(p),
+                    )
+                    .await
+                    .expect("block count vote succeeds");
+            }
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+            .await;
+        let fresh_state = dbtx
+            .to_ref_nc()
+            .get_value(&WithdrawalStateKey(fresh))
+            .await
+            .expect("WithdrawalState present");
+        assert!(
+            matches!(fresh_state, WithdrawalState::Signing(_)),
+            "a fresh, unrelated withdrawal must be picked up by the trigger normally, got \
+             {fresh_state:?}"
         );
     }
 
@@ -12964,6 +13760,8 @@ mod tests {
         )
         .await;
         dbtx.insert_new_entry(&HasEverBeenReadyKey, &()).await;
+        dbtx.insert_new_entry(&WithdrawalBatchCapKey(out_point), &2u32)
+            .await;
 
         dbtx.commit_tx().await;
 
@@ -12989,11 +13787,12 @@ mod tests {
             "Withdrawal States",
             "Bootstrap Votes",
             "Has Ever Been Ready",
+            "Withdrawal Batch Caps",
         ];
         assert_eq!(
             dumped.len(),
             expected_labels.len(),
-            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x0F)"
+            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x10)"
         );
         for label in expected_labels {
             assert!(
