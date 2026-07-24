@@ -495,6 +495,7 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
         UserOpReceipt {
             success: true,
             block: 42,
+            block_hash: [0u8; 32],
             actual_gas_cost_wei: UsdtAmount(0),
         },
     );
@@ -889,6 +890,7 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
         UserOpReceipt {
             success: true,
             block: 42,
+            block_hash: [0u8; 32],
             actual_gas_cost_wei: UsdtAmount(0),
         },
     );
@@ -1197,6 +1199,7 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
         UserOpReceipt {
             success: true,
             block: 42,
+            block_hash: [0u8; 32],
             actual_gas_cost_wei: UsdtAmount(0),
         },
     );
@@ -1355,6 +1358,7 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
         UserOpReceipt {
             success: true,
             block: 77,
+            block_hash: [0u8; 32],
             actual_gas_cost_wei: UsdtAmount(0),
         },
     );
@@ -1609,16 +1613,26 @@ mod fedimint_migration_tests {
             },
         )
         .await;
-        dbtx.insert_new_entry(
-            &DepositObservationVoteKey(account, PeerId::from(0)),
-            &DepositObservation {
-                account,
-                balance: UsdtAmount(1_000_000),
-                block: 1,
-                claim_pk,
-            },
-        )
-        .await;
+        // The pre-`migrate_db_v1` `DepositObservationVoteKey -> DepositObservation`
+        // shape (findings 04/12/15), written at the raw byte level because the
+        // current `DepositObservation` type now carries a `block_hash` the old
+        // on-disk rows did not (mirrors the raw `FeeVote` write above). A
+        // derived struct encodes as the concatenation of its fields in order,
+        // so this is exactly the old four-field layout `migrate_db_v1` must
+        // drop.
+        let mut old_deposit_vote_key_bytes = vec![DbKeyPrefix::DepositObservationVote as u8];
+        old_deposit_vote_key_bytes.extend_from_slice(
+            &DepositObservationVoteKey(account, PeerId::from(0)).consensus_encode_to_vec(),
+        );
+        let mut old_deposit_vote_value_bytes = Vec::new();
+        old_deposit_vote_value_bytes.extend_from_slice(&account.consensus_encode_to_vec());
+        old_deposit_vote_value_bytes
+            .extend_from_slice(&UsdtAmount(1_000_000).consensus_encode_to_vec());
+        old_deposit_vote_value_bytes.extend_from_slice(&1u64.consensus_encode_to_vec());
+        old_deposit_vote_value_bytes.extend_from_slice(&claim_pk.consensus_encode_to_vec());
+        dbtx.raw_insert_bytes(&old_deposit_vote_key_bytes, &old_deposit_vote_value_bytes)
+            .await
+            .expect("DB error");
         dbtx.insert_new_entry(
             &PendingCheckKey(account),
             &PendingCheck {
@@ -1678,15 +1692,22 @@ mod fedimint_migration_tests {
             },
         )
         .await;
-        dbtx.insert_new_entry(
-            &UserOpConfirmedVoteKey(op_hash, PeerId::from(0)),
-            &UserOpConfirmedObservation {
-                success: true,
-                block: 1,
-                swept: UsdtAmount(1_000_000),
-            },
-        )
-        .await;
+        // The pre-`migrate_db_v1` `UserOpConfirmedVoteKey ->
+        // UserOpConfirmedObservation` shape (findings 04/15), written raw for
+        // the same reason as the deposit vote above (the current type gained a
+        // `block_hash`). Old three-field layout: `success ++ block ++ swept`.
+        let mut old_userop_vote_key_bytes = vec![DbKeyPrefix::UserOpConfirmedVote as u8];
+        old_userop_vote_key_bytes.extend_from_slice(
+            &UserOpConfirmedVoteKey(op_hash, PeerId::from(0)).consensus_encode_to_vec(),
+        );
+        let mut old_userop_vote_value_bytes = Vec::new();
+        old_userop_vote_value_bytes.extend_from_slice(&true.consensus_encode_to_vec());
+        old_userop_vote_value_bytes.extend_from_slice(&1u64.consensus_encode_to_vec());
+        old_userop_vote_value_bytes
+            .extend_from_slice(&UsdtAmount(1_000_000).consensus_encode_to_vec());
+        dbtx.raw_insert_bytes(&old_userop_vote_key_bytes, &old_userop_vote_value_bytes)
+            .await
+            .expect("DB error");
         dbtx.insert_new_entry(
             &fedimint_usdt_server::db::UnclaimedWithdrawalKey(out_point),
             &UsdtWithdrawalV0 {
@@ -1773,13 +1794,22 @@ mod fedimint_migration_tests {
                         info!("Validated DepositRecord");
                     }
                     DbKeyPrefix::DepositObservationVote => {
+                        // Findings 04/12/15: `migrate_db_v1` DROPS pre-migration
+                        // `DepositObservationVote` rows (they carry no
+                        // `block_hash` and are re-proposed every scan tick --
+                        // see that function's doc comment), so the table must
+                        // read back cleanly in the NEW shape as EMPTY.
                         let votes = dbtx
                             .find_by_prefix(&fedimint_usdt_server::db::DepositObservationVotePrefix)
                             .await
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<(DepositObservationVoteKey, DepositObservation)>>()
                             .await;
-                        ensure!(!votes.is_empty(), "no DepositObservationVotes read back");
-                        info!("Validated DepositObservationVote");
+                        ensure!(
+                            votes.is_empty(),
+                            "pre-migration DepositObservationVote rows must be dropped by \
+                             migrate_db_v1, not rewritten"
+                        );
+                        info!("Validated DepositObservationVote (dropped, not rewritten)");
                     }
                     DbKeyPrefix::PendingCheck => {
                         let checks = dbtx
@@ -1832,13 +1862,21 @@ mod fedimint_migration_tests {
                         info!("Validated PoolState");
                     }
                     DbKeyPrefix::UserOpConfirmedVote => {
+                        // Findings 04/15: `migrate_db_v1` DROPS pre-migration
+                        // `UserOpConfirmedVote` rows (no `block_hash`; re-polled
+                        // and re-proposed every submit tick), so the table must
+                        // read back cleanly in the NEW shape as EMPTY.
                         let votes = dbtx
                             .find_by_prefix(&fedimint_usdt_server::db::UserOpConfirmedVotePrefix)
                             .await
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<(UserOpConfirmedVoteKey, UserOpConfirmedObservation)>>()
                             .await;
-                        ensure!(!votes.is_empty(), "no UserOpConfirmedVotes read back");
-                        info!("Validated UserOpConfirmedVote");
+                        ensure!(
+                            votes.is_empty(),
+                            "pre-migration UserOpConfirmedVote rows must be dropped by \
+                             migrate_db_v1, not rewritten"
+                        );
+                        info!("Validated UserOpConfirmedVote (dropped, not rewritten)");
                     }
                     DbKeyPrefix::UnclaimedWithdrawal => {
                         let withdrawals = dbtx

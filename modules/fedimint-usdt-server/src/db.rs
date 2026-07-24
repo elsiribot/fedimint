@@ -487,6 +487,12 @@ impl_db_lookup!(key = PoolStateKey, query_prefix = PoolStatePrefix);
 pub struct UserOpConfirmedObservation {
     pub success: bool,
     pub block: u64,
+    /// The canonical hash of `block` (security findings 04/15), carried in
+    /// the vote so the full-field `#[derive(PartialEq)]` tally binds each
+    /// vote to a specific fork: two guardians observing the same op on
+    /// different forks at the same height produce non-equal observations that
+    /// never aggregate toward threshold.
+    pub block_hash: [u8; 32],
     pub swept: UsdtAmount,
 }
 
@@ -680,6 +686,7 @@ mod tests {
             account,
             balance: UsdtAmount(2_000_000),
             block,
+            block_hash: [0u8; 32],
             claim_pk,
         };
 
@@ -990,6 +997,7 @@ mod tests {
         let vote = |block: u64| UserOpConfirmedObservation {
             success: true,
             block,
+            block_hash: [0u8; 32],
             swept: UsdtAmount(2_000_000),
         };
 

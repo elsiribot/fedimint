@@ -932,6 +932,12 @@ impl ServerModuleInit for UsdtInit {
     /// the freshness stamp `fee_vote_median`'s TTL/quorum gate needs). See
     /// [`migrate_db_v0`] for why this migration drops rather than rewrites
     /// the old-format rows.
+    ///
+    /// `DatabaseVersion(1)` (security findings 04/12/15): both
+    /// [`DepositObservation`](fedimint_usdt_common::DepositObservation) and
+    /// [`UserOpConfirmedObservation`](crate::db::UserOpConfirmedObservation)
+    /// gained a `block_hash` field. See [`migrate_db_v1`] for why this
+    /// migration drops (rather than rewrites) the old-format vote rows.
     fn get_database_migrations(
         &self,
     ) -> BTreeMap<DatabaseVersion, ServerModuleDbMigrationFn<Usdt>> {
@@ -940,6 +946,10 @@ impl ServerModuleInit for UsdtInit {
         migrations.insert(
             DatabaseVersion(0),
             Box::new(|ctx| migrate_db_v0(ctx).boxed()),
+        );
+        migrations.insert(
+            DatabaseVersion(1),
+            Box::new(|ctx| migrate_db_v1(ctx).boxed()),
         );
         migrations
     }
@@ -963,6 +973,39 @@ impl ServerModuleInit for UsdtInit {
 async fn migrate_db_v0(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> anyhow::Result<()> {
     ctx.dbtx()
         .raw_remove_by_prefix(&[DbKeyPrefix::FeeVote as u8])
+        .await
+        .expect("DB error");
+    Ok(())
+}
+
+/// Migrates the deposit- and userop-observation vote tables' value shapes for
+/// the `block_hash` binding (security findings 04/12/15):
+/// [`DepositObservationVoteKey`](crate::db::DepositObservationVoteKey)'s value
+/// ([`DepositObservation`](fedimint_usdt_common::DepositObservation)) and
+/// [`UserOpConfirmedVoteKey`](crate::db::UserOpConfirmedVoteKey)'s value
+/// ([`UserOpConfirmedObservation`](crate::db::UserOpConfirmedObservation)) each
+/// gained a `block_hash` field.
+///
+/// Like [`migrate_db_v0`], this DROPS every existing row of both tables rather
+/// than reinterpreting the old-format bytes. These are transient, guardian-
+/// local observation votes: the deposit scanner re-proposes each pending
+/// account's observation every scan tick, and the user-op submitter re-polls
+/// and re-proposes every `SubmittedUserOp`'s receipt every submit tick -- both
+/// now stamped with a real `block_hash` -- so both vote quorums re-establish
+/// themselves within one tick of upgrading. Fabricating a `block_hash` for the
+/// old rows (e.g. all-zero) would be worse than dropping them: a zero hash is
+/// not any real fork's hash, so those rows could never full-field-equal a
+/// freshly-observed vote and would just linger as dead weight until expired.
+/// Dropping them outright (mirroring `fedimint-mint-server`'s `migrate_db_v1`,
+/// which also `raw_remove_by_prefix`es a stale-format table) is simpler and
+/// loses nothing meaningful.
+async fn migrate_db_v1(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> anyhow::Result<()> {
+    ctx.dbtx()
+        .raw_remove_by_prefix(&[DbKeyPrefix::DepositObservationVote as u8])
+        .await
+        .expect("DB error");
+    ctx.dbtx()
+        .raw_remove_by_prefix(&[DbKeyPrefix::UserOpConfirmedVote as u8])
         .await
         .expect("DB error");
     Ok(())
@@ -1065,6 +1108,9 @@ struct UserOpConfirmedProposal {
     op_hash: [u8; 32],
     success: bool,
     block: u64,
+    /// Canonical hash of `block`, from the authoritative `EntryPoint` log (see
+    /// [`crate::rpc::IServerEvmRpc::get_user_op_receipt`]).
+    block_hash: [u8; 32],
     swept: UsdtAmount,
 }
 
@@ -1103,6 +1149,13 @@ struct UserOpSubmitterHandles {
     db: Database,
     evm_rpc: DynServerEvmRpc,
     user_op_confirmed_proposals: Arc<Mutex<Vec<UserOpConfirmedProposal>>>,
+    /// EVM reorg confirmation depth (security finding 04): a receipt is not
+    /// proposed for threshold confirmation until its block is this many
+    /// consensus blocks deep, mirroring the deposit scanner's own depth gate.
+    confirmation_depth: u64,
+    /// Needed to compute `consensus_block_count(dbtx, num_peers)` for the
+    /// depth gate from the guardian-local DB.
+    num_peers: NumPeers,
 }
 
 /// Grouped handles/config for [`Usdt::spawn_bootstrap_observer`] (Part C),
@@ -1337,6 +1390,7 @@ impl ServerModule for Usdt {
             let obs = UserOpConfirmedObservation {
                 success: proposal.success,
                 block: proposal.block,
+                block_hash: proposal.block_hash,
                 swept: proposal.swept,
             };
             let current_vote = dbtx
@@ -1347,6 +1401,7 @@ impl ServerModule for Usdt {
                     op_hash: proposal.op_hash,
                     success: proposal.success,
                     block: proposal.block,
+                    block_hash: proposal.block_hash,
                     swept: proposal.swept,
                 });
             }
@@ -1412,13 +1467,65 @@ impl ServerModule for Usdt {
                     "deposit observation claim_pk does not derive its account"
                 );
 
+                // Security finding 12: FRESHNESS gate. Reject (non-state-
+                // changing `Err`, BEFORE any DB mutation) an observation that
+                // is outside the acceptable window relative to consensus:
+                //   * too NEW: `obs.block` must be at least `confirmation_depth` behind the
+                //     consensus block count (mirrors the deposit scanner's own read height), so
+                //     an observation cannot be credited before it is confirmation-deep; and
+                //   * too OLD: `obs.block` must be within `confirmation_depth +
+                //     DEPOSIT_VOTE_MAX_AGE_BLOCKS` of the consensus block count, so a very old
+                //     pre-reorg vote can never complete a threshold long after the fact (the
+                //     deep- reorg stale-vote scenario). Purely a function of `obs` +
+                //     `consensus_block_count(dbtx)` + config, so every honest guardian decides
+                //     identically.
+                let confirmation_depth = self.cfg.consensus.confirmation_depth;
+                let ccount = self.consensus_block_count(dbtx).await;
+                ensure!(
+                    obs.block <= ccount.saturating_sub(confirmation_depth),
+                    "deposit observation block is not yet confirmation-deep"
+                );
+                ensure!(
+                    ccount.saturating_sub(obs.block)
+                        <= confirmation_depth + DEPOSIT_VOTE_MAX_AGE_BLOCKS,
+                    "deposit observation is too old (outside the freshness window)"
+                );
+
                 // Store this peer's vote; redundancy guard (unbounded-history rule).
                 let key = DepositObservationVoteKey(obs.account, peer_id);
                 if dbtx.insert_entry(&key, &obs).await.as_ref() == Some(&obs) {
                     bail!("Deposit observation vote is redundant");
                 }
 
-                // Count identical observations for this account.
+                // Security finding 12: EXPIRY + SUPERSESSION of stale/older
+                // stored votes for this account (deterministic hygiene, reads
+                // only `ccount` + the stored votes + `obs`). Remove any stored
+                // vote that is now either outside the freshness window (so a
+                // sub-threshold set of stale votes cannot linger and later
+                // complete a threshold after a deep reorg) OR at a strictly
+                // LOWER block than this fresh observation (a higher-block
+                // observation supersedes older, now-divergent ones). This never
+                // removes `obs` itself (equal block, in-window) and only ever
+                // removes votes that could NOT have counted toward `obs`'s tally
+                // anyway (a different `block`/`block_hash` cannot full-field-
+                // equal `obs`), so it cannot change THIS credit decision -- it
+                // only prevents stale accumulation. `credited` stays monotonic.
+                let stored: Vec<(DepositObservationVoteKey, DepositObservation)> = dbtx
+                    .find_by_prefix(&DepositObservationVoteAccountPrefix(obs.account))
+                    .await
+                    .collect()
+                    .await;
+                for (vote_key, vote) in &stored {
+                    let too_old = ccount.saturating_sub(vote.block)
+                        > confirmation_depth + DEPOSIT_VOTE_MAX_AGE_BLOCKS;
+                    let superseded = vote.block < obs.block && *vote != obs;
+                    if too_old || superseded {
+                        dbtx.remove_entry(vote_key).await;
+                    }
+                }
+
+                // Count identical observations for this account (over what
+                // survives the expiry/supersession sweep above).
                 let votes: Vec<DepositObservation> = dbtx
                     .find_by_prefix(&DepositObservationVoteAccountPrefix(obs.account))
                     .await
@@ -1447,6 +1554,7 @@ impl ServerModule for Usdt {
                 op_hash,
                 success,
                 block,
+                block_hash,
                 swept,
             } => {
                 // DETERMINISTIC, mirrors the `Deposit` arm's exact
@@ -1473,6 +1581,7 @@ impl ServerModule for Usdt {
                 let obs = UserOpConfirmedObservation {
                     success,
                     block,
+                    block_hash,
                     swept,
                 };
                 let key = UserOpConfirmedVoteKey(op_hash, peer_id);
@@ -2035,6 +2144,20 @@ const FEE_VOTE_TTL_BLOCKS: u64 = 50;
 /// move monotonically) rather than on inequality.
 const FEE_VOTE_REFRESH_BLOCKS: u64 = 20;
 
+/// Extra age (in consensus blocks, ON TOP of `confirmation_depth`) a stored
+/// [`DepositObservation`] vote may have and still be accepted / counted
+/// toward a threshold credit (security finding 12). A vote is FRESH only while
+/// `consensus_block_count - obs.block <= confirmation_depth +
+/// DEPOSIT_VOTE_MAX_AGE_BLOCKS`; older votes are rejected at store time and
+/// opportunistically expired from the vote table when a later `Deposit` item
+/// for the same account is processed. This closes the "a very old pre-reorg
+/// vote completes a threshold much later, after a deep reorg removed the
+/// deposit" gap: even a Byzantine or delayed-honest duplicate of a stale
+/// observation can no longer credit funds once the observation has aged out of
+/// this window. Computed purely from `consensus_block_count(dbtx)` (never
+/// wall-clock), so every guardian agrees.
+const DEPOSIT_VOTE_MAX_AGE_BLOCKS: u64 = 100;
+
 /// A fixed, compiled-in `secp256k1` public key -- the point for secret scalar
 /// `1` (the curve generator `G`) -- used by [`Usdt::observe_bootstrap`] as a
 /// deterministic sample claim key (sec-16 readiness deepening, finding 16).
@@ -2104,6 +2227,8 @@ impl Usdt {
                 db: db.clone(),
                 evm_rpc: evm_rpc.clone(),
                 user_op_confirmed_proposals: user_op_confirmed_proposals.clone(),
+                confirmation_depth: cfg.consensus.confirmation_depth,
+                num_peers,
             },
         );
 
@@ -2628,6 +2753,8 @@ impl Usdt {
             db,
             evm_rpc,
             user_op_confirmed_proposals,
+            confirmation_depth,
+            num_peers,
         } = handles;
 
         task_group.spawn_cancellable("usdt-user-op-submitter", async move {
@@ -2638,6 +2765,10 @@ impl Usdt {
                     .await
                     .collect()
                     .await;
+                // Security finding 04: the consensus block count as this
+                // guardian sees it, for the confirmation-depth gate below. Read
+                // once per tick (it is identical for every op in the batch).
+                let ccount = consensus_block_count(&mut dbtx, num_peers).await;
                 drop(dbtx);
 
                 // Security finding 19: bounded concurrency (not a serial
@@ -2673,6 +2804,30 @@ impl Usdt {
 
                             match rpc_deadline(evm_rpc.get_user_op_receipt(op_hash)).await {
                                 Ok(Some(receipt)) => {
+                                    // Security finding 04: CONFIRMATION-DEPTH
+                                    // gate. Do not propose a threshold
+                                    // confirmation until the receipt's block is
+                                    // `confirmation_depth` consensus blocks deep
+                                    // (mirrors the deposit scanner's own depth
+                                    // gate), so a reorg shallower than the depth
+                                    // cannot make the federation apply an
+                                    // irreversible sweep/withdrawal settlement
+                                    // against a block that later disappears. The
+                                    // op stays `SubmittedUserOp`, so this is
+                                    // simply re-polled next tick until it is
+                                    // deep enough.
+                                    if receipt.block.saturating_add(confirmation_depth) > ccount {
+                                        debug!(
+                                            target: "usdt",
+                                            ?op_hash,
+                                            receipt_block = receipt.block,
+                                            ccount,
+                                            confirmation_depth,
+                                            "UserOp receipt not yet confirmation-deep, deferring \
+                                             confirmation proposal"
+                                        );
+                                        return;
+                                    }
                                     // `swept` doubles as "amount moved by
                                     // this op": swept-TO-the-pool for
                                     // `DeployAndSweep`, paid-OUT-of-the-pool
@@ -2749,6 +2904,7 @@ impl Usdt {
                                             op_hash,
                                             success: receipt.success,
                                             block: receipt.block,
+                                            block_hash: receipt.block_hash,
                                             swept,
                                         });
                                 }
@@ -4910,6 +5066,29 @@ async fn scan_pending_deposits(
         .collect()
         .await;
 
+    // Security finding 12: the canonical hash of the read block `at`, fetched
+    // ONCE per scan (it is the same for every account) and bound into every
+    // observation so votes from different forks at the same height cannot
+    // aggregate. `None` when this guardian's node hasn't confirmed `at` yet
+    // (`at > cached_head`) or the hash read failed -- either way, no
+    // observation can be proposed this tick (retried next tick).
+    let block_hash = if at > cached_head {
+        None
+    } else {
+        match rpc_deadline(evm_rpc.get_block_hash(at)).await {
+            Ok(hash) => Some(hash),
+            Err(err) => {
+                debug!(
+                    target: "usdt",
+                    err = %err.fmt_compact_anyhow(),
+                    at_block = at,
+                    "deposit block-hash read failed, retrying next tick"
+                );
+                None
+            }
+        }
+    };
+
     let mut observations = Vec::new();
     for (PendingCheckKey(account), check) in pending {
         // Skipped (not deleted) here -- see this function's doc comment for
@@ -4919,11 +5098,12 @@ async fn scan_pending_deposits(
             continue;
         }
 
-        if at > cached_head {
-            // This guardian's own EVM node hasn't confirmed that block yet;
-            // retry next tick.
+        let Some(block_hash) = block_hash else {
+            // This guardian's own EVM node hasn't confirmed `at` yet (or its
+            // hash read failed); retry next tick. Subsumes the old
+            // `at > cached_head` skip.
             continue;
-        }
+        };
 
         let balance =
             match rpc_deadline(evm_rpc.get_erc20_balance(usdt_contract, account, at)).await {
@@ -4950,6 +5130,7 @@ async fn scan_pending_deposits(
                 account,
                 balance,
                 block: at,
+                block_hash,
                 claim_pk: check.claim_pk,
             });
         }
@@ -5180,6 +5361,29 @@ mod tests {
         /// (security finding 19; see `set_receipt_hangs`), used to prove a
         /// stalled RPC call for one op cannot block progress on others.
         hung_receipts: Mutex<std::collections::HashSet<[u8; 32]>>,
+        /// `user_op_hash`es the BUNDLER claims success for but for which the
+        /// authoritative `EntryPoint` `UserOperationEvent` log is ABSENT
+        /// (security finding 15 op facet; see
+        /// `set_bundler_success_without_entrypoint_log`). Models the
+        /// cross-check contract of `AlloyEvmRpc::get_user_op_receipt`: a
+        /// bundler hint with no confirming `EntryPoint` log resolves to `None`
+        /// (do NOT confirm), NOT to a fabricated receipt.
+        bundler_only_receipts: Mutex<std::collections::HashSet<[u8; 32]>>,
+        /// Scripted `get_block_hash` overrides, keyed by block number. An
+        /// unscripted block falls back to a deterministic block-number-derived
+        /// hash (see `mock_block_hash`).
+        block_hashes: Mutex<std::collections::HashMap<u64, [u8; 32]>>,
+    }
+
+    /// Deterministic, block-number-derived stand-in for a canonical block hash
+    /// (NOT a real keccak256): stable and distinct per height, all the
+    /// deposit-observation/user-op `block_hash` binding needs in hermetic unit
+    /// tests. Mirrors `fedimint-usdt-tests`' `mock_block_hash`.
+    fn mock_block_hash(block: u64) -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&block.to_be_bytes());
+        hash[31] = 0xB1;
+        hash
     }
 
     impl MockEvmRpc {
@@ -5225,6 +5429,29 @@ mod tests {
                 .lock()
                 .expect("not poisoned")
                 .insert(user_op_hash);
+        }
+
+        /// Scripts `get_user_op_receipt(user_op_hash)` to model the security
+        /// finding 15 mismatch: the bundler claims the op succeeded, but the
+        /// authoritative `EntryPoint` `UserOperationEvent` log is absent -- so
+        /// the cross-checked result is `None` (do NOT confirm), exactly as
+        /// `AlloyEvmRpc::get_user_op_receipt` returns when its single-block
+        /// `eth_getLogs` finds no matching event.
+        fn set_bundler_success_without_entrypoint_log(&self, user_op_hash: [u8; 32]) {
+            self.bundler_only_receipts
+                .lock()
+                .expect("not poisoned")
+                .insert(user_op_hash);
+        }
+
+        /// Scripts the canonical hash `get_block_hash(block)` returns,
+        /// overriding the default `mock_block_hash`-derived value.
+        #[allow(dead_code)]
+        fn set_block_hash(&self, block: u64, hash: [u8; 32]) {
+            self.block_hashes
+                .lock()
+                .expect("not poisoned")
+                .insert(block, hash);
         }
 
         /// Every `SignedUserOp` batch previously passed to
@@ -5300,6 +5527,16 @@ mod tests {
 
         async fn get_block_number(&self) -> anyhow::Result<u64> {
             Ok(0)
+        }
+
+        async fn get_block_hash(&self, block: u64) -> anyhow::Result<[u8; 32]> {
+            Ok(self
+                .block_hashes
+                .lock()
+                .expect("not poisoned")
+                .get(&block)
+                .copied()
+                .unwrap_or_else(|| mock_block_hash(block)))
         }
 
         async fn get_erc20_balance(
@@ -5418,6 +5655,26 @@ mod tests {
                 // the test's own bounded wait) is what must make progress
                 // possible despite this.
                 std::future::pending::<()>().await;
+            }
+            // Security finding 15 op facet: a bundler hint with no confirming
+            // EntryPoint log cross-checks to `None` (do not confirm), even
+            // though the bundler claimed success -- mirrors
+            // `AlloyEvmRpc::get_user_op_receipt`'s single-block `eth_getLogs`
+            // finding no matching event. Only the authoritative log (a
+            // scripted `UserOpReceipt`, carrying its `block_hash`) yields
+            // `Some`.
+            if self
+                .bundler_only_receipts
+                .lock()
+                .expect("not poisoned")
+                .contains(&user_op_hash)
+                && !self
+                    .user_op_receipts
+                    .lock()
+                    .expect("not poisoned")
+                    .contains_key(&user_op_hash)
+            {
+                return Ok(None);
             }
             Ok(self
                 .user_op_receipts
@@ -5861,6 +6118,11 @@ mod tests {
     async fn deposit_credited_only_at_threshold_of_identical_observations() {
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let db = module.db_for_test();
+        // Security finding 12: the freshness gate requires the observation's
+        // block (50) to be `confirmation_depth`-deep and within the freshness
+        // window relative to consensus, so seed a consensus block count at
+        // `50 + confirmation_depth`.
+        seed_block_count_votes(db, 4, 50 + module.cfg.consensus.confirmation_depth).await;
         let claim_pk = test_pubkey(0xaa);
         let account = derive_deposit_account(
             &module.cfg.consensus.group_public_key,
@@ -5891,6 +6153,7 @@ mod tests {
             account,
             balance: UsdtAmount(2_000_000),
             block: 50,
+            block_hash: [0u8; 32],
             claim_pk,
         };
         let mut dbtx = db.begin_transaction().await;
@@ -5970,6 +6233,8 @@ mod tests {
         // Same peer submitting the same observation twice must Err.
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
+        // Freshness gate (finding 12): keep the block-10 observation in-window.
+        seed_block_count_votes(db, 4, 10 + module.cfg.consensus.confirmation_depth).await;
         let claim_pk = test_pubkey(0xbb);
         let account = derive_deposit_account(
             &module.cfg.consensus.group_public_key,
@@ -5995,6 +6260,7 @@ mod tests {
             account,
             balance: UsdtAmount(1_000_000),
             block: 10,
+            block_hash: [0u8; 32],
             claim_pk,
         };
         let mut dbtx = db.begin_transaction().await;
@@ -6044,6 +6310,7 @@ mod tests {
             account,
             balance: UsdtAmount(1_000_000),
             block: 10,
+            block_hash: [0u8; 32],
             claim_pk,
         };
         let mut dbtx = db.begin_transaction().await;
@@ -6090,6 +6357,8 @@ mod tests {
     async fn credit_deposit_succeeds_without_any_local_pending_check() {
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let db = module.db_for_test();
+        // Freshness gate (finding 12): keep the block-50 observation in-window.
+        seed_block_count_votes(db, 4, 50 + module.cfg.consensus.confirmation_depth).await;
         let claim_pk = test_pubkey(0x42);
         let account = derive_deposit_account(
             &module.cfg.consensus.group_public_key,
@@ -6113,6 +6382,7 @@ mod tests {
             account,
             balance: UsdtAmount(2_000_000),
             block: 50,
+            block_hash: [0u8; 32],
             claim_pk,
         };
         let mut dbtx = db.begin_transaction().await;
@@ -6167,6 +6437,7 @@ mod tests {
             account: wrong_account,
             balance: UsdtAmount(2_000_000),
             block: 50,
+            block_hash: [0u8; 32],
             claim_pk,
         };
 
@@ -6761,6 +7032,7 @@ mod tests {
                 account,
                 balance: UsdtAmount(3_000_000),
                 block: at,
+                block_hash: mock_block_hash(at),
                 claim_pk,
             }]
         );
@@ -7091,6 +7363,9 @@ mod tests {
         // field never moves down.
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
+        // Freshness gate (finding 12): seed a consensus block count that keeps
+        // BOTH the block-50 and (later) block-80 observations in-window.
+        seed_block_count_votes(db, 4, 80 + module.cfg.consensus.confirmation_depth).await;
         let claim_pk = test_pubkey(0x75);
         let account = derive_deposit_account(
             &module.cfg.consensus.group_public_key,
@@ -7103,6 +7378,7 @@ mod tests {
             account,
             balance: UsdtAmount(2_000_000),
             block: 50,
+            block_hash: [0u8; 32],
             claim_pk,
         };
         let mut dbtx = db.begin_transaction().await;
@@ -7130,6 +7406,7 @@ mod tests {
             account,
             balance: UsdtAmount(500_000),
             block: 80,
+            block_hash: [0u8; 32],
             claim_pk,
         };
         for p in [0u16, 1, 2] {
@@ -9773,6 +10050,7 @@ mod tests {
         let receipt = UserOpReceipt {
             success: true,
             block: 42,
+            block_hash: [0u8; 32],
             actual_gas_cost_wei: fedimint_usdt_common::UsdtAmount(1_000),
         };
         mock.set_user_op_receipt(user_op_hash, receipt);
@@ -9850,6 +10128,7 @@ mod tests {
             account,
             balance: UsdtAmount(4_500_000),
             block: 5,
+            block_hash: [0u8; 32],
             claim_pk,
         };
 
@@ -9867,6 +10146,14 @@ mod tests {
         };
         for module in modules.values() {
             seed_fee_votes(module.db_for_test(), N, low_fee_vote).await;
+            // Security finding 12 freshness gate: keep the block-5 deposit
+            // observation in-window on every guardian.
+            seed_block_count_votes(
+                module.db_for_test(),
+                N,
+                5 + module.cfg.consensus.confirmation_depth,
+            )
+            .await;
         }
 
         // Every guardian independently processes the identical ordered
@@ -10123,6 +10410,7 @@ mod tests {
             op_hash,
             success: true,
             block: 20,
+            block_hash: [0u8; 32],
             swept: UsdtAmount(4_000_000),
         };
         let mut dbtx = db.begin_transaction().await;
@@ -10149,6 +10437,7 @@ mod tests {
                     op_hash,
                     success: true,
                     block: 20,
+                    block_hash: [0u8; 32],
                     swept: UsdtAmount(1),
                 },
                 PeerId::from(2),
@@ -10236,6 +10525,7 @@ mod tests {
                 &UserOpConfirmedObservation {
                     success: true,
                     block: 20,
+                    block_hash: [0u8; 32],
                     swept: UsdtAmount(4_000_000),
                 },
             )
@@ -10280,6 +10570,7 @@ mod tests {
             op_hash: unknown_op_hash,
             success: true,
             block: 20,
+            block_hash: [0u8; 32],
             swept: UsdtAmount(1_000_000),
         };
 
@@ -10337,6 +10628,7 @@ mod tests {
                     op_hash: known_op_hash,
                     success: true,
                     block: 20,
+                    block_hash: [0u8; 32],
                     swept: UsdtAmount(1_000_000),
                 },
                 PeerId::from(0),
@@ -10400,6 +10692,7 @@ mod tests {
             op_hash,
             success: false,
             block: 21,
+            block_hash: [0u8; 32],
             swept: UsdtAmount(0),
         };
         let mut dbtx = db.begin_transaction().await;
@@ -10691,6 +10984,7 @@ mod tests {
                 account,
                 balance: UsdtAmount(1),
                 block: 10,
+                block_hash: [0u8; 32],
                 claim_pk,
             };
             let mut dbtx = db.begin_transaction().await;
@@ -10788,6 +11082,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 20,
+                        block_hash: [0u8; 32],
                         swept: UsdtAmount(100_000_000),
                     },
                 )
@@ -10864,6 +11159,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 30,
+                        block_hash: [0u8; 32],
                         swept: UsdtAmount(100_000_000),
                     },
                 )
@@ -10985,6 +11281,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 25,
+                        block_hash: [0u8; 32],
                         swept: UsdtAmount(100_000_000),
                     },
                 )
@@ -11060,6 +11357,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: false,
                         block: 21,
+                        block_hash: [0u8; 32],
                         swept: UsdtAmount(0),
                     },
                 )
@@ -11697,6 +11995,7 @@ mod tests {
             op_hash,
             success: true,
             block: 99,
+            block_hash: [0u8; 32],
             swept: total,
         };
         let mut dbtx = db.begin_transaction().await;
@@ -11745,6 +12044,7 @@ mod tests {
                 &UserOpConfirmedObservation {
                     success: true,
                     block: 99,
+                    block_hash: [0u8; 32],
                     swept: total,
                 },
             )
@@ -11824,6 +12124,7 @@ mod tests {
             op_hash,
             success: false,
             block: 101,
+            block_hash: [0u8; 32],
             swept: UsdtAmount(0),
         };
         let mut dbtx = db.begin_transaction().await;
@@ -11992,6 +12293,7 @@ mod tests {
                 &UserOpConfirmedObservation {
                     success: true,
                     block: 55,
+                    block_hash: [0u8; 32],
                     swept: amount,
                 },
             )
@@ -12058,6 +12360,7 @@ mod tests {
                 account,
                 balance: UsdtAmount(1_000_000),
                 block: 1,
+                block_hash: [0u8; 32],
                 claim_pk,
             },
         )
@@ -12126,6 +12429,7 @@ mod tests {
             &UserOpConfirmedObservation {
                 success: true,
                 block: 1,
+                block_hash: [0u8; 32],
                 swept: UsdtAmount(1_000_000),
             },
         )
@@ -12358,10 +12662,20 @@ mod tests {
                 fedimint_usdt_common::user_op::UserOpReceipt {
                     success: true,
                     block: 42,
+                    block_hash: [0u8; 32],
                     actual_gas_cost_wei: UsdtAmount(0),
                 },
             );
         }
+
+        // Security finding 04: the confirmation-depth gate needs a consensus
+        // block count comfortably past `receipt.block (42) + confirmation_depth`
+        // so this test (which predates the gate) still sees its proposals.
+        let num_peers = (0..4u16)
+            .map(PeerId::from)
+            .collect::<Vec<_>>()
+            .to_num_peers();
+        seed_block_count_votes(&db, 4, 100).await;
 
         let user_op_confirmed_proposals = Arc::new(Mutex::new(Vec::new()));
         let task_group = TaskGroup::new();
@@ -12371,6 +12685,8 @@ mod tests {
                 db: db.clone(),
                 evm_rpc: evm_rpc.into_dyn(),
                 user_op_confirmed_proposals: user_op_confirmed_proposals.clone(),
+                confirmation_depth: 6,
+                num_peers,
             },
         );
 
@@ -12461,6 +12777,7 @@ mod tests {
             fedimint_usdt_common::user_op::UserOpReceipt {
                 success: true,
                 block: 7,
+                block_hash: [0u8; 32],
                 actual_gas_cost_wei: UsdtAmount(0),
             },
         );
@@ -12502,6 +12819,15 @@ mod tests {
             dbtx.commit_tx().await;
         }
 
+        // Security finding 04: seed a consensus block count past
+        // `receipt.block (7) + confirmation_depth` so the confirmation-depth
+        // gate does not suppress the prompt op's proposal this test asserts on.
+        let num_peers = (0..4u16)
+            .map(PeerId::from)
+            .collect::<Vec<_>>()
+            .to_num_peers();
+        seed_block_count_votes(&db, 4, 100).await;
+
         let user_op_confirmed_proposals = Arc::new(Mutex::new(Vec::new()));
         let task_group = TaskGroup::new();
         Usdt::spawn_user_op_submitter(
@@ -12510,6 +12836,8 @@ mod tests {
                 db: db.clone(),
                 evm_rpc: evm_rpc.into_dyn(),
                 user_op_confirmed_proposals: user_op_confirmed_proposals.clone(),
+                confirmation_depth: 6,
+                num_peers,
             },
         );
 
@@ -12608,6 +12936,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 10,
+                        block_hash: [0u8; 32],
                         swept: UsdtAmount(999_999_999),
                     },
                 )
@@ -12648,6 +12977,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 11,
+                        block_hash: [0u8; 32],
                         swept: real_amount,
                     },
                 )
@@ -12738,6 +13068,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 20,
+                        block_hash: [0u8; 32],
                         swept: UsdtAmount(1),
                     },
                 )
@@ -12791,6 +13122,7 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: 21,
+                        block_hash: [0u8; 32],
                         swept: real_total,
                     },
                 )
@@ -12823,6 +13155,439 @@ mod tests {
             );
             dbtx.commit_tx().await;
         }
+    }
+
+    /// **Security finding 04 (Task 5.1).** The user-op submitter must NOT
+    /// propose a threshold confirmation for a receipt until its block is
+    /// `confirmation_depth` consensus blocks deep -- so a reorg shallower than
+    /// the depth cannot make the federation apply an irreversible sweep/
+    /// withdrawal settlement against a block that later disappears.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn userop_confirm_waits_for_confirmation_depth() {
+        let source = EvmAddress([0x51; 20]);
+        let op_hash = [0x52u8; 32];
+        let receipt_block = 10u64;
+        let confirmation_depth = 6u64;
+
+        let evm_rpc = MockEvmRpc::default();
+        evm_rpc.set_user_op_receipt(
+            op_hash,
+            fedimint_usdt_common::user_op::UserOpReceipt {
+                success: true,
+                block: receipt_block,
+                block_hash: [0x77; 32],
+                actual_gas_cost_wei: UsdtAmount(0),
+            },
+        );
+
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_deploy_and_sweep_op_for_test(source, UsdtAmount(1_000_000)),
+                        signature: vec![0xcc; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep { source },
+                    submitted_block: 1,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let num_peers = (0..4u16)
+            .map(PeerId::from)
+            .collect::<Vec<_>>()
+            .to_num_peers();
+        // Consensus block count 12 < receipt_block(10) + confirmation_depth(6)
+        // = 16, so the gate must suppress the proposal.
+        seed_block_count_votes(&db, 4, 12).await;
+
+        let proposals = Arc::new(Mutex::new(Vec::new()));
+        let task_group = TaskGroup::new();
+        Usdt::spawn_user_op_submitter(
+            &task_group,
+            UserOpSubmitterHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.into_dyn(),
+                user_op_confirmed_proposals: proposals.clone(),
+                confirmation_depth,
+                num_peers,
+            },
+        );
+
+        // Below depth: give the task several 1s test-env ticks; NO proposal
+        // may appear.
+        fedimint_core::runtime::sleep(Duration::from_secs(3)).await;
+        assert!(
+            proposals.lock().expect("not poisoned").is_empty(),
+            "a receipt shallower than confirmation_depth must not be proposed"
+        );
+
+        // Advance the consensus block count to exactly confirmation-deep.
+        seed_block_count_votes(&db, 4, receipt_block + confirmation_depth).await;
+
+        let deadline = fedimint_core::time::now() + Duration::from_secs(10);
+        loop {
+            if let Some(p) = proposals.lock().expect("not poisoned").first().cloned() {
+                assert_eq!(p.op_hash, op_hash);
+                assert_eq!(p.block, receipt_block);
+                assert_eq!(
+                    p.block_hash, [0x77; 32],
+                    "the proposal must carry the receipt's canonical block hash"
+                );
+                break;
+            }
+            assert!(
+                fedimint_core::time::now() < deadline,
+                "receipt must be proposed once it becomes confirmation-deep"
+            );
+            fedimint_core::runtime::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// **Security findings 04/15 (Task 5.1).** `UserOpConfirmed` votes that
+    /// agree on `{success, block, swept}` but carry DIFFERENT `block_hash`es
+    /// (two forks at the same height) must NOT aggregate toward the
+    /// confirmation threshold; only a matching-hash quorum applies the
+    /// settlement.
+    #[tokio::test]
+    async fn userop_votes_on_different_block_hashes_do_not_aggregate() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+        let source = EvmAddress([0x61; 20]);
+        let op_hash = [0x62u8; 32];
+        let amount = UsdtAmount(1_000_000);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_deploy_and_sweep_op_for_test(source, amount),
+                        signature: vec![0xcc; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep { source },
+                    submitted_block: 1,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let hash_fork_a = [0xA1u8; 32];
+        let hash_fork_b = [0xB2u8; 32];
+        let vote = |block_hash: [u8; 32]| UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: true,
+            block: 10,
+            block_hash,
+            swept: amount,
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        // 2 votes on fork A + 1 vote on fork B at the SAME height: no full-field
+        // quorum of 3, so the op must NOT be applied.
+        for p in [0u16, 1] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), vote(hash_fork_a), PeerId::from(p))
+                .await
+                .unwrap();
+        }
+        module
+            .process_consensus_item(&mut dbtx.to_ref_nc(), vote(hash_fork_b), PeerId::from(2))
+            .await
+            .unwrap();
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(op_hash))
+                .await
+                .is_some(),
+            "split-fork votes must not reach threshold, so the op stays submitted"
+        );
+        assert!(
+            dbtx.to_ref_nc().get_value(&PoolStateKey).await.is_none(),
+            "no settlement may occur without a matching-hash quorum"
+        );
+
+        // Peer 2 switches to fork A: now three votes fully agree -> applied.
+        module
+            .process_consensus_item(&mut dbtx.to_ref_nc(), vote(hash_fork_a), PeerId::from(2))
+            .await
+            .unwrap();
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(op_hash))
+                .await
+                .is_none(),
+            "a matching-hash quorum must apply and clear the submitted op"
+        );
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .get_value(&PoolStateKey)
+                .await
+                .expect("pool credited on successful sweep")
+                .balance,
+            amount
+        );
+    }
+
+    /// **Security finding 15 op facet (Task 5.1).** When the bundler claims an
+    /// op succeeded but the authoritative `EntryPoint` `UserOperationEvent`
+    /// log is absent, `get_user_op_receipt` returns `None` and the submitter
+    /// must propose NOTHING for it -- while a genuinely log-confirmed op
+    /// alongside it is still proposed (proving the task is live).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn entrypoint_log_mismatch_rejects_receipt() {
+        let good_source = EvmAddress([0x71; 20]);
+        let good_hash = [0x72u8; 32];
+        let mismatch_source = EvmAddress([0x73; 20]);
+        let mismatch_hash = [0x74u8; 32];
+
+        let evm_rpc = MockEvmRpc::default();
+        // Positive control: a genuinely EntryPoint-log-confirmed receipt.
+        evm_rpc.set_user_op_receipt(
+            good_hash,
+            fedimint_usdt_common::user_op::UserOpReceipt {
+                success: true,
+                block: 10,
+                block_hash: [0x88; 32],
+                actual_gas_cost_wei: UsdtAmount(0),
+            },
+        );
+        // Bundler claims success, but no confirming EntryPoint log -> None.
+        evm_rpc.set_bundler_success_without_entrypoint_log(mismatch_hash);
+
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for (hash, source) in [(good_hash, good_source), (mismatch_hash, mismatch_source)] {
+                dbtx.insert_new_entry(
+                    &SubmittedUserOpKey(hash),
+                    &SubmittedUserOp {
+                        signed: fedimint_usdt_common::user_op::SignedUserOp {
+                            unsigned: real_deploy_and_sweep_op_for_test(
+                                source,
+                                UsdtAmount(500_000),
+                            ),
+                            signature: vec![0xcc; 65],
+                        },
+                        purpose: UserOpPurpose::DeployAndSweep { source },
+                        submitted_block: 1,
+                    },
+                )
+                .await;
+            }
+            dbtx.commit_tx().await;
+        }
+
+        let num_peers = (0..4u16)
+            .map(PeerId::from)
+            .collect::<Vec<_>>()
+            .to_num_peers();
+        seed_block_count_votes(&db, 4, 100).await; // well past any depth gate
+
+        let proposals = Arc::new(Mutex::new(Vec::new()));
+        let task_group = TaskGroup::new();
+        Usdt::spawn_user_op_submitter(
+            &task_group,
+            UserOpSubmitterHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.into_dyn(),
+                user_op_confirmed_proposals: proposals.clone(),
+                confirmation_depth: 6,
+                num_peers,
+            },
+        );
+
+        // Wait for the positive control to be proposed (proves the task ran).
+        let deadline = fedimint_core::time::now() + Duration::from_secs(10);
+        loop {
+            let has_good = proposals
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .any(|p: &UserOpConfirmedProposal| p.op_hash == good_hash);
+            if has_good {
+                break;
+            }
+            assert!(
+                fedimint_core::time::now() < deadline,
+                "the log-confirmed positive-control op must be proposed"
+            );
+            fedimint_core::runtime::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The mismatch op (bundler-only, no EntryPoint log) must never be
+        // proposed.
+        assert!(
+            proposals
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .all(|p: &UserOpConfirmedProposal| p.op_hash != mismatch_hash),
+            "an op whose EntryPoint log is absent must not be confirmed on the bundler's word"
+        );
+    }
+
+    /// **Security finding 12 (Task 5.1).** A sub-threshold set of deposit
+    /// observation votes that ages out of the freshness window can no longer
+    /// be completed to a threshold credit by a late (Byzantine or delayed)
+    /// duplicate -- the deep-reorg stale-vote scenario.
+    #[tokio::test]
+    async fn stale_deposit_vote_past_max_age_cannot_complete() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+        let depth = module.cfg.consensus.confirmation_depth;
+        let claim_pk = test_pubkey(0x88);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        let obs = DepositObservation {
+            account,
+            balance: UsdtAmount(2_000_000),
+            block: 50,
+            block_hash: [0x9A; 32],
+            claim_pk,
+        };
+
+        // In-window: two honest votes stored, below the 3-of-4 threshold.
+        seed_block_count_votes(db, 4, 50 + depth).await;
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::Deposit(obs.clone()),
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        dbtx.commit_tx().await;
+        assert!(
+            db.begin_transaction_nc()
+                .await
+                .get_value(&DepositRecordKey(account))
+                .await
+                .is_none(),
+            "two of three votes must not credit"
+        );
+
+        // A deep reorg's worth of blocks pass: advance consensus far past the
+        // freshness window (age = depth + 200 > depth + DEPOSIT_VOTE_MAX_AGE_BLOCKS).
+        seed_block_count_votes(db, 4, 50 + depth + DEPOSIT_VOTE_MAX_AGE_BLOCKS + 100).await;
+
+        // The late (would-be threshold-completing) third vote must be rejected
+        // as too old and credit nothing.
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::Deposit(obs.clone()),
+                PeerId::from(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too old"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .is_none(),
+            "a vote aged out of the freshness window must never complete a threshold credit"
+        );
+    }
+
+    /// **Security finding 12 (Task 5.1).** Deposit observations that agree on
+    /// account/balance/height but carry different `block_hash`es (two forks)
+    /// must not aggregate; only a matching-hash quorum credits.
+    #[tokio::test]
+    async fn deposit_observation_carries_and_requires_block_hash() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+        let depth = module.cfg.consensus.confirmation_depth;
+        let claim_pk = test_pubkey(0x99);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        seed_block_count_votes(db, 4, 50 + depth).await;
+
+        let obs = |block_hash: [u8; 32]| DepositObservation {
+            account,
+            balance: UsdtAmount(2_000_000),
+            block: 50,
+            block_hash,
+            claim_pk,
+        };
+        let fork_a = [0xAAu8; 32];
+        let fork_b = [0xBBu8; 32];
+
+        let mut dbtx = db.begin_transaction().await;
+        // 2 votes on fork A + 1 on fork B at the same height: no full-field
+        // quorum, so no credit.
+        for p in [0u16, 1] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::Deposit(obs(fork_a)),
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::Deposit(obs(fork_b)),
+                PeerId::from(2),
+            )
+            .await
+            .unwrap();
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .is_none(),
+            "different-fork observations must not aggregate to a credit"
+        );
+
+        // Peer 2 switches to fork A: three matching-hash votes -> credited.
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::Deposit(obs(fork_a)),
+                PeerId::from(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .get_value(&DepositRecordKey(account))
+                .await
+                .expect("matching-hash quorum credits")
+                .credited,
+            UsdtAmount(2_000_000)
+        );
     }
 }
 

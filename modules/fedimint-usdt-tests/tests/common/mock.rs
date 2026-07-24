@@ -43,6 +43,25 @@ struct State {
     submitted_user_ops: Vec<Vec<SignedUserOp>>,
     /// Scripted `get_user_op_receipt` responses, keyed by `user_op_hash`.
     user_op_receipts: HashMap<[u8; 32], UserOpReceipt>,
+    /// Scripted `get_block_hash` overrides, keyed by block number. An
+    /// unscripted block falls back to a deterministic block-number-derived
+    /// hash (see [`mock_block_hash`]) so every guardian agrees on a stable,
+    /// distinct-per-height value out of the box (security finding 12).
+    block_hashes: HashMap<u64, [u8; 32]>,
+}
+
+/// Deterministic, block-number-derived stand-in for a canonical block hash
+/// (NOT a real keccak256): stable and distinct per height, which is all the
+/// deposit-observation `block_hash` binding needs in hermetic tests. Real
+/// block-hash behavior is exercised against `anvil` in the e2e harness.
+#[must_use]
+pub fn mock_block_hash(block: u64) -> [u8; 32] {
+    let mut hash = [0u8; 32];
+    hash[..8].copy_from_slice(&block.to_be_bytes());
+    // A fixed non-zero tag in the tail so the value is never the all-zero
+    // hash (which reads as "no fork identity").
+    hash[31] = 0xB1;
+    hash
 }
 
 impl Default for State {
@@ -74,6 +93,7 @@ impl Default for State {
             sent_raw_transactions: Vec::new(),
             submitted_user_ops: Vec::new(),
             user_op_receipts: HashMap::new(),
+            block_hashes: HashMap::new(),
         }
     }
 }
@@ -204,6 +224,12 @@ impl MockEvmRpc {
         self.lock().user_op_receipts.insert(user_op_hash, receipt);
     }
 
+    /// Scripts the canonical hash `get_block_hash(block)` returns, overriding
+    /// the default [`mock_block_hash`]-derived value (security finding 12).
+    pub fn set_block_hash(&self, block: u64, hash: [u8; 32]) {
+        self.lock().block_hashes.insert(block, hash);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -219,6 +245,16 @@ impl IServerEvmRpc for MockEvmRpc {
 
     async fn get_block_number(&self) -> anyhow::Result<u64> {
         Ok(self.lock().block_number)
+    }
+
+    async fn get_block_hash(&self, block: u64) -> anyhow::Result<[u8; 32]> {
+        let state = self.lock();
+        anyhow::ensure!(block <= state.block_number, "header not found");
+        Ok(state
+            .block_hashes
+            .get(&block)
+            .copied()
+            .unwrap_or_else(|| mock_block_hash(block)))
     }
 
     async fn get_erc20_balance(
@@ -460,6 +496,7 @@ mod tests {
         let receipt = UserOpReceipt {
             success: true,
             block: 7,
+            block_hash: [0u8; 32],
             actual_gas_cost_wei: UsdtAmount(500),
         };
         mock.set_user_op_receipt(user_op_hash, receipt);
