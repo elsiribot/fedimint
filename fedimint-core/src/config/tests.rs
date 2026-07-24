@@ -70,7 +70,7 @@ fn module_params_registry_round_trips_with_duplicate_kinds() {
             .iter_modules()
             .map(|(id, kind, _)| (id, kind.clone()))
             .collect::<Vec<_>>(),
-        vec![(0, mint.clone()), (1, mint.clone())]
+        vec![(0, mint.clone()), (1, mint)]
     );
 
     // serde round trip (JSON-RPC admin surface).

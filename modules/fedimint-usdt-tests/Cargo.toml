@@ -11,6 +11,10 @@ version = { workspace = true }
 name = "usdt-e2e-test"
 path = "bin/usdt_e2e.rs"
 
+[[test]]
+name = "fedimint_usdt_tests"
+path = "tests/tests.rs"
+
 [dependencies]
 alloy = { workspace = true }
 anyhow = { workspace = true }
@@ -38,10 +42,6 @@ hex = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-
-[[test]]
-name = "fedimint_usdt_tests"
-path = "tests/tests.rs"
 
 [lints]
 workspace = true
