@@ -127,6 +127,18 @@ pub const FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV: &str = "FM_USDT_BROADCASTER_M
 /// characteristics.
 pub const FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV: &str = "FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH";
 
+/// Explicit operator acknowledgement to run the USDT module's EVM RPC over a
+/// plaintext, non-loopback `http://` endpoint.
+///
+/// `AlloyEvmRpc::new` refuses any RPC URL that is neither `https://` nor a
+/// loopback host (`127.0.0.1`, `::1`, `localhost`) unless this is set to
+/// `"1"` (sec-18 hardening) -- a remote plaintext endpoint lets a
+/// network-position attacker observe and tamper with every RPC-derived
+/// guardian observation/submission. Set only when the operator has
+/// deliberately accepted that MITM exposure (e.g. a private, otherwise-secured
+/// network path).
+pub const FM_USDT_UNSAFE_ALLOW_HTTP_ENV: &str = "FM_USDT_UNSAFE_ALLOW_HTTP";
+
 /// Env var to override the `mintv2` module's `amount_unit` config-gen param
 /// (a decimal [`crate::module::AmountUnit`] id, e.g. `1` for
 /// `fedimint_usdt_common::USDT_UNIT`).

@@ -87,13 +87,18 @@ pub struct UsdtConfigLocal {
 
 // `broadcaster_private_key` is secret key material (an EOA private key that
 // fronts gas and could be used to drain the broadcaster account), so it must
-// never leak into logs. Redact it explicitly instead of deriving `Debug`;
-// `evm_rpc_url` is non-secret and stays visible. Mirrors the redaction style
-// used by `UsdtConfigPrivate` above.
+// never leak into logs. Redact it explicitly instead of deriving `Debug`.
+// `evm_rpc_url` is not itself secret, but commonly carries a provider API key
+// (e.g. appended by `FM_USDT_EVM_RPC_API_KEY`, see `crate::rpc`), so it is
+// shown in its credential-redacted form (sec-18) rather than verbatim.
+// Mirrors the redaction style used by `UsdtConfigPrivate` above.
 impl std::fmt::Debug for UsdtConfigLocal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UsdtConfigLocal")
-            .field("evm_rpc_url", &self.evm_rpc_url)
+            .field(
+                "evm_rpc_url",
+                &crate::rpc::redact_rpc_url(&self.evm_rpc_url),
+            )
             .field(
                 "broadcaster_private_key",
                 &self.broadcaster_private_key.as_ref().map(|_| "<redacted>"),
@@ -202,10 +207,11 @@ mod tests {
             rendered.contains("<redacted>"),
             "expected redaction marker in Debug output: {rendered}"
         );
-        // The non-secret RPC URL stays visible.
+        // The non-secret, key-free default dev RPC URL stays legible (no
+        // path segment to hide).
         assert!(
             rendered.contains(&default_evm_rpc_url()),
-            "evm_rpc_url should remain visible in Debug output: {rendered}"
+            "key-free evm_rpc_url should remain legible in Debug output: {rendered}"
         );
 
         // `None` renders as `None`, not `<redacted>`.
@@ -216,5 +222,24 @@ mod tests {
         let rendered_none = format!("{cfg_none:?}");
         assert!(rendered_none.contains("None"));
         assert!(!rendered_none.contains("<redacted>"));
+    }
+
+    /// sec-18: a provider API key embedded in `evm_rpc_url` (e.g. appended as
+    /// the final path segment, as `FM_USDT_EVM_RPC_API_KEY` does) must not
+    /// leak into `UsdtConfigLocal`'s `Debug` output either.
+    #[test]
+    fn debug_usdt_config_local_hides_key() {
+        let secret = "sk_live_super_secret_key_123";
+        let cfg = UsdtConfigLocal {
+            evm_rpc_url: format!("https://eth-mainnet.g.alchemy.com/v2/{secret}"),
+            broadcaster_private_key: None,
+        };
+
+        let rendered = format!("{cfg:?}");
+
+        assert!(
+            !rendered.contains(secret),
+            "RPC API key leaked into UsdtConfigLocal Debug output: {rendered}"
+        );
     }
 }
