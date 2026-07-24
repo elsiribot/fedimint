@@ -458,7 +458,11 @@ impl UsdtClientModule {
 
     /// Enqueues this guardian's local deposit-checker task to start watching
     /// `claim_pk`'s deposit address (thin wrapper around the federation API
-    /// call; see [`UsdtFederationApi::check_deposit`]).
+    /// call; see [`UsdtFederationApi::check_deposit`]). The response's
+    /// `ready` field (security finding 13's r2 facet) reports whether the
+    /// federation was actually ready to start watching -- if `false`, no
+    /// guardian enqueued anything and the caller should wait and retry
+    /// (mirrors [`Self::allocate_deposit`]'s own readiness gate).
     pub async fn check_deposit(
         &self,
         claim_pk: secp256k1::PublicKey,
@@ -587,6 +591,13 @@ impl UsdtClientModule {
         // is deterministic, so it does not matter which guardian's response we use
         // here.
         let checked = self.module_api.check_deposit(claim_pk).await?;
+        if !checked.ready {
+            bail!(
+                "federation infrastructure not ready yet (deposit to {} is not being watched); \
+                 try again after bootstrap completes",
+                checked.account,
+            );
+        }
 
         let deadline_at = Instant::now() + deadline;
         let mut backoff = Duration::from_millis(250);
