@@ -86,7 +86,7 @@ impl AmountUnit {
         self == Self::BITCOIN
     }
 
-    pub fn new_custom(unit: u64) -> Self {
+    pub const fn new_custom(unit: u64) -> Self {
         Self(unit)
     }
 

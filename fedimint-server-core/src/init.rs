@@ -6,19 +6,20 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{any, marker};
 
+use anyhow::Context as _;
 use bitcoin::Network;
 use fedimint_api_client::api::DynModuleApi;
 use fedimint_core::config::{
-    ClientModuleConfig, CommonModuleInitRegistry, ModuleInitRegistry, ServerModuleConfig,
-    ServerModuleConsensusConfig,
+    ClientModuleConfig, CommonModuleInitRegistry, ConfigGenModuleParams, ModuleInitRegistry,
+    ServerModuleConfig, ServerModuleConsensusConfig,
 };
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::db::{Database, DatabaseVersion};
 use fedimint_core::module::{
     CommonModuleInit, CoreConsensusVersion, IDynCommonModuleInit, ModuleConsensusVersion,
-    ModuleInit, SupportedModuleApiVersions,
+    ModuleInit, SupportedModuleApiVersions, serde_json,
 };
-use fedimint_core::task::TaskGroup;
+use fedimint_core::task::{MaybeSend, MaybeSync, TaskGroup};
 use fedimint_core::{NumPeers, PeerId, apply, async_trait_maybe_send, dyn_newtype_define};
 
 use crate::bitcoin_rpc::ServerBitcoinRpcMonitor;
@@ -69,16 +70,23 @@ pub trait IServerModuleInit: IDynCommonModuleInit {
         server_bitcoin_rpc_monitor: ServerBitcoinRpcMonitor,
     ) -> anyhow::Result<DynServerModule>;
 
+    /// Default config gen params for this module, used to build the per-kind
+    /// params registry during config generation. Returns the type-erased
+    /// serialization of [`ServerModuleInit::Params`]'s default.
+    fn default_config_gen_params(&self) -> ConfigGenModuleParams;
+
     fn trusted_dealer_gen(
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
+        params: &ConfigGenModuleParams,
     ) -> BTreeMap<PeerId, ServerModuleConfig>;
 
     async fn distributed_gen(
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
+        params: &ConfigGenModuleParams,
     ) -> anyhow::Result<ServerModuleConfig>;
 
     fn validate_config(&self, identity: &PeerId, config: ServerModuleConfig) -> anyhow::Result<()>;
@@ -165,6 +173,14 @@ where
 pub trait ServerModuleInit: ModuleInit + Sized {
     type Module: ServerModule + Send + Sync;
 
+    /// Per-instance, typed config gen params for this module.
+    ///
+    /// Federation-wide values (bitcoin network, base-fee policy) are supplied
+    /// separately via [`ConfigGenModuleArgs`]; this type carries only the
+    /// values that may differ per module instance. Modules with no per-instance
+    /// params use `()`.
+    type Params: serde::de::DeserializeOwned + Default + serde::Serialize + MaybeSend + MaybeSync;
+
     /// Version of the module consensus supported by this implementation given a
     /// certain [`CoreConsensusVersion`].
     ///
@@ -188,16 +204,31 @@ pub trait ServerModuleInit: ModuleInit + Sized {
     /// Initialize the module instance from its config
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module>;
 
+    /// Parse the type-erased config gen params into this module's typed
+    /// [`Self::Params`].
+    fn parse_params(&self, params: &ConfigGenModuleParams) -> anyhow::Result<Self::Params> {
+        serde_json::from_value(params.clone()).context("Failed to parse module params")
+    }
+
+    /// Default config gen params for this module. Override to supply
+    /// module-specific defaults (e.g. mint's denomination base). The default
+    /// implementation returns [`Self::Params`]'s [`Default`].
+    fn default_config_gen_params(&self) -> Self::Params {
+        Self::Params::default()
+    }
+
     fn trusted_dealer_gen(
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
+        params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig>;
 
     async fn distributed_gen(
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
+        params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig>;
 
     fn validate_config(&self, identity: &PeerId, config: ServerModuleConfig) -> anyhow::Result<()>;
@@ -278,20 +309,30 @@ where
         Ok(DynServerModule::from(module))
     }
 
+    fn default_config_gen_params(&self) -> ConfigGenModuleParams {
+        serde_json::to_value(<Self as ServerModuleInit>::default_config_gen_params(self))
+            .expect("Default config gen params must serialize")
+    }
+
     fn trusted_dealer_gen(
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
+        params: &ConfigGenModuleParams,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
-        <Self as ServerModuleInit>::trusted_dealer_gen(self, peers, args)
+        let params = <Self as ServerModuleInit>::parse_params(self, params)
+            .expect("Config gen params were validated during config generation");
+        <Self as ServerModuleInit>::trusted_dealer_gen(self, peers, args, &params)
     }
 
     async fn distributed_gen(
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
+        params: &ConfigGenModuleParams,
     ) -> anyhow::Result<ServerModuleConfig> {
-        <Self as ServerModuleInit>::distributed_gen(self, peers, args).await
+        let params = <Self as ServerModuleInit>::parse_params(self, params)?;
+        <Self as ServerModuleInit>::distributed_gen(self, peers, args, &params).await
     }
 
     fn validate_config(&self, identity: &PeerId, config: ServerModuleConfig) -> anyhow::Result<()> {

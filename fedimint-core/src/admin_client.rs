@@ -1,9 +1,8 @@
-use std::collections::BTreeSet;
 use std::fmt::Debug;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::ModuleKind;
+use crate::config::ServerModuleConfigGenParamsRegistry;
 use crate::encoding::{Decodable, Encodable};
 
 /// The state of the server returned via APIs
@@ -49,9 +48,9 @@ pub struct SetLocalParamsRequest {
     pub federation_name: Option<String>,
     /// Whether to disable base fees, set by the leader
     pub disable_base_fees: Option<bool>,
-    /// Modules enabled by the leader (if None, all available modules are
-    /// enabled)
-    pub enabled_modules: Option<BTreeSet<ModuleKind>>,
+    /// The module instance list configured by the leader (if `None`, the
+    /// default set of module instances is used)
+    pub module_params: Option<ServerModuleConfigGenParamsRegistry>,
     /// Total number of guardians (including the one who sets this), set by the
     /// leader
     pub federation_size: Option<u32>,
