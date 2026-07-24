@@ -2341,19 +2341,48 @@ impl Usdt {
                             // federation-agreed `op`'s own calldata, never
                             // from the RPC response, per this fn's own doc
                             // comment.
+                            //
+                            // Security finding 21 (Phase 9 hardening):
+                            // fail CLOSED on a decode error instead of the
+                            // old `.unwrap_or(UsdtAmount(0))` -- decoding
+                            // the ALREADY-committed calldata of a
+                            // successful op can only fail on an invariant
+                            // violation (e.g. a future/malformed op format
+                            // this guardian's decoder doesn't understand
+                            // yet), and proposing `swept = 0` for it would
+                            // let a real on-chain transfer settle without
+                            // ever moving the corresponding pool
+                            // accounting. Skip proposing ANY confirmation
+                            // for this op this tick instead -- `continue`
+                            // simply leaves `SubmittedUserOp` in place, so
+                            // this is retried (and re-logged) every tick
+                            // for as long as it stays live, never silently
+                            // dropped.
                             let swept = if receipt.success {
-                                match &record.purpose {
+                                let decoded = match &record.purpose {
                                     UserOpPurpose::DeployAndSweep { .. } => {
                                         crate::user_op::decode_transfer_amount(
                                             &record.signed.unsigned,
                                         )
-                                        .unwrap_or(UsdtAmount(0))
                                     }
                                     UserOpPurpose::Withdraw { .. } => {
                                         crate::user_op::decode_batch_transfer_total(
                                             &record.signed.unsigned,
                                         )
-                                        .unwrap_or(UsdtAmount(0))
+                                    }
+                                };
+                                match decoded {
+                                    Ok(swept) => swept,
+                                    Err(err) => {
+                                        warn!(
+                                            target: "usdt",
+                                            ?op_hash,
+                                            err = %err.fmt_compact_anyhow(),
+                                            purpose = ?record.purpose,
+                                            "failed to decode swept amount from committed op \
+                                             calldata; not proposing a confirmation for this op"
+                                        );
+                                        continue;
                                     }
                                 }
                             } else {
@@ -3176,10 +3205,11 @@ impl Usdt {
     /// Applies a threshold-agreed [`UserOpConfirmedObservation`] for
     /// `op_hash`, branching on the finalized [`SubmittedUserOp::purpose`]
     /// (Phase 8, Task 2): a `DeployAndSweep` op, if `success`, credits
-    /// `PoolState.balance` by `obs.swept` and marks the corresponding
-    /// [`DepositRecord`] (recovered from the op's own `sender`, i.e. the
-    /// swept deposit account) as swept forward (Phase 7 behavior,
-    /// unchanged); a `Withdraw` op settles the covered withdrawals -- see
+    /// `PoolState.balance` by the RE-DERIVED swept amount (see "Security
+    /// finding 21" below) and marks the corresponding [`DepositRecord`]
+    /// (recovered from the op's own `sender`, i.e. the swept deposit
+    /// account) as swept forward (Phase 7 behavior, unchanged); a
+    /// `Withdraw` op settles the covered withdrawals -- see
     /// [`Usdt::apply_withdraw_confirmed`]'s own doc comment. Either way,
     /// clears the now-finalized [`SubmittedUserOp`] and the op's vote
     /// prefix. Replay-safe: if `SubmittedUserOpKey(op_hash)` is already
@@ -3199,6 +3229,33 @@ impl Usdt {
     /// consensus-DB state (copied verbatim from the `PendingUserOp` that
     /// started the signing session -- see `Usdt::process_mpc_signature`),
     /// never `our_peer_id`-conditional.
+    ///
+    /// # Security finding 21 (Phase 9 hardening): re-derive, don't trust
+    ///
+    /// A `success: true` observation's amount is never applied as-voted.
+    /// `submitted.signed.unsigned.call_data` (already consensus-committed,
+    /// deterministic, no RPC) is re-decoded per `submitted.purpose` --
+    /// [`crate::user_op::decode_transfer_amount`] for `DeployAndSweep`,
+    /// [`crate::user_op::decode_batch_transfer_total`] for `Withdraw` --
+    /// and `obs.swept` is required to equal it exactly before that
+    /// RE-DERIVED amount (not the raw vote) is used for the actual
+    /// settlement math below. This shrinks the trusted surface of a
+    /// `UserOpConfirmed` vote from "threshold must agree on every field,
+    /// including a deterministic amount" down to "threshold agrees on
+    /// success/block; the amount is derived from already-committed
+    /// consensus state". On a decode error OR a mismatch -- an invariant
+    /// violation, unreachable on the honest path since
+    /// `spawn_user_op_submitter` fails closed on the same decode (see its
+    /// own doc comment) -- this function leaves EVERY bit of state
+    /// untouched (does not even advance the nonce) and warns loudly,
+    /// keeping `SubmittedUserOp` live for a later retry/timeout mechanism
+    /// to act on. Leaving state fully untouched (rather than, say,
+    /// advancing the nonce but skipping only the balance mutation) is
+    /// deliberate: since `SubmittedUserOp` is NOT removed on this path, it
+    /// does not gain the removal-based idempotency guard the happy path
+    /// below relies on -- a late, independently-threshold-crossing
+    /// duplicate vote for the same mismatch must replay as a complete
+    /// no-op, never double-mutate any counter.
     async fn apply_user_op_confirmed(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -3214,11 +3271,53 @@ impl Usdt {
             return;
         };
 
+        let effective_swept = if obs.success {
+            let expected = match &submitted.purpose {
+                UserOpPurpose::DeployAndSweep { .. } => {
+                    crate::user_op::decode_transfer_amount(&submitted.signed.unsigned)
+                }
+                UserOpPurpose::Withdraw { .. } => {
+                    crate::user_op::decode_batch_transfer_total(&submitted.signed.unsigned)
+                }
+            };
+            match expected {
+                Ok(expected) if expected == obs.swept => expected,
+                Ok(expected) => {
+                    warn!(
+                        target: "usdt",
+                        ?op_hash,
+                        obs_swept = obs.swept.0,
+                        expected_swept = expected.0,
+                        purpose = ?submitted.purpose,
+                        "UserOpConfirmed swept amount does not match the amount decoded from \
+                         the op's own committed calldata -- NOT applying settlement, leaving \
+                         SubmittedUserOp live for retry (invariant violation, security finding \
+                         21)"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        target: "usdt",
+                        ?op_hash,
+                        err = %err.fmt_compact_anyhow(),
+                        purpose = ?submitted.purpose,
+                        "failed to re-derive swept amount from committed op calldata at apply \
+                         time -- NOT applying settlement, leaving SubmittedUserOp live for retry \
+                         (invariant violation, security finding 21)"
+                    );
+                    return;
+                }
+            }
+        } else {
+            UsdtAmount(0)
+        };
+
         info!(
             target: "usdt",
             ?op_hash,
             success = obs.success,
-            swept = obs.swept.0,
+            swept = effective_swept.0,
             block = obs.block,
             purpose = ?submitted.purpose,
             "UserOp confirmed on-chain (applying threshold-agreed outcome)"
@@ -3258,7 +3357,10 @@ impl Usdt {
                     // is strictly safer than a deterministic panic on the
                     // (unreachable) chance of a `u64` overflow, and stays
                     // just as reproducible across guardians as a raw `+`.
-                    pool.balance = UsdtAmount(pool.balance.0.saturating_add(obs.swept.0));
+                    // Uses `effective_swept` (re-derived and cross-checked
+                    // against `obs.swept` above, security finding 21), not
+                    // the raw vote field.
+                    pool.balance = UsdtAmount(pool.balance.0.saturating_add(effective_swept.0));
                     dbtx.insert_entry(&PoolStateKey, &pool).await;
 
                     retrigger_source = Some(source);
@@ -3284,7 +3386,7 @@ impl Usdt {
                             record
                                 .swept
                                 .0
-                                .saturating_add(obs.swept.0)
+                                .saturating_add(effective_swept.0)
                                 .min(record.credited.0),
                         );
                     }
@@ -3292,7 +3394,8 @@ impl Usdt {
                 }
             }
             UserOpPurpose::Withdraw { outpoints } => {
-                self.apply_withdraw_confirmed(dbtx, outpoints, obs).await;
+                self.apply_withdraw_confirmed(dbtx, outpoints, obs, effective_swept)
+                    .await;
             }
         }
 
@@ -3326,13 +3429,13 @@ impl Usdt {
     /// would be built with a stale (already-consumed) nonce, permanently
     /// wedging withdrawals.
     ///
-    /// On `success`: debits `PoolState.balance` by `obs.swept` (the total
-    /// actually paid out, decoded from the agreed op's own calldata --
-    /// see [`crate::user_op::decode_batch_transfer_total`]), marks every
-    /// `outpoints` withdrawal `WithdrawalState::Confirmed { block: obs.block
-    /// }`, and removes its now-settled `UnclaimedWithdrawal` (so `Usdt::audit`
-    /// stops subtracting it -- see that method's doc comment for the
-    /// solvency argument).
+    /// On `success`: debits `PoolState.balance` by `swept` (the total
+    /// actually paid out -- see the `swept` parameter's own doc, security
+    /// finding 21), marks every `outpoints` withdrawal
+    /// `WithdrawalState::Confirmed { block: obs.block }`, and removes its
+    /// now-settled `UnclaimedWithdrawal` (so `Usdt::audit` stops
+    /// subtracting it -- see that method's doc comment for the solvency
+    /// argument).
     ///
     /// On `!success`: the DELIBERATE, solvent choice (documented per this
     /// task's spec) is to revert every `outpoints` withdrawal back to
@@ -3347,11 +3450,22 @@ impl Usdt {
     /// them) or require re-issuing e-cash (a much larger, out-of-scope
     /// change); retrying is simple, keeps the pool's on-chain and
     /// consensus-DB `nonce` in lockstep, and never loses funds.
+    ///
+    /// `swept` (Phase 9 hardening, security finding 21): the AUTHORITATIVE
+    /// amount to debit, computed by the caller
+    /// ([`Usdt::apply_user_op_confirmed`]) by re-deriving it from
+    /// `submitted.signed.unsigned.call_data` via
+    /// [`crate::user_op::decode_batch_transfer_total`] and cross-checking
+    /// it against the voted `obs.swept` -- NOT read from `obs.swept`
+    /// directly here, so this function can never be called with an
+    /// unverified amount. `UsdtAmount(0)` (irrelevant, unused) when
+    /// `!obs.success`.
     async fn apply_withdraw_confirmed(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
         outpoints: &[OutPoint],
         obs: &UserOpConfirmedObservation,
+        swept: UsdtAmount,
     ) {
         let mut pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
             account: self.pool_account(),
@@ -3361,7 +3475,7 @@ impl Usdt {
         pool.nonce += 1;
 
         if obs.success {
-            pool.balance = UsdtAmount(pool.balance.0.saturating_sub(obs.swept.0));
+            pool.balance = UsdtAmount(pool.balance.0.saturating_sub(swept.0));
         }
         dbtx.insert_entry(&PoolStateKey, &pool).await;
 
@@ -3383,7 +3497,7 @@ impl Usdt {
             info!(
                 target: "usdt",
                 count = outpoints.len(),
-                paid_out = obs.swept.0,
+                paid_out = swept.0,
                 block = obs.block,
                 pool_balance_after = pool.balance.0,
                 new_pool_nonce = pool.nonce,
@@ -8836,13 +8950,15 @@ mod tests {
                 },
             )
             .await;
-            let mut sample = sample_unsigned_user_op_for_test();
-            sample.sender = source;
             dbtx.insert_new_entry(
                 &SubmittedUserOpKey(op_hash),
                 &SubmittedUserOp {
                     signed: fedimint_usdt_common::user_op::SignedUserOp {
-                        unsigned: sample,
+                        // Real, decodable calldata (Phase 9 hardening,
+                        // sec-21): `apply_user_op_confirmed` re-derives
+                        // `swept` from this and rejects a mismatch against
+                        // the votes below, which claim `4_000_000`.
+                        unsigned: real_deploy_and_sweep_op_for_test(source, UsdtAmount(4_000_000)),
                         signature: vec![0xaa; 65],
                     },
                     purpose: UserOpPurpose::DeployAndSweep { source },
@@ -10173,7 +10289,11 @@ mod tests {
                 &SubmittedUserOpKey(op_hash),
                 &SubmittedUserOp {
                     signed: fedimint_usdt_common::user_op::SignedUserOp {
-                        unsigned: sample_unsigned_user_op_for_test(),
+                        // Real, decodable calldata (Phase 9 hardening,
+                        // sec-21): `apply_user_op_confirmed` re-derives
+                        // `swept` from this and rejects a mismatch against
+                        // the votes below, which claim `total`.
+                        unsigned: real_withdraw_op_for_test(total),
                         signature: vec![0xdd; 65],
                     },
                     purpose: UserOpPurpose::Withdraw {
@@ -10464,7 +10584,11 @@ mod tests {
             &SubmittedUserOpKey(op_hash),
             &SubmittedUserOp {
                 signed: fedimint_usdt_common::user_op::SignedUserOp {
-                    unsigned: sample_unsigned_user_op_for_test(),
+                    // Real, decodable calldata (Phase 9 hardening, sec-21):
+                    // `apply_user_op_confirmed` re-derives `swept` from
+                    // this and rejects a mismatch against the observation
+                    // below, which claims `amount`.
+                    unsigned: real_withdraw_op_for_test(amount),
                     signature: vec![0x11; 65],
                 },
                 purpose: UserOpPurpose::Withdraw {
@@ -10662,11 +10786,16 @@ mod tests {
         }
     }
 
-    /// Shared sample [`UnsignedUserOp`] for the `UserOpConfirmed` tests
-    /// above, whose `call_data` decodes to a `transfer(pool, 4_000_000)`
-    /// call via `crate::user_op::decode_transfer_amount` (exercised by
-    /// `spawn_user_op_submitter`, not directly by these consensus-level
-    /// tests, but kept realistic).
+    /// Shared sample [`UnsignedUserOp`] for tests that need a
+    /// `SubmittedUserOp` fixture but never actually decode its `call_data`
+    /// (e.g. a `success: false` `UserOpConfirmed` observation, or a
+    /// signing-session fixture). Deliberately NOT a valid `execute()`/
+    /// `executeBatch()` encoding (`call_data: [0xde, 0xad]`) -- since
+    /// [`Usdt::apply_user_op_confirmed`] now re-derives `swept` from this
+    /// calldata on any `success: true` observation (Phase 9 hardening,
+    /// sec-21) and rejects a decode failure, a test whose confirm path must
+    /// actually settle needs [`real_deploy_and_sweep_op_for_test`]/
+    /// [`real_withdraw_op_for_test`] instead.
     fn sample_unsigned_user_op_for_test() -> fedimint_usdt_common::user_op::UnsignedUserOp {
         fedimint_usdt_common::user_op::UnsignedUserOp {
             sender: EvmAddress([0; 20]),
@@ -10679,6 +10808,481 @@ mod tests {
             max_priority_fee_per_gas: 1_500_000_000,
             max_fee_per_gas: 30_000_000_000,
             paymaster_and_data: vec![],
+        }
+    }
+
+    /// A real, decodable `DeployAndSweep` [`UnsignedUserOp`] whose
+    /// [`crate::user_op::decode_transfer_amount`] equals `amount`, sender
+    /// `source` (Phase 9 hardening, sec-21) -- for fixtures whose
+    /// `UserOpConfirmed { success: true, .. }` confirm path must actually
+    /// re-derive and settle (see [`sample_unsigned_user_op_for_test`]'s doc
+    /// comment for why the old undecodable sample no longer suffices
+    /// there). The `account_factory`/`usdt_contract`/`owner`/`pool`
+    /// addresses and `claim_pk` are arbitrary test fixtures -- only the
+    /// decoded transfer amount is load-bearing for these tests.
+    fn real_deploy_and_sweep_op_for_test(
+        source: EvmAddress,
+        amount: UsdtAmount,
+    ) -> fedimint_usdt_common::user_op::UnsignedUserOp {
+        crate::user_op::build_deploy_and_sweep_userop(DeployAndSweepParams {
+            account_factory: EvmAddress([0x01; 20]),
+            usdt_contract: EvmAddress([0x02; 20]),
+            deposit_account: source,
+            owner: EvmAddress([0x03; 20]),
+            claim_pk: test_pubkey(0xf0),
+            amount,
+            pool: EvmAddress([0x04; 20]),
+            nonce: alloy::primitives::U256::ZERO,
+            needs_deploy: false,
+            paymaster_and_data: Vec::new(),
+            gas_bounds: GasBounds::DEPLOY_AND_SWEEP_DEVNET,
+        })
+    }
+
+    /// Mirrors [`real_deploy_and_sweep_op_for_test`] for the `Withdraw`
+    /// purpose: a real, decodable single-item batch [`UnsignedUserOp`]
+    /// whose [`crate::user_op::decode_batch_transfer_total`] equals
+    /// `amount`, paid to one arbitrary recipient. The specific recipient
+    /// and the number of transfer items in the batch are irrelevant to
+    /// these tests -- `UserOpPurpose::Withdraw { outpoints }`'s own
+    /// `outpoints` (not this calldata) is what determines which
+    /// `WithdrawalState`s a confirm settles; this calldata only needs to
+    /// decode to the right TOTAL.
+    fn real_withdraw_op_for_test(
+        amount: UsdtAmount,
+    ) -> fedimint_usdt_common::user_op::UnsignedUserOp {
+        crate::user_op::build_withdrawal_batch_userop(WithdrawalBatchParams {
+            account_factory: EvmAddress([0x01; 20]),
+            usdt_contract: EvmAddress([0x02; 20]),
+            pool: EvmAddress([0x04; 20]),
+            owner: EvmAddress([0x03; 20]),
+            withdrawals: vec![(EvmAddress([0x05; 20]), amount)],
+            nonce: alloy::primitives::U256::ZERO,
+            needs_deploy: false,
+            paymaster_and_data: Vec::new(),
+            gas_bounds: GasBounds::withdrawal_batch(1, false),
+        })
+    }
+
+    /// **Security finding 21, fix (a).** The guardian-local `UserOp`
+    /// confirmation task (`Usdt::spawn_user_op_submitter`) must fail
+    /// CLOSED, not open, when a successful op's own committed calldata
+    /// fails to decode: it must skip proposing a `UserOpConfirmed` for that
+    /// op entirely, never propose one with a fabricated `swept =
+    /// UsdtAmount(0)` (the old `.unwrap_or(UsdtAmount(0))` behavior, which
+    /// would let a real on-chain transfer settle without moving the pool
+    /// accounting). Exercised for BOTH purposes (`DeployAndSweep` via
+    /// `decode_transfer_amount`, `Withdraw` via
+    /// `decode_batch_transfer_total`), each with undecodable calldata
+    /// (`sample_unsigned_user_op_for_test`'s `[0xde, 0xad]`). A THIRD,
+    /// well-formed `DeployAndSweep` op is the positive control: it must
+    /// still produce a proposal with the correctly-decoded `swept`, proving
+    /// the malformed ops' absence is really the fail-closed skip and not
+    /// just the background task never having run.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn swept_decode_failure_does_not_propose_zero() {
+        let evm_rpc = MockEvmRpc::default();
+
+        let malformed_sweep_hash = [0xf1; 32];
+        let malformed_sweep_source = EvmAddress([0xf2; 20]);
+        let malformed_withdraw_hash = [0xf3; 32];
+        let malformed_withdraw_out = test_out_point(0xf4);
+        let good_hash = [0xf5; 32];
+        let good_source = EvmAddress([0xf6; 20]);
+        let good_amount = UsdtAmount(7_000_000);
+
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let mut malformed_sweep = sample_unsigned_user_op_for_test();
+            malformed_sweep.sender = malformed_sweep_source;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(malformed_sweep_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: malformed_sweep,
+                        signature: vec![0xaa; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep {
+                        source: malformed_sweep_source,
+                    },
+                    submitted_block: 1,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(malformed_withdraw_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: sample_unsigned_user_op_for_test(),
+                        signature: vec![0xbb; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: vec![malformed_withdraw_out],
+                    },
+                    submitted_block: 1,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(good_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_deploy_and_sweep_op_for_test(good_source, good_amount),
+                        signature: vec![0xcc; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep {
+                        source: good_source,
+                    },
+                    submitted_block: 1,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        for hash in [malformed_sweep_hash, malformed_withdraw_hash, good_hash] {
+            evm_rpc.set_user_op_receipt(
+                hash,
+                fedimint_usdt_common::user_op::UserOpReceipt {
+                    success: true,
+                    block: 42,
+                    actual_cost_usdt: UsdtAmount(0),
+                },
+            );
+        }
+
+        let user_op_confirmed_proposals = Arc::new(Mutex::new(Vec::new()));
+        let task_group = TaskGroup::new();
+        Usdt::spawn_user_op_submitter(
+            &task_group,
+            UserOpSubmitterHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.into_dyn(),
+                user_op_confirmed_proposals: user_op_confirmed_proposals.clone(),
+            },
+        );
+
+        // Poll (rather than a fixed sleep) for the positive control to
+        // appear, bounded well above the 1s test-env tick interval so this
+        // is not flaky under load; failure to appear at all fails the test
+        // below via the final assertion, not a timeout panic.
+        let deadline = fedimint_core::time::now() + Duration::from_secs(10);
+        loop {
+            if user_op_confirmed_proposals
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .any(|p| p.op_hash == good_hash)
+                || fedimint_core::time::now() >= deadline
+            {
+                break;
+            }
+            fedimint_core::runtime::sleep(Duration::from_millis(50)).await;
+        }
+
+        let proposals = user_op_confirmed_proposals.lock().expect("not poisoned");
+        assert!(
+            !proposals.iter().any(|p| p.op_hash == malformed_sweep_hash),
+            "a DeployAndSweep op whose calldata fails to decode must never propose a \
+             confirmation (found: {proposals:?})"
+        );
+        assert!(
+            !proposals
+                .iter()
+                .any(|p| p.op_hash == malformed_withdraw_hash),
+            "a Withdraw op whose calldata fails to decode must never propose a confirmation \
+             (found: {proposals:?})"
+        );
+        let good = proposals
+            .iter()
+            .find(|p| p.op_hash == good_hash)
+            .expect("positive control: a well-formed op must still propose a confirmation");
+        assert_eq!(
+            good.swept, good_amount,
+            "positive control's proposed swept must match the op's real decoded amount"
+        );
+    }
+
+    /// **Security finding 21, fix (b).** `apply_user_op_confirmed` must
+    /// re-derive the expected swept amount from the committed op's own
+    /// calldata and reject a `UserOpConfirmed` vote whose `swept` disagrees
+    /// with it, rather than trusting the vote outright: on a mismatch, NO
+    /// state changes at all (balance, `DepositRecord`/`WithdrawalState`,
+    /// AND `SubmittedUserOp` -- see `apply_user_op_confirmed`'s own doc
+    /// comment for why the nonce must not advance either) so the op stays
+    /// retriable; a SUBSEQUENT matching observation for the exact same
+    /// `op_hash` then applies exactly as the honest happy path always has.
+    /// Exercised for both purposes.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn apply_rejects_swept_mismatch() {
+        // --- DeployAndSweep branch. -----------------------------------
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let source = EvmAddress([0xe1; 20]);
+        let claim_pk = test_pubkey(0xe2);
+        let op_hash = [0xe3; 32];
+        let real_amount = UsdtAmount(2_500_000);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(source),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(2_500_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_deploy_and_sweep_op_for_test(source, real_amount),
+                        signature: vec![0x22; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep { source },
+                    submitted_block: 1,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // A mismatched vote (claims 999_999_999, the op's calldata really
+        // decodes to 2_500_000) must be a complete no-op.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    op_hash,
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 10,
+                        swept: UsdtAmount(999_999_999),
+                    },
+                )
+                .await;
+            assert!(
+                dbtx.to_ref_nc().get_value(&PoolStateKey).await.is_none(),
+                "a mismatched vote must not create/credit PoolState"
+            );
+            let record = dbtx
+                .to_ref_nc()
+                .get_value(&DepositRecordKey(source))
+                .await
+                .expect("DepositRecord present");
+            assert_eq!(record.swept, UsdtAmount(0), "swept must not advance");
+            assert_eq!(
+                record.nonce, 0,
+                "nonce must not advance either -- the whole apply is a no-op on mismatch"
+            );
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&SubmittedUserOpKey(op_hash))
+                    .await
+                    .is_some(),
+                "SubmittedUserOp must remain live (retriable) after a mismatched vote"
+            );
+            dbtx.commit_tx().await;
+        }
+
+        // Positive control: a SUBSEQUENT, matching observation for the
+        // SAME op_hash applies exactly as the honest happy path always
+        // has.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    op_hash,
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 11,
+                        swept: real_amount,
+                    },
+                )
+                .await;
+            let pool = dbtx
+                .to_ref_nc()
+                .get_value(&PoolStateKey)
+                .await
+                .expect("PoolState created by the matching apply");
+            assert_eq!(pool.balance, real_amount);
+            let record = dbtx
+                .to_ref_nc()
+                .get_value(&DepositRecordKey(source))
+                .await
+                .expect("DepositRecord present");
+            assert_eq!(record.swept, real_amount);
+            assert_eq!(record.nonce, 1);
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&SubmittedUserOpKey(op_hash))
+                    .await
+                    .is_none(),
+                "a matching apply must clear SubmittedUserOp as usual"
+            );
+            dbtx.commit_tx().await;
+        }
+
+        // --- Withdraw branch. -------------------------------------------
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let out_point = test_out_point(0xe4);
+        let recipient = EvmAddress([0xe5; 20]);
+        let real_total = UsdtAmount(1_800_000);
+        let withdraw_op_hash = [0xe6; 32];
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(5_000_000),
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out_point),
+                &UsdtWithdrawalV0 {
+                    recipient,
+                    amount: real_total,
+                    max_fee: UsdtAmount(1_000),
+                    requested_block: 0,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &WithdrawalStateKey(out_point),
+                &WithdrawalState::Signing(withdraw_op_hash),
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(withdraw_op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_withdraw_op_for_test(real_total),
+                        signature: vec![0x33; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: vec![out_point],
+                    },
+                    submitted_block: 1,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // A mismatched vote must not debit the pool, must not touch
+        // WithdrawalState/UnclaimedWithdrawal, and must not bump
+        // PoolState.nonce.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    withdraw_op_hash,
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 20,
+                        swept: UsdtAmount(1),
+                    },
+                )
+                .await;
+            let pool = dbtx
+                .to_ref_nc()
+                .get_value(&PoolStateKey)
+                .await
+                .expect("PoolState present");
+            assert_eq!(
+                pool.balance,
+                UsdtAmount(5_000_000),
+                "a mismatched vote must not debit the pool"
+            );
+            assert_eq!(pool.nonce, 0, "nonce must not advance on mismatch");
+            let state = dbtx
+                .to_ref_nc()
+                .get_value(&WithdrawalStateKey(out_point))
+                .await
+                .expect("WithdrawalState present");
+            assert_eq!(
+                state,
+                WithdrawalState::Signing(withdraw_op_hash),
+                "a mismatched vote must not mark Confirmed (or revert to Queued)"
+            );
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&UnclaimedWithdrawalKey(out_point))
+                    .await
+                    .is_some(),
+                "UnclaimedWithdrawal must survive a mismatched vote unchanged"
+            );
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&SubmittedUserOpKey(withdraw_op_hash))
+                    .await
+                    .is_some(),
+                "SubmittedUserOp must remain live (retriable) after a mismatched vote"
+            );
+            dbtx.commit_tx().await;
+        }
+
+        // Positive control: a SUBSEQUENT, matching observation applies
+        // exactly as the honest happy path always has.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    withdraw_op_hash,
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 21,
+                        swept: real_total,
+                    },
+                )
+                .await;
+            let pool = dbtx
+                .to_ref_nc()
+                .get_value(&PoolStateKey)
+                .await
+                .expect("PoolState present");
+            assert_eq!(pool.balance, UsdtAmount(5_000_000 - real_total.0));
+            assert_eq!(pool.nonce, 1);
+            let state = dbtx
+                .to_ref_nc()
+                .get_value(&WithdrawalStateKey(out_point))
+                .await
+                .expect("WithdrawalState present");
+            assert_eq!(state, WithdrawalState::Confirmed { block: 21 });
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&UnclaimedWithdrawalKey(out_point))
+                    .await
+                    .is_none(),
+                "UnclaimedWithdrawal must be removed once confirmed"
+            );
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&SubmittedUserOpKey(withdraw_op_hash))
+                    .await
+                    .is_none()
+            );
+            dbtx.commit_tx().await;
         }
     }
 }
