@@ -184,7 +184,9 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
         account_factory,
         simple_account_impl,
         check_ttl_blocks: 10_000,
-        broadcaster_min_balance_wei: 0,
+        // Must be > 0 (sec-17 config validation); the broadcaster is the
+        // anvil-funded account, so any low value is trivially satisfied.
+        broadcaster_min_balance_wei: 1,
         // Point every guardian at the mock Chainlink feed deployed above
         // (real read, Task 3/5 of the ETH/USD price-feed plan) instead of
         // the static `$3000` fallback. A generously large staleness bound:

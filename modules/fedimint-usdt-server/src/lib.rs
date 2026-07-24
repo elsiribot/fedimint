@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, ensure};
+use anyhow::{Context as _, bail, ensure};
 use async_trait::async_trait;
 use fedimint_core::config::{
     ServerModuleConfig, ServerModuleConsensusConfig, TypedServerModuleConfig,
@@ -22,8 +22,8 @@ use fedimint_core::envs::{
     FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
     FM_USDT_CHAIN_ID_ENV, FM_USDT_CONFIRMATION_DEPTH_ENV, FM_USDT_CONTRACT_ENV,
     FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV, FM_USDT_EVM_RPC_API_KEY_ENV,
-    FM_USDT_EVM_RPC_URL_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, is_env_var_set_opt,
-    is_running_in_test_env,
+    FM_USDT_EVM_RPC_URL_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
+    FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV, is_env_var_set_opt, is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -54,11 +54,11 @@ use fedimint_usdt_common::{
     DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES, MAX_PENDING_CHECKS,
     MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse,
     SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
-    UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
-    UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
-    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse,
-    deposit_fee_quote, derive_deposit_account, derive_pool_account, evm_address, pool_salt,
-    signing_session_id, withdrawal_fee_quote,
+    UsdtGenParams, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
+    UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
+    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
+    WithdrawalStatusResponse, deposit_fee_quote, derive_deposit_account, derive_pool_account,
+    evm_address, pool_salt, signing_session_id, validate_usdt_params, withdrawal_fee_quote,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -331,6 +331,157 @@ impl ModuleInit for UsdtInit {
     }
 }
 
+/// Builds the config-gen leader's default [`UsdtGenParams`], applying every
+/// documented `FM_USDT_*` env-var override (see
+/// [`ServerModuleInit::get_documented_env_vars`] below). Fallible: a
+/// malformed env var value (bad hex address, non-numeric `u64`) returns a
+/// clear `anyhow::Error` describing which variable and why, instead of
+/// corrupting state or panicking deep inside a `.parse()` call. The one
+/// remaining panic boundary is [`UsdtInit::default_config_gen_params`]
+/// itself, which the `ServerModuleInit`/`ModuleInit` trait requires to be
+/// infallible.
+///
+/// Does not call [`fedimint_usdt_common::validate_usdt_params`] -- safety
+/// validation runs uniformly at the config-gen call sites
+/// (`UsdtInit::trusted_dealer_gen`, `dkg::distributed_gen`) and in
+/// `validate_config`, so every path that produces or accepts a consensus
+/// config is checked exactly once, regardless of whether the params came
+/// from this env-driven default, [`UsdtInit::gen_params_override`], or a
+/// setup-code-supplied override.
+fn usdt_gen_params_from_env() -> anyhow::Result<UsdtGenParams> {
+    let mut params = fedimint_usdt_common::UsdtGenParams::default();
+
+    // Each override is a `0x`-prefixed 20-byte hex EvmAddress; an
+    // unset/empty var is treated as absent.
+    let env_override =
+        |env_name: &str| -> anyhow::Result<Option<fedimint_usdt_common::EvmAddress>> {
+            match std::env::var(env_name) {
+                Ok(value) if !value.is_empty() => value
+                    .parse()
+                    .map(Some)
+                    .with_context(|| format!("{env_name} must be a valid EvmAddress")),
+                _ => Ok(None),
+            }
+        };
+
+    if let Some(usdt_contract) = env_override(FM_USDT_CONTRACT_ENV)? {
+        params.usdt_contract = usdt_contract;
+    }
+    if let Some(entry_point) = env_override(FM_USDT_ENTRY_POINT_ENV)? {
+        params.entry_point = entry_point;
+    }
+
+    // Part A: the ERC-4337 `account_factory`/`simple_account_impl` are
+    // DERIVED deterministically from the (now-resolved) `entry_point` plus
+    // vendored constants, so the operator need not supply them and every
+    // guardian computes the byte-identical addresses (a pure function of
+    // the consensus `entry_point`). `account_factory =
+    // CREATE2(ARACHNID_DEPLOYER, factory_create2_salt(),
+    // FACTORY_CREATION_CODE ‖ abi.encode(entry_point))`;
+    // `simple_account_impl = CREATE(account_factory, 1)` (the factory's
+    // constructor's first internal deploy). The module then self-deploys
+    // that exact factory on-chain (see `Usdt::spawn_bootstrap_observer`'s
+    // deploy tick), and Part C's `getAddress`-equivalence readiness gate
+    // verifies the on-chain factory matches before any deposit address is
+    // handed out (fail-safe on a wrong constant).
+    //
+    // The `FM_USDT_ACCOUNT_FACTORY`/`FM_USDT_SIMPLE_ACCOUNT_IMPL` env
+    // overrides remain an ESCAPE HATCH for a pre-deployed / nonstandard
+    // stack: an explicit override always wins over the computed value.
+    params.account_factory = match env_override(FM_USDT_ACCOUNT_FACTORY_ENV)? {
+        Some(account_factory) => account_factory,
+        None => factory_bytecode::derive_account_factory(params.entry_point),
+    };
+    params.simple_account_impl = match env_override(FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV)? {
+        Some(simple_account_impl) => simple_account_impl,
+        None => factory_bytecode::derive_simple_account_impl(params.account_factory),
+    };
+
+    if let Some(feed) = env_override(FM_USDT_ETH_USD_PRICE_FEED_ENV)? {
+        params.eth_usd_price_feed = feed;
+    }
+
+    // Numeric config-gen overrides. `chain_id` and `confirmation_depth`
+    // default to anvil values (31337 / 1); a real chain (e.g. Sepolia)
+    // MUST override `chain_id` -- it is bound into the ERC-4337
+    // `userOpHash` the federation signs, so a wrong value makes every
+    // signature invalid on-chain.
+    let u64_env_override = |env_name: &str| -> anyhow::Result<Option<u64>> {
+        match std::env::var(env_name) {
+            Ok(value) if !value.is_empty() => value
+                .parse()
+                .map(Some)
+                .with_context(|| format!("{env_name} must be a valid u64")),
+            _ => Ok(None),
+        }
+    };
+    if let Some(chain_id) = u64_env_override(FM_USDT_CHAIN_ID_ENV)? {
+        params.chain_id = chain_id;
+    }
+    if let Some(confirmation_depth) = u64_env_override(FM_USDT_CONFIRMATION_DEPTH_ENV)? {
+        params.confirmation_depth = confirmation_depth;
+    }
+    if let Some(min_balance) = u64_env_override(FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV)? {
+        params.broadcaster_min_balance_wei = min_balance;
+    }
+
+    Ok(params)
+}
+
+/// Startup chain-id sanity check (sec-15/17): confirms `evm_rpc` actually
+/// points at the chain `consensus_chain_id` (i.e. `cfg.consensus.chain_id`)
+/// expects, and refuses to start on a DEFINITIVE mismatch. `chain_id` is
+/// bound into every signed ERC-4337 `userOpHash`
+/// ([`fedimint_usdt_common::user_op::user_op_hash`]), so guardians running
+/// against the wrong chain would sign `UserOps` that are valid nowhere,
+/// silently wedging every sweep/withdrawal.
+///
+/// Distinguishes a definitive mismatch from an inability to determine the
+/// chain id at all: an RPC error or timeout only warns and lets `init`
+/// proceed, mirroring the existing transfer-fee startup check's fail-open
+/// timeout handling a few lines below in `init` -- a transient RPC outage at
+/// process start must not permanently brick a guardian that would otherwise
+/// recover once the node is reachable again.
+async fn check_chain_id_at_startup(
+    evm_rpc: &crate::rpc::DynServerEvmRpc,
+    consensus_chain_id: u64,
+) -> anyhow::Result<()> {
+    match fedimint_core::runtime::timeout(Duration::from_secs(30), evm_rpc.get_chain_id()).await {
+        Ok(Ok(onchain_chain_id)) => {
+            ensure!(
+                onchain_chain_id == consensus_chain_id,
+                "configured chain_id {consensus_chain_id} does not match the RPC-reported \
+                 chain_id {onchain_chain_id}; refusing to start (every signed userOpHash is bound \
+                 to chain_id, so running against the wrong chain would sign UserOps that are \
+                 invalid everywhere)"
+            );
+            debug!(
+                target: "usdt",
+                consensus_chain_id,
+                "startup chain-id check passed: RPC-reported chain_id matches consensus config"
+            );
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            warn!(
+                target: "usdt",
+                consensus_chain_id,
+                err = %err.fmt_compact_anyhow(),
+                "could not verify chain_id at startup (RPC error); proceeding without the check"
+            );
+            Ok(())
+        }
+        Err(_elapsed) => {
+            warn!(
+                target: "usdt",
+                consensus_chain_id,
+                "chain_id check timed out at startup; proceeding without the check"
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Implementation of server module non-consensus functions
 #[async_trait]
 impl ServerModuleInit for UsdtInit {
@@ -372,86 +523,19 @@ impl ServerModuleInit for UsdtInit {
             return gen_params.clone();
         }
 
-        let mut params = fedimint_usdt_common::UsdtGenParams::default();
-
-        // Each override is a `0x`-prefixed 20-byte hex EvmAddress; an
-        // unset/empty var is treated as absent. A malformed value is a
-        // config-gen-leader misconfiguration, so panic (deterministically,
-        // before any consensus starts) rather than silently deploy against a
-        // wrong address.
-        let env_override =
-            |env_name: &str| -> Option<fedimint_usdt_common::EvmAddress> {
-                match std::env::var(env_name) {
-                    Ok(value) if !value.is_empty() => Some(value.parse().unwrap_or_else(|err| {
-                        panic!("{env_name} must be a valid EvmAddress: {err}")
-                    })),
-                    _ => None,
-                }
-            };
-
-        if let Some(usdt_contract) = env_override(FM_USDT_CONTRACT_ENV) {
-            params.usdt_contract = usdt_contract;
-        }
-        if let Some(entry_point) = env_override(FM_USDT_ENTRY_POINT_ENV) {
-            params.entry_point = entry_point;
-        }
-
-        // Part A: the ERC-4337 `account_factory`/`simple_account_impl` are
-        // DERIVED deterministically from the (now-resolved) `entry_point` plus
-        // vendored constants, so the operator need not supply them and every
-        // guardian computes the byte-identical addresses (a pure function of
-        // the consensus `entry_point`). `account_factory =
-        // CREATE2(ARACHNID_DEPLOYER, factory_create2_salt(),
-        // FACTORY_CREATION_CODE ‖ abi.encode(entry_point))`;
-        // `simple_account_impl = CREATE(account_factory, 1)` (the factory's
-        // constructor's first internal deploy). The module then self-deploys
-        // that exact factory on-chain (see `Usdt::spawn_bootstrap_observer`'s
-        // deploy tick), and Part C's `getAddress`-equivalence readiness gate
-        // verifies the on-chain factory matches before any deposit address is
-        // handed out (fail-safe on a wrong constant).
-        //
-        // The `FM_USDT_ACCOUNT_FACTORY`/`FM_USDT_SIMPLE_ACCOUNT_IMPL` env
-        // overrides remain an ESCAPE HATCH for a pre-deployed / nonstandard
-        // stack: an explicit override always wins over the computed value.
-        params.account_factory = env_override(FM_USDT_ACCOUNT_FACTORY_ENV)
-            .unwrap_or_else(|| factory_bytecode::derive_account_factory(params.entry_point));
-        params.simple_account_impl =
-            env_override(FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV).unwrap_or_else(|| {
-                factory_bytecode::derive_simple_account_impl(params.account_factory)
-            });
-
-        if let Some(feed) = env_override(FM_USDT_ETH_USD_PRICE_FEED_ENV) {
-            params.eth_usd_price_feed = feed;
-        }
-
-        // Numeric config-gen overrides. `chain_id` and `confirmation_depth`
-        // default to anvil values (31337 / 1); a real chain (e.g. Sepolia)
-        // MUST override `chain_id` -- it is bound into the ERC-4337
-        // `userOpHash` the federation signs, so a wrong value makes every
-        // signature invalid on-chain. As with the address overrides, a
-        // malformed value is a config-gen-leader misconfiguration -> panic
-        // deterministically before consensus starts.
-        let u64_env_override = |env_name: &str| -> Option<u64> {
-            match std::env::var(env_name) {
-                Ok(value) if !value.is_empty() => Some(
-                    value
-                        .parse()
-                        .unwrap_or_else(|err| panic!("{env_name} must be a valid u64: {err}")),
-                ),
-                _ => None,
-            }
-        };
-        if let Some(chain_id) = u64_env_override(FM_USDT_CHAIN_ID_ENV) {
-            params.chain_id = chain_id;
-        }
-        if let Some(confirmation_depth) = u64_env_override(FM_USDT_CONFIRMATION_DEPTH_ENV) {
-            params.confirmation_depth = confirmation_depth;
-        }
-        if let Some(min_balance) = u64_env_override(FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV) {
-            params.broadcaster_min_balance_wei = min_balance;
-        }
-
-        params
+        // The fallible env-parsing work lives in `usdt_gen_params_from_env`
+        // (unit-tested directly, see `env_override_parse_error_is_not_a_panic`
+        // below) so a malformed env var produces a clean, testable
+        // `anyhow::Error` rather than an ad hoc `panic!` at an arbitrary
+        // parse call site. `default_config_gen_params` itself is infallible
+        // per the `ServerModuleInit`/`ModuleInit` trait (it cannot return
+        // `Result` without a workspace-wide trait signature change, out of
+        // scope here), so this remains the one unavoidable panic boundary --
+        // deterministic, before any consensus starts, exactly as documented
+        // below.
+        usdt_gen_params_from_env().unwrap_or_else(|err| {
+            panic!("USDT module config-gen params misconfigured via environment variable: {err:#}")
+        })
     }
 
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
@@ -501,6 +585,14 @@ impl ServerModuleInit for UsdtInit {
             }
             rpc.into_dyn()
         };
+
+        // Startup chain-id sanity check (sec-15/17): confirm the RPC endpoint
+        // just built above actually points at the chain this federation's
+        // consensus config expects. A DEFINITIVE mismatch (the RPC answered
+        // with a different chain id) hard-fails startup; an RPC error or
+        // timeout only warns and lets startup proceed (see
+        // `check_chain_id_at_startup`'s doc comment for the rationale).
+        check_chain_id_at_startup(&evm_rpc, cfg.consensus.chain_id).await?;
 
         // Startup transfer-fee solvency check (guardian-local; REFUSES to start
         // on a confirmed fee). This module credits the pool by the full
@@ -578,6 +670,15 @@ impl ServerModuleInit for UsdtInit {
         args: &ConfigGenModuleArgs,
         params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
+        // `trusted_dealer_gen` is infallible per the `ServerModuleInit` trait
+        // (returns a plain `BTreeMap`, not `Result`), so an unsafe param set
+        // is a deterministic panic here -- consistent with this function's
+        // existing style (see the `.expect(...)` calls a few lines below) and
+        // with this being a test/dev-only path (see this fn's doc comment).
+        // Production key generation runs `distributed_gen`, which validates
+        // fallibly (see `dkg::distributed_gen`).
+        validate_usdt_params(params).expect("USDT config-gen params failed safety validation");
+
         let num_peers = peers.to_num_peers();
         let n = u16::try_from(num_peers.total())
             .expect("federation sizes fit in u16 in every supported deployment");
@@ -695,6 +796,26 @@ impl ServerModuleInit for UsdtInit {
             config.consensus.mpc_encryption_pks.get(identity) == Some(&our_mpc_pk),
             "This guardian's MPC encryption public key does not match the consensus configuration"
         );
+
+        // Defense-in-depth (sec-17): re-run the same safety validation the
+        // config-gen paths already ran, over the params as they landed in
+        // THIS guardian's consensus config. Catches a bad config that
+        // somehow reached a guardian without going through
+        // `trusted_dealer_gen`/`dkg::distributed_gen` (e.g. a hand-edited
+        // config file, or a future config-gen path that forgets the check).
+        validate_usdt_params(&UsdtGenParams {
+            usdt_contract: config.consensus.usdt_contract,
+            chain_id: config.consensus.chain_id,
+            confirmation_depth: config.consensus.confirmation_depth,
+            entry_point: config.consensus.entry_point,
+            account_factory: config.consensus.account_factory,
+            simple_account_impl: config.consensus.simple_account_impl,
+            check_ttl_blocks: config.consensus.check_ttl_blocks,
+            broadcaster_min_balance_wei: config.consensus.broadcaster_min_balance_wei,
+            eth_usd_price_feed: config.consensus.eth_usd_price_feed,
+            price_feed_max_staleness_secs: config.consensus.price_feed_max_staleness_secs,
+        })
+        .context("consensus config failed USDT safety validation")?;
 
         Ok(())
     }
@@ -4696,6 +4817,13 @@ mod tests {
         user_op_receipts: Mutex<
             std::collections::HashMap<[u8; 32], fedimint_usdt_common::user_op::UserOpReceipt>,
         >,
+        /// Scripted `get_chain_id()` response (Task 3.1, sec-17). Defaults to
+        /// `Ok(0)`, set via `set_chain_id`/`set_chain_id_error`.
+        chain_id: Mutex<u64>,
+        /// When `true`, `get_chain_id()` returns `Err` instead of the
+        /// scripted `chain_id` value, for exercising the startup RPC-error
+        /// (warn-and-continue) path.
+        chain_id_err: Mutex<bool>,
     }
 
     impl MockEvmRpc {
@@ -4740,12 +4868,25 @@ mod tests {
                 .expect("not poisoned")
                 .clone()
         }
+
+        /// Scripts `get_chain_id()` to return `Ok(chain_id)`.
+        fn set_chain_id(&self, chain_id: u64) {
+            *self.chain_id.lock().expect("not poisoned") = chain_id;
+        }
+
+        /// Scripts `get_chain_id()` to return `Err`.
+        fn set_chain_id_error(&self) {
+            *self.chain_id_err.lock().expect("not poisoned") = true;
+        }
     }
 
     #[async_trait::async_trait]
     impl crate::rpc::IServerEvmRpc for MockEvmRpc {
         async fn get_chain_id(&self) -> anyhow::Result<u64> {
-            Ok(0)
+            if *self.chain_id_err.lock().expect("not poisoned") {
+                anyhow::bail!("mock RPC: chain-id read failed");
+            }
+            Ok(*self.chain_id.lock().expect("not poisoned"))
         }
 
         async fn get_block_number(&self) -> anyhow::Result<u64> {
@@ -4839,6 +4980,95 @@ mod tests {
                 .get(&user_op_hash)
                 .copied())
         }
+    }
+
+    #[tokio::test]
+    async fn init_fails_on_chain_id_mismatch() {
+        let mock = Arc::new(MockEvmRpc::default());
+        mock.set_chain_id(999);
+        let evm_rpc: crate::rpc::DynServerEvmRpc = mock;
+
+        let err = check_chain_id_at_startup(&evm_rpc, 1)
+            .await
+            .expect_err("a definitive RPC-reported chain_id mismatch must hard-fail init");
+        assert!(err.to_string().contains("chain_id"));
+    }
+
+    #[tokio::test]
+    async fn init_passes_on_chain_id_match() {
+        let mock = Arc::new(MockEvmRpc::default());
+        mock.set_chain_id(1);
+        let evm_rpc: crate::rpc::DynServerEvmRpc = mock;
+
+        check_chain_id_at_startup(&evm_rpc, 1)
+            .await
+            .expect("a matching RPC-reported chain_id must pass");
+    }
+
+    #[tokio::test]
+    async fn init_warns_but_continues_on_chain_id_rpc_error() {
+        let mock = Arc::new(MockEvmRpc::default());
+        mock.set_chain_id_error();
+        let evm_rpc: crate::rpc::DynServerEvmRpc = mock;
+
+        check_chain_id_at_startup(&evm_rpc, 1)
+            .await
+            .expect("an RPC error reading chain_id must warn and let startup continue, not fail");
+    }
+
+    /// Serializes tests that touch process-wide `FM_USDT_*` env vars so they
+    /// cannot race under `cargo test`'s default parallel-test execution.
+    static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn env_override_parse_error_is_not_a_panic() {
+        let _lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::set_var(FM_USDT_CHAIN_ID_ENV, "not-a-number");
+        }
+        let result = std::panic::catch_unwind(usdt_gen_params_from_env);
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(FM_USDT_CHAIN_ID_ENV);
+        }
+
+        match result {
+            Ok(inner) => {
+                let err = inner.expect_err("a malformed FM_USDT_CHAIN_ID must be a clean Err");
+                assert!(err.to_string().contains(FM_USDT_CHAIN_ID_ENV));
+            }
+            // A panic here means `usdt_gen_params_from_env` panicked instead
+            // of returning `Result::Err` on a malformed env var -- surface
+            // the original panic payload/message rather than discarding it.
+            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+        }
+    }
+
+    #[test]
+    fn env_override_valid_values_are_applied() {
+        let _lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::set_var(FM_USDT_CHAIN_ID_ENV, "1");
+            std::env::set_var(FM_USDT_CONFIRMATION_DEPTH_ENV, "6");
+        }
+        let result = usdt_gen_params_from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(FM_USDT_CHAIN_ID_ENV);
+            std::env::remove_var(FM_USDT_CONFIRMATION_DEPTH_ENV);
+        }
+
+        let params = result.expect("valid env overrides must parse cleanly");
+        assert_eq!(params.chain_id, 1);
+        assert_eq!(params.confirmation_depth, 6);
     }
 
     /// Builds a [`Usdt`] module (via [`Usdt::new_for_test`], so no poller
