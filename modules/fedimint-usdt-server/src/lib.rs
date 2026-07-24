@@ -4899,26 +4899,54 @@ impl Usdt {
         Ok(())
     }
 
-    /// The deterministic signer subset for a session's `attempt`: a rotated
-    /// window of size `t = threshold` over the sorted peer ring of size `n`,
-    /// starting at offset `attempt % n` and wrapping. Returned in the same
-    /// canonical sorted order [`spawn_signing_session`]/[`process_mpc_round`]
-    /// use everywhere else, so every guardian independently agrees on both the
-    /// membership and the party ordering of each attempt's subset.
+    /// The deterministic signer subset for a session's `(digest, attempt)`:
+    /// a combination schedule that, over one full period of `C(n, t)`
+    /// attempts, enumerates EVERY size-`t` subset of the `n` peers exactly
+    /// once (security finding 10). This guarantees liveness under any
+    /// `f = NumPeers::max_evil()`-sized Byzantine/offline set: since
+    /// `t = n - f`, the all-honest complement of any tolerated faulty set is
+    /// itself one size-`t` subset, so it is guaranteed to be reached within
+    /// `C(n, t)` attempts. The previous contiguous-rotating-window schedule
+    /// only ever tried `n` of the `C(n, t)` subsets, which for `f >= 2` can
+    /// permanently miss the all-honest subset (see
+    /// `security-review/10-medium-signer-rotation-byzantine-liveness.md`).
     ///
-    /// A pure function of `num_peers` and `attempt`: peer ids are exactly
-    /// `0..n` and [`NumPeers::peer_ids`] yields them in order, so attempt 0 is
-    /// the lowest-`t` subset and each subsequent attempt rotates the window
-    /// one peer forward. Rotating on retry keeps a single persistently-faulty
-    /// signer from stalling every attempt.
-    fn signer_subset(&self, attempt: u32) -> Vec<PeerId> {
+    /// Returned in the same canonical sorted order
+    /// [`spawn_signing_session`]/[`process_mpc_round`] use everywhere else,
+    /// so every guardian independently agrees on both the membership and the
+    /// party ordering of each attempt's subset.
+    ///
+    /// A pure function of `num_peers`, `digest`, and `attempt` — no
+    /// RPC/wall-clock/`our_peer_id` — so every guardian computes the
+    /// identical subset for the same `(digest, attempt)`:
+    /// 1. Enumerate all `C(n, t)` size-`t` combinations of `0..n` in a fixed
+    ///    lexicographic order (see [`t_combinations`]).
+    /// 2. Derive a per-session seed from the first 8 bytes of `digest`, so
+    ///    different sessions start their walk at different offsets (spreads
+    ///    load across guardians) without affecting coverage.
+    /// 3. `idx = (seed + attempt) % C(n, t)`. Because the stride over `attempt`
+    ///    is 1 and `gcd(1, C(n, t)) = 1`, a single session's attempts `0, 1,
+    ///    .., C(n, t) - 1` visit every combination exactly once before
+    ///    repeating (a full-period walk) — see
+    ///    `rotation_covers_every_combination_within_period`.
+    fn signer_subset(&self, digest: &[u8; 32], attempt: u32) -> Vec<PeerId> {
         let ids: Vec<PeerId> = self.num_peers.peer_ids().collect();
-        let n = ids.len();
         let t = self.num_peers.threshold();
-        let offset = (attempt as usize) % n;
-        let mut subset: Vec<PeerId> = (0..t).map(|i| ids[(offset + i) % n]).collect();
-        subset.sort_unstable();
-        subset
+        let combos = t_combinations(&ids, t);
+        let period = combos.len();
+        let seed = u64::from_be_bytes(
+            digest[0..8]
+                .try_into()
+                .expect("digest is a fixed-size [u8; 32]; the first 8 bytes always fit"),
+        );
+        // Reduce mod `period` in u64 (usize -> u64 is lossless) so the final
+        // `usize::try_from` always succeeds (result is < period, a usize) and
+        // no 32-bit-target truncation of `seed` can skip combinations.
+        let idx = usize::try_from(seed.wrapping_add(u64::from(attempt)) % period as u64)
+            .expect("value is < period, which is a usize");
+        // Already sorted: `t_combinations` builds each combination from
+        // ascending indices into the already-sorted `ids`.
+        combos[idx].clone()
     }
 
     /// Proposes a [`UsdtConsensusItem::RotateSigning`] for every `session` in
@@ -5331,8 +5359,8 @@ impl Usdt {
     ///
     /// Writes the consensus [`SigningSession`] — id
     /// [`signing_session_id(&digest, attempt)`][signing_session_id], signer
-    /// subset [`signer_subset(attempt)`][Self::signer_subset], `round: 0`,
-    /// [`SessionState::InProgress`] — and no-ops if a session for this
+    /// subset [`signer_subset(&digest, attempt)`][Self::signer_subset], `round:
+    /// 0`, [`SessionState::InProgress`] — and no-ops if a session for this
     /// `(digest, attempt)` already exists. If this guardian is in the subset
     /// it also spawns the off-thread signing state machine into
     /// `signing_sessions` and pre-pumps round 0's payload, so the next
@@ -5367,7 +5395,7 @@ impl Usdt {
             return;
         }
 
-        let signers = self.signer_subset(attempt);
+        let signers = self.signer_subset(&digest, attempt);
         // The block count at creation is this session's initial "progress"
         // baseline for `timed_out` — a session that never sees a round
         // advance still gets `timeout_blocks()` consensus blocks before it
@@ -5509,6 +5537,62 @@ fn chunk_payload(payload: &[u8]) -> Vec<Vec<u8>> {
         .chunks(MPC_ROUND_CHUNK_SIZE)
         .map(<[u8]>::to_vec)
         .collect()
+}
+
+/// Enumerates every size-`t` combination of `items` in a fixed lexicographic
+/// order (ordered by ascending index into `items`), used by
+/// [`Usdt::signer_subset`] (security finding 10) to build a deterministic
+/// combination schedule that is guaranteed to eventually try every `t`-of-`n`
+/// signer subset.
+///
+/// Pure and deterministic: identical `items`/`t` always yield an identical,
+/// identically-ordered result on every guardian. `items` is expected to
+/// already be sorted (as `NumPeers::peer_ids()` yields), so each returned
+/// combination is itself sorted.
+///
+/// Returns an empty `Vec` if `t > items.len()`; returns a single empty
+/// combination if `t == 0`. `n` is always small in practice (a federation's
+/// guardian count, realistically <= ~20), so `C(n, t)` is cheap to fully
+/// materialize.
+fn t_combinations<T: Copy>(items: &[T], t: usize) -> Vec<Vec<T>> {
+    let n = items.len();
+    if t > n {
+        return Vec::new();
+    }
+    if t == 0 {
+        return vec![Vec::new()];
+    }
+
+    let mut result = Vec::new();
+    // `idx[i]` is the index into `items` for position `i` of the current
+    // combination; starts at the lexicographically-first combination
+    // `[0, 1, .., t-1]`.
+    let mut idx: Vec<usize> = (0..t).collect();
+    loop {
+        result.push(idx.iter().map(|&i| items[i]).collect());
+
+        // Find the rightmost position that can still be advanced: position
+        // `i` can hold at most `i + n - t` (so the remaining `t - 1 - i`
+        // positions after it still have room for strictly-increasing
+        // indices up to `n - 1`).
+        let mut advance_at = None;
+        for i in (0..t).rev() {
+            if idx[i] < i + n - t {
+                advance_at = Some(i);
+                break;
+            }
+        }
+        let Some(i) = advance_at else {
+            // Every position is already at its maximum: the last
+            // combination `[n-t, .., n-1]` was just pushed.
+            break;
+        };
+        idx[i] += 1;
+        for j in (i + 1)..t {
+            idx[j] = idx[j - 1] + 1;
+        }
+    }
+    result
 }
 
 /// The number of consensus blocks a signing session may go without progress
@@ -7185,23 +7269,114 @@ mod tests {
         }
     }
 
-    /// `signer_subset` is a deterministic rotated window of size `t` over the
-    /// sorted peer ring, offset by `attempt % n` and wrapping — the same
-    /// canonical sorted order every guardian independently agrees on. For
-    /// n=4, t=3: attempt 0 → {0,1,2}; attempt 1 → {1,2,3}; attempt 2 wraps to
-    /// sorted {0,2,3}; attempt 3 wraps to sorted {0,1,3}; attempt 4 wraps back
-    /// to attempt 0's subset.
+    /// `signer_subset` is a deterministic combination schedule: for n=4, t=3,
+    /// `C(4,3)=4` and the lexicographic combination order is
+    /// `[0,1,2],[0,1,3],[0,2,3],[1,2,3]`. With `digest = [0u8;32]` the seed
+    /// derived from the digest is 0, so `idx = attempt % 4` walks that order
+    /// directly and attempt 4 wraps back to attempt 0's subset.
     #[tokio::test]
     async fn signer_subset_rotates_and_wraps_deterministically() {
         let module = test_module_with_block_count(4, 0).await;
         let p = |i: u16| PeerId::from(i);
+        let digest = [0u8; 32];
 
-        assert_eq!(module.signer_subset(0), vec![p(0), p(1), p(2)]);
-        assert_eq!(module.signer_subset(1), vec![p(1), p(2), p(3)]);
-        assert_eq!(module.signer_subset(2), vec![p(0), p(2), p(3)]);
-        assert_eq!(module.signer_subset(3), vec![p(0), p(1), p(3)]);
-        // Wraps: attempt 4 == attempt 0 (offset 4 % 4 == 0).
-        assert_eq!(module.signer_subset(4), module.signer_subset(0));
+        assert_eq!(module.signer_subset(&digest, 0), vec![p(0), p(1), p(2)]);
+        assert_eq!(module.signer_subset(&digest, 1), vec![p(0), p(1), p(3)]);
+        assert_eq!(module.signer_subset(&digest, 2), vec![p(0), p(2), p(3)]);
+        assert_eq!(module.signer_subset(&digest, 3), vec![p(1), p(2), p(3)]);
+        // Wraps: attempt 4 == attempt 0 (idx 4 % 4 == 0).
+        assert_eq!(
+            module.signer_subset(&digest, 4),
+            module.signer_subset(&digest, 0)
+        );
+    }
+
+    /// The finding-10 regression: for `n=7, t=5`, a Byzantine/offline set
+    /// `{0,3}` made every CONTIGUOUS rotation window contain a faulty
+    /// signer, so the all-honest subset `{1,2,4,5,6}` was never tried. The
+    /// combination schedule must eventually reach it.
+    #[tokio::test]
+    async fn rotation_eventually_selects_all_honest_subset() {
+        let module = test_module_with_block_count(7, 0).await;
+        let p = |i: u16| PeerId::from(i);
+        let digest = [7u8; 32];
+        let all_honest = vec![p(1), p(2), p(4), p(5), p(6)];
+
+        let period = usize::try_from(n_choose_k(7, 5)).expect("fits usize");
+        assert_eq!(period, 21, "C(7,5) == 21");
+
+        let period_u32 = u32::try_from(period).expect("C(7,5)=21 fits u32");
+        let found =
+            (0..period_u32).any(|attempt| module.signer_subset(&digest, attempt) == all_honest);
+        assert!(
+            found,
+            "the all-honest subset {{1,2,4,5,6}} must be reached within one full period"
+        );
+    }
+
+    /// Over one full period (`C(n,t)` attempts), the schedule must visit
+    /// EVERY size-`t` subset exactly once — a stride-1 walk over a
+    /// lexicographically-ordered combination list is a full permutation of
+    /// the combination indices, so no subset is skipped and none repeats
+    /// before the period completes.
+    #[tokio::test]
+    async fn rotation_covers_every_combination_within_period() {
+        let module = test_module_with_block_count(7, 0).await;
+        let digest = [42u8; 32];
+        let period = usize::try_from(n_choose_k(7, 5)).expect("fits usize");
+
+        let mut seen: std::collections::HashSet<Vec<PeerId>> = std::collections::HashSet::new();
+        let period_u32 = u32::try_from(period).expect("C(7,5)=21 fits u32");
+        for attempt in 0..period_u32 {
+            let subset = module.signer_subset(&digest, attempt);
+            assert_eq!(subset.len(), 5, "every subset must have size t=5");
+            let mut sorted = subset.clone();
+            sorted.sort_unstable();
+            assert_eq!(subset, sorted, "every subset must already be sorted");
+            assert!(
+                seen.insert(subset),
+                "attempt {attempt} repeated a subset within a single period"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            period,
+            "every one of the C(7,5)=21 combinations must appear exactly once"
+        );
+    }
+
+    /// `signer_subset` is a pure, deterministic function of
+    /// `(num_peers, digest, attempt)`: the same inputs always produce the
+    /// same sorted, correctly-sized subset.
+    #[tokio::test]
+    async fn signer_subset_is_deterministic_and_sorted() {
+        let module = test_module_with_block_count(7, 0).await;
+        let digest = [9u8; 32];
+
+        for attempt in 0..10u32 {
+            let a = module.signer_subset(&digest, attempt);
+            let b = module.signer_subset(&digest, attempt);
+            assert_eq!(a, b, "identical inputs must yield identical subsets");
+            assert_eq!(a.len(), module.num_peers.threshold());
+            let mut sorted = a.clone();
+            sorted.sort_unstable();
+            assert_eq!(a, sorted, "subset must be returned in sorted order");
+        }
+    }
+
+    /// Test-only helper mirroring `n_choose_k` used to derive expected
+    /// period lengths (`C(n,t)`) independently of the production
+    /// combinations generator.
+    fn n_choose_k(n: u64, k: u64) -> u64 {
+        if k > n {
+            return 0;
+        }
+        let k = k.min(n - k);
+        let mut result: u64 = 1;
+        for i in 0..k {
+            result = result * (n - i) / (i + 1);
+        }
+        result
     }
 
     /// A stalled (`InProgress`, timed-out) signing session is deterministically
