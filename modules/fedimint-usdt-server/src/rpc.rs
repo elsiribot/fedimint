@@ -36,6 +36,14 @@ sol! {
         // `derive_deposit_account`/`derive_pool_account` CREATE2 math -- the
         // footgun-killer that proves derived deposit addresses are spendable.
         function getAddress(address owner, uint256 salt) external view returns (address);
+
+        // sec-16 readiness deepening: the factory's immutable
+        // `SimpleAccount` implementation address, read directly (rather than
+        // only inferred through `getAddress`'s CREATE2 math) so readiness can
+        // reject a factory whose `getAddress` happens to special-case the
+        // sampled salts but whose deployed accounts would actually proxy to a
+        // non-canonical implementation.
+        function accountImplementation() external view returns (address);
     }
 
     #[sol(rpc)]
@@ -190,6 +198,19 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
         factory: EvmAddress,
         owner: EvmAddress,
         salt: [u8; 32],
+    ) -> anyhow::Result<EvmAddress>;
+
+    /// `SimpleAccountFactory(factory).accountImplementation()`: the
+    /// factory's immutable `SimpleAccount` implementation address (sec-16
+    /// readiness deepening). Compared directly against the module's
+    /// configured `simple_account_impl` by the bootstrap-readiness observer
+    /// so a factory cannot satisfy readiness merely by special-casing
+    /// `getAddress` for the salts readiness happens to sample while actually
+    /// proxying accounts to a different (potentially malicious)
+    /// implementation.
+    async fn factory_account_implementation(
+        &self,
+        factory: EvmAddress,
     ) -> anyhow::Result<EvmAddress>;
 
     /// This guardian's broadcaster EOA's ETH balance, in wei (`None` if no
@@ -518,6 +539,20 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .call()
             .await
             .with_context(|| format!("getAddress(owner, salt) on factory {factory}"))?;
+
+        Ok(EvmAddress(address.into_array()))
+    }
+
+    async fn factory_account_implementation(
+        &self,
+        factory: EvmAddress,
+    ) -> anyhow::Result<EvmAddress> {
+        let contract = ISimpleAccountFactory::new(Address::from(factory.0), &self.provider);
+        let address = contract
+            .accountImplementation()
+            .call()
+            .await
+            .with_context(|| format!("accountImplementation() on factory {factory}"))?;
 
         Ok(EvmAddress(address.into_array()))
     }

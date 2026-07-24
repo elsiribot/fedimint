@@ -733,9 +733,12 @@ pub struct BootstrapObservation {
     pub entry_point_ok: bool,
     /// The configured `account_factory` has code AND its on-chain
     /// `getAddress(owner, salt)` matches this build's off-chain
-    /// [`derive_pool_account`] CREATE2 derivation (the immutable-invariant
-    /// check that proves derived deposit addresses are spendable -- the
-    /// footgun-killer).
+    /// [`derive_pool_account`] CREATE2 derivation for the fixed `pool_salt`
+    /// AND for one deterministic claim-key-derived sample salt (against
+    /// [`derive_deposit_account`]) AND its `accountImplementation()` matches
+    /// the configured `simple_account_impl` (sec-16 readiness deepening,
+    /// finding 16) -- the immutable-invariant check that proves derived
+    /// deposit addresses are spendable -- the footgun-killer.
     pub factory_ok: bool,
     /// The configured `simple_account_impl` has contract code deployed.
     pub impl_ok: bool,

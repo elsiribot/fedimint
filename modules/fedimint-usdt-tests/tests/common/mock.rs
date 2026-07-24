@@ -28,6 +28,11 @@ struct State {
     /// Scripted `factory_get_address` responses, keyed by `(factory, owner,
     /// salt)` (Part C readiness).
     factory_addresses: HashMap<(EvmAddress, EvmAddress, [u8; 32]), EvmAddress>,
+    /// Scripted `factory_account_implementation` responses, keyed by
+    /// `factory` (sec-16 readiness deepening). An unscripted factory reads
+    /// as the all-zero address, which will fail a `== simple_account_impl`
+    /// comparison (safe default: readiness fails closed rather than open).
+    factory_account_implementations: HashMap<EvmAddress, EvmAddress>,
     /// Scripted broadcaster ETH balance (wei); `None` means "no broadcaster
     /// configured" (Part C readiness).
     broadcaster_eth_balance: Option<u128>,
@@ -48,6 +53,7 @@ impl Default for State {
             balances: HashMap::new(),
             code_len: HashMap::new(),
             factory_addresses: HashMap::new(),
+            factory_account_implementations: HashMap::new(),
             broadcaster_eth_balance: None,
             fee: FeeVote {
                 max_fee_per_gas_wei: 0,
@@ -135,6 +141,19 @@ impl MockEvmRpc {
         self.lock()
             .factory_addresses
             .insert((factory, owner, salt), address);
+    }
+
+    /// Scripts the address returned by
+    /// [`IServerEvmRpc::factory_account_implementation`] for `factory`
+    /// (sec-16 readiness deepening).
+    pub fn set_factory_account_implementation(
+        &self,
+        factory: EvmAddress,
+        implementation: EvmAddress,
+    ) {
+        self.lock()
+            .factory_account_implementations
+            .insert(factory, implementation);
     }
 
     /// Scripts the broadcaster ETH balance (wei) returned by
@@ -226,6 +245,18 @@ impl IServerEvmRpc for MockEvmRpc {
             .lock()
             .factory_addresses
             .get(&(factory, owner, salt))
+            .copied()
+            .unwrap_or(EvmAddress([0u8; 20])))
+    }
+
+    async fn factory_account_implementation(
+        &self,
+        factory: EvmAddress,
+    ) -> anyhow::Result<EvmAddress> {
+        Ok(self
+            .lock()
+            .factory_account_implementations
+            .get(&factory)
             .copied()
             .unwrap_or(EvmAddress([0u8; 20])))
     }

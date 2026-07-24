@@ -57,8 +57,9 @@ use fedimint_usdt_common::{
     UsdtGenParams, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
     UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
     WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
-    WithdrawalStatusResponse, deposit_fee_quote, derive_deposit_account, derive_pool_account,
-    evm_address, pool_salt, signing_session_id, validate_usdt_params, withdrawal_fee_quote,
+    WithdrawalStatusResponse, deposit_fee_quote, deposit_salt, derive_deposit_account,
+    derive_pool_account, evm_address, pool_salt, signing_session_id, validate_usdt_params,
+    withdrawal_fee_quote,
 };
 use futures::StreamExt as _;
 use rand::rngs::OsRng;
@@ -1877,6 +1878,38 @@ impl ServerModule for Usdt {
 /// regardless of how stale a client's cached quote is.
 const FEE_QUOTE_VALID_BLOCKS: u64 = 50;
 
+/// A fixed, compiled-in `secp256k1` public key -- the point for secret scalar
+/// `1` (the curve generator `G`) -- used by [`Usdt::observe_bootstrap`] as a
+/// deterministic sample claim key (sec-16 readiness deepening, finding 16).
+///
+/// `observe_bootstrap`'s factory readiness check previously sampled only
+/// [`pool_salt`], a single fixed, claim-key-independent salt; a malicious or
+/// mistaken factory could special-case that one salt in `getAddress` while
+/// mis-deploying every real (claim-key-derived) deposit account. Checking
+/// `factory.getAddress(owner, deposit_salt(sample_claim_pk()))` against the
+/// off-chain [`derive_deposit_account`] closes that bypass by exercising the
+/// exact same claim-key-derived salt path a real deposit address uses.
+///
+/// A pure function of a compiled-in constant -- every guardian computes the
+/// byte-identical key, so their `BootstrapObservation`s can agree. This is
+/// NOT a real claim key: no deposit is ever expected at its derived address,
+/// it exists purely as a readiness probe. Cached in a [`std::sync::LazyLock`]
+/// since [`Usdt::spawn_bootstrap_observer`] recomputes it every poll tick.
+#[must_use]
+pub fn sample_claim_pk() -> secp256k1::PublicKey {
+    static SAMPLE_CLAIM_PK: std::sync::LazyLock<secp256k1::PublicKey> =
+        std::sync::LazyLock::new(|| {
+            secp256k1::SecretKey::from_slice(&{
+                let mut scalar = [0u8; 32];
+                scalar[31] = 1;
+                scalar
+            })
+            .expect("scalar 1 is a valid secp256k1 secret key")
+            .public_key(secp256k1::SECP256K1)
+        });
+    *SAMPLE_CLAIM_PK
+}
+
 impl Usdt {
     /// Create new module instance, spawning the background block-count
     /// poller task (see [`Usdt::spawn_block_count_poller`]) and the
@@ -2180,7 +2213,43 @@ impl Usdt {
             let onchain_pool = evm_rpc
                 .factory_get_address(account_factory, owner, pool_salt())
                 .await?;
-            let factory_ok = factory_has_code && onchain_pool == expected_pool;
+            let pool_salt_ok = onchain_pool == expected_pool;
+
+            // sec-16 readiness deepening (finding 16): `pool_salt` alone is a
+            // single fixed, claim-key-independent salt, so a special-cased
+            // factory could pass the check above while mis-deploying every
+            // real (claim-key-derived) deposit account. Additionally sample
+            // one deterministic claim-key-derived salt
+            // (`sample_claim_pk`/`deposit_salt`) and require the SAME
+            // equivalence against the off-chain `derive_deposit_account`
+            // this build's clients actually use to compute deposit
+            // addresses.
+            let sample_claim_pk = sample_claim_pk();
+            let expected_sample_deposit = derive_deposit_account(
+                group_public_key,
+                account_factory,
+                simple_account_impl,
+                &sample_claim_pk,
+            );
+            let onchain_sample_deposit = evm_rpc
+                .factory_get_address(account_factory, owner, deposit_salt(&sample_claim_pk))
+                .await?;
+            let deposit_salt_ok = onchain_sample_deposit == expected_sample_deposit;
+
+            // sec-16 readiness deepening: independently confirm the factory's
+            // own immutable `accountImplementation()` matches the module's
+            // configured `simple_account_impl`, rather than relying solely on
+            // the CREATE2-address equivalences above to imply it -- a factory
+            // could conceivably special-case `getAddress` for exactly the
+            // salts readiness samples while proxying real `createAccount`
+            // calls to a different implementation.
+            let onchain_impl = evm_rpc
+                .factory_account_implementation(account_factory)
+                .await?;
+            let impl_matches_factory = onchain_impl == simple_account_impl;
+
+            let factory_ok =
+                factory_has_code && pool_salt_ok && deposit_salt_ok && impl_matches_factory;
 
             let impl_ok = evm_rpc.get_code_len(simple_account_impl).await? > 0;
 
@@ -4824,6 +4893,35 @@ mod tests {
         /// scripted `chain_id` value, for exercising the startup RPC-error
         /// (warn-and-continue) path.
         chain_id_err: Mutex<bool>,
+        /// Scripted `get_code_len` responses, keyed by address (sec-16
+        /// readiness deepening; see `set_code_len`). Unset addresses read as
+        /// `0` (no code).
+        code_len: Mutex<std::collections::HashMap<fedimint_usdt_common::EvmAddress, usize>>,
+        /// Scripted `factory_get_address` responses, keyed by `(factory,
+        /// owner, salt)` (sec-16 readiness deepening; see
+        /// `set_factory_get_address`). Unset entries read as the all-zero
+        /// address.
+        #[allow(clippy::type_complexity)]
+        factory_addresses: Mutex<
+            std::collections::HashMap<
+                (
+                    fedimint_usdt_common::EvmAddress,
+                    fedimint_usdt_common::EvmAddress,
+                    [u8; 32],
+                ),
+                fedimint_usdt_common::EvmAddress,
+            >,
+        >,
+        /// Scripted `factory_account_implementation` responses, keyed by
+        /// `factory` (sec-16 readiness deepening; see
+        /// `set_factory_account_implementation`). Unset entries read as the
+        /// all-zero address.
+        factory_account_implementations: Mutex<
+            std::collections::HashMap<
+                fedimint_usdt_common::EvmAddress,
+                fedimint_usdt_common::EvmAddress,
+            >,
+        >,
     }
 
     impl MockEvmRpc {
@@ -4878,6 +4976,47 @@ mod tests {
         fn set_chain_id_error(&self) {
             *self.chain_id_err.lock().expect("not poisoned") = true;
         }
+
+        /// Scripts the length returned by `get_code_len(addr)` (sec-16
+        /// readiness deepening).
+        fn set_code_len(&self, addr: fedimint_usdt_common::EvmAddress, len: usize) {
+            self.code_len
+                .lock()
+                .expect("not poisoned")
+                .insert(addr, len);
+        }
+
+        /// Scripts the address returned by `factory_get_address(factory,
+        /// owner, salt)` for that exact `(factory, owner, salt)` triple
+        /// (sec-16 readiness deepening: lets a test give a mock factory a
+        /// correct `pool_salt` address but a wrong sample-deposit-salt
+        /// address, or vice versa).
+        fn set_factory_get_address(
+            &self,
+            factory: fedimint_usdt_common::EvmAddress,
+            owner: fedimint_usdt_common::EvmAddress,
+            salt: [u8; 32],
+            address: fedimint_usdt_common::EvmAddress,
+        ) {
+            self.factory_addresses
+                .lock()
+                .expect("not poisoned")
+                .insert((factory, owner, salt), address);
+        }
+
+        /// Scripts the address returned by
+        /// `factory_account_implementation(factory)` (sec-16 readiness
+        /// deepening).
+        fn set_factory_account_implementation(
+            &self,
+            factory: fedimint_usdt_common::EvmAddress,
+            implementation: fedimint_usdt_common::EvmAddress,
+        ) {
+            self.factory_account_implementations
+                .lock()
+                .expect("not poisoned")
+                .insert(factory, implementation);
+        }
     }
 
     #[async_trait::async_trait]
@@ -4925,18 +5064,43 @@ mod tests {
 
         async fn get_code_len(
             &self,
-            _addr: fedimint_usdt_common::EvmAddress,
+            addr: fedimint_usdt_common::EvmAddress,
         ) -> anyhow::Result<usize> {
-            Ok(0)
+            Ok(self
+                .code_len
+                .lock()
+                .expect("not poisoned")
+                .get(&addr)
+                .copied()
+                .unwrap_or(0))
         }
 
         async fn factory_get_address(
             &self,
-            _factory: fedimint_usdt_common::EvmAddress,
-            _owner: fedimint_usdt_common::EvmAddress,
-            _salt: [u8; 32],
+            factory: fedimint_usdt_common::EvmAddress,
+            owner: fedimint_usdt_common::EvmAddress,
+            salt: [u8; 32],
         ) -> anyhow::Result<fedimint_usdt_common::EvmAddress> {
-            Ok(fedimint_usdt_common::EvmAddress([0u8; 20]))
+            Ok(self
+                .factory_addresses
+                .lock()
+                .expect("not poisoned")
+                .get(&(factory, owner, salt))
+                .copied()
+                .unwrap_or(fedimint_usdt_common::EvmAddress([0u8; 20])))
+        }
+
+        async fn factory_account_implementation(
+            &self,
+            factory: fedimint_usdt_common::EvmAddress,
+        ) -> anyhow::Result<fedimint_usdt_common::EvmAddress> {
+            Ok(self
+                .factory_account_implementations
+                .lock()
+                .expect("not poisoned")
+                .get(&factory)
+                .copied()
+                .unwrap_or(fedimint_usdt_common::EvmAddress([0u8; 20])))
         }
 
         async fn broadcaster_eth_balance(&self) -> anyhow::Result<Option<u128>> {
@@ -5272,6 +5436,133 @@ mod tests {
             module.bootstrap_state(&mut dbtx.to_ref_nc()).await,
             BootstrapState::Degraded
         );
+    }
+
+    /// Scripts `mock` so `Usdt::observe_bootstrap`, run against `cfg`, would
+    /// observe a fully canonical factory: code present at
+    /// `entry_point`/`account_factory`/`simple_account_impl`, the factory's
+    /// `getAddress` matching the off-chain CREATE2 derivation for BOTH the
+    /// fixed `pool_salt()` AND the deterministic `sample_claim_pk()` deposit
+    /// salt, and its `accountImplementation()` matching `simple_account_impl`
+    /// (sec-16 readiness deepening, finding 16). Individual tests then
+    /// deviate one condition at a time to prove `factory_ok` catches each.
+    fn script_canonical_factory(mock: &MockEvmRpc, cfg: &UsdtConfigConsensus) {
+        mock.set_code_len(cfg.entry_point, 32);
+        mock.set_code_len(cfg.account_factory, 32);
+        mock.set_code_len(cfg.simple_account_impl, 32);
+
+        let owner = evm_address(&cfg.group_public_key);
+        let pool = derive_pool_account(
+            &cfg.group_public_key,
+            cfg.account_factory,
+            cfg.simple_account_impl,
+        );
+        mock.set_factory_get_address(cfg.account_factory, owner, pool_salt(), pool);
+
+        let sample = sample_claim_pk();
+        let sample_deposit = derive_deposit_account(
+            &cfg.group_public_key,
+            cfg.account_factory,
+            cfg.simple_account_impl,
+            &sample,
+        );
+        mock.set_factory_get_address(
+            cfg.account_factory,
+            owner,
+            deposit_salt(&sample),
+            sample_deposit,
+        );
+
+        mock.set_factory_account_implementation(cfg.account_factory, cfg.simple_account_impl);
+    }
+
+    /// Positive control (sec-16 readiness deepening): a factory that is
+    /// canonical for the fixed `pool_salt`, the deterministic sample deposit
+    /// salt, AND `accountImplementation()` reports `factory_ok == true`.
+    #[tokio::test]
+    async fn readiness_ok_when_factory_fully_canonical() {
+        let module = test_module_with_block_count(4, 0).await;
+        let cfg = module.cfg.consensus.clone();
+        let mock = MockEvmRpc::default();
+        script_canonical_factory(&mock, &cfg);
+
+        let observation = Usdt::observe_bootstrap(
+            &mock,
+            &cfg.group_public_key,
+            cfg.entry_point,
+            cfg.account_factory,
+            cfg.simple_account_impl,
+            cfg.broadcaster_min_balance_wei,
+        )
+        .await;
+
+        assert!(observation.rpc_healthy);
+        assert!(observation.factory_ok);
+    }
+
+    /// sec-16 readiness deepening (finding 16): a factory whose `getAddress`
+    /// returns the CORRECT address for the fixed `pool_salt` but a WRONG
+    /// address for the deterministic sample deposit salt -- i.e. it
+    /// special-cases `pool_salt` while mis-deploying real (claim-key-derived)
+    /// deposit accounts -- must NOT be reported ready. Before this task,
+    /// `observe_bootstrap` sampled only `pool_salt` and would have missed
+    /// this.
+    #[tokio::test]
+    async fn readiness_fails_when_factory_special_cases_pool_salt() {
+        let module = test_module_with_block_count(4, 0).await;
+        let cfg = module.cfg.consensus.clone();
+        let mock = MockEvmRpc::default();
+        script_canonical_factory(&mock, &cfg);
+
+        // Overwrite the sample-deposit-salt entry with a WRONG address (the
+        // pool-salt entry from `script_canonical_factory` stays correct).
+        let owner = evm_address(&cfg.group_public_key);
+        let sample = sample_claim_pk();
+        let wrong = fedimint_usdt_common::EvmAddress([0xEE; 20]);
+        mock.set_factory_get_address(cfg.account_factory, owner, deposit_salt(&sample), wrong);
+
+        let observation = Usdt::observe_bootstrap(
+            &mock,
+            &cfg.group_public_key,
+            cfg.entry_point,
+            cfg.account_factory,
+            cfg.simple_account_impl,
+            cfg.broadcaster_min_balance_wei,
+        )
+        .await;
+
+        assert!(observation.rpc_healthy);
+        assert!(!observation.factory_ok);
+    }
+
+    /// sec-16 readiness deepening (finding 16): a factory whose `getAddress`
+    /// is canonical for both sampled salts, but whose own
+    /// `accountImplementation()` reports a DIFFERENT address than the
+    /// module's configured `simple_account_impl`, must NOT be reported ready.
+    #[tokio::test]
+    async fn readiness_fails_when_account_implementation_mismatches() {
+        let module = test_module_with_block_count(4, 0).await;
+        let cfg = module.cfg.consensus.clone();
+        let mock = MockEvmRpc::default();
+        script_canonical_factory(&mock, &cfg);
+
+        // Overwrite `accountImplementation()` with a DIFFERENT address than
+        // the configured `simple_account_impl`.
+        let wrong_impl = fedimint_usdt_common::EvmAddress([0xDD; 20]);
+        mock.set_factory_account_implementation(cfg.account_factory, wrong_impl);
+
+        let observation = Usdt::observe_bootstrap(
+            &mock,
+            &cfg.group_public_key,
+            cfg.entry_point,
+            cfg.account_factory,
+            cfg.simple_account_impl,
+            cfg.broadcaster_min_balance_wei,
+        )
+        .await;
+
+        assert!(observation.rpc_healthy);
+        assert!(!observation.factory_ok);
     }
 
     /// Deterministic `secp256k1::PublicKey` derived from `byte`, for tests
