@@ -160,7 +160,7 @@ async fn hand_signed_withdrawal_batch_deploys_pool_and_pays_recipients() -> anyh
 
     eprintln!(
         "UserOperationEvent: success={} block={} actual_cost={:?}",
-        receipt.success, receipt.block, receipt.actual_cost_usdt
+        receipt.success, receipt.block, receipt.actual_gas_cost_wei
     );
 
     assert!(

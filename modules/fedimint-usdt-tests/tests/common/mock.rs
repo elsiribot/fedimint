@@ -446,7 +446,7 @@ mod tests {
         let receipt = UserOpReceipt {
             success: true,
             block: 7,
-            actual_cost_usdt: UsdtAmount(500),
+            actual_gas_cost_wei: UsdtAmount(500),
         };
         mock.set_user_op_receipt(user_op_hash, receipt);
         assert_eq!(
