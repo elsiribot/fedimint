@@ -4,6 +4,7 @@
 //! `MockEvmRpc` instead of a live node.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::eips::BlockId;
 use alloy::network::TransactionBuilder as _;
@@ -12,11 +13,31 @@ use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
+use alloy::transports::http::reqwest;
 use anyhow::Context as _;
 use fedimint_core::util::FmtCompactAnyhow as _;
 use fedimint_usdt_common::user_op::{PackedUserOperation, SignedUserOp, UserOpReceipt};
 use fedimint_usdt_common::{EvmAddress, FeeVote, UsdtAmount};
 use tracing::{debug, warn};
+
+/// Builds a `reqwest::Client` bounded by [`crate::RPC_REQUEST_TIMEOUT_SECS`]
+/// (total request timeout) and a 10s connect timeout, for use with
+/// `ProviderBuilder::connect_reqwest` instead of `connect_http`'s default,
+/// unbounded client (security finding 19): a provider that accepts a
+/// TCP/TLS connection but never sends a JSON-RPC response would otherwise
+/// wedge the calling task inside the `reqwest` await forever (the default
+/// `reqwest::Client` has no overall request timeout). Shares its constant
+/// with [`crate::rpc_deadline`], which wraps every recurring operational RPC
+/// await with the SAME deadline, so a stalled call surfaces as an `Err` (in
+/// the same branch as a normal RPC error) at the same bound regardless of
+/// which layer catches it first.
+fn bounded_reqwest_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(crate::RPC_REQUEST_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build the bounded EVM RPC HTTP client")
+}
 
 use crate::factory_bytecode::{
     ARACHNID_DEPLOY_TX_COST_WEI, ARACHNID_DEPLOYER, ARACHNID_DEPLOYER_SIGNER,
@@ -450,7 +471,9 @@ impl AlloyEvmRpc {
             );
         }
 
-        let provider = ProviderBuilder::new().connect_http(url).erased();
+        let provider = ProviderBuilder::new()
+            .connect_reqwest(bounded_reqwest_client()?, url)
+            .erased();
 
         Ok(Self {
             provider,
@@ -493,7 +516,7 @@ impl AlloyEvmRpc {
             .with_context(|| format!("invalid EVM RPC URL: {}", self.display_url))?;
         let provider = ProviderBuilder::new()
             .wallet(signer)
-            .connect_http(url)
+            .connect_reqwest(bounded_reqwest_client()?, url)
             .erased();
 
         self.broadcaster = Some(provider);

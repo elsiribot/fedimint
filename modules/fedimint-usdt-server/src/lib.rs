@@ -418,6 +418,58 @@ fn usdt_gen_params_from_env() -> anyhow::Result<UsdtGenParams> {
     Ok(params)
 }
 
+/// Deadline (in seconds) for every recurring, operational EVM RPC await this
+/// module makes outside of consensus-decision paths (security finding 19):
+/// the block-count/fee pollers, the bootstrap observer/self-deploy, the
+/// per-account deposit balance read, and the `UserOp` submitter/receipt
+/// poller. Shared with [`crate::rpc::AlloyEvmRpc`]'s bounded `reqwest`
+/// client, so a stalled call is caught at the same bound regardless of
+/// which layer (the HTTP client's own request timeout, or this module-level
+/// deadline) happens to notice first. Mirrors the value the startup
+/// transfer-fee/chain-id checks already hardcode as `Duration::from_secs(30)`
+/// (kept as separate literals there since those are one-shot, not recurring,
+/// checks).
+const RPC_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum number of submitted `UserOp`s [`Usdt::spawn_user_op_submitter`]
+/// processes concurrently (security finding 19), bounding this guardian's
+/// simultaneous outbound RPC load while still ensuring a stall on one op
+/// cannot block the others (unlike the old fully-serial `for` loop).
+const USER_OP_SUBMIT_CONCURRENCY: usize = 8;
+
+/// Wraps an EVM RPC await with [`RPC_REQUEST_TIMEOUT_SECS`] (security
+/// finding 19), mapping a timed-out future into an `anyhow::Error` so it
+/// lands in the exact same `Err` branch of the caller's existing
+/// retry/sleep/cached-value logic as a normal RPC error -- never a panic or
+/// an indefinitely wedged task. Mirrors the pattern the startup transfer-fee
+/// check (a few lines below, in `UsdtInit::init`) already uses via
+/// `fedimint_core::runtime::timeout` directly. A thin wrapper around
+/// [`rpc_deadline_with`] fixing the deadline at the production value -- see
+/// that function's doc comment for why the deadline itself is a parameter
+/// rather than baked in here.
+async fn rpc_deadline<T>(
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    rpc_deadline_with(Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS), fut).await
+}
+
+/// [`rpc_deadline`]'s implementation, parameterized on the deadline itself
+/// so `rpc_deadline_times_out` can exercise the timeout->`Err` mapping with a
+/// short, deterministic duration instead of the real 30s production value
+/// (`RPC_REQUEST_TIMEOUT_SECS`) or an `is_running_in_test_env`-scaled one --
+/// the latter would depend on `NEXTEST`/`FM_IN_DEVIMINT` being set, which
+/// plain `cargo test` (as `just test` runs it) does not set, making the
+/// scaling unreliable for a unit test.
+async fn rpc_deadline_with<T>(
+    deadline: Duration,
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match fedimint_core::runtime::timeout(deadline, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(anyhow::anyhow!("RPC call timed out after {deadline:?}")),
+    }
+}
+
 /// Startup chain-id sanity check (sec-15/17): confirms `evm_rpc` actually
 /// points at the chain `consensus_chain_id` (i.e. `cfg.consensus.chain_id`)
 /// expects, and refuses to start on a DEFINITIVE mismatch. `chain_id` is
@@ -2085,7 +2137,7 @@ impl Usdt {
     ) {
         task_group.spawn_cancellable("usdt-block-count-poller", async move {
             loop {
-                match evm_rpc.get_block_number().await {
+                match rpc_deadline(evm_rpc.get_block_number()).await {
                     Ok(n) => {
                         block_count.store(n, Ordering::Relaxed);
                     }
@@ -2125,7 +2177,7 @@ impl Usdt {
     ) {
         task_group.spawn_cancellable("usdt-fee-estimate-poller", async move {
             loop {
-                match evm_rpc.get_fee_estimate().await {
+                match rpc_deadline(evm_rpc.get_fee_estimate()).await {
                     Ok(vote) => {
                         *fee_estimate.lock().expect("not poisoned") = Some(vote);
                     }
@@ -2242,7 +2294,7 @@ impl Usdt {
         broadcaster_min_balance_wei: u64,
     ) -> BootstrapObservation {
         let observe = || async {
-            let entry_point_ok = evm_rpc.get_code_len(entry_point).await? > 0;
+            let entry_point_ok = rpc_deadline(evm_rpc.get_code_len(entry_point)).await? > 0;
 
             // Factory readiness (the footgun-killer): the factory must have
             // code AND its on-chain `getAddress(owner, pool_salt)` must equal
@@ -2253,13 +2305,13 @@ impl Usdt {
             // account (a fixed, claim-key-independent address) is used as the
             // representative counterfactual since it shares the exact CREATE2
             // construction with every deposit account.
-            let factory_has_code = evm_rpc.get_code_len(account_factory).await? > 0;
+            let factory_has_code = rpc_deadline(evm_rpc.get_code_len(account_factory)).await? > 0;
             let owner = evm_address(group_public_key);
             let expected_pool =
                 derive_pool_account(group_public_key, account_factory, simple_account_impl);
-            let onchain_pool = evm_rpc
-                .factory_get_address(account_factory, owner, pool_salt())
-                .await?;
+            let onchain_pool =
+                rpc_deadline(evm_rpc.factory_get_address(account_factory, owner, pool_salt()))
+                    .await?;
             let pool_salt_ok = onchain_pool == expected_pool;
 
             // sec-16 readiness deepening (finding 16): `pool_salt` alone is a
@@ -2278,9 +2330,12 @@ impl Usdt {
                 simple_account_impl,
                 &sample_claim_pk,
             );
-            let onchain_sample_deposit = evm_rpc
-                .factory_get_address(account_factory, owner, deposit_salt(&sample_claim_pk))
-                .await?;
+            let onchain_sample_deposit = rpc_deadline(evm_rpc.factory_get_address(
+                account_factory,
+                owner,
+                deposit_salt(&sample_claim_pk),
+            ))
+            .await?;
             let deposit_salt_ok = onchain_sample_deposit == expected_sample_deposit;
 
             // sec-16 readiness deepening: independently confirm the factory's
@@ -2290,20 +2345,18 @@ impl Usdt {
             // could conceivably special-case `getAddress` for exactly the
             // salts readiness samples while proxying real `createAccount`
             // calls to a different implementation.
-            let onchain_impl = evm_rpc
-                .factory_account_implementation(account_factory)
-                .await?;
+            let onchain_impl =
+                rpc_deadline(evm_rpc.factory_account_implementation(account_factory)).await?;
             let impl_matches_factory = onchain_impl == simple_account_impl;
 
             let factory_ok =
                 factory_has_code && pool_salt_ok && deposit_salt_ok && impl_matches_factory;
 
-            let impl_ok = evm_rpc.get_code_len(simple_account_impl).await? > 0;
+            let impl_ok = rpc_deadline(evm_rpc.get_code_len(simple_account_impl)).await? > 0;
 
             // Broadcaster funding: `None` (no broadcaster configured) counts
             // as not funded.
-            let broadcaster_funded = evm_rpc
-                .broadcaster_eth_balance()
+            let broadcaster_funded = rpc_deadline(evm_rpc.broadcaster_eth_balance())
                 .await?
                 .is_some_and(|balance| balance >= u128::from(broadcaster_min_balance_wei));
 
@@ -2364,22 +2417,21 @@ impl Usdt {
         broadcaster_min_balance_wei: u64,
     ) -> anyhow::Result<()> {
         // 1. Already deployed -> nothing to do.
-        if evm_rpc.get_code_len(account_factory).await? > 0 {
+        if rpc_deadline(evm_rpc.get_code_len(account_factory)).await? > 0 {
             return Ok(());
         }
 
         // 2. Only the guardians whose broadcaster is funded attempt the deploy
         //    (fronting its gas). `None` (no broadcaster) counts as not funded.
-        let funded = evm_rpc
-            .broadcaster_eth_balance()
+        let funded = rpc_deadline(evm_rpc.broadcaster_eth_balance())
             .await?
             .is_some_and(|balance| balance >= u128::from(broadcaster_min_balance_wei));
         if !funded {
             return Ok(());
         }
 
-        evm_rpc.ensure_create2_deployer().await?;
-        evm_rpc.deploy_factory(entry_point).await?;
+        rpc_deadline(evm_rpc.ensure_create2_deployer()).await?;
+        rpc_deadline(evm_rpc.deploy_factory(entry_point)).await?;
         info!(
             target: "usdt",
             %account_factory,
@@ -2497,6 +2549,12 @@ impl Usdt {
     /// function of consensus data, so every guardian proposing for the same
     /// `op_hash` proposes an identical `swept` value once they agree on
     /// `success`.
+    ///
+    /// Security finding 19: processed with bounded concurrency (see the
+    /// function body) rather than a serial loop, so one hung/slow op's RPC
+    /// calls cannot starve the others; this constant caps how many ops are
+    /// in flight against `evm_rpc` at once.
+    #[allow(clippy::too_many_lines)]
     fn spawn_user_op_submitter(task_group: &TaskGroup, handles: UserOpSubmitterHandles) {
         let UserOpSubmitterHandles {
             db,
@@ -2514,104 +2572,131 @@ impl Usdt {
                     .await;
                 drop(dbtx);
 
-                for (SubmittedUserOpKey(op_hash), record) in submitted {
-                    // Idempotent, guardian-local: errors (including "already
-                    // included") are swallowed and simply retried next tick.
-                    if let Err(err) = evm_rpc.submit_user_ops(vec![record.signed.clone()]).await {
-                        debug!(
-                            target: "usdt",
-                            err = %err.fmt_compact_anyhow(),
-                            ?op_hash,
-                            "UserOp submission failed, retrying next tick"
-                        );
-                    }
+                // Security finding 19: bounded concurrency (not a serial
+                // `for` loop) so a stalled/slow `submit_user_ops` or
+                // `get_user_op_receipt` for ONE op cannot starve
+                // submission/receipt-polling of every other submitted op --
+                // each op's own two RPC awaits are additionally bounded by
+                // `rpc_deadline`, so a truly hung provider surfaces as an
+                // `Err` (the existing "retry next tick" branch) instead of
+                // wedging that op's task forever. `USER_OP_SUBMIT_CONCURRENCY`
+                // caps how many ops are in flight at once, bounding this
+                // guardian's simultaneous outbound RPC load.
+                let evm_rpc = &evm_rpc;
+                let user_op_confirmed_proposals = &user_op_confirmed_proposals;
+                futures::stream::iter(submitted)
+                    .for_each_concurrent(
+                        USER_OP_SUBMIT_CONCURRENCY,
+                        move |(SubmittedUserOpKey(op_hash), record)| async move {
+                            // Idempotent, guardian-local: errors (including
+                            // "already included") are swallowed and simply
+                            // retried next tick.
+                            if let Err(err) =
+                                rpc_deadline(evm_rpc.submit_user_ops(vec![record.signed.clone()]))
+                                    .await
+                            {
+                                debug!(
+                                    target: "usdt",
+                                    err = %err.fmt_compact_anyhow(),
+                                    ?op_hash,
+                                    "UserOp submission failed, retrying next tick"
+                                );
+                            }
 
-                    match evm_rpc.get_user_op_receipt(op_hash).await {
-                        Ok(Some(receipt)) => {
-                            // `swept` doubles as "amount moved by this op":
-                            // swept-TO-the-pool for `DeployAndSweep`,
-                            // paid-OUT-of-the-pool for `Withdraw` (Phase 8,
-                            // Task 2) -- both decoded from the already
-                            // federation-agreed `op`'s own calldata, never
-                            // from the RPC response, per this fn's own doc
-                            // comment.
-                            //
-                            // Security finding 21 (Phase 9 hardening):
-                            // fail CLOSED on a decode error instead of the
-                            // old `.unwrap_or(UsdtAmount(0))` -- decoding
-                            // the ALREADY-committed calldata of a
-                            // successful op can only fail on an invariant
-                            // violation (e.g. a future/malformed op format
-                            // this guardian's decoder doesn't understand
-                            // yet), and proposing `swept = 0` for it would
-                            // let a real on-chain transfer settle without
-                            // ever moving the corresponding pool
-                            // accounting. Skip proposing ANY confirmation
-                            // for this op this tick instead -- `continue`
-                            // simply leaves `SubmittedUserOp` in place, so
-                            // this is retried (and re-logged) every tick
-                            // for as long as it stays live, never silently
-                            // dropped.
-                            let swept = if receipt.success {
-                                let decoded = match &record.purpose {
-                                    UserOpPurpose::DeployAndSweep { .. } => {
-                                        crate::user_op::decode_transfer_amount(
-                                            &record.signed.unsigned,
-                                        )
-                                    }
-                                    UserOpPurpose::Withdraw { .. } => {
-                                        crate::user_op::decode_batch_transfer_total(
-                                            &record.signed.unsigned,
-                                        )
-                                    }
-                                };
-                                match decoded {
-                                    Ok(swept) => swept,
-                                    Err(err) => {
-                                        warn!(
-                                            target: "usdt",
-                                            ?op_hash,
-                                            err = %err.fmt_compact_anyhow(),
-                                            purpose = ?record.purpose,
-                                            "failed to decode swept amount from committed op \
-                                             calldata; not proposing a confirmation for this op"
-                                        );
-                                        continue;
-                                    }
+                            match rpc_deadline(evm_rpc.get_user_op_receipt(op_hash)).await {
+                                Ok(Some(receipt)) => {
+                                    // `swept` doubles as "amount moved by
+                                    // this op": swept-TO-the-pool for
+                                    // `DeployAndSweep`, paid-OUT-of-the-pool
+                                    // for `Withdraw` (Phase 8, Task 2) --
+                                    // both decoded from the already
+                                    // federation-agreed `op`'s own calldata,
+                                    // never from the RPC response, per this
+                                    // fn's own doc comment.
+                                    //
+                                    // Security finding 21 (Phase 9
+                                    // hardening): fail CLOSED on a decode
+                                    // error instead of the old
+                                    // `.unwrap_or(UsdtAmount(0))` --
+                                    // decoding the ALREADY-committed
+                                    // calldata of a successful op can only
+                                    // fail on an invariant violation (e.g. a
+                                    // future/malformed op format this
+                                    // guardian's decoder doesn't understand
+                                    // yet), and proposing `swept = 0` for it
+                                    // would let a real on-chain transfer
+                                    // settle without ever moving the
+                                    // corresponding pool accounting. Skip
+                                    // proposing ANY confirmation for this op
+                                    // this tick instead -- `return` simply
+                                    // leaves `SubmittedUserOp` in place, so
+                                    // this is retried (and re-logged) every
+                                    // tick for as long as it stays live,
+                                    // never silently dropped.
+                                    let swept = if receipt.success {
+                                        let decoded = match &record.purpose {
+                                            UserOpPurpose::DeployAndSweep { .. } => {
+                                                crate::user_op::decode_transfer_amount(
+                                                    &record.signed.unsigned,
+                                                )
+                                            }
+                                            UserOpPurpose::Withdraw { .. } => {
+                                                crate::user_op::decode_batch_transfer_total(
+                                                    &record.signed.unsigned,
+                                                )
+                                            }
+                                        };
+                                        match decoded {
+                                            Ok(swept) => swept,
+                                            Err(err) => {
+                                                warn!(
+                                                    target: "usdt",
+                                                    ?op_hash,
+                                                    err = %err.fmt_compact_anyhow(),
+                                                    purpose = ?record.purpose,
+                                                    "failed to decode swept amount from \
+                                                     committed op calldata; not proposing a \
+                                                     confirmation for this op"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        UsdtAmount(0)
+                                    };
+                                    debug!(
+                                        target: "usdt",
+                                        ?op_hash,
+                                        success = receipt.success,
+                                        block = receipt.block,
+                                        swept = swept.0,
+                                        purpose = ?record.purpose,
+                                        "UserOp receipt observed on-chain, proposing threshold \
+                                         confirmation"
+                                    );
+                                    user_op_confirmed_proposals
+                                        .lock()
+                                        .expect("not poisoned")
+                                        .push(UserOpConfirmedProposal {
+                                            op_hash,
+                                            success: receipt.success,
+                                            block: receipt.block,
+                                            swept,
+                                        });
                                 }
-                            } else {
-                                UsdtAmount(0)
-                            };
-                            debug!(
-                                target: "usdt",
-                                ?op_hash,
-                                success = receipt.success,
-                                block = receipt.block,
-                                swept = swept.0,
-                                purpose = ?record.purpose,
-                                "UserOp receipt observed on-chain, proposing threshold confirmation"
-                            );
-                            user_op_confirmed_proposals
-                                .lock()
-                                .expect("not poisoned")
-                                .push(UserOpConfirmedProposal {
-                                    op_hash,
-                                    success: receipt.success,
-                                    block: receipt.block,
-                                    swept,
-                                });
-                        }
-                        Ok(None) => {}
-                        Err(err) => {
-                            debug!(
-                                target: "usdt",
-                                err = %err.fmt_compact_anyhow(),
-                                ?op_hash,
-                                "UserOp receipt poll failed, retrying next tick"
-                            );
-                        }
-                    }
-                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    debug!(
+                                        target: "usdt",
+                                        err = %err.fmt_compact_anyhow(),
+                                        ?op_hash,
+                                        "UserOp receipt poll failed, retrying next tick"
+                                    );
+                                }
+                            }
+                        },
+                    )
+                    .await;
 
                 fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
                     1
@@ -4650,19 +4735,20 @@ async fn scan_pending_deposits(
             continue;
         }
 
-        let balance = match evm_rpc.get_erc20_balance(usdt_contract, account, at).await {
-            Ok(balance) => balance,
-            Err(err) => {
-                debug!(
-                    target: "usdt",
-                    err = %err.fmt_compact_anyhow(),
-                    ?account,
-                    at_block = at,
-                    "deposit balance check failed, retrying next tick"
-                );
-                continue;
-            }
-        };
+        let balance =
+            match rpc_deadline(evm_rpc.get_erc20_balance(usdt_contract, account, at)).await {
+                Ok(balance) => balance,
+                Err(err) => {
+                    debug!(
+                        target: "usdt",
+                        err = %err.fmt_compact_anyhow(),
+                        ?account,
+                        at_block = at,
+                        "deposit balance check failed, retrying next tick"
+                    );
+                    continue;
+                }
+            };
 
         let credited = dbtx
             .get_value(&DepositRecordKey(account))
@@ -4900,6 +4986,10 @@ mod tests {
                 fedimint_usdt_common::EvmAddress,
             >,
         >,
+        /// `user_op_hash`es for which `get_user_op_receipt` never resolves
+        /// (security finding 19; see `set_receipt_hangs`), used to prove a
+        /// stalled RPC call for one op cannot block progress on others.
+        hung_receipts: Mutex<std::collections::HashSet<[u8; 32]>>,
     }
 
     impl MockEvmRpc {
@@ -4933,6 +5023,18 @@ mod tests {
                 .lock()
                 .expect("not poisoned")
                 .insert(user_op_hash, receipt);
+        }
+
+        /// Scripts `get_user_op_receipt(user_op_hash)` to never resolve
+        /// (security finding 19), simulating a provider that accepts the
+        /// request but never answers -- used to prove `rpc_deadline` bounds
+        /// the await and that the bounded-concurrency submitter still makes
+        /// progress on other ops despite this one hanging.
+        fn set_receipt_hangs(&self, user_op_hash: [u8; 32]) {
+            self.hung_receipts
+                .lock()
+                .expect("not poisoned")
+                .insert(user_op_hash);
         }
 
         /// Every `SignedUserOp` batch previously passed to
@@ -5115,6 +5217,18 @@ mod tests {
             &self,
             user_op_hash: [u8; 32],
         ) -> anyhow::Result<Option<fedimint_usdt_common::user_op::UserOpReceipt>> {
+            if self
+                .hung_receipts
+                .lock()
+                .expect("not poisoned")
+                .contains(&user_op_hash)
+            {
+                // Security finding 19: simulates a provider that never
+                // answers. Never resolves; the caller's `rpc_deadline` (or
+                // the test's own bounded wait) is what must make progress
+                // possible despite this.
+                std::future::pending::<()>().await;
+            }
             Ok(self
                 .user_op_receipts
                 .lock()
@@ -11530,6 +11644,138 @@ mod tests {
         assert_eq!(
             good.swept, good_amount,
             "positive control's proposed swept must match the op's real decoded amount"
+        );
+    }
+
+    /// **Security finding 19.** [`rpc_deadline_with`] (the parameterized
+    /// implementation behind [`rpc_deadline`]) must turn a never-resolving
+    /// future into a bounded `Err` rather than hanging forever, so a
+    /// stalled RPC call lands in the same retry/sleep branch as an ordinary
+    /// RPC error. Uses a short (50ms) deadline directly rather than the
+    /// production `RPC_REQUEST_TIMEOUT_SECS` so this test is fast and
+    /// deterministic regardless of whether it runs under plain `cargo test`
+    /// or `cargo nextest run`.
+    #[tokio::test]
+    async fn rpc_deadline_times_out() {
+        let result = fedimint_core::runtime::timeout(Duration::from_secs(10), async {
+            rpc_deadline_with::<()>(Duration::from_millis(50), std::future::pending()).await
+        })
+        .await
+        .expect("rpc_deadline_with itself must return well within the outer 10s test bound");
+
+        let err = result.expect_err("a never-resolving future must map to Err, not hang");
+        assert!(
+            err.to_string().contains("timed out"),
+            "rpc_deadline's error should explain it was a timeout, got: {err}"
+        );
+    }
+
+    /// **Security finding 19.** `Usdt::spawn_user_op_submitter` must not let
+    /// one op whose `get_user_op_receipt` never resolves block progress on
+    /// other submitted ops: with the old fully-serial `for` loop, the hung
+    /// op's await would wedge the whole task and the prompt op's receipt
+    /// would never be observed. With bounded-concurrency processing (each
+    /// op's RPC awaits wrapped in `rpc_deadline`), the prompt op's
+    /// `UserOpConfirmed` proposal must still appear within a bounded wait.
+    #[tokio::test]
+    async fn hung_rpc_does_not_block_other_submitted_ops() {
+        let evm_rpc = MockEvmRpc::default();
+
+        let hung_hash = [0xa1; 32];
+        let hung_source = EvmAddress([0xa2; 20]);
+        let prompt_hash = [0xa3; 32];
+        let prompt_source = EvmAddress([0xa4; 20]);
+        let prompt_amount = UsdtAmount(1_500_000);
+
+        evm_rpc.set_receipt_hangs(hung_hash);
+        evm_rpc.set_user_op_receipt(
+            prompt_hash,
+            fedimint_usdt_common::user_op::UserOpReceipt {
+                success: true,
+                block: 7,
+                actual_cost_usdt: UsdtAmount(0),
+            },
+        );
+
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(hung_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: sample_unsigned_user_op_for_test(),
+                        signature: vec![0xaa; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep {
+                        source: hung_source,
+                    },
+                    submitted_block: 1,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(prompt_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_deploy_and_sweep_op_for_test(prompt_source, prompt_amount),
+                        signature: vec![0xcc; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep {
+                        source: prompt_source,
+                    },
+                    submitted_block: 1,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let user_op_confirmed_proposals = Arc::new(Mutex::new(Vec::new()));
+        let task_group = TaskGroup::new();
+        Usdt::spawn_user_op_submitter(
+            &task_group,
+            UserOpSubmitterHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.into_dyn(),
+                user_op_confirmed_proposals: user_op_confirmed_proposals.clone(),
+            },
+        );
+
+        // Poll (rather than a fixed sleep) for the prompt op's proposal,
+        // bounded well above both `rpc_deadline`'s own test-env deadline and
+        // the 1s test-env tick interval, so the test is not flaky under
+        // load; the hung op being present forever alongside it (or absent
+        // entirely, since it never produces a proposal) is asserted below.
+        let deadline = fedimint_core::time::now() + Duration::from_secs(10);
+        loop {
+            if user_op_confirmed_proposals
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .any(|p| p.op_hash == prompt_hash)
+                || fedimint_core::time::now() >= deadline
+            {
+                break;
+            }
+            fedimint_core::runtime::sleep(Duration::from_millis(50)).await;
+        }
+
+        let proposals = user_op_confirmed_proposals.lock().expect("not poisoned");
+        let prompt = proposals.iter().find(|p| p.op_hash == prompt_hash).expect(
+            "a hung get_user_op_receipt for one op must not block the receipt poll of \
+                 another submitted op",
+        );
+        assert_eq!(
+            prompt.swept, prompt_amount,
+            "the prompt op's proposal must still carry its correctly-decoded swept amount"
+        );
+        assert!(
+            !proposals.iter().any(|p| p.op_hash == hung_hash),
+            "the hung op must never have produced a proposal (found: {proposals:?})"
         );
     }
 
