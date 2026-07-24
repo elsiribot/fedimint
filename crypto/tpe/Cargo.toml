@@ -6,13 +6,13 @@ license = { workspace = true }
 name = "fedimint-tpe"
 version = { workspace = true }
 
-[features]
-default = []
-unstable = []
-
 [lib]
 name = "tpe"
 path = "src/lib.rs"
+
+[features]
+default = []
+unstable = []
 
 [dependencies]
 bitcoin_hashes = { workspace = true }

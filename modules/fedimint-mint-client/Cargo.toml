@@ -15,18 +15,13 @@ rustc-args = ["--cfg", "tokio_unstable"]
 # cargo udeps can't detect that one
 normal = ["aquamarine"]
 
-[features]
-cli = ["dep:clap"]
-default = []
-
 [lib]
 name = "fedimint_mint_client"
 path = "src/lib.rs"
 
-[[bench]]
-harness = false
-name = "notes"
-path = "benches/notes.rs"
+[features]
+cli = ["dep:clap"]
+default = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -66,6 +61,11 @@ tracing = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 test-log = { workspace = true }
+
+[[bench]]
+harness = false
+name = "notes"
+path = "benches/notes.rs"
 
 [lints]
 workspace = true

@@ -8,12 +8,12 @@ readme = { workspace = true }
 repository = { workspace = true }
 version = { workspace = true }
 
-[features]
-tor = ["fedimint-api-client/tor"]
-
 [lib]
 name = "fedimint_gateway_common"
 path = "src/lib.rs"
+
+[features]
+tor = ["fedimint-api-client/tor"]
 
 [dependencies]
 anyhow = { workspace = true }

@@ -11,10 +11,6 @@ version = { workspace = true }
 name = "mintv2-module-tests"
 path = "bin/tests.rs"
 
-[[test]]
-name = "fedimint_mintv2_tests"
-path = "tests/tests.rs"
-
 [dependencies]
 anyhow = { workspace = true }
 async-stream = { workspace = true }
@@ -46,3 +42,7 @@ fedimint-dummy-client = { workspace = true }
 fedimint-dummy-common = { workspace = true }
 fedimint-dummy-server = { workspace = true }
 fedimint-usdt-common = { workspace = true }
+
+[[test]]
+name = "fedimint_mintv2_tests"
+path = "tests/tests.rs"
