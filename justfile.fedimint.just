@@ -31,6 +31,16 @@ test-full-compatibility *VERSIONS="v0.4.4":
 test-upgrades *VERSIONS="v0.8.2 current, v0.9.1 current, v0.10.0 current":
   ./scripts/tests/upgrade-test.sh {{VERSIONS}}
 
+# Real-chain (devimint + anvil) usdt module e2e. Opt-in / NOT part of
+# `test-ci-all`: enabling the usdt module pays a real cggmp21 DKG (~100s+) at
+# every guardian's startup. The gating Phase 5 acceptance test is the
+# hermetic `deposit_becomes_claimable_usdt_ecash` test in
+# `fedimint-usdt-tests` (part of the default suite). Requires a real nix
+# devshell (for the real `anvil`/`bitcoind` binaries), unlike most `just`
+# recipes this one is not expected to work in every sandboxed environment.
+test-usdt-e2e *PARAMS:
+  ./scripts/tests/usdt-e2e-test.sh {{PARAMS}}
+
 # `cargo udeps` check
 udeps:
   nix build -L .#nightly.test.workspaceCargoUdeps
@@ -87,6 +97,7 @@ check-wasm *EXTRA_ARGS:
         --package fedimint-wasm-tests \
         --package fedimint-mintv2-client \
         --package fedimint-walletv2-client \
+        --package fedimint-usdt-client \
         {{EXTRA_ARGS}}
 
 # regenerate server db migration snapshots

@@ -159,6 +159,7 @@ declare_vars! {
         FM_PORT_LND_REST: u16 = port_alloc(1)?; env: "FM_PORT_LND_REST";
         FM_PORT_ESPLORA: u16 = port_alloc(1)?; env: "FM_PORT_ESPLORA";
         FM_PORT_ESPLORA_MONITORING: u16 = port_alloc(1)?; env: "FM_PORT_ESPLORA_MONITORING";
+        FM_PORT_ANVIL: u16 = port_alloc(1)?; env: "FM_PORT_ANVIL";
         FM_PORT_GW_LND: u16 = match gateway_base_port {
             Some(b) => b + GATEWAY_PORT_OFFSET_LND,
             None => port_alloc(1)?,
@@ -309,5 +310,9 @@ declare_vars! {
         // rpc settings over command-line etc. so always will use the right ones.
         FM_FORCE_BITCOIN_RPC_URL: String = f!("http://bitcoin:bitcoin@127.0.0.1:{}", globals.FM_PORT_BTC_RPC); env: FM_FORCE_BITCOIN_RPC_URL_ENV;
         FM_FORCE_BITCOIN_RPC_KIND: String = "bitcoind"; env: FM_FORCE_BITCOIN_RPC_KIND_ENV;
+
+        // RPC url for the anvil (EVM devnet) daemon, used by the usdt module's
+        // deposit watcher on every guardian.
+        FM_USDT_EVM_RPC_URL: String = f!("http://127.0.0.1:{}", globals.FM_PORT_ANVIL); env: "FM_USDT_EVM_RPC_URL";
     }
 }

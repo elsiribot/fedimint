@@ -29,9 +29,9 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::envs::{
-    FM_BACKWARDS_COMPATIBILITY_TEST_ENV, FM_BITCOIN_CLI_BASE_EXECUTABLE_ENV,
-    FM_BITCOIND_BASE_EXECUTABLE_ENV, FM_BTC_CLIENT_ENV, FM_CLIENT_DIR_ENV,
-    FM_DEVIMINT_CMD_INHERIT_STDERR_ENV, FM_DEVIMINT_FAUCET_BASE_EXECUTABLE_ENV,
+    FM_ANVIL_BASE_EXECUTABLE_ENV, FM_BACKWARDS_COMPATIBILITY_TEST_ENV,
+    FM_BITCOIN_CLI_BASE_EXECUTABLE_ENV, FM_BITCOIND_BASE_EXECUTABLE_ENV, FM_BTC_CLIENT_ENV,
+    FM_CLIENT_DIR_ENV, FM_DEVIMINT_CMD_INHERIT_STDERR_ENV, FM_DEVIMINT_FAUCET_BASE_EXECUTABLE_ENV,
     FM_ESPLORA_BASE_EXECUTABLE_ENV, FM_FEDIMINT_CLI_BASE_EXECUTABLE_ENV,
     FM_FEDIMINT_DBTOOL_BASE_EXECUTABLE_ENV, FM_FEDIMINTD_BASE_EXECUTABLE_ENV,
     FM_GATEWAY_CLI_BASE_EXECUTABLE_ENV, FM_GATEWAYD_BASE_EXECUTABLE_ENV, FM_GWCLI_LDK_ENV,
@@ -99,6 +99,10 @@ impl ProcessHandle {
 
     pub async fn is_running(&self) -> bool {
         self.0.lock().await.child.is_some()
+    }
+
+    pub async fn id(&self) -> Option<u32> {
+        self.0.lock().await.child.as_ref().and_then(Child::id)
     }
 }
 
@@ -666,6 +670,8 @@ const LND_FALLBACK: &str = "lnd";
 
 const ESPLORA_FALLBACK: &str = "esplora";
 
+const ANVIL_FALLBACK: &str = "anvil";
+
 const RECOVERYTOOL_FALLBACK: &str = "fedimint-recoverytool";
 
 const DEVIMINT_FAUCET_FALLBACK: &str = "devimint";
@@ -998,6 +1004,16 @@ impl Esplora {
         to_command(get_command_str_for_alias(
             &[FM_ESPLORA_BASE_EXECUTABLE_ENV],
             &[ESPLORA_FALLBACK],
+        ))
+    }
+}
+
+pub struct Anvil;
+impl Anvil {
+    pub fn cmd(self) -> Command {
+        to_command(get_command_str_for_alias(
+            &[FM_ANVIL_BASE_EXECUTABLE_ENV],
+            &[ANVIL_FALLBACK],
         ))
     }
 }
