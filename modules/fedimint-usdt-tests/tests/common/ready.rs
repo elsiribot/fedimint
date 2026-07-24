@@ -22,23 +22,27 @@ use fedimint_core::runtime::{Instant, sleep};
 use fedimint_core::secp256k1::PublicKey;
 use fedimint_usdt_client::UsdtClientModule;
 use fedimint_usdt_common::{
-    BootstrapState, EvmAddress, derive_pool_account, evm_address, pool_salt,
+    BootstrapState, EvmAddress, deposit_salt, derive_deposit_account, derive_pool_account,
+    evm_address, pool_salt,
 };
 
 use super::mock::MockEvmRpc;
 
 /// Scripts `mock` so a guardian's server-side `observe_bootstrap` poll (which
 /// reads `get_code_len(entry_point/account_factory/simple_account_impl)`,
-/// `factory_get_address(account_factory, evm_address(group_pk), pool_salt())`,
-/// and `broadcaster_eth_balance()`) observes every Part C readiness condition
-/// as met, so it votes an all-`true` `BootstrapObservation`.
+/// `factory_get_address(account_factory, evm_address(group_pk), salt)` for
+/// both `pool_salt()` and a deterministic sample deposit salt,
+/// `factory_account_implementation(account_factory)`, and
+/// `broadcaster_eth_balance()`) observes every Part C readiness condition as
+/// met, so it votes an all-`true` `BootstrapObservation`.
 ///
-/// The scripted `factory_get_address` return is computed with the SAME
-/// [`derive_pool_account`] the real poll cross-checks against, so the
-/// footgun-killer equivalence check passes. In the hermetic fixtures the three
-/// contract addresses are all the all-zero placeholder
-/// ([`EvmAddress`]`([0; 20])`); passing them explicitly keeps this helper
-/// usable for any address set.
+/// The scripted `factory_get_address`/`factory_account_implementation`
+/// returns are computed with the SAME [`derive_pool_account`]/
+/// [`derive_deposit_account`]/`sample_claim_pk` the real poll cross-checks
+/// against (sec-16 readiness deepening, finding 16), so the footgun-killer
+/// equivalence checks pass. In the hermetic fixtures the three contract
+/// addresses are all the all-zero placeholder ([`EvmAddress`]`([0; 20])`);
+/// passing them explicitly keeps this helper usable for any address set.
 pub fn mock_ready_stack(
     mock: &MockEvmRpc,
     group_public_key: &PublicKey,
@@ -54,6 +58,29 @@ pub fn mock_ready_stack(
     let owner = evm_address(group_public_key);
     let pool = derive_pool_account(group_public_key, account_factory, simple_account_impl);
     mock.set_factory_get_address(account_factory, owner, pool_salt(), pool);
+
+    // sec-16 readiness deepening: also script the deterministic sample
+    // deposit salt (`fedimint_usdt_server::sample_claim_pk`) so the
+    // deepened `factory_ok` check -- which now additionally samples a
+    // claim-key-derived salt, not just the fixed `pool_salt` -- passes for
+    // this hermetic (all-canonical) mock stack.
+    let sample = fedimint_usdt_server::sample_claim_pk();
+    let sample_deposit = derive_deposit_account(
+        group_public_key,
+        account_factory,
+        simple_account_impl,
+        &sample,
+    );
+    mock.set_factory_get_address(
+        account_factory,
+        owner,
+        deposit_salt(&sample),
+        sample_deposit,
+    );
+
+    // sec-16 readiness deepening: the factory's own `accountImplementation()`
+    // must also report the configured `simple_account_impl`.
+    mock.set_factory_account_implementation(account_factory, simple_account_impl);
 
     // 1000 ETH in wei -- comfortably above any `broadcaster_min_balance_wei`
     // the tests configure.
