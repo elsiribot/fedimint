@@ -201,17 +201,17 @@ impl_db_record!(
 );
 impl_db_lookup!(key = PendingCheckKey, query_prefix = PendingCheckPrefix);
 
-/// What a signing session's digest is being signed for. Phase 6a only ever
-/// creates [`SigningPurpose::Test`] sessions (exercising the round-advance
-/// loop end to end); Phase 7 adds [`SigningPurpose::UserOp`], deterministically
+/// What a signing session's digest is being signed for. Deterministically
 /// created alongside a [`PendingUserOp`] (see `Usdt::maybe_trigger_sweep`) to
-/// drive the deploy-and-sweep flow. `Test` is kept (not removed) so the
-/// Phase-6a/6b `debug_start_signing` acceptance tests keep working
-/// unmodified (Phase 9 removes the debug endpoint and this variant together).
-/// A `Withdraw` purpose is deferred to Phase 8.
+/// drive the deploy-and-sweep flow -- `UserOp` is the ONLY variant (sec-01
+/// hardening: an unauthenticated debug-only variant, which let a caller
+/// drive an arbitrary-digest signing oracle over the group key via a
+/// dedicated debug consensus item, has been removed entirely along with the
+/// debug endpoints and that consensus item). `process_mpc_signature` relies
+/// on this being the only purpose: every signing session MUST be backed by a
+/// live [`PendingUserOp`] to finalize.
 #[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
 pub enum SigningPurpose {
-    Test([u8; 32]),
     /// Signing session for the `userOpHash`-derived EIP-191 digest of the
     /// [`PendingUserOp`] keyed by this `op_hash` (its `user_op_hash`, i.e.
     /// the [`PendingUserOpKey`]/[`SubmittedUserOpKey`] of the same op).
@@ -722,7 +722,7 @@ mod tests {
         let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
         let id = signing_session_id(&[1; 32], 0);
         let session = SigningSession {
-            purpose: SigningPurpose::Test([2; 32]),
+            purpose: SigningPurpose::UserOp([2; 32]),
             digest: [1; 32],
             signers: vec![PeerId::from(0), PeerId::from(1), PeerId::from(2)],
             round: 0,

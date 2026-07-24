@@ -24,7 +24,12 @@ pub mod user_op;
 pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 
 /// Modules are non-compatible with older versions
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 0);
+///
+/// Bumped to `0.1` (sec-01 hardening): the debug-signing-oracle consensus
+/// item was removed from `UsdtConsensusItem` and `SigningPurpose` lost its
+/// debug-only variant -- both consensus-encoded types changed shape, so old
+/// and new binaries can no longer agree on the wire format.
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 1);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
@@ -1002,17 +1007,6 @@ pub enum UsdtConsensusItem {
     /// One guardian's message for a single round of a signing session's
     /// cggmp21 state machine (Phase 6a).
     MpcRound(MpcRoundItem),
-    /// Starts a threshold-ECDSA signing session over `digest` on every
-    /// guardian, atomically, in consensus order (Phase 6a). Deliberately a
-    /// consensus item rather than a per-guardian API call: if guardians
-    /// started sessions independently, a signer could propose round 0 of its
-    /// `MpcRound` before another guardian had started the session, and that
-    /// guardian's `process_consensus_item` would reject it as belonging to
-    /// an unknown session, stalling the round. Processing this item is a
-    /// pure function of the digest, prior consensus DB state, and config
-    /// (see `Usdt::start_session`), so every guardian — signer or not —
-    /// performs the identical `SigningSession` write.
-    StartSigning { digest: [u8; 32] },
     /// A signer's federation-agreed signature for a signing session (Phase
     /// 6b). Proposed by a signer once its off-thread cggmp21 state machine
     /// finishes (see `Usdt::advance_local_signer`'s

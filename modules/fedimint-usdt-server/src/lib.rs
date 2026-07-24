@@ -3,7 +3,7 @@
 #![allow(clippy::must_use_candidate)]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,10 +43,9 @@ use fedimint_threshold_ecdsa::{convert_signature, group_public_key};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
-    CHECK_DEPOSIT_ENDPOINT, DEBUG_START_SIGNING_ENDPOINT, DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
-    DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
-    POOL_STATE_ENDPOINT, SIGNING_SESSION_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT,
-    USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    CHECK_DEPOSIT_ENDPOINT, DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT,
+    GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
+    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
@@ -835,34 +834,14 @@ pub struct Usdt {
     /// (so non-signers hold it too) is a Phase 6b concern. Read by Task 4's
     /// status endpoint.
     completed_signatures: Arc<Mutex<BTreeMap<SigningSessionId, Vec<u8>>>>,
-    /// Digests queued by the test-only `debug_start_signing` API endpoint
-    /// (Phase-6a scaffolding; not access-gated — see the endpoint), drained
-    /// into
-    /// `UsdtConsensusItem::StartSigning` proposals in `consensus_proposal`.
-    /// Mirrors `deposit_proposals`'s drain pattern. A test needs only to
-    /// call `debug_start_signing` on ONE guardian: the resulting consensus
-    /// item starts the session identically on every guardian (see
-    /// `UsdtConsensusItem::StartSigning`'s doc comment for why this must go
-    /// through consensus rather than being called per-guardian directly).
-    pending_signing_starts: Arc<Mutex<Vec<[u8; 32]>>>,
     /// Signatures this guardian's off-thread signers have assembled and are
     /// awaiting federation-wide agreement (Phase 6b): pushed by
     /// [`Usdt::advance_local_signer`] alongside (not instead of) its
     /// `completed_signatures` write, drained into
     /// `UsdtConsensusItem::MpcSignature` proposals in `consensus_proposal`.
-    /// Mirrors `pending_signing_starts`'s drain pattern.
+    /// Mirrors `deposit_proposals`'s drain pattern.
     #[allow(clippy::type_complexity)]
     pending_signature_proposals: Arc<Mutex<Vec<(SigningSessionId, Vec<u8>)>>>,
-    /// Test-only (Phase 6b Task 4 harness): when set, this guardian skips
-    /// proposing `MpcRound` items for attempt-0 signing sessions in
-    /// `consensus_proposal`, letting a test force attempt 0 to stall (and
-    /// eventually time out) without a real killed guardian. Toggled by the
-    /// `debug_suppress_attempt0_round` API endpoint; see
-    /// `DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT`'s doc comment for why the
-    /// `fedimint-testing` degraded-federation fixture can't be used here
-    /// instead. Purely guardian-local — never read by `process_consensus_item`
-    /// or folded into any consensus-DB write or `Ok`/`Err` decision.
-    suppress_attempt0_round: Arc<AtomicBool>,
     /// `UserOp` on-chain outcomes gathered by the background
     /// `usdt-user-op-submitter` task (spawned in [`Usdt::new`]; see
     /// [`Usdt::spawn_user_op_submitter`]), drained into
@@ -1055,16 +1034,6 @@ impl ServerModule for Usdt {
                 continue;
             }
 
-            // Test-only (Phase 6b Task 4 harness): a guardian with
-            // suppression toggled on never proposes `MpcRound` items for
-            // attempt-0 sessions, so the round can never reach 3-of-3 and
-            // the session stalls until it times out. Scoped to attempt 0
-            // only, so a rotated later attempt is unaffected. See
-            // `suppress_attempt0_round`'s doc comment.
-            if session.attempt == 0 && self.suppress_attempt0_round.load(Ordering::Relaxed) {
-                continue;
-            }
-
             // Only READ the current round's pending payload — never remove or
             // pump the slot here. Fedimint runs `consensus_proposal` in a
             // separate task (`submit_module_ci_proposals`, a ~100ms timer)
@@ -1119,16 +1088,6 @@ impl ServerModule for Usdt {
                     payload: chunk_bytes,
                 }));
             }
-        }
-
-        // Drain digests queued by the test-only `debug_start_signing` API
-        // endpoint, proposing a `StartSigning` consensus item for each so
-        // every guardian starts the session atomically in consensus order
-        // (see `UsdtConsensusItem::StartSigning`'s doc comment).
-        let pending_starts =
-            std::mem::take(&mut *self.pending_signing_starts.lock().expect("not poisoned"));
-        for digest in pending_starts {
-            items.push(UsdtConsensusItem::StartSigning { digest });
         }
 
         // Drain signatures this guardian's off-thread signers have
@@ -1247,31 +1206,6 @@ impl ServerModule for Usdt {
                 Ok(())
             }
             UsdtConsensusItem::MpcRound(item) => self.process_mpc_round(dbtx, item, peer_id).await,
-            UsdtConsensusItem::StartSigning { digest } => {
-                // DETERMINISTIC (mirrors the `MpcRound` arm's discipline): a
-                // pure function of the item, prior consensus-DB state, and
-                // config. `start_session` is idempotent (it no-ops if the
-                // session already exists), so the redundancy guard here must
-                // check FIRST and reject a repeat proposal rather than
-                // silently no-op-`Ok`ing it (the unbounded-history rule).
-                // `our_peer_id` never influences this `Ok`/`Err` or the
-                // consensus-DB write below -- only whether `start_session`
-                // additionally spawns this guardian's in-memory off-thread
-                // state machine, a guardian-local side effect.
-                let session_id = signing_session_id(&digest, 0);
-                if dbtx
-                    .get_value(&SigningSessionKey(session_id))
-                    .await
-                    .is_some()
-                {
-                    bail!("redundant StartSigning");
-                }
-
-                self.start_session(dbtx, SigningPurpose::Test(digest), digest, 0)
-                    .await;
-
-                Ok(())
-            }
             UsdtConsensusItem::RotateSigning { session_id } => {
                 self.process_rotate_signing(dbtx, session_id).await
             }
@@ -1669,63 +1603,6 @@ impl ServerModule for Usdt {
                 }
             },
             api_endpoint! {
-                DEBUG_START_SIGNING_ENDPOINT,
-                ApiVersion::new(0, 0),
-                async |module: &Usdt, _context, digest: [u8; 32]| -> () {
-                    // Phase-6a debug/scaffolding trigger: queues `digest` so
-                    // this guardian proposes a `StartSigning` consensus item,
-                    // which deterministically starts the session on every
-                    // guardian (see `DEBUG_START_SIGNING_ENDPOINT`'s doc
-                    // comment for why session start must go through consensus).
-                    // Phase 7 replaces this with deterministic session creation
-                    // from pending sign-request records and removes this
-                    // endpoint. It is intentionally not access-gated here: the
-                    // usdt module is experimental and opt-in
-                    // (`FM_ENABLE_MODULE_USDT`), so the endpoint only exists on
-                    // federations that deliberately enabled it, and in Phase 6a
-                    // a triggered signing session has no on-chain effect.
-                    module
-                        .pending_signing_starts
-                        .lock()
-                        .expect("not poisoned")
-                        .push(digest);
-
-                    Ok(())
-                }
-            },
-            api_endpoint! {
-                SIGNING_SESSION_STATUS_ENDPOINT,
-                ApiVersion::new(0, 0),
-                async |_module: &Usdt, context, session_id: SigningSessionId| -> Option<Vec<u8>> {
-                    // Read-only: reads the federation-agreed consensus state
-                    // (Phase 6b), so any guardian -- not just a signer -- can
-                    // answer authoritatively (see
-                    // `SIGNING_SESSION_STATUS_ENDPOINT`'s doc comment).
-                    let db = context.db();
-                    let mut dbtx = db.begin_transaction_nc().await;
-                    let session = dbtx.get_value(&SigningSessionKey(session_id)).await;
-
-                    Ok(match session.map(|s| s.state) {
-                        Some(SessionState::Completed(sig)) => Some(sig),
-                        _ => None,
-                    })
-                }
-            },
-            api_endpoint! {
-                DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT,
-                ApiVersion::new(0, 0),
-                async |module: &Usdt, _context, suppress: bool| -> () {
-                    // Test-only (Phase 6b Task 4 harness); see
-                    // `DEBUG_SUPPRESS_ATTEMPT0_ROUND_ENDPOINT`'s doc comment.
-                    // Purely guardian-local: never touches the consensus DB.
-                    module
-                        .suppress_attempt0_round
-                        .store(suppress, Ordering::Relaxed);
-
-                    Ok(())
-                }
-            },
-            api_endpoint! {
                 POOL_STATE_ENDPOINT,
                 ApiVersion::new(0, 0),
                 async |module: &Usdt, context, _params: ()| -> PoolStateResponse {
@@ -1950,9 +1827,7 @@ impl Usdt {
             deposit_proposals,
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
-            pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
-            suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
             user_op_confirmed_proposals,
             fee_estimate,
             bootstrap_proposals,
@@ -1981,9 +1856,7 @@ impl Usdt {
             deposit_proposals: Arc::new(Mutex::new(Vec::new())),
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
-            pending_signing_starts: Arc::new(Mutex::new(Vec::new())),
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
-            suppress_attempt0_round: Arc::new(AtomicBool::new(false)),
             user_op_confirmed_proposals: Arc::new(Mutex::new(Vec::new())),
             fee_estimate: Arc::new(Mutex::new(None)),
             // The bootstrap-observer poller is NOT spawned in tests (mirroring
@@ -2833,14 +2706,12 @@ impl Usdt {
             "sweep enqueued (PendingUserOp), starting MPC signing session"
         );
 
-        // Same consensus-ordered `start_session` path Phase 6a's
-        // `debug_start_signing` uses -- every guardian processes this
-        // identical `Deposit` item, so every guardian starts the identical
-        // session deterministically (no separate `StartSigning` consensus
-        // item needed: unlike the debug endpoint, which fans a single
-        // guardian's local trigger out through consensus, this trigger is
-        // ALREADY inside `process_consensus_item`, so it runs on every
-        // guardian directly).
+        // `start_session` is called identically by every guardian here:
+        // every guardian processes this same `Deposit` consensus item, so
+        // every guardian starts the identical session deterministically --
+        // no separate consensus item is needed to fan this out, since this
+        // trigger is ALREADY inside `process_consensus_item` and therefore
+        // already runs on every guardian directly.
         let digest = eth_signed_message_hash(op_hash);
         self.start_session(dbtx, SigningPurpose::UserOp(op_hash), digest, 0)
             .await;
@@ -3770,8 +3641,18 @@ impl Usdt {
     /// proposer) is a Byzantine guard: a malformed or forged proposal must
     /// never enter the agreed record, no matter which peer proposed it.
     ///
-    /// **`UserOp` finalization (Phase 7, Task 5).** If `session.purpose` is
-    /// `SigningPurpose::UserOp(op_hash)`, this ALSO assembles the 65-byte
+    /// **`UserOp` finalization (Phase 7, Task 5; sec-01 hardening).**
+    /// `SigningPurpose::UserOp(op_hash)` is the ONLY purpose a signing
+    /// session can have, and a session is only ever authorized to finalize
+    /// if a live `PendingUserOp` still backs its `op_hash` -- this is what
+    /// makes "verified against the group key" and "authorized to act" two
+    /// separate checks instead of one. If no `PendingUserOp` is found (it
+    /// was never created, or a racing attempt already consumed it), this
+    /// method returns `Err` and -- critically -- does NOT write
+    /// `SessionState::Completed`, so a signature with no backing
+    /// consensus-approved record can never be finalized or persisted as an
+    /// agreed outcome (see `mpc_signature_without_pending_user_op_is_rejected`
+    /// in this module's tests). Otherwise, this assembles the 65-byte
     /// Ethereum `SignedUserOp` from the now-verified compact `(r, s)` (via
     /// [`assemble_eth_signature`], brute-forcing the recovery id against the
     /// group-key owner -- deterministic, and, since `signature` already
@@ -3783,9 +3664,7 @@ impl Usdt {
     /// including non-signers, computes the identical `SignedUserOp` from it.
     /// All fallible steps (signature parse/verify, signature assembly, the
     /// `PendingUserOp` lookup) happen BEFORE any write in this function, so
-    /// either everything here commits or (only in the unreachable case
-    /// `assemble_eth_signature` fails, which the verified-signature
-    /// precondition rules out) nothing does.
+    /// either everything here commits or nothing does.
     async fn process_mpc_signature(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -3812,64 +3691,62 @@ impl Usdt {
             )
             .map_err(|_| anyhow::anyhow!("MpcSignature does not verify against the group key"))?;
 
-        // Prepare the UserOp-finalization write (if any) BEFORE any write
-        // happens below -- see this method's doc comment.
-        let finalized_user_op = if let SigningPurpose::UserOp(op_hash) = session.purpose {
-            match dbtx.get_value(&PendingUserOpKey(op_hash)).await {
-                Some(pending) => {
-                    let compact: [u8; 64] = signature.as_slice().try_into().map_err(|_| {
-                        anyhow::anyhow!("MPC signature is not the expected 64-byte compact length")
-                    })?;
-                    let owner = evm_address(&self.cfg.consensus.group_public_key);
-                    let eth_sig =
-                        assemble_eth_signature(compact, session.digest, owner).map_err(|err| {
-                            anyhow::anyhow!(
-                                "failed to assemble the Ethereum signature for completed \
-                                 UserOp session {session_id:?} (op_hash {op_hash:?}): {err}"
-                            )
-                        })?;
-                    Some((op_hash, pending, eth_sig))
-                }
-                // Already finalized by a racing attempt of the same digest
-                // that reached `Completed` first; nothing left to do.
-                None => None,
-            }
-        } else {
-            None
-        };
+        // Prepare the UserOp-finalization write BEFORE any write happens
+        // below -- see this method's doc comment. `SigningPurpose` has only
+        // one production variant, so this match is exhaustive: there is no
+        // purpose that can reach `Completed` without an authorizing
+        // `PendingUserOp` record.
+        let SigningPurpose::UserOp(op_hash) = session.purpose;
+        let pending = dbtx
+            .get_value(&PendingUserOpKey(op_hash))
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MpcSignature for session {session_id:?} (op_hash {op_hash:?}) has no live \
+                 PendingUserOp backing it -- refusing to finalize an unauthorized signature"
+                )
+            })?;
+        let compact: [u8; 64] = signature.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!("MPC signature is not the expected 64-byte compact length")
+        })?;
+        let owner = evm_address(&self.cfg.consensus.group_public_key);
+        let eth_sig = assemble_eth_signature(compact, session.digest, owner).map_err(|err| {
+            anyhow::anyhow!(
+                "failed to assemble the Ethereum signature for completed UserOp session \
+                 {session_id:?} (op_hash {op_hash:?}): {err}"
+            )
+        })?;
 
         let mut completed = session;
         completed.state = SessionState::Completed(signature);
         dbtx.insert_entry(&SigningSessionKey(session_id), &completed)
             .await;
 
-        if let Some((op_hash, pending, eth_sig)) = finalized_user_op {
-            let submitted_block = self.consensus_block_count(dbtx).await;
-            let signed = SignedUserOp {
-                unsigned: pending.op,
-                signature: eth_sig.to_vec(),
-            };
-            dbtx.insert_entry(
-                &SubmittedUserOpKey(op_hash),
-                &SubmittedUserOp {
-                    signed,
-                    // Carried forward verbatim (Phase 8, Task 2) so
-                    // `apply_user_op_confirmed` knows purely from consensus
-                    // DB state whether this op is a `DeployAndSweep` or a
-                    // `Withdraw` once it confirms -- see
-                    // `SubmittedUserOp::purpose`'s doc comment.
-                    purpose: pending.purpose,
-                    submitted_block,
-                },
-            )
-            .await;
-            dbtx.remove_entry(&PendingUserOpKey(op_hash)).await;
-            info!(
-                target: "usdt",
-                ?op_hash,
-                "MPC signature verified; UserOp finalized to SubmittedUserOp (submitter will broadcast handleOps)"
-            );
-        }
+        let submitted_block = self.consensus_block_count(dbtx).await;
+        let signed = SignedUserOp {
+            unsigned: pending.op,
+            signature: eth_sig.to_vec(),
+        };
+        dbtx.insert_entry(
+            &SubmittedUserOpKey(op_hash),
+            &SubmittedUserOp {
+                signed,
+                // Carried forward verbatim (Phase 8, Task 2) so
+                // `apply_user_op_confirmed` knows purely from consensus
+                // DB state whether this op is a `DeployAndSweep` or a
+                // `Withdraw` once it confirms -- see
+                // `SubmittedUserOp::purpose`'s doc comment.
+                purpose: pending.purpose,
+                submitted_block,
+            },
+        )
+        .await;
+        dbtx.remove_entry(&PendingUserOpKey(op_hash)).await;
+        info!(
+            target: "usdt",
+            ?op_hash,
+            "MPC signature verified; UserOp finalized to SubmittedUserOp (submitter will broadcast handleOps)"
+        );
 
         Ok(())
     }
@@ -5098,7 +4975,7 @@ mod tests {
 
         let session_id = signing_session_id(&[7; 32], 0);
         let session = SigningSession {
-            purpose: SigningPurpose::Test([7; 32]),
+            purpose: SigningPurpose::UserOp([7; 32]),
             digest: [7; 32],
             signers: vec![PeerId::from(0), PeerId::from(1), PeerId::from(2)],
             round: 0,
@@ -5203,7 +5080,7 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(b"usdt rotate-signing timeout test").into();
         let attempt0_id = fedimint_usdt_common::signing_session_id(&digest, 0);
         let attempt1_id = fedimint_usdt_common::signing_session_id(&digest, 1);
-        let purpose = SigningPurpose::Test(digest);
+        let purpose = SigningPurpose::UserOp(digest);
 
         // Attempt 0: every guardian starts the identical session over the
         // lowest-`t` subset {0,1,2}. `consensus_block_count` is 0 here (no
@@ -5382,7 +5259,7 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(b"usdt byzantine chunk-count test").into();
         let attempt0_id = fedimint_usdt_common::signing_session_id(&digest, 0);
         let attempt1_id = fedimint_usdt_common::signing_session_id(&digest, 1);
-        let purpose = SigningPurpose::Test(digest);
+        let purpose = SigningPurpose::UserOp(digest);
 
         // Attempt 0: every guardian starts the identical session over the
         // lowest-`t` subset {0,1,2}.
@@ -6877,7 +6754,7 @@ mod tests {
 
         let digest: [u8; 32] = Sha256::digest(b"usdt mpc-round consensus signing test").into();
         let session_id = fedimint_usdt_common::signing_session_id(&digest, 0);
-        let purpose = SigningPurpose::Test(digest);
+        let purpose = SigningPurpose::UserOp(digest);
 
         // Every guardian starts the (identical) session: writes its own
         // consensus `SigningSession` and, if in the subset, spawns its
@@ -7057,11 +6934,28 @@ mod tests {
         }
 
         let digest: [u8; 32] = Sha256::digest(b"usdt mpc-signature consensus item test").into();
+        let op_hash: [u8; 32] =
+            Sha256::digest(b"usdt mpc-signature consensus item test op_hash").into();
         let session_id = fedimint_usdt_common::signing_session_id(&digest, 0);
-        let purpose = SigningPurpose::Test(digest);
+        let purpose = SigningPurpose::UserOp(op_hash);
 
+        // A live `PendingUserOp` must back this session on EVERY guardian's
+        // DB for `process_mpc_signature` to finalize it (sec-01 hardening:
+        // `SigningPurpose` no longer has a `Test` variant that bypasses this
+        // check).
         for module in modules.values() {
             let mut dbtx = module.db_for_test().begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PendingUserOpKey(op_hash),
+                &PendingUserOp {
+                    op: sample_unsigned_user_op_for_test(),
+                    purpose: UserOpPurpose::DeployAndSweep {
+                        source: EvmAddress([0x71; 20]),
+                    },
+                    created_block: 0,
+                },
+            )
+            .await;
             module
                 .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest, 0)
                 .await;
@@ -7200,6 +7094,187 @@ mod tests {
         assert!(
             result.is_err(),
             "a second identical MpcSignature must be rejected as redundant"
+        );
+    }
+
+    /// **Sec-01 regression guard.** A signing session's `purpose` is the
+    /// ONLY thing that can authorize `process_mpc_signature` to finalize
+    /// anything: a `SigningPurpose::UserOp(op_hash)` session whose
+    /// `PendingUserOpKey(op_hash)` was NEVER written (i.e. no consensus-
+    /// approved record backs this session) must be REJECTED even once a
+    /// validly group-signed compact signature is presented for it -- and,
+    /// critically, must NOT be marked `SessionState::Completed`. Before this
+    /// fix, the now-removed debug-signing-purpose variant's `else { None }`
+    /// branch stored `Completed` unconditionally; this test pins the
+    /// replacement invariant directly against `SigningPurpose::UserOp`,
+    /// which is now the only purpose there is.
+    ///
+    /// Drives a REAL threshold-ECDSA signing session to completion (mirrors
+    /// `mpc_signature_consensus_item_completes_session_on_every_guardian`) so
+    /// the presented signature is genuinely valid against the group key --
+    /// proving that verifying-against-the-group-key is NOT sufficient
+    /// authorization on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn mpc_signature_without_pending_user_op_is_rejected() {
+        use sha2::{Digest as _, Sha256};
+
+        const N: u16 = 4;
+        let peers: Vec<PeerId> = (0..N).map(PeerId::from).collect();
+        let num_peers = peers.to_num_peers();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(
+            &peers,
+            &args,
+            &fedimint_usdt_common::UsdtGenParams::default(),
+        );
+
+        let mut modules: BTreeMap<PeerId, Usdt> = BTreeMap::new();
+        for &peer in &peers {
+            let cfg = server_cfgs[&peer]
+                .clone()
+                .to_typed::<UsdtConfig>()
+                .expect("config was just generated by the same configgen");
+            let db = fedimint_core::db::Database::new(
+                fedimint_core::db::mem_impl::MemDatabase::new(),
+                fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+            );
+            modules.insert(
+                peer,
+                Usdt::new_for_test(cfg, MockEvmRpc::default().into_dyn(), db, peer, num_peers),
+            );
+        }
+
+        // A `UserOp`-purpose session whose `op_hash` deliberately never gets a
+        // `PendingUserOpKey` written anywhere -- simulating an attacker (or a
+        // stray/rogue proposal) starting a session over an op that consensus
+        // never actually authorized.
+        let op_hash: [u8; 32] =
+            Sha256::digest(b"usdt unbound-userop-rejection test op_hash").into();
+        let digest: [u8; 32] = Sha256::digest(b"usdt unbound-userop-rejection test digest").into();
+        let session_id = fedimint_usdt_common::signing_session_id(&digest, 0);
+        let purpose = SigningPurpose::UserOp(op_hash);
+
+        for module in modules.values() {
+            let mut dbtx = module.db_for_test().begin_transaction().await;
+            module
+                .start_session(&mut dbtx.to_ref_nc(), purpose.clone(), digest, 0)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Drive the real `MpcRound` consensus loop to completion (mirrors
+        // `mpc_round_consensus_drives_signing_to_completion`).
+        let mut consensus_rounds = 0u32;
+        loop {
+            let mut proposed: Vec<(PeerId, MpcRoundItem)> = Vec::new();
+            for (&peer, module) in &modules {
+                let mut dbtx = module.db_for_test().begin_transaction().await;
+                let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+                dbtx.commit_tx().await;
+                for item in items {
+                    if let UsdtConsensusItem::MpcRound(mpc) = item {
+                        proposed.push((peer, mpc));
+                    }
+                }
+            }
+
+            if proposed.is_empty() {
+                break;
+            }
+
+            proposed.sort_by(|(a, ia), (b, ib)| {
+                (a, ia.session_id.0, ia.round, ia.chunk).cmp(&(
+                    b,
+                    ib.session_id.0,
+                    ib.round,
+                    ib.chunk,
+                ))
+            });
+
+            for (proposer, item) in &proposed {
+                for module in modules.values() {
+                    let mut dbtx = module.db_for_test().begin_transaction().await;
+                    module
+                        .process_consensus_item(
+                            &mut dbtx.to_ref_nc(),
+                            UsdtConsensusItem::MpcRound(item.clone()),
+                            *proposer,
+                        )
+                        .await
+                        .expect("every proposed MpcRound item must process cleanly");
+                    dbtx.commit_tx().await;
+                }
+            }
+
+            consensus_rounds += 1;
+            assert!(consensus_rounds < 1_000, "signing failed to converge");
+        }
+        assert!(
+            consensus_rounds >= 1,
+            "signing must have taken at least one consensus round"
+        );
+
+        // Grab a signer's genuinely-assembled, group-key-valid compact
+        // signature for the unbound session.
+        let signer_peer = peers[0];
+        let signature_bytes = modules[&signer_peer]
+            .completed_signatures
+            .lock()
+            .expect("not poisoned")
+            .get(&session_id)
+            .cloned()
+            .expect("a signer must have assembled a signature for the unbound session");
+        assert_eq!(signature_bytes.len(), 64, "compact signature is 64 bytes");
+
+        // Sanity: the signature genuinely verifies against the group key --
+        // so a naive "verify against group key -> Completed" implementation
+        // would wrongly accept it.
+        let group_pk = server_cfgs[&signer_peer]
+            .clone()
+            .to_typed::<UsdtConfig>()
+            .expect("valid config")
+            .consensus
+            .group_public_key;
+        let msg = secp256k1::Message::from_digest(digest);
+        let sig = secp256k1::ecdsa::Signature::from_compact(&signature_bytes)
+            .expect("stored bytes are a valid compact signature");
+        secp256k1::Secp256k1::verification_only()
+            .verify_ecdsa(&msg, &sig, &group_pk)
+            .expect("the presented signature genuinely verifies against the group key");
+
+        // Feed it directly to `process_mpc_signature` -- no `PendingUserOpKey`
+        // for `op_hash` was ever written on this (or any) guardian's DB.
+        let mut dbtx = modules[&signer_peer]
+            .db_for_test()
+            .begin_transaction()
+            .await;
+        let result = modules[&signer_peer]
+            .process_mpc_signature(&mut dbtx.to_ref_nc(), session_id, signature_bytes)
+            .await;
+        dbtx.commit_tx().await;
+
+        assert!(
+            result.is_err(),
+            "a signature for a session with no backing PendingUserOp must be rejected, not finalized"
+        );
+
+        let mut dbtx = modules[&signer_peer]
+            .db_for_test()
+            .begin_transaction_nc()
+            .await;
+        let session = dbtx
+            .get_value(&SigningSessionKey(session_id))
+            .await
+            .expect("the session itself must still be present");
+        assert!(
+            !matches!(session.state, SessionState::Completed(_)),
+            "an unbound session must never be marked Completed, even though the signature \
+             itself is genuinely valid: {:?}",
+            session.state
         );
     }
 
@@ -9184,7 +9259,7 @@ mod tests {
         dbtx.insert_new_entry(
             &SigningSessionKey(session_id),
             &SigningSession {
-                purpose: SigningPurpose::Test([0x61; 32]),
+                purpose: SigningPurpose::UserOp(op_hash),
                 digest: [0x61; 32],
                 signers: vec![PeerId::from(0)],
                 round: 0,
