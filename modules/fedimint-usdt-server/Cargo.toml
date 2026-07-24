@@ -33,6 +33,7 @@ sha2 = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 bls12_381 = { workspace = true }

@@ -290,15 +290,75 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
     }
 }
 
+/// Strips credentials from an EVM RPC URL for `Debug`/logging/error-context
+/// display (sec-18 hardening): removes userinfo (username/password), drops
+/// the query string, and replaces the LAST path segment with `…` (provider
+/// API keys -- Alchemy, Infura, `QuickNode`, … -- are commonly appended as the
+/// final path segment, e.g. `https://host/v2/<key>`).
+///
+/// Never returns the raw input verbatim on any code path: a `url` that fails
+/// to parse gets a coarse fallback redaction instead of being echoed back.
+pub(crate) fn redact_rpc_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            // Strip userinfo. `set_username`/`set_password` only fail for
+            // schemes that cannot have a host (e.g. `data:`); an RPC URL
+            // always has one, but ignore the (impossible here) error rather
+            // than panic.
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+
+            let segments: Vec<&str> = parsed
+                .path_segments()
+                .map_or_else(Vec::new, Iterator::collect);
+            if let Some((last, rest)) = segments.split_last() {
+                // A `last` segment of "" means the path is empty/root (no
+                // key-bearing segment to hide) -- leave it alone so plain
+                // dev endpoints like `http://127.0.0.1:8545` stay readable.
+                if !last.is_empty() {
+                    let mut new_path = String::from("/");
+                    new_path.push_str(&rest.join("/"));
+                    if !rest.is_empty() {
+                        new_path.push('/');
+                    }
+                    new_path.push('…');
+                    parsed.set_path(&new_path);
+                }
+            }
+
+            parsed.to_string()
+        }
+        // Coarse fallback: keep only `scheme://host`-looking prefix, discard
+        // the rest -- never echo the raw (potentially credentialed) string.
+        Err(_) => match url.split_once("://") {
+            Some((scheme, rest)) => {
+                let host_end = rest.find('/').unwrap_or(rest.len());
+                format!("{scheme}://{}/…", &rest[..host_end])
+            }
+            None => "<redacted: unparseable RPC URL>".to_string(),
+        },
+    }
+}
+
 /// [`IServerEvmRpc`] backed by a real EVM node over JSON-RPC/HTTP, via
 /// `alloy`.
 pub struct AlloyEvmRpc {
     /// Type-erased so this struct's type doesn't need to name (or change
     /// with) the concrete filler stack `ProviderBuilder` happens to produce.
     provider: DynProvider,
-    /// Kept only for [`std::fmt::Debug`] (the `alloy` provider itself does
-    /// not implement `Debug`).
+    /// The real, potentially credentialed RPC URL (e.g. a provider API key
+    /// appended as the final path segment). Used only to re-parse when
+    /// building the wallet-connected broadcaster provider in
+    /// [`Self::with_broadcaster`] -- deliberately NEVER `Debug`-printed or
+    /// embedded in error context; use `display_url` for that (sec-18).
     url: String,
+    /// Credential-redacted (see [`redact_rpc_url`]) form of `url`: userinfo,
+    /// query string, and the final path segment (where provider API keys
+    /// commonly live) are stripped. Safe to log, `Debug`-print, or embed in
+    /// error context.
+    display_url: String,
     /// A second, wallet-connected provider signing as this guardian's (or
     /// the shared) broadcaster EOA, used only by
     /// [`IServerEvmRpc::submit_user_ops`]. `None` until
@@ -326,7 +386,7 @@ impl std::fmt::Debug for AlloyEvmRpc {
         // printed (never the broadcaster's private key -- this struct never
         // even stores one past `with_broadcaster`'s own stack frame).
         f.debug_struct("AlloyEvmRpc")
-            .field("url", &self.url)
+            .field("url", &self.display_url)
             .field("has_broadcaster", &self.broadcaster.is_some())
             .field("entry_point", &self.entry_point)
             .finish_non_exhaustive()
@@ -347,16 +407,55 @@ impl AlloyEvmRpc {
     ///
     /// # Errors
     ///
-    /// Returns an error only if `rpc_url` cannot be parsed as a URL.
+    /// Returns an error if `rpc_url` cannot be parsed as a URL, or (sec-18
+    /// hardening) if it is a plaintext `http://` endpoint on a non-loopback
+    /// host and [`fedimint_core::envs::FM_USDT_UNSAFE_ALLOW_HTTP_ENV`] is not
+    /// set to `"1"` -- such an endpoint lets a network-position attacker
+    /// observe and tamper with every RPC-derived guardian observation/
+    /// submission.
     pub fn new(rpc_url: &str) -> anyhow::Result<Self> {
+        let display_url = redact_rpc_url(rpc_url);
         let url = rpc_url
             .parse()
-            .with_context(|| format!("invalid EVM RPC URL: {rpc_url}"))?;
+            .with_context(|| format!("invalid EVM RPC URL: {display_url}"))?;
+
+        // Separately parsed (not reused for `connect_http` below) purely for
+        // the scheme/host transport-security check; keeps this check
+        // decoupled from whatever concrete `Url` type `connect_http` expects.
+        let parsed: url::Url = rpc_url
+            .parse()
+            .with_context(|| format!("invalid EVM RPC URL: {display_url}"))?;
+        let is_https = parsed.scheme() == "https";
+        // `Url::host_str` renders IPv6 hosts bracketed (`"[::1]"`), so match
+        // on the parsed `Host` instead of the string form.
+        let is_loopback_host = match parsed.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+            Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+            _ => false,
+        };
+        let unsafe_override =
+            std::env::var(fedimint_core::envs::FM_USDT_UNSAFE_ALLOW_HTTP_ENV).as_deref() == Ok("1");
+        anyhow::ensure!(
+            is_https || is_loopback_host || unsafe_override,
+            "refusing plaintext http:// EVM RPC endpoint {display_url}: scheme is not https and \
+             host is not loopback; set {}=1 to override (traffic will be MITM-able)",
+            fedimint_core::envs::FM_USDT_UNSAFE_ALLOW_HTTP_ENV,
+        );
+        if !is_https && !is_loopback_host && unsafe_override {
+            warn!(
+                target: "usdt",
+                url = %display_url,
+                "remote http:// RPC endpoint allowed via FM_USDT_UNSAFE_ALLOW_HTTP; traffic is MITM-able"
+            );
+        }
+
         let provider = ProviderBuilder::new().connect_http(url).erased();
 
         Ok(Self {
             provider,
             url: rpc_url.to_string(),
+            display_url,
             broadcaster: None,
             broadcaster_address: None,
             entry_point: None,
@@ -391,7 +490,7 @@ impl AlloyEvmRpc {
         let url = self
             .url
             .parse()
-            .with_context(|| format!("invalid EVM RPC URL: {}", self.url))?;
+            .with_context(|| format!("invalid EVM RPC URL: {}", self.display_url))?;
         let provider = ProviderBuilder::new()
             .wallet(signer)
             .connect_http(url)
@@ -889,5 +988,154 @@ mod tests {
     #[test]
     fn new_does_not_require_a_live_node() {
         AlloyEvmRpc::new("http://127.0.0.1:1").expect("construction is lazy and infallible here");
+    }
+
+    /// Serializes tests that touch the process-wide `FM_USDT_UNSAFE_ALLOW_HTTP`
+    /// env var so they cannot race under `cargo test`'s default parallel-test
+    /// execution (mirrors the `ENV_VAR_LOCK` pattern in `lib.rs`'s tests).
+    static ENV_VAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // sec-18 (a): `redact_rpc_url` must never let the secret substring
+    // through, whether the key rides in the final path segment, in
+    // userinfo, or in a query parameter -- and it must not echo the raw
+    // string back verbatim when it fails to parse as a URL.
+
+    #[test]
+    fn redacts_final_path_key() {
+        let secret = "sk_live_super_secret_key_123";
+        let url = format!("https://eth-mainnet.g.alchemy.com/v2/{secret}");
+
+        let redacted = redact_rpc_url(&url);
+
+        assert!(
+            !redacted.contains(secret),
+            "API key leaked into redacted URL: {redacted}"
+        );
+        assert!(
+            redacted.contains("eth-mainnet.g.alchemy.com"),
+            "host should remain visible: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redacts_userinfo() {
+        let secret = "hunter2password";
+        let url = format!("https://apiuser:{secret}@rpc.example.com/v1/path");
+
+        let redacted = redact_rpc_url(&url);
+
+        assert!(
+            !redacted.contains(secret),
+            "userinfo password leaked into redacted URL: {redacted}"
+        );
+        assert!(
+            !redacted.contains("apiuser"),
+            "userinfo username leaked into redacted URL: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redacts_query_token() {
+        let secret = "qtoken_abcdef123456";
+        let url = format!("https://rpc.example.com/mainnet?api_key={secret}");
+
+        let redacted = redact_rpc_url(&url);
+
+        assert!(
+            !redacted.contains(secret),
+            "query-string token leaked into redacted URL: {redacted}"
+        );
+        assert!(
+            !redacted.contains('?'),
+            "query string should be dropped entirely: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redacts_unparseable() {
+        let secret = "SECRETTOKEN";
+        let raw = format!("not a valid url with {secret} embedded");
+
+        let redacted = redact_rpc_url(&raw);
+
+        assert!(
+            !redacted.contains(secret),
+            "secret leaked from an unparseable URL: {redacted}"
+        );
+        assert_ne!(
+            redacted, raw,
+            "unparseable input must not be echoed back verbatim"
+        );
+    }
+
+    // sec-18 (b): the redaction must actually be wired into `Debug`.
+
+    #[test]
+    fn debug_alloy_evm_rpc_hides_key() {
+        let secret = "sk_live_super_secret_key_123";
+        let url = format!("https://eth-mainnet.g.alchemy.com/v2/{secret}");
+        let rpc = AlloyEvmRpc::new(&url).expect("a valid https URL constructs");
+
+        let rendered = format!("{rpc:?}");
+
+        assert!(
+            !rendered.contains(secret),
+            "API key leaked into AlloyEvmRpc Debug output: {rendered}"
+        );
+    }
+
+    // sec-18 (c): remote plaintext `http://` is refused by default; loopback
+    // `http://` and any `https://` remain allowed.
+
+    #[test]
+    fn remote_http_refused() {
+        let _lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::remove_var(fedimint_core::envs::FM_USDT_UNSAFE_ALLOW_HTTP_ENV);
+        }
+
+        let secret = "sk_live_super_secret_key_123";
+        let url = format!("http://example.com/v2/{secret}");
+        let err = AlloyEvmRpc::new(&url).expect_err("remote http:// must be refused by default");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains(secret),
+            "refusal error must use the redacted URL, not the raw one: {rendered}"
+        );
+    }
+
+    #[test]
+    fn loopback_http_ok() {
+        AlloyEvmRpc::new("http://127.0.0.1:8545").expect("loopback http:// is allowed");
+        AlloyEvmRpc::new("http://localhost:8545").expect("loopback http:// is allowed");
+        AlloyEvmRpc::new("http://[::1]:8545").expect("loopback http:// is allowed");
+    }
+
+    #[test]
+    fn https_ok() {
+        AlloyEvmRpc::new("https://eth-mainnet.g.alchemy.com/v2/key").expect("https is allowed");
+    }
+
+    #[test]
+    fn unsafe_override_allows_remote_http() {
+        let _lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::set_var(fedimint_core::envs::FM_USDT_UNSAFE_ALLOW_HTTP_ENV, "1");
+        }
+        let result = AlloyEvmRpc::new("http://example.com/v2/key");
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(fedimint_core::envs::FM_USDT_UNSAFE_ALLOW_HTTP_ENV);
+        }
+
+        result.expect("remote http must be allowed once the unsafe override is set");
     }
 }
