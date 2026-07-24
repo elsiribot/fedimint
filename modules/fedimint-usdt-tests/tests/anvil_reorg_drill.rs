@@ -51,6 +51,7 @@ use std::time::Duration;
 
 use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::Context as _;
+use fedimint_core::runtime::sleep;
 use fedimint_usdt_common::{EvmAddress, UsdtAmount};
 use fedimint_usdt_server::rpc::{AlloyEvmRpc, IServerEvmRpc};
 
@@ -102,7 +103,7 @@ async fn read_balance_retrying(
             Ok(balance) => return Ok(balance),
             Err(err) => last_err = Some(err),
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     Err(last_err.expect("the loop above always runs at least once"))
 }

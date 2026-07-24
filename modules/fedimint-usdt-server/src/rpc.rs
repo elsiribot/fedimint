@@ -13,6 +13,7 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::Context as _;
+use fedimint_core::util::FmtCompactAnyhow as _;
 use fedimint_usdt_common::user_op::{PackedUserOperation, SignedUserOp, UserOpReceipt};
 use fedimint_usdt_common::{EvmAddress, FeeVote, UsdtAmount};
 use tracing::{debug, warn};
@@ -740,7 +741,7 @@ impl IServerEvmRpc for AlloyEvmRpc {
                 warn!(
                     target: "usdt",
                     %sender,
-                    err = %err,
+                    err = %err.fmt_compact_anyhow(),
                     "auto-prefund of EntryPoint deposit failed; proceeding to handleOps anyway",
                 );
             }
