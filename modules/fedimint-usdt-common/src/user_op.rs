@@ -344,6 +344,13 @@ pub struct UserOpReceipt {
     pub success: bool,
     /// The block the `UserOperationEvent` was emitted in.
     pub block: u64,
+    /// The canonical hash of [`Self::block`] (security findings 04/15): read
+    /// from the authoritative `EntryPoint` `UserOperationEvent` log's
+    /// `blockHash` (see `IServerEvmRpc::get_user_op_receipt`). Binds the
+    /// observed outcome to a specific fork, so two guardians reading the same
+    /// op on DIFFERENT forks at the same height produce non-equal
+    /// observations that never aggregate toward the confirmation threshold.
+    pub block_hash: [u8; 32],
     /// See this struct's doc comment: the raw `actualGasCost` **wei**
     /// value (`UsdtAmount` reused only as a convenient `u64` newtype -- this
     /// is NOT a USDT amount).
