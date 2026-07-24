@@ -15,7 +15,8 @@ use fedimint_core::config::{
 };
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{
-    Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
+    Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCore,
+    IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::envs::{
     FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV,
@@ -35,7 +36,9 @@ use fedimint_core::task::TaskGroup;
 use fedimint_core::util::FmtCompactAnyhow as _;
 use fedimint_core::{InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, push_db_pair_items};
 use fedimint_server_core::config::PeerHandleOps;
-use fedimint_server_core::migration::ServerModuleDbMigrationFn;
+use fedimint_server_core::migration::{
+    ServerModuleDbMigrationFn, ServerModuleDbMigrationFnContext,
+};
 use fedimint_server_core::{
     ConfigGenModuleArgs, EnvVarDoc, ServerModule, ServerModuleInit, ServerModuleInitArgs,
 };
@@ -58,10 +61,10 @@ use fedimint_usdt_common::{
     UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
     WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
     WithdrawalStatusResponse, deposit_fee_quote, deposit_salt, derive_deposit_account,
-    derive_pool_account, evm_address, pool_salt, signing_session_id, usdt_amount,
-    validate_usdt_params, withdrawal_fee_quote,
+    derive_pool_account, evm_address, fee_vote_in_sane_range, pool_salt, signing_session_id,
+    usdt_amount, validate_usdt_params, withdrawal_fee_quote,
 };
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use rand::rngs::OsRng;
 use strum::IntoEnumIterator;
 use tracing::{debug, info, warn};
@@ -76,10 +79,11 @@ use crate::db::{
     MpcRoundChunkSessionRoundPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
     PendingUserOp, PendingUserOpKey, PendingUserOpPrefix, PoolState, PoolStateKey, PoolStatePrefix,
     SessionState, SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix,
-    SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix, UnclaimedWithdrawalKey,
-    UnclaimedWithdrawalPrefix, UsdtWithdrawalV0, UserOpConfirmedObservation,
-    UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix, UserOpConfirmedVotePrefix, UserOpPurpose,
-    WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
+    StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix,
+    UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
+    UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
+    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalState, WithdrawalStateKey,
+    WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -179,7 +183,7 @@ impl ModuleInit for UsdtInit {
                         dbtx,
                         FeeVotePrefix,
                         crate::db::FeeVoteKey,
-                        fedimint_usdt_common::FeeVote,
+                        StoredFeeVote,
                         items,
                         "Fee Votes"
                     );
@@ -922,48 +926,46 @@ impl ServerModuleInit for UsdtInit {
 
     /// DB migrations to move from old to newer versions.
     ///
-    /// Empty today: the `usdt` module is greenfield/unreleased (this is its
-    /// first, still-`MODULE_CONSENSUS_VERSION`-0 shape), so there is no
-    /// prior on-disk layout to migrate FROM yet. This doc comment exists to
-    /// establish the pattern this module MUST follow the first time a DB
-    /// schema change actually ships (Phase 9, Task 1 hardening scaffold),
-    /// mirroring e.g. `fedimint-mint-server`'s
-    /// `ServerModuleInit::get_database_migrations`/
-    /// `fedimint-wallet-server`'s equivalent:
-    ///
-    /// 1. Bump [`MODULE_CONSENSUS_VERSION`]'s DB-relevant component and add a
-    ///    `migrate_db_v<N>(ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) ->
-    ///    anyhow::Result<()>` free function next to this `impl` that reads the
-    ///    OLD key/value shape and rewrites it into the NEW one (typically via
-    ///    `ctx.get_typed_module_history_stream()` + `dbtx.insert_entry`,
-    ///    removing/replacing stale keys as needed).
-    /// 2. Register it here: `migrations.insert(DatabaseVersion(N),
-    ///    Box::new(|ctx| migrate_db_v<N>(ctx).boxed()))`.
-    /// 3. Add a `fedimint_migration_tests` module in
-    ///    `fedimint-usdt-tests/tests/tests.rs` (mirroring
-    ///    `fedimint-mint-tests`' module of the same name) with:
-    ///    - `create_server_db_with_v<N-1>_data` -- builds a `Database`
-    ///      populated with the OLD shape's records (one of every affected
-    ///      `DbKeyPrefix`, matching this module's own `dump_database` coverage
-    ///      test).
-    ///    - `snapshot_server_db_migrations` -- calls
-    ///      `fedimint_testing::db::snapshot_db_migrations::<_, UsdtCommonInit>`
-    ///      to freeze that pre-migration DB as a checked-in snapshot
-    ///      (regenerated via `just snapshot-server-db-migrations
-    ///      fedimint-usdt-tests`).
-    ///    - `test_server_db_migrations` -- calls
-    ///      `fedimint_testing::db::validate_migrations_server`, runs
-    ///      `get_database_migrations` against the frozen snapshot, and asserts
-    ///      every `DbKeyPrefix` reads back in the NEW shape.
-    ///
-    /// See `fedimint-mint-server/src/lib.rs`'s `get_database_migrations` +
-    /// `fedimint-mint-tests/tests/tests.rs`'s `fedimint_migration_tests`
-    /// module for a complete worked example of this exact pattern.
+    /// `DatabaseVersion(0)` is the module's first real migration (security
+    /// finding 06): [`FeeVoteKey`](crate::db::FeeVoteKey)'s value changed
+    /// from a bare [`FeeVote`] to [`StoredFeeVote`] (adds `recorded_block`,
+    /// the freshness stamp `fee_vote_median`'s TTL/quorum gate needs). See
+    /// [`migrate_db_v0`] for why this migration drops rather than rewrites
+    /// the old-format rows.
     fn get_database_migrations(
         &self,
     ) -> BTreeMap<DatabaseVersion, ServerModuleDbMigrationFn<Usdt>> {
-        BTreeMap::new()
+        let mut migrations: BTreeMap<DatabaseVersion, ServerModuleDbMigrationFn<Usdt>> =
+            BTreeMap::new();
+        migrations.insert(
+            DatabaseVersion(0),
+            Box::new(|ctx| migrate_db_v0(ctx).boxed()),
+        );
+        migrations
     }
+}
+
+/// Migrates [`FeeVoteKey`](crate::db::FeeVoteKey)'s value shape from the
+/// pre-hardening bare [`FeeVote`] to [`StoredFeeVote`] (security finding 06).
+///
+/// Rather than reinterpreting each old-format row's bytes into the new shape,
+/// this simply drops every existing `FeeVote` entry: they are guardian-local,
+/// ephemeral per-peer observations (never economically load-bearing on their
+/// own, only their current median is), and every guardian's
+/// `usdt-fee-estimate-poller` re-proposes its current reading -- stamped with
+/// a real `recorded_block` -- within one poll interval of upgrading, so the
+/// federation's fee-vote quorum re-establishes itself almost immediately.
+/// Fabricating a `recorded_block` for the old rows instead (e.g. `0`) would
+/// just make them read as maximally stale under the new TTL check anyway, so
+/// dropping them outright (mirroring `fedimint-mint-server`'s
+/// `migrate_db_v1`, which also `raw_remove_by_prefix`s a stale-format table)
+/// is simpler and has no observable difference in outcome.
+async fn migrate_db_v0(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> anyhow::Result<()> {
+    ctx.dbtx()
+        .raw_remove_by_prefix(&[DbKeyPrefix::FeeVote as u8])
+        .await
+        .expect("DB error");
+    Ok(())
 }
 
 /// USDT-on-EVM module
@@ -1036,7 +1038,11 @@ pub struct Usdt {
     /// all-zero fields would be a meaningfully wrong value to ever propose,
     /// unlike block count `0`, which is a legitimate (if unlikely)
     /// "chain not observed yet" state already handled elsewhere. `None`
-    /// until the poller's first successful read.
+    /// until the poller's first successful read, AND whenever the most
+    /// recent poll failed (security finding 06's freshness facet -- the
+    /// poller clears this on error rather than keeping a stale reading, so
+    /// this guardian stops proposing/refreshing its `FeeVote` while its fee
+    /// source is unreachable; see [`Usdt::spawn_fee_estimate_poller`]).
     fee_estimate: Arc<Mutex<Option<FeeVote>>>,
     /// Readiness observations gathered by the background bootstrap-observer
     /// task (Part C; spawned in [`Usdt::new`], see
@@ -1151,10 +1157,29 @@ impl ServerModule for Usdt {
         // above but with equality-based (not `>`) dedup: the EVM fee market
         // moves in both directions, so "changed" (not "increased") is the
         // right redundancy test (Phase 8, Task 1).
+        //
+        // Security finding 06's freshness facet: also re-propose an
+        // UNCHANGED value once this peer's stored vote's `recorded_block`
+        // has fallen `FEE_VOTE_REFRESH_BLOCKS` behind the current consensus
+        // block count, so a healthy guardian whose polled value is stable
+        // keeps its vote fresh under `fee_vote_median`'s TTL instead of
+        // silently aging out. `None` here (no cached local reading -- either
+        // never polled, or the poller is currently failing, see
+        // `spawn_fee_estimate_poller`) proposes nothing, letting this
+        // guardian's last stored vote age past the TTL and drop out of the
+        // quorum, rather than pin a stale/wrong value forever.
         let fee_vote = *self.fee_estimate.lock().expect("not poisoned");
         if let Some(vote) = fee_vote {
             let current_vote = dbtx.get_value(&FeeVoteKey(self.our_peer_id)).await;
-            if current_vote != Some(vote) {
+            let should_propose = match &current_vote {
+                Some(stored) => {
+                    stored.vote != vote
+                        || current_consensus.saturating_sub(stored.recorded_block)
+                            >= FEE_VOTE_REFRESH_BLOCKS
+                }
+                None => true,
+            };
+            if should_propose {
                 items.push(UsdtConsensusItem::FeeVote(vote));
             }
         }
@@ -1469,21 +1494,57 @@ impl ServerModule for Usdt {
                 Ok(())
             }
             UsdtConsensusItem::FeeVote(vote) => {
-                // DETERMINISTIC, mirrors the `BlockCount` arm's discipline:
-                // store this peer's vote with a redundancy guard. Unlike
-                // `BlockCount` (monotonic, so the guard is `vote >
-                // current_vote`), the EVM fee market moves in both
-                // directions, so the guard here is equality-based (reject
-                // only an EXACT repeat). No threshold-triggered "apply"
-                // step: the federation's fee quote is always read on
-                // demand as the median over whatever votes are currently
-                // stored (see `Usdt::fee_vote_median`), never derived from
-                // any single peer's vote or written to a separate
-                // consensus-agreed record here.
-                let current_vote = dbtx.get_value(&FeeVoteKey(peer_id)).await;
-                ensure!(current_vote != Some(vote), "FeeVote is redundant");
+                // Security finding 06's bounds facet: reject an
+                // out-of-range vote outright (non-state-changing `Err`, so
+                // it is never stored/retained in consensus history). A pure
+                // function of `vote` alone -- every guardian rejects
+                // identically. Without this, a single Byzantine extreme
+                // vote could push `withdrawal_fee_quote`/`deposit_fee_quote`
+                // into `FeeQuoteOverflow`, turning consensus quoting into a
+                // deposit/withdrawal DoS.
+                ensure!(
+                    fee_vote_in_sane_range(&vote),
+                    "FeeVote is outside the sane range"
+                );
 
-                dbtx.insert_entry(&FeeVoteKey(peer_id), &vote).await;
+                // DETERMINISTIC, mirrors the `BlockCount` arm's discipline:
+                // store this peer's vote (now with a `recorded_block`
+                // freshness stamp, security finding 06) with a redundancy
+                // guard. Unlike `BlockCount` (monotonic, so the guard is
+                // `vote > current_vote`), the EVM fee market moves in both
+                // directions, so the value-equality guard is used here --
+                // relaxed (security finding 06's freshness facet) to also
+                // ACCEPT an unchanged value once the peer's previously
+                // stored vote has gone `FEE_VOTE_REFRESH_BLOCKS` blocks
+                // without a refresh, so a healthy guardian's stable-valued
+                // vote can keep itself fresh under `fee_vote_median`'s TTL
+                // instead of being rejected as "redundant" forever. No
+                // threshold-triggered "apply" step: the federation's fee
+                // quote is always read on demand as the median over
+                // whatever FRESH votes are currently stored (see
+                // `Usdt::fee_vote_median`), never derived from any single
+                // peer's vote or written to a separate consensus-agreed
+                // record here.
+                let current_block = self.consensus_block_count(dbtx).await;
+                let current_vote = dbtx.get_value(&FeeVoteKey(peer_id)).await;
+                let is_redundant = match &current_vote {
+                    Some(stored) => {
+                        stored.vote == vote
+                            && current_block.saturating_sub(stored.recorded_block)
+                                < FEE_VOTE_REFRESH_BLOCKS
+                    }
+                    None => false,
+                };
+                ensure!(!is_redundant, "FeeVote is redundant");
+
+                dbtx.insert_entry(
+                    &FeeVoteKey(peer_id),
+                    &StoredFeeVote {
+                        vote,
+                        recorded_block: current_block,
+                    },
+                )
+                .await;
 
                 Ok(())
             }
@@ -1953,6 +2014,27 @@ impl ServerModule for Usdt {
 /// regardless of how stale a client's cached quote is.
 const FEE_QUOTE_VALID_BLOCKS: u64 = 50;
 
+/// Maximum age (in consensus blocks) a stored [`StoredFeeVote`] may have and
+/// still count toward [`fee_vote_median`]'s quorum (security finding 06's
+/// freshness facet). A vote older than this is excluded from the median as
+/// if its guardian had never voted -- closing the "stale honest vote from a
+/// now-broken fee source stays authoritative forever" gap, and (combined with
+/// [`FEE_VOTE_REFRESH_BLOCKS`]) making a permanently-down guardian's poller
+/// age its vote out of the quorum entirely rather than pin a wrong value.
+const FEE_VOTE_TTL_BLOCKS: u64 = 50;
+
+/// Re-proposal cadence for a guardian's own [`StoredFeeVote`] (security
+/// finding 06's freshness facet), strictly less than [`FEE_VOTE_TTL_BLOCKS`]
+/// so a healthy guardian whose polled value hasn't changed still refreshes
+/// its `recorded_block` comfortably before the TTL would otherwise age it
+/// out. `consensus_proposal` re-proposes this guardian's current fee
+/// estimate once its stored vote's `recorded_block` falls this far behind
+/// `consensus_block_count`, even when the polled value itself is unchanged --
+/// mirroring `BlockCountVote`'s "propose again every round while behind"
+/// cadence, but gated on age (the fee market, unlike block count, does not
+/// move monotonically) rather than on inequality.
+const FEE_VOTE_REFRESH_BLOCKS: u64 = 20;
+
 /// A fixed, compiled-in `secp256k1` public key -- the point for secret scalar
 /// `1` (the curve generator `G`) -- used by [`Usdt::observe_bootstrap`] as a
 /// deterministic sample claim key (sec-16 readiness deepening, finding 16).
@@ -2158,11 +2240,21 @@ impl Usdt {
                         *fee_estimate.lock().expect("not poisoned") = Some(vote);
                     }
                     Err(err) => {
+                        // Security finding 06's freshness facet: clear the
+                        // cached reading (rather than keeping the last
+                        // successful one) so `consensus_proposal` stops
+                        // re-proposing/refreshing this guardian's `FeeVote`
+                        // while its fee source is unreachable. Its
+                        // last-stored vote then ages past
+                        // `FEE_VOTE_TTL_BLOCKS` on its own and drops out of
+                        // `fee_vote_median`'s quorum, instead of pinning a
+                        // possibly-wrong value forever.
                         warn!(
                             target: "usdt",
                             err = %err.fmt_compact_anyhow(),
-                            "fee estimate poll failed; keeping last vote (abstaining this cycle)"
+                            "fee estimate poll failed; abstaining until the next successful poll"
                         );
+                        *fee_estimate.lock().expect("not poisoned") = None;
                     }
                 }
 
@@ -2698,9 +2790,10 @@ impl Usdt {
     }
 
     /// The federation's current withdrawal fee quote: the per-field MEDIAN
-    /// (over every peer's stored [`FeeVote`]) of `max_fee_per_gas_wei` and
-    /// `usdt_per_eth_e6` independently, `None` if not a single peer has
-    /// voted yet (Phase 8, Task 1).
+    /// (over every peer's stored, FRESH [`StoredFeeVote`]) of
+    /// `max_fee_per_gas_wei` and `usdt_per_eth_e6` independently, `None`
+    /// unless at least `num_peers.threshold()` fresh votes are present
+    /// (Phase 8, Task 1; security finding 06's quorum + freshness facets).
     ///
     /// Delegates to the free [`fee_vote_median`] function, mirroring
     /// [`Self::consensus_block_count`]'s delegation to the free
@@ -2709,21 +2802,35 @@ impl Usdt {
     /// without a `&Usdt` (today, nothing needs to; `process_output` and the
     /// `withdraw_fee_quote` endpoint both hold `&self`).
     ///
-    /// Deliberately does NOT zero-pad missing votes out to `num_peers` the
-    /// way [`consensus_block_count`] does: block count is monotonic (a
+    /// # Quorum + freshness (security finding 06)
+    ///
+    /// Before this hardening, ANY non-empty vote set (even a single vote)
+    /// was accepted as authoritative, and votes never expired -- letting one
+    /// early Byzantine vote control the quote during bootstrap/partial-vote
+    /// windows, and a stale honest vote from a broken fee source stay
+    /// authoritative forever. Now, a vote only counts toward the median if
+    /// it is FRESH (`consensus_block_count - recorded_block <=
+    /// FEE_VOTE_TTL_BLOCKS`), and the median is `None` unless at least
+    /// `num_peers.threshold()` such fresh votes exist -- both computed
+    /// purely from consensus DB state (`consensus_block_count`), never
+    /// wall-clock, so every guardian agrees.
+    ///
+    /// Deliberately does NOT zero-pad missing/stale votes out to `num_peers`
+    /// the way [`consensus_block_count`] does: block count is monotonic (a
     /// missing/lagging peer's vote is always "behind", so padding with `0`
     /// is a safe, conservative default), but the EVM fee market moves in
     /// both directions, so padding an absent guardian's vote with `0` would
     /// let a Byzantine guardian bias the fee quote DOWN merely by
     /// withholding a vote (undercharging users, at the federation's
     /// expense) — the opposite of what padding protects against for block
-    /// count. The median is instead taken over whatever votes are actually
-    /// present, which — combined with `process_consensus_item`'s
-    /// per-vote redundancy guard — still bounds any single Byzantine
-    /// guardian's influence on the result to one vote out of however many
-    /// have been cast.
+    /// count. The median is instead taken over whatever FRESH votes are
+    /// actually present, which — combined with `process_consensus_item`'s
+    /// per-vote redundancy guard and the quorum requirement above — bounds
+    /// any single Byzantine guardian's influence on the result to one vote
+    /// out of at least `threshold()` votes.
     pub async fn fee_vote_median(&self, dbtx: &mut DatabaseTransaction<'_>) -> Option<FeeVote> {
-        fee_vote_median(dbtx).await
+        let current_block = self.consensus_block_count(dbtx).await;
+        fee_vote_median(dbtx, self.num_peers, current_block).await
     }
 
     /// Tallies the per-field [`BootstrapObservation`] vote counts across every
@@ -4680,17 +4787,31 @@ async fn consensus_block_count(dbtx: &mut DatabaseTransaction<'_>, num_peers: Nu
 
 /// Free-function core of [`Usdt::fee_vote_median`]; see that method's doc
 /// comment for the full rationale (in particular why, unlike
-/// [`consensus_block_count`], this does NOT zero-pad missing votes out to a
-/// peer count).
-async fn fee_vote_median(dbtx: &mut DatabaseTransaction<'_>) -> Option<FeeVote> {
+/// [`consensus_block_count`], this does NOT zero-pad missing/stale votes out
+/// to a peer count).
+///
+/// `current_block` is the caller's already-computed `consensus_block_count`
+/// (threaded in rather than recomputed here so callers that already have it
+/// -- e.g. [`Usdt::fee_vote_median`] -- do not pay for a second read of the
+/// `BlockCountVote` table).
+async fn fee_vote_median(
+    dbtx: &mut DatabaseTransaction<'_>,
+    num_peers: NumPeers,
+    current_block: u64,
+) -> Option<FeeVote> {
     let votes: Vec<FeeVote> = dbtx
         .find_by_prefix(&FeeVotePrefix)
         .await
         .map(|entry| entry.1)
+        .filter(|stored: &StoredFeeVote| {
+            let age = current_block.saturating_sub(stored.recorded_block);
+            std::future::ready(age <= FEE_VOTE_TTL_BLOCKS)
+        })
+        .map(|stored| stored.vote)
         .collect()
         .await;
 
-    if votes.is_empty() {
+    if votes.len() < num_peers.threshold() {
         return None;
     }
 
@@ -7342,9 +7463,14 @@ mod tests {
         }
     }
 
+    /// Security finding 06's quorum facet: `fee_vote_median` must be `None`
+    /// while fewer than `num_peers.threshold()` (fresh) votes are stored,
+    /// even though the table is non-empty -- this is the fix for the
+    /// startup/partial-vote window the finding describes (previously ANY
+    /// single stored vote was already treated as the authoritative median).
     #[tokio::test]
-    async fn fee_vote_median_none_until_first_vote_and_is_per_field() {
-        let module = test_module_with_block_count(4, 0).await;
+    async fn median_none_below_quorum() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let mut dbtx = module.db_for_test().begin_transaction().await;
 
         // No votes yet -> None.
@@ -7366,7 +7492,7 @@ mod tests {
                 usdt_per_eth_e6: 5_000_000_000,
             },
         ];
-        for (i, vote) in votes.iter().enumerate() {
+        for (i, vote) in votes.iter().take(2).enumerate() {
             module
                 .process_consensus_item(
                     &mut dbtx.to_ref_nc(),
@@ -7377,6 +7503,21 @@ mod tests {
                 .expect("first vote from each peer must succeed");
         }
 
+        // Only 2 of 4 peers have voted -- below the 3-vote threshold -> still
+        // None, EVEN THOUGH the table is non-empty (the pre-fix bug: any
+        // non-empty vote set was already authoritative).
+        assert_eq!(module.fee_vote_median(&mut dbtx.to_ref_nc()).await, None);
+
+        // The third vote clears the quorum threshold.
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(votes[2]),
+                PeerId::from(2),
+            )
+            .await
+            .expect("third vote must succeed");
+
         // max_fee_per_gas_wei median of [10, 20, 30] = 20 (index 1).
         // usdt_per_eth_e6 median of [1e9, 3e9, 5e9] = 3e9 (index 1).
         assert_eq!(
@@ -7386,6 +7527,209 @@ mod tests {
                 usdt_per_eth_e6: 3_000_000_000,
             })
         );
+    }
+
+    /// Security finding 06's freshness facet: a vote whose `recorded_block`
+    /// has aged past `FEE_VOTE_TTL_BLOCKS` no longer counts toward the
+    /// median (or the quorum) -- so a stale honest vote from a guardian
+    /// whose fee source went offline cannot stay authoritative forever.
+    #[tokio::test]
+    async fn median_excludes_stale_votes() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        // 3 fresh votes (at consensus block 0) clear the quorum.
+        let mut dbtx = db.begin_transaction().await;
+        for p in 0..3u16 {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::FeeVote(sample_fee_vote()),
+                    PeerId::from(p),
+                )
+                .await
+                .expect("fee vote succeeds");
+        }
+        assert_eq!(
+            module.fee_vote_median(&mut dbtx.to_ref_nc()).await,
+            Some(sample_fee_vote())
+        );
+        dbtx.commit_tx().await;
+
+        // Advance the consensus block count past the TTL without refreshing
+        // any vote -- every stored vote is now stale.
+        let mut dbtx = db.begin_transaction().await;
+        for p in 0..4u16 {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::BlockCount(FEE_VOTE_TTL_BLOCKS + 1),
+                    PeerId::from(p),
+                )
+                .await
+                .expect("block count vote succeeds");
+        }
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        assert_eq!(
+            module.fee_vote_median(&mut dbtx.to_ref_nc()).await,
+            None,
+            "every stored vote aged past FEE_VOTE_TTL_BLOCKS -> below quorum -> None"
+        );
+    }
+
+    /// Security finding 06's bounds facet: a `FeeVote` outside the
+    /// configured sane range is rejected by `process_consensus_item` as a
+    /// non-state-changing `Err` and never stored, closing the
+    /// `FeeQuoteOverflow`-as-DoS path a single extreme Byzantine vote could
+    /// otherwise open.
+    #[tokio::test]
+    async fn median_rejects_out_of_range_vote() {
+        let module = test_module_with_block_count(4, 0).await;
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        let too_high_gas = FeeVote {
+            max_fee_per_gas_wei: fedimint_usdt_common::MAX_SANE_MAX_FEE_PER_GAS_WEI + 1,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(too_high_gas),
+                PeerId::from(0),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("sane range"));
+
+        let too_high_price = FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: fedimint_usdt_common::MAX_SANE_USDT_PER_ETH_E6 + 1,
+        };
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(too_high_price),
+                PeerId::from(0),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("sane range"));
+
+        let zero_vote = FeeVote {
+            max_fee_per_gas_wei: 0,
+            usdt_per_eth_e6: 3_000_000_000,
+        };
+        let err = module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(zero_vote),
+                PeerId::from(0),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("sane range"));
+
+        // None of the rejected votes were stored.
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .get_value(&FeeVoteKey(PeerId::from(0)))
+                .await,
+            None
+        );
+    }
+
+    /// Security finding 06's freshness facet: `consensus_proposal` must
+    /// re-propose a guardian's current fee estimate even when its polled
+    /// VALUE is unchanged, once the previously stored vote's `recorded_block`
+    /// has fallen `FEE_VOTE_REFRESH_BLOCKS` behind the current consensus
+    /// block count -- otherwise a perfectly healthy guardian whose fee
+    /// market simply hasn't moved would eventually age its own vote out of
+    /// `fee_vote_median`'s TTL for no good reason.
+    #[tokio::test]
+    async fn healthy_vote_is_refreshed_before_ttl() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let vote = sample_fee_vote();
+        *module.fee_estimate.lock().expect("not poisoned") = Some(vote);
+
+        // First proposal + apply: stores the vote at consensus block 0.
+        let mut dbtx = db.begin_transaction().await;
+        let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert!(items.contains(&UsdtConsensusItem::FeeVote(vote)));
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(vote),
+                module.our_peer_id,
+            )
+            .await
+            .expect("apply this guardian's own proposed vote");
+        dbtx.commit_tx().await;
+
+        // Advance the consensus block count by less than the refresh
+        // cadence: the unchanged value must NOT be re-proposed yet.
+        let mut dbtx = db.begin_transaction().await;
+        for p in 0..4u16 {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::BlockCount(FEE_VOTE_REFRESH_BLOCKS - 1),
+                    PeerId::from(p),
+                )
+                .await
+                .expect("block count vote succeeds");
+        }
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, UsdtConsensusItem::FeeVote(_))),
+            "still within the refresh cadence -> unchanged value not re-proposed"
+        );
+        dbtx.commit_tx().await;
+
+        // Advance past the refresh cadence (but still well within the TTL):
+        // the unchanged value MUST now be re-proposed and re-accepted.
+        let mut dbtx = db.begin_transaction().await;
+        for p in 0..4u16 {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::BlockCount(FEE_VOTE_REFRESH_BLOCKS),
+                    PeerId::from(p),
+                )
+                .await
+                .expect("block count vote succeeds");
+        }
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert!(
+            items.contains(&UsdtConsensusItem::FeeVote(vote)),
+            "past the refresh cadence -> unchanged value IS re-proposed to stay fresh"
+        );
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::FeeVote(vote),
+                module.our_peer_id,
+            )
+            .await
+            .expect("a due refresh (same value, newer block) must be accepted, not rejected as redundant");
+
+        let refreshed = dbtx
+            .to_ref_nc()
+            .get_value(&FeeVoteKey(module.our_peer_id))
+            .await
+            .expect("vote still stored");
+        assert_eq!(refreshed.vote, vote);
+        assert_eq!(refreshed.recorded_block, FEE_VOTE_REFRESH_BLOCKS);
     }
 
     /// (misc #4, finding 06's client-confusion facet.) With no `FeeVote`
@@ -7419,23 +7763,27 @@ mod tests {
     /// median -- the fee math itself must not change.
     #[tokio::test]
     async fn fee_quote_available_and_unchanged_when_median_exists() {
-        let module = test_module_with_block_count(4, 0).await;
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let mut dbtx = module.db_for_test().begin_transaction().await;
         let vote = sample_fee_vote();
 
-        module
-            .process_consensus_item(
-                &mut dbtx.to_ref_nc(),
-                UsdtConsensusItem::FeeVote(vote),
-                PeerId::from(0u16),
-            )
-            .await
-            .expect("first vote must succeed");
+        // Quorum requires >= threshold() (3 of 4) fresh votes (security
+        // finding 06); identical votes trivially median to themselves.
+        for p in 0..3u16 {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::FeeVote(vote),
+                    PeerId::from(p),
+                )
+                .await
+                .expect("vote must succeed");
+        }
 
         let median = module
             .fee_vote_median(&mut dbtx.to_ref_nc())
             .await
-            .expect("a single stored vote is its own median");
+            .expect("threshold-many identical votes are their own median");
         assert_eq!(median, vote);
 
         let expected_max_fee =
@@ -7540,13 +7888,24 @@ mod tests {
         );
     }
 
-    /// Seeds every peer's `FeeVoteKey` with `vote`, so
-    /// `Usdt::fee_vote_median` resolves to exactly `vote` (all fields
-    /// identical across peers -> trivially their own median).
+    /// Seeds every peer's `FeeVoteKey` with `vote`, stamped FRESH (at the
+    /// current `consensus_block_count`), so `Usdt::fee_vote_median` resolves
+    /// to exactly `vote` (all fields identical across peers -> trivially
+    /// their own median, and `num_peers` fresh votes always clears the
+    /// quorum threshold).
     async fn seed_fee_votes(db: &fedimint_core::db::Database, num_peers: u16, vote: FeeVote) {
+        let peers = (0..num_peers)
+            .map(PeerId::from)
+            .collect::<Vec<_>>()
+            .to_num_peers();
         let mut dbtx = db.begin_transaction().await;
+        let recorded_block = consensus_block_count(&mut dbtx.to_ref_nc(), peers).await;
+        let stored = StoredFeeVote {
+            vote,
+            recorded_block,
+        };
         for p in 0..num_peers {
-            dbtx.insert_new_entry(&FeeVoteKey(PeerId::from(p)), &vote)
+            dbtx.insert_new_entry(&FeeVoteKey(PeerId::from(p)), &stored)
                 .await;
         }
         dbtx.commit_tx().await;
@@ -11376,8 +11735,14 @@ mod tests {
 
         dbtx.insert_new_entry(&BlockCountVoteKey(PeerId::from(0)), &42u64)
             .await;
-        dbtx.insert_new_entry(&FeeVoteKey(PeerId::from(0)), &sample_fee_vote())
-            .await;
+        dbtx.insert_new_entry(
+            &FeeVoteKey(PeerId::from(0)),
+            &StoredFeeVote {
+                vote: sample_fee_vote(),
+                recorded_block: 42,
+            },
+        )
+        .await;
         dbtx.insert_new_entry(
             &DepositRecordKey(account),
             &DepositRecord {
@@ -11480,6 +11845,18 @@ mod tests {
         .await;
         dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
             .await;
+        dbtx.insert_new_entry(
+            &BootstrapVoteKey(PeerId::from(0)),
+            &BootstrapObservation {
+                entry_point_ok: true,
+                factory_ok: true,
+                impl_ok: true,
+                broadcaster_funded: true,
+                rpc_healthy: true,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(&HasEverBeenReadyKey, &()).await;
 
         dbtx.commit_tx().await;
 
@@ -11503,11 +11880,13 @@ mod tests {
             "UserOp Confirmed Votes",
             "Unclaimed Withdrawals",
             "Withdrawal States",
+            "Bootstrap Votes",
+            "Has Ever Been Ready",
         ];
         assert_eq!(
             dumped.len(),
             expected_labels.len(),
-            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x0D)"
+            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x0F)"
         );
         for label in expected_labels {
             assert!(

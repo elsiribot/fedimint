@@ -1436,3 +1436,392 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
 
     Ok(())
 }
+
+/// Server DB migration coverage for the `usdt` module (security finding 06):
+/// its first-ever migration, `migrate_db_v0`, changes `FeeVoteKey`'s value
+/// shape from a bare `FeeVote` to `StoredFeeVote` (adds the `recorded_block`
+/// freshness stamp `fee_vote_median`'s TTL/quorum gate needs). Mirrors
+/// `fedimint-mint-tests`' `fedimint_migration_tests` module (see that
+/// module's doc comments for the general pattern).
+#[cfg(test)]
+mod fedimint_migration_tests {
+    use anyhow::ensure;
+    use fedimint_core::db::{
+        Database, IDatabaseTransactionOpsCore, IDatabaseTransactionOpsCoreTyped,
+    };
+    use fedimint_core::encoding::Encodable;
+    use fedimint_core::{BitcoinHash as _, OutPoint, PeerId, TransactionId, secp256k1};
+    use fedimint_logging::TracingSetup;
+    use fedimint_server::core::DynServerModuleInit;
+    use fedimint_testing::db::{snapshot_db_migrations, validate_migrations_server};
+    use fedimint_usdt_common::user_op::{SignedUserOp, UnsignedUserOp};
+    use fedimint_usdt_common::{
+        BootstrapObservation, DepositObservation, EvmAddress, FeeVote, UsdtAmount, UsdtCommonInit,
+        signing_session_id,
+    };
+    use fedimint_usdt_server::db::{
+        BlockCountVoteKey, BootstrapVoteKey, DbKeyPrefix, DepositObservationVoteKey, DepositRecord,
+        DepositRecordKey, FeeVoteKey, FeeVotePrefix, HasEverBeenReadyKey, MpcRoundChunk,
+        MpcRoundChunkKey, PendingCheck, PendingCheckKey, PendingUserOp, PendingUserOpKey,
+        PoolState, PoolStateKey, SessionState, SigningPurpose, SigningSession, SigningSessionKey,
+        StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey, UsdtWithdrawalV0,
+        UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpPurpose, WithdrawalState,
+        WithdrawalStateKey,
+    };
+    use futures::StreamExt as _;
+    use strum::IntoEnumIterator;
+    use tracing::info;
+
+    use crate::UsdtInit;
+
+    fn test_pubkey() -> secp256k1::PublicKey {
+        let secp = secp256k1::Secp256k1::new();
+        secp256k1::SecretKey::from_slice(&[0x11; 32])
+            .expect("valid scalar")
+            .public_key(&secp)
+    }
+
+    fn test_out_point(idx: u64) -> OutPoint {
+        OutPoint {
+            txid: TransactionId::all_zeros(),
+            out_idx: idx,
+        }
+    }
+
+    fn sample_unsigned_user_op() -> UnsignedUserOp {
+        UnsignedUserOp {
+            sender: EvmAddress([0x21; 20]),
+            nonce: alloy::primitives::U256::ZERO,
+            init_code: vec![0xde, 0xad],
+            call_data: vec![0xbe, 0xef],
+            verification_gas_limit: 500_000,
+            call_gas_limit: 200_000,
+            pre_verification_gas: alloy::primitives::U256::from(100_000u64),
+            max_priority_fee_per_gas: 1_500_000_000,
+            max_fee_per_gas: 30_000_000_000,
+            paymaster_and_data: vec![],
+        }
+    }
+
+    /// Create a database with pre-`migrate_db_v0` (i.e. this module's very
+    /// first shipped) data: one record per `DbKeyPrefix` variant (matching
+    /// `fedimint-usdt-server`'s own `dump_database_covers_every_key_prefix`
+    /// coverage), EXCEPT `FeeVoteKey`, which is written at the RAW byte
+    /// level as the pre-hardening bare `FeeVote` shape (the current crate no
+    /// longer has a Rust type for it, since `FeeVoteKey`'s value is now
+    /// `StoredFeeVote`) so this genuinely exercises the old on-disk layout
+    /// `migrate_db_v0` must handle.
+    ///
+    /// This function should not be updated when database keys/values
+    /// change -- instead a new function should be added that creates a new
+    /// database backup that can be tested (mirroring
+    /// `fedimint-mint-tests`' convention).
+    async fn create_server_db_with_v0_data(db: Database) {
+        let claim_pk = test_pubkey();
+        let account = EvmAddress([0x31; 20]);
+        let op_hash = [0x41; 32];
+        let out_point = test_out_point(9);
+        let session_id = signing_session_id(&[0x51; 32], 0);
+
+        let mut dbtx = db.begin_transaction().await;
+
+        dbtx.insert_new_entry(&BlockCountVoteKey(PeerId::from(0)), &42u64)
+            .await;
+
+        // The pre-`migrate_db_v0` `FeeVoteKey -> FeeVote` shape, written at
+        // the raw byte level (see this function's doc comment).
+        let mut old_fee_vote_key_bytes = vec![DbKeyPrefix::FeeVote as u8];
+        old_fee_vote_key_bytes
+            .extend_from_slice(&FeeVoteKey(PeerId::from(0)).consensus_encode_to_vec());
+        let old_fee_vote_value_bytes = FeeVote {
+            max_fee_per_gas_wei: 30_000_000_000,
+            usdt_per_eth_e6: 3_000_000_000,
+        }
+        .consensus_encode_to_vec();
+        dbtx.raw_insert_bytes(&old_fee_vote_key_bytes, &old_fee_vote_value_bytes)
+            .await
+            .expect("DB error");
+
+        dbtx.insert_new_entry(
+            &DepositRecordKey(account),
+            &DepositRecord {
+                claim_pk,
+                credited: UsdtAmount(1_000_000),
+                claimed: UsdtAmount(0),
+                last_observed_block: 1,
+                swept: UsdtAmount(0),
+                nonce: 0,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &DepositObservationVoteKey(account, PeerId::from(0)),
+            &DepositObservation {
+                account,
+                balance: UsdtAmount(1_000_000),
+                block: 1,
+                claim_pk,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &PendingCheckKey(account),
+            &PendingCheck {
+                claim_pk,
+                requested_at_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &SigningSessionKey(session_id),
+            &SigningSession {
+                purpose: SigningPurpose::UserOp(op_hash),
+                digest: [0x61; 32],
+                signers: vec![PeerId::from(0)],
+                round: 0,
+                state: SessionState::InProgress,
+                attempt: 0,
+                last_progress_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &MpcRoundChunkKey(session_id, 0, PeerId::from(0), 0),
+            &MpcRoundChunk {
+                count: 1,
+                bytes: vec![0x01],
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &PendingUserOpKey(op_hash),
+            &PendingUserOp {
+                op: sample_unsigned_user_op(),
+                purpose: UserOpPurpose::DeployAndSweep { source: account },
+                created_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &SubmittedUserOpKey(op_hash),
+            &SubmittedUserOp {
+                signed: SignedUserOp {
+                    unsigned: sample_unsigned_user_op(),
+                    signature: vec![0x71; 65],
+                },
+                purpose: UserOpPurpose::DeployAndSweep { source: account },
+                submitted_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &PoolStateKey,
+            &PoolState {
+                account,
+                balance: UsdtAmount(1_000_000),
+                nonce: 0,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &UserOpConfirmedVoteKey(op_hash, PeerId::from(0)),
+            &UserOpConfirmedObservation {
+                success: true,
+                block: 1,
+                swept: UsdtAmount(1_000_000),
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &fedimint_usdt_server::db::UnclaimedWithdrawalKey(out_point),
+            &UsdtWithdrawalV0 {
+                recipient: account,
+                amount: UsdtAmount(1_000_000),
+                max_fee: UsdtAmount(20_000),
+                requested_block: 1,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+            .await;
+        dbtx.insert_new_entry(
+            &BootstrapVoteKey(PeerId::from(0)),
+            &BootstrapObservation {
+                entry_point_ok: true,
+                factory_ok: true,
+                impl_ok: true,
+                broadcaster_funded: true,
+                rpc_healthy: true,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(&HasEverBeenReadyKey, &()).await;
+
+        dbtx.commit_tx().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_server_db_migrations() -> anyhow::Result<()> {
+        snapshot_db_migrations::<_, UsdtCommonInit>("usdt-server-v0", |db| {
+            Box::pin(async {
+                create_server_db_with_v0_data(db).await;
+            })
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_server_db_migrations() -> anyhow::Result<()> {
+        let _ = TracingSetup::default().init();
+
+        let module = DynServerModuleInit::from(UsdtInit::default());
+        validate_migrations_server(module, "usdt-server", |db| async move {
+            let mut dbtx = db.begin_transaction_nc().await;
+
+            for prefix in DbKeyPrefix::iter() {
+                match prefix {
+                    DbKeyPrefix::BlockCountVote => {
+                        let votes = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::BlockCountVotePrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!votes.is_empty(), "no BlockCountVotes read back");
+                        info!("Validated BlockCountVote");
+                    }
+                    DbKeyPrefix::FeeVote => {
+                        // Security finding 06: `migrate_db_v0` DROPS
+                        // pre-migration `FeeVote` rows rather than
+                        // rewriting them (see that function's doc comment
+                        // for why this loses nothing meaningful) -- so the
+                        // only thing to assert is that the table reads back
+                        // cleanly (in the NEW `StoredFeeVote` shape) as
+                        // EMPTY, not that any data survived.
+                        let votes = dbtx
+                            .find_by_prefix(&FeeVotePrefix)
+                            .await
+                            .collect::<Vec<(FeeVoteKey, StoredFeeVote)>>()
+                            .await;
+                        ensure!(
+                            votes.is_empty(),
+                            "pre-migration FeeVote rows must be dropped by migrate_db_v0, not rewritten"
+                        );
+                        info!("Validated FeeVote (dropped, not rewritten)");
+                    }
+                    DbKeyPrefix::DepositRecord => {
+                        let records = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::DepositRecordPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!records.is_empty(), "no DepositRecords read back");
+                        info!("Validated DepositRecord");
+                    }
+                    DbKeyPrefix::DepositObservationVote => {
+                        let votes = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::DepositObservationVotePrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!votes.is_empty(), "no DepositObservationVotes read back");
+                        info!("Validated DepositObservationVote");
+                    }
+                    DbKeyPrefix::PendingCheck => {
+                        let checks = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::PendingCheckPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!checks.is_empty(), "no PendingChecks read back");
+                        info!("Validated PendingCheck");
+                    }
+                    DbKeyPrefix::SigningSession => {
+                        let sessions = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::SigningSessionPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!sessions.is_empty(), "no SigningSessions read back");
+                        info!("Validated SigningSession");
+                    }
+                    DbKeyPrefix::MpcRoundChunk => {
+                        let chunks = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::MpcRoundChunkPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!chunks.is_empty(), "no MpcRoundChunks read back");
+                        info!("Validated MpcRoundChunk");
+                    }
+                    DbKeyPrefix::PendingUserOp => {
+                        let ops = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::PendingUserOpPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!ops.is_empty(), "no PendingUserOps read back");
+                        info!("Validated PendingUserOp");
+                    }
+                    DbKeyPrefix::SubmittedUserOp => {
+                        let ops = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::SubmittedUserOpPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!ops.is_empty(), "no SubmittedUserOps read back");
+                        info!("Validated SubmittedUserOp");
+                    }
+                    DbKeyPrefix::PoolState => {
+                        let state = dbtx.get_value(&PoolStateKey).await;
+                        ensure!(state.is_some(), "no PoolState read back");
+                        info!("Validated PoolState");
+                    }
+                    DbKeyPrefix::UserOpConfirmedVote => {
+                        let votes = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::UserOpConfirmedVotePrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!votes.is_empty(), "no UserOpConfirmedVotes read back");
+                        info!("Validated UserOpConfirmedVote");
+                    }
+                    DbKeyPrefix::UnclaimedWithdrawal => {
+                        let withdrawals = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::UnclaimedWithdrawalPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!withdrawals.is_empty(), "no UnclaimedWithdrawals read back");
+                        info!("Validated UnclaimedWithdrawal");
+                    }
+                    DbKeyPrefix::WithdrawalState => {
+                        let states = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::WithdrawalStatePrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!states.is_empty(), "no WithdrawalStates read back");
+                        info!("Validated WithdrawalState");
+                    }
+                    DbKeyPrefix::BootstrapVote => {
+                        let votes = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::BootstrapVotePrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(!votes.is_empty(), "no BootstrapVotes read back");
+                        info!("Validated BootstrapVote");
+                    }
+                    DbKeyPrefix::HasEverBeenReady => {
+                        let latch = dbtx.get_value(&HasEverBeenReadyKey).await;
+                        ensure!(latch.is_some(), "HasEverBeenReady latch not read back");
+                        info!("Validated HasEverBeenReady");
+                    }
+                }
+            }
+
+            Ok(())
+        })
+        .await
+    }
+}
