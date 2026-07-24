@@ -526,6 +526,13 @@ impl ClientModule for MintClientModule {
 }
 
 impl MintClientModule {
+    /// The [`AmountUnit`] this mint instance is denominated in (e.g.
+    /// Bitcoin, or the usdt module's USDT unit for a USDT-denominated
+    /// instance).
+    pub fn amount_unit(&self) -> AmountUnit {
+        self.cfg.amount_unit
+    }
+
     async fn select_funding_input(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
