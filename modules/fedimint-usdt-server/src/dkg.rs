@@ -19,7 +19,7 @@ use fedimint_threshold_ecdsa::transport::{
     EncryptedRoundCodec, drive_over_exchange, spawn_protocol,
 };
 use fedimint_threshold_ecdsa::{Curve, assemble_key_share, group_public_key};
-use fedimint_usdt_common::UsdtGenParams;
+use fedimint_usdt_common::{UsdtGenParams, validate_usdt_params};
 use rand::rngs::OsRng;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest as _, Sha256};
@@ -274,6 +274,11 @@ pub(crate) async fn distributed_gen(
     args: &ConfigGenModuleArgs,
     params: &UsdtGenParams,
 ) -> anyhow::Result<UsdtConfig> {
+    // Fail config-gen for the whole federation (not just this guardian) on
+    // an unsafe param set, before any of the expensive multi-round MPC
+    // protocols below even start.
+    validate_usdt_params(params).context("USDT config-gen params failed safety validation")?;
+
     let secp = Secp256k1::new();
     let mpc_encryption_sk = SecretKey::new(&mut OsRng);
     let our_enc_pk = mpc_encryption_sk.public_key(&secp);
