@@ -6,7 +6,7 @@ use fedimint_usdt_common::{EvmAddress, UsdtAmount};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::UsdtClientModule;
+use crate::{UsdtClientModule, check_fee_cap};
 
 #[derive(Debug, Clone, Parser, Serialize)]
 enum Opts {
@@ -26,7 +26,24 @@ enum Opts {
     /// balance (requires a nonzero `claimable` from `deposit-status`, and
     /// that `claim_pk` was previously produced by `deposit-address` on this
     /// client).
-    Claim { claim_pk: secp256k1::PublicKey },
+    ///
+    /// By default, refuses to submit if the federation's deposit fee quote
+    /// is more than 25% of the claimable amount (security finding 07) --
+    /// pass `--accept-high-fee` to proceed anyway, or `--max-deposit-fee` to
+    /// set an explicit hard cap instead of the default sanity guard.
+    Claim {
+        claim_pk: secp256k1::PublicKey,
+        /// Refuse to submit if the federation's deposit fee quote exceeds
+        /// this many smallest-on-chain-USDT-units. A hard ceiling: unlike
+        /// the default sanity guard, `--accept-high-fee` cannot override it.
+        #[arg(long)]
+        max_deposit_fee: Option<u64>,
+        /// Bypass the default 25%-of-amount sanity guard when no
+        /// `--max-deposit-fee` is given. Has no effect if `--max-deposit-fee`
+        /// is set.
+        #[arg(long)]
+        accept_high_fee: bool,
+    },
     /// Report the federation's current withdrawal fee quote for `amount`
     /// (the smallest on-chain USDT unit, 1e-6 USDT) -- the minimum `max_fee`
     /// a `withdraw` of `amount` must offer right now.
@@ -40,7 +57,25 @@ enum Opts {
     /// 20-byte, optionally `0x`-prefixed hex EVM address), and print the
     /// enqueued withdrawal's `OutPoint` -- pass it to `withdrawal-status`
     /// to track the withdrawal.
-    Withdraw { recipient: EvmAddress, amount: u64 },
+    ///
+    /// By default, refuses to submit if the federation's withdrawal fee
+    /// quote is more than 25% of `amount` (security finding 07) -- pass
+    /// `--accept-high-fee` to proceed anyway, or `--max-fee` to set an
+    /// explicit hard cap instead of the default sanity guard.
+    Withdraw {
+        recipient: EvmAddress,
+        amount: u64,
+        /// Refuse to submit if the federation's withdrawal fee quote
+        /// exceeds this many smallest-on-chain-USDT-units. A hard ceiling:
+        /// unlike the default sanity guard, `--accept-high-fee` cannot
+        /// override it.
+        #[arg(long)]
+        max_fee: Option<u64>,
+        /// Bypass the default 25%-of-amount sanity guard when no
+        /// `--max-fee` is given. Has no effect if `--max-fee` is set.
+        #[arg(long)]
+        accept_high_fee: bool,
+    },
     /// Report the consensus-agreed lifecycle stage
     /// (`Unknown`/`Queued`/`Signing`/`Submitted`/`Confirmed`/`Failed`) of a
     /// queued withdrawal, identified by the `OutPoint` (`txid`, `out_idx`)
@@ -100,18 +135,46 @@ pub(crate) async fn handle_cli_command(
             }
         }
         Opts::DepositStatus { claim_pk } => json(usdt.deposit_status(claim_pk).await?),
-        Opts::Claim { claim_pk } => {
-            let result = usdt.claim(claim_pk).await?;
+        Opts::Claim {
+            claim_pk,
+            max_deposit_fee,
+            accept_high_fee,
+        } => {
+            // The security finding 07 fee-cap guard runs inside
+            // `usdt.claim` (via `submit_claim`), BEFORE any e-cash is
+            // minted -- it needs the freshly fetched deposit-fee quote,
+            // which is only available once `claim` fetches it internally.
+            let result = usdt
+                .claim(claim_pk, max_deposit_fee.map(UsdtAmount), accept_high_fee)
+                .await?;
+            let net = UsdtAmount(result.claimed.0.saturating_sub(result.fee.0));
             json(serde_json::json!({
                 "claimed": result.claimed.0,
                 "fee": result.fee.0,
+                "net": net.0,
             }))
         }
         Opts::FeeQuote { amount } => json(usdt.withdraw_fee_quote(UsdtAmount(amount)).await?),
         Opts::DepositFeeQuote => json(usdt.deposit_fee_quote().await?),
-        Opts::Withdraw { recipient, amount } => {
+        Opts::Withdraw {
+            recipient,
+            amount,
+            max_fee,
+            accept_high_fee,
+        } => {
             let amount = UsdtAmount(amount);
             let quote = usdt.withdraw_fee_quote(amount).await?;
+            // Security finding 07: the fee-cap guard runs BEFORE
+            // `usdt.withdraw` ever burns e-cash -- a rejection here never
+            // reaches the library's transaction submission.
+            check_fee_cap(
+                quote.max_fee,
+                amount,
+                max_fee.map(UsdtAmount),
+                accept_high_fee,
+                "--max-fee",
+            )?;
+            let total_debit = UsdtAmount(amount.0.saturating_add(quote.max_fee.0));
             let range = usdt.withdraw(recipient, amount, quote.max_fee).await?;
             let out_point = UsdtClientModule::withdrawal_out_point(&range);
             json(serde_json::json!({
@@ -119,6 +182,7 @@ pub(crate) async fn handle_cli_command(
                 "recipient": recipient.to_string(),
                 "amount": amount.0,
                 "max_fee": quote.max_fee.0,
+                "total_debit": total_debit.0,
             }))
         }
         Opts::WithdrawalStatus { txid, out_idx } => {
@@ -190,9 +254,42 @@ mod tests {
 
     #[test]
     fn parses_claim() {
+        // Bare `claim` (no fee-cap flags) must still parse, defaulting the
+        // security finding 07 cap flags to "no explicit cap, sanity guard
+        // not bypassed" -- `claim`'s default sanity guard applies.
         assert!(matches!(
             Opts::try_parse_from(["usdt", "claim", TEST_PUBKEY]).expect("parses"),
-            Opts::Claim { .. }
+            Opts::Claim {
+                max_deposit_fee: None,
+                accept_high_fee: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_claim_with_max_deposit_fee() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "claim", TEST_PUBKEY, "--max-deposit-fee", "1000"])
+                .expect("parses"),
+            Opts::Claim {
+                max_deposit_fee: Some(1000),
+                accept_high_fee: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_claim_with_accept_high_fee() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "claim", TEST_PUBKEY, "--accept-high-fee"])
+                .expect("parses"),
+            Opts::Claim {
+                max_deposit_fee: None,
+                accept_high_fee: true,
+                ..
+            }
         ));
     }
 
@@ -214,6 +311,9 @@ mod tests {
 
     #[test]
     fn parses_withdraw() {
+        // Bare `withdraw` (no fee-cap flags) must still parse, defaulting
+        // the security finding 07 cap flags to "no explicit cap, sanity
+        // guard not bypassed".
         assert!(matches!(
             Opts::try_parse_from([
                 "usdt",
@@ -224,6 +324,49 @@ mod tests {
             .expect("parses"),
             Opts::Withdraw {
                 amount: 2_000_000,
+                max_fee: None,
+                accept_high_fee: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_withdraw_with_max_fee() {
+        assert!(matches!(
+            Opts::try_parse_from([
+                "usdt",
+                "withdraw",
+                "0x1111111111111111111111111111111111111111",
+                "2000000",
+                "--max-fee",
+                "50000"
+            ])
+            .expect("parses"),
+            Opts::Withdraw {
+                amount: 2_000_000,
+                max_fee: Some(50_000),
+                accept_high_fee: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_withdraw_with_accept_high_fee() {
+        assert!(matches!(
+            Opts::try_parse_from([
+                "usdt",
+                "withdraw",
+                "0x1111111111111111111111111111111111111111",
+                "2000000",
+                "--accept-high-fee"
+            ])
+            .expect("parses"),
+            Opts::Withdraw {
+                amount: 2_000_000,
+                max_fee: None,
+                accept_high_fee: true,
                 ..
             }
         ));

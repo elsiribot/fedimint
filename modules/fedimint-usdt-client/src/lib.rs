@@ -92,6 +92,75 @@ fn ensure_fee_quote_available<T>(quote: T, available: bool) -> anyhow::Result<T>
     Ok(quote)
 }
 
+/// Default client-side sanity threshold for a federation fee quote (security
+/// finding 07): when the caller gives no explicit `--max-fee`/
+/// `--max-deposit-fee` cap, a fee quote exceeding this percentage of the
+/// transferred amount is treated as abnormal and blocked by
+/// [`check_fee_cap`] unless `--accept-high-fee` is set.
+const FEE_SANITY_PERCENT: u64 = 25;
+
+/// Client-side fee-cap guard (security finding 07): decides whether
+/// `quote_fee` -- a federation-supplied withdrawal `max_fee` quote or
+/// deposit `fee` quote -- is acceptable to submit against a transfer of
+/// `amount`. A malicious/compromised threshold federation (or a skewed
+/// fee-vote median) can otherwise quote up to ~100% of a deposit/withdrawal
+/// as "fee"; this is the client's only independent check before that quote
+/// is ever signed over.
+///
+/// - If `explicit_cap` is `Some`, it is a hard ceiling: `quote_fee` exceeding
+///   it always bails, regardless of `accept_high_fee` (an explicit cap cannot
+///   be overridden by the bypass flag).
+/// - Otherwise, `quote_fee` exceeding `FEE_SANITY_PERCENT`% of `amount` bails
+///   unless `accept_high_fee` is set.
+///
+/// `cap_flag` names the caller's explicit-cap CLI flag (`--max-fee` for
+/// withdrawals, `--max-deposit-fee` for claims) purely for the error
+/// message.
+///
+/// Pure and synchronous (no network/DB/wall-clock access, wasm-safe) so it
+/// is unit-testable without a live federation. Callers MUST invoke this
+/// BEFORE any irreversible submit -- burning e-cash for a withdrawal or
+/// minting e-cash net of a deposit fee for a claim -- so a rejection never
+/// leaves a signed/submitted transaction behind.
+fn check_fee_cap(
+    quote_fee: UsdtAmount,
+    amount: UsdtAmount,
+    explicit_cap: Option<UsdtAmount>,
+    accept_high_fee: bool,
+    cap_flag: &str,
+) -> anyhow::Result<()> {
+    if let Some(cap) = explicit_cap {
+        if quote_fee.0 > cap.0 {
+            bail!("federation fee quote {quote_fee} exceeds your {cap_flag} {cap}; not submitting");
+        }
+        return Ok(());
+    }
+
+    if accept_high_fee {
+        return Ok(());
+    }
+
+    // u128 throughout: `amount.0 * FEE_SANITY_PERCENT` would overflow a u64
+    // for amounts near u64::MAX.
+    let threshold = u128::from(amount.0) * u128::from(FEE_SANITY_PERCENT) / 100;
+    if u128::from(quote_fee.0) > threshold {
+        let pct = if amount.0 == 0 {
+            // No denominator to express a ratio against; any nonzero fee on
+            // a zero amount is unconditionally abnormal.
+            u128::from(quote_fee.0).saturating_mul(100)
+        } else {
+            u128::from(quote_fee.0) * 100 / u128::from(amount.0)
+        };
+        bail!(
+            "federation fee quote {quote_fee} is {pct}% of the amount, above the \
+             {FEE_SANITY_PERCENT}% sanity threshold; re-run with {cap_flag} <cap> or \
+             --accept-high-fee to proceed"
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct UsdtClientModule {
     cfg: UsdtClientConfig,
@@ -564,7 +633,26 @@ impl UsdtClientModule {
     /// the deposit-checker task) and waited for the federation to observe and
     /// credit the on-chain transfer; use [`Self::deposit_status`] to poll for
     /// that.
-    pub async fn claim(&self, claim_pk: secp256k1::PublicKey) -> anyhow::Result<ClaimResult> {
+    ///
+    /// `max_deposit_fee`/`accept_high_fee` are the security finding 07 fee
+    /// cap: `max_deposit_fee` is an explicit hard ceiling on the federation's
+    /// deposit fee quote (checked in [`Self::submit_claim`] via
+    /// [`check_fee_cap`]); if `None`, the default `FEE_SANITY_PERCENT` sanity
+    /// guard applies instead unless `accept_high_fee` is set. See
+    /// [`check_fee_cap`] for the exact semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` -- BEFORE any e-cash is minted -- if the federation's
+    /// deposit fee quote exceeds `max_deposit_fee`, or (when
+    /// `max_deposit_fee` is `None` and `accept_high_fee` is `false`) exceeds
+    /// the default sanity threshold.
+    pub async fn claim(
+        &self,
+        claim_pk: secp256k1::PublicKey,
+        max_deposit_fee: Option<UsdtAmount>,
+        accept_high_fee: bool,
+    ) -> anyhow::Result<ClaimResult> {
         let (account, claim_keypair) = self.load_claim_keypair(&claim_pk).await?;
         let status = self.module_api.deposit_status(claim_pk).await?;
 
@@ -578,7 +666,13 @@ impl UsdtClientModule {
         }
 
         let fee = self
-            .submit_claim(&claim_keypair, account, status.claimable)
+            .submit_claim(
+                &claim_keypair,
+                account,
+                status.claimable,
+                max_deposit_fee,
+                accept_high_fee,
+            )
             .await?;
 
         Ok(ClaimResult {
@@ -654,7 +748,14 @@ impl UsdtClientModule {
             backoff = (backoff * 2).min(CHECK_AND_CLAIM_MAX_BACKOFF);
         };
 
-        self.submit_claim(claim_keypair, account, claimable).await?;
+        // No caller-facing cap flags on this polling convenience method (it
+        // predates the CLI's `--max-deposit-fee`/`--accept-high-fee` and is
+        // only used by [`Self::claim`]'s callers indirectly via tests) --
+        // `accept_high_fee: true` preserves its prior unrestricted-quote
+        // behavior rather than silently starting to enforce the finding-07
+        // default sanity guard here.
+        self.submit_claim(claim_keypair, account, claimable, None, true)
+            .await?;
 
         Ok(())
     }
@@ -670,14 +771,29 @@ impl UsdtClientModule {
     /// `USDT_UNIT`) balances by minting e-cash notes; no explicit output is
     /// added here. The e-cash minted is the NET `amount - fee` (see
     /// [`Self::claim_input`]).
+    ///
+    /// Applies the security finding 07 [`check_fee_cap`] guard against the
+    /// freshly fetched quote BEFORE building the claim input or submitting
+    /// anything -- see `max_deposit_fee`/`accept_high_fee` on [`Self::claim`]
+    /// for the semantics.
     async fn submit_claim(
         &self,
         claim_keypair: &Keypair,
         account: EvmAddress,
         amount: UsdtAmount,
+        max_deposit_fee: Option<UsdtAmount>,
+        accept_high_fee: bool,
     ) -> anyhow::Result<UsdtAmount> {
         let quote = self.deposit_fee_quote().await?;
         let fee = quote.fee;
+
+        check_fee_cap(
+            fee,
+            amount,
+            max_deposit_fee,
+            accept_high_fee,
+            "--max-deposit-fee",
+        )?;
 
         let input = Self::claim_input(claim_keypair, account, amount, fee)?;
 
@@ -1020,7 +1136,7 @@ mod tests {
 
     use super::{
         Amount, Amounts, EvmAddress, FEE_QUOTE_UNAVAILABLE_MESSAGE, Keypair, SECP256K1, USDT_UNIT,
-        UsdtAmount, UsdtClientModule, UsdtInput, ensure_fee_quote_available,
+        UsdtAmount, UsdtClientModule, UsdtInput, check_fee_cap, ensure_fee_quote_available,
     };
 
     /// Deterministic test keypair (mirrors
@@ -1147,5 +1263,116 @@ mod tests {
             UsdtClientModule::claim_keypair_static(&other, 0),
             "a different seed must derive a different claim key"
         );
+    }
+
+    // --- security finding 07: `check_fee_cap` -----------------------------
+
+    /// An explicit cap is a hard ceiling: a quote above it must bail, citing
+    /// the caller's flag name, even though `accept_high_fee` is unset.
+    #[test]
+    fn withdraw_rejects_quote_over_explicit_cap() {
+        let err = check_fee_cap(
+            UsdtAmount(200),
+            UsdtAmount(1_000),
+            Some(UsdtAmount(100)),
+            false,
+            "--max-fee",
+        )
+        .expect_err("quote 200 exceeds explicit cap 100");
+        assert!(err.to_string().contains("--max-fee"));
+        assert!(err.to_string().contains("100"));
+        assert!(err.to_string().contains("200"));
+    }
+
+    /// Same as [`withdraw_rejects_quote_over_explicit_cap`] but for the
+    /// claim path's `--max-deposit-fee` flag -- the error message must name
+    /// the flag the caller actually has, not a hardcoded `--max-fee`.
+    #[test]
+    fn claim_rejects_fee_over_explicit_cap() {
+        let err = check_fee_cap(
+            UsdtAmount(200),
+            UsdtAmount(1_000),
+            Some(UsdtAmount(100)),
+            false,
+            "--max-deposit-fee",
+        )
+        .expect_err("fee 200 exceeds explicit cap 100");
+        assert!(err.to_string().contains("--max-deposit-fee"));
+    }
+
+    /// An explicit cap is a hard ceiling regardless of `accept_high_fee`:
+    /// the bypass flag only affects the *default* sanity guard, not a
+    /// caller-specified cap.
+    #[test]
+    fn explicit_cap_is_not_overridden_by_accept_high_fee() {
+        check_fee_cap(
+            UsdtAmount(200),
+            UsdtAmount(1_000),
+            Some(UsdtAmount(100)),
+            true,
+            "--max-fee",
+        )
+        .expect_err("an explicit cap must reject an over-cap quote even with accept_high_fee");
+    }
+
+    /// A quote within an explicit cap proceeds.
+    #[test]
+    fn explicit_cap_within_range_proceeds() {
+        check_fee_cap(
+            UsdtAmount(50),
+            UsdtAmount(1_000),
+            Some(UsdtAmount(100)),
+            false,
+            "--max-fee",
+        )
+        .expect("quote 50 is within the explicit cap 100");
+    }
+
+    /// With no explicit cap and no `accept_high_fee`, a quote above
+    /// `FEE_SANITY_PERCENT`% of the amount must bail.
+    #[test]
+    fn default_sanity_guard_blocks_abnormal_fee_without_accept_flag() {
+        // 300 / 1_000 == 30%, above the 25% default threshold.
+        let err = check_fee_cap(UsdtAmount(300), UsdtAmount(1_000), None, false, "--max-fee")
+            .expect_err("a 30% fee must be blocked by the default sanity guard");
+        assert!(err.to_string().contains("30%"));
+        assert!(err.to_string().contains("25%"));
+        assert!(err.to_string().contains("--accept-high-fee"));
+    }
+
+    /// `--accept-high-fee` bypasses the default sanity guard entirely (but
+    /// only in the absence of an explicit cap; see
+    /// [`explicit_cap_is_not_overridden_by_accept_high_fee`]).
+    #[test]
+    fn accept_high_fee_bypasses_default_guard() {
+        check_fee_cap(UsdtAmount(300), UsdtAmount(1_000), None, true, "--max-fee")
+            .expect("accept_high_fee must bypass the default sanity guard");
+    }
+
+    /// A quote at or below the default threshold proceeds even without
+    /// `accept_high_fee`.
+    #[test]
+    fn default_sanity_guard_allows_fee_within_threshold() {
+        // 100 / 1_000 == 10%, comfortably under 25%.
+        check_fee_cap(UsdtAmount(100), UsdtAmount(1_000), None, false, "--max-fee")
+            .expect("a 10% fee is within the default sanity threshold");
+    }
+
+    /// Boundary: a fee at exactly `FEE_SANITY_PERCENT`% is allowed (the
+    /// guard only blocks fees strictly *above* the threshold).
+    #[test]
+    fn default_sanity_guard_allows_fee_at_exact_threshold() {
+        // 250 / 1_000 == exactly 25%.
+        check_fee_cap(UsdtAmount(250), UsdtAmount(1_000), None, false, "--max-fee")
+            .expect("a fee at exactly the 25% threshold must not be blocked");
+    }
+
+    /// A zero-amount transfer has no ratio to compare against; any nonzero
+    /// fee must still be treated as abnormal by the default guard (rather
+    /// than e.g. dividing by zero or vacuously passing).
+    #[test]
+    fn default_sanity_guard_blocks_any_fee_on_zero_amount() {
+        check_fee_cap(UsdtAmount(1), UsdtAmount(0), None, false, "--max-fee")
+            .expect_err("any nonzero fee against a zero amount must be blocked");
     }
 }

@@ -187,7 +187,10 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     // `claim` returns both the gross claimed amount and the deposit fee
     // actually charged against it (Task 5 cleanup: threading the real charged
     // fee through `ClaimResult` rather than a separately re-fetched quote).
-    let result = usdt2.claim(recovered.claim_pk).await?;
+    // No fee cap under test here (security finding 07 client-side caps) --
+    // `accept_high_fee: true` preserves this test's prior unrestricted-quote
+    // behavior.
+    let result = usdt2.claim(recovered.claim_pk, None, true).await?;
     assert_eq!(result.claimed, deposit_amount);
     assert_eq!(result.fee, deposit_fee);
 
