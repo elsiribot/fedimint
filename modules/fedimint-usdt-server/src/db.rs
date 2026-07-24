@@ -75,12 +75,23 @@ pub enum DbKeyPrefix {
     /// from `AwaitingInfra` (never `Ready`) -- a pure count over the current
     /// votes cannot.
     HasEverBeenReady = 0x0F,
+    /// The maximum batch size a given queued withdrawal may next be included
+    /// in (security finding 05, poisoned-batch isolation). Absent means the
+    /// default [`crate::BATCH_MAX_ITEMS`]. Halved (floor 1) on each failed
+    /// batch that covered this withdrawal, forcing a poisoned batch to
+    /// binary-split down to a singleton, and removed once the withdrawal
+    /// reaches a terminal state (`Confirmed` or `Failed`). See
+    /// [`WithdrawalBatchCapKey`].
+    WithdrawalBatchCap = 0x10,
     /// Per-account record of the consensus-agreed EVM block at which the
     /// account's most recent SUCCESSFUL sweep confirmed (see
     /// [`LastSweepBlockKey`]). `Usdt::credit_deposit` compares each deposit
     /// observation's block against it to pick the credit rule that lets a
     /// NEW deposit to an already-swept address credit fully.
-    LastSweepBlock = 0x10,
+    ///
+    /// LOCAL fedi extension (not upstream): numbered 0x20 to stay clear of
+    /// upstream's growing prefix range (0x10..).
+    LastSweepBlock = 0x20,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -654,6 +665,49 @@ impl_db_record!(
 impl_db_lookup!(
     key = HasEverBeenReadyKey,
     query_prefix = HasEverBeenReadyPrefix
+);
+
+/// The maximum batch size the withdrawal at `OutPoint` may next be included
+/// in (security finding 05, poisoned-batch isolation task). Absent is
+/// equivalent to [`crate::BATCH_MAX_ITEMS`] (`Usdt`'s
+/// `withdrawal_batch_cap` helper applies that default).
+///
+/// # Lifecycle
+///
+/// - Written by `Usdt::apply_withdraw_confirmed`'s `!obs.success` branch, ONLY
+///   when the failed batch covered more than one withdrawal: every covered
+///   outpoint's cap is set to `max(1, n / 2)` (`n` = the failed batch's size),
+///   so the NEXT batch containing this withdrawal is at most half as large --
+///   see `Usdt::maybe_trigger_withdrawal_batch`'s `effective_cap` computation,
+///   which reads this record for every candidate in its sorted window.
+/// - Removed once the withdrawal reaches a terminal state: `Confirmed` (the
+///   success path) or `Failed` (a failed SINGLETON batch, i.e. `n == 1` -- the
+///   isolated poison). Housekeeping only; a stray leftover entry for an
+///   already-terminal withdrawal is harmless (never read again, since
+///   `maybe_trigger_withdrawal_batch` only ever considers `Queued`
+///   withdrawals), but removing it keeps the table from growing unbounded.
+///
+/// # Determinism
+///
+/// A brand-new prefix holding only new `u32` data -- no existing stored
+/// value's shape changed, so this needed no `DatabaseVersion` migration (see
+/// `Usdt::get_database_migrations`'s doc comment), only a
+/// `MODULE_CONSENSUS_VERSION` bump (a new consensus-serialized DB record) and
+/// `dump_database` coverage.
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct WithdrawalBatchCapKey(pub OutPoint);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct WithdrawalBatchCapPrefix;
+
+impl_db_record!(
+    key = WithdrawalBatchCapKey,
+    value = u32,
+    db_prefix = DbKeyPrefix::WithdrawalBatchCap,
+);
+impl_db_lookup!(
+    key = WithdrawalBatchCapKey,
+    query_prefix = WithdrawalBatchCapPrefix
 );
 
 /// The consensus-agreed EVM block (`value = u64`) at which this deposit
