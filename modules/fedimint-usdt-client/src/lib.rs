@@ -368,6 +368,68 @@ impl UsdtClientModule {
             })
     }
 
+    /// Returns the most recently allocated deposit address if it has never
+    /// received a deposit, otherwise allocates a fresh one -- so a caller
+    /// that repeatedly shows "the" deposit address (e.g. a wallet's receive
+    /// screen) reuses the same unused address instead of burning a new
+    /// derivation index on every view. The returned `bool` is
+    /// `newly_allocated`: `false` on the reuse path, `true` when this call
+    /// fell through to [`Self::allocate_deposit`].
+    ///
+    /// Reuse path: if [`NextDepositIndexKey`] is past `0`, the keypair for
+    /// the last-handed-out index is re-derived (deterministically, see
+    /// [`Self::claim_keypair_for_index`]) and the federation's
+    /// `deposit_status` is consulted; `credited == 0` means the address has
+    /// never been credited a deposit, so it is returned as-is (with its
+    /// [`ClaimKeyKey`] idempotently re-stored, mirroring
+    /// [`Self::recover_deposits`]' key-restoring discipline, so a client DB
+    /// that lost the key still ends up with it). A `deposit_status` failure
+    /// is propagated rather than silently falling through to a fresh
+    /// allocation (the caller is interactive and can retry; silently
+    /// allocating on every transient API error would defeat the reuse).
+    ///
+    /// The reuse path deliberately does NOT apply [`Self::allocate_deposit`]'s
+    /// `BootstrapState::Ready` readiness gate: only the ADVERTISEMENT of NEW
+    /// deposit addresses is gated (see that method's doc comment), and a
+    /// reused address already exists -- the federation watches it regardless.
+    ///
+    /// Otherwise (nothing allocated yet, or the last address was already
+    /// credited -- reusing a credited address would mislead depositors into
+    /// paying an address whose earlier deposit may already be claimed), this
+    /// falls through to [`Self::allocate_deposit`], gate included.
+    pub async fn current_or_allocate_deposit(&self) -> anyhow::Result<(Keypair, EvmAddress, bool)> {
+        let next_index = self
+            .db
+            .begin_transaction_nc()
+            .await
+            .get_value(&NextDepositIndexKey)
+            .await
+            .unwrap_or(0);
+
+        if next_index > 0 {
+            let claim_keypair = self.claim_keypair_for_index(next_index - 1);
+            let claim_pk = claim_keypair.public_key();
+            let account = self.deposit_address(&claim_pk);
+
+            let status = self.module_api.deposit_status(claim_pk).await?;
+            if status.credited.0 == 0 {
+                // Idempotently ensure the claim key is stored (it normally
+                // already is, from the `allocate_deposit` that handed this
+                // index out, but re-storing the deterministically re-derived
+                // key is harmless and heals a lost entry).
+                let mut dbtx = self.db.begin_transaction().await;
+                dbtx.insert_entry(&ClaimKeyKey(account), &claim_keypair)
+                    .await;
+                dbtx.commit_tx().await;
+
+                return Ok((claim_keypair, account, false));
+            }
+        }
+
+        let (claim_keypair, account) = self.allocate_deposit().await?;
+        Ok((claim_keypair, account, true))
+    }
+
     /// Rescans the federation from the seed alone to rediscover deposits whose
     /// client-DB state was lost, re-storing each rediscovered claim key so the
     /// existing [`Self::claim`]/[`Self::check_and_claim`] path can then be run
