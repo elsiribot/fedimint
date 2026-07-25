@@ -201,8 +201,18 @@ pub struct RecoverySummary {
     /// rediscovered account -- what a follow-up `claim` per account can still
     /// pull into e-cash.
     pub total_claimable: UsdtAmount,
-    /// One entry per rediscovered account.
+    /// One entry per rediscovered (already-credited) account.
     pub accounts: Vec<RecoveredAccount>,
+    /// Security finding 08: one entry per scanned index that reported
+    /// `credited == 0` while `check_uncredited` was set -- its claim key was
+    /// persisted and a federation-side [`UsdtClientModule::check_deposit`]
+    /// was enqueued, closing the "funded but never checked" recovery gap.
+    /// Distinct from `accounts` (which are already credited): entries here
+    /// may still become claimable once the federation observes and credits
+    /// the on-chain transfer -- re-run `recover` or poll `deposit-status` for
+    /// each `claim_pk` to follow up. Empty when `check_uncredited` was
+    /// `false`.
+    pub checked: Vec<CheckedAccount>,
 }
 
 /// Result of a single [`UsdtClientModule::claim`] call: the gross
@@ -232,6 +242,28 @@ pub struct RecoveredAccount {
     pub credited: UsdtAmount,
     /// USDT still claimable (`credited - claimed`) on this account.
     pub claimable: UsdtAmount,
+}
+
+/// A scanned-but-uncredited (`credited == 0` at scan time) deposit index
+/// whose claim key was persisted and a federation-side check enqueued during
+/// [`UsdtClientModule::recover_deposits`] (security finding 08). This is what
+/// makes a funded-but-never-checked deposit recoverable from seed alone: the
+/// account may become credited later, at which point a follow-up `recover`
+/// (or a direct `claim`, since the key is now in the local DB) picks it up.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckedAccount {
+    /// The seed-derivation index this account's claim key lives at.
+    pub index: u64,
+    /// The derived deposit account (EVM address) the federation watches.
+    pub account: EvmAddress,
+    /// The public key of the (re-derived, re-persisted) claim keypair.
+    pub claim_pk: secp256k1::PublicKey,
+    /// Whether the federation was ready to enqueue a `PendingCheck` for this
+    /// account (Task 2.3's readiness gate, security finding 13's r2 facet).
+    /// `false` means no guardian started watching yet -- the claim key is
+    /// still persisted, and re-running `check-deposit`/`recover` once the
+    /// federation reports `Ready` will enqueue it.
+    pub check_ready: bool,
 }
 
 /// Data needed by the state machine
@@ -527,13 +559,24 @@ impl UsdtClientModule {
     /// [`Self::claim_keypair_for_index`] and querying the federation's
     /// `deposit_status` for each. An index whose account has been credited
     /// (`credited > 0`) is treated as used -- its claim key is re-stored
-    /// ([`ClaimKeyKey`]) and recorded -- and resets the consecutive-miss
-    /// counter; an uncredited index increments it. The scan stops after
-    /// `gap_limit` consecutive misses.
+    /// ([`ClaimKeyKey`]) and recorded in [`RecoverySummary::accounts`] -- and
+    /// resets the consecutive-miss counter; an uncredited index increments
+    /// it. The scan stops after `gap_limit` consecutive misses.
+    ///
+    /// If `check_uncredited` is set (security finding 08), every scanned
+    /// index that reports `credited == 0` ALSO has its claim key persisted
+    /// and a federation-side [`Self::check_deposit`] enqueued, recorded in
+    /// [`RecoverySummary::checked`] -- see "Known limitation" below. The
+    /// consecutive-miss counter still advances for these indices (the scan
+    /// still terminates at `gap_limit`); only [`Self::recover_deposits`]
+    /// being run again (or an explicit `claim`) later picks up a deposit that
+    /// becomes credited afterward, since [`NextDepositIndexKey`] is NOT
+    /// advanced past a merely-checked (not yet credited) index -- see below.
     ///
     /// After scanning, [`NextDepositIndexKey`] is advanced to one past the
-    /// highest used index seen, so future [`Self::allocate_deposit`] calls do
-    /// not collide with recovered deposits (left untouched if none were found).
+    /// highest CREDITED index seen (not the highest checked one), so future
+    /// [`Self::allocate_deposit`] calls do not collide with recovered
+    /// deposits (left untouched if none were found).
     ///
     /// This does NOT auto-claim: recovery is deliberately read-mostly plus
     /// key-restoring, so the caller decides when to run [`Self::claim`] per
@@ -544,14 +587,52 @@ impl UsdtClientModule {
     ///
     /// # Known limitation
     ///
-    /// This rediscovers only deposits the federation has already CREDITED (a
-    /// [`Self::check_deposit`] -> observe -> credit must have happened for the
-    /// account); a funded-but-never-checked deposit at scan time reports
-    /// `credited == 0` and is skipped. Such funds are not lost -- re-running
-    /// `check-deposit` for the address and re-scanning finds them once the
-    /// federation credits the deposit.
-    pub async fn recover_deposits(&self, gap_limit: u64) -> anyhow::Result<RecoverySummary> {
+    /// With `check_uncredited` set, a funded-but-never-checked deposit is no
+    /// longer silently abandoned: its claim key is persisted and a check is
+    /// enqueued as soon as this scan reaches its index, so it is credited by
+    /// the federation on its own (asynchronous) schedule after that. The
+    /// residual limitation is purely that async delay -- this call itself
+    /// does not wait for crediting to complete, so a caller may need to
+    /// re-run `recover` (or poll `deposit-status` using the `claim_pk`
+    /// recorded in [`RecoverySummary::checked`]) once the federation has had
+    /// time to observe and credit the on-chain transfer. If
+    /// [`Self::check_deposit`]'s response reports `check_ready: false`
+    /// (Task 2.3's readiness gate: the federation was not yet
+    /// [`BootstrapState::Ready`]), no guardian enqueued a watch yet either --
+    /// the claim key is still persisted, so re-running `recover`/
+    /// `check-deposit` once the federation is ready enqueues it then.
+    pub async fn recover_deposits(
+        &self,
+        gap_limit: u64,
+        check_uncredited: bool,
+    ) -> anyhow::Result<RecoverySummary> {
+        Self::recover_deposits_scan(
+            &self.db,
+            &*self.module_api,
+            &self.module_root_secret,
+            gap_limit,
+            check_uncredited,
+        )
+        .await
+    }
+
+    /// The scan loop behind [`Self::recover_deposits`], factored out as a
+    /// free function generic over [`UsdtFederationApi`] (rather than an
+    /// inherent method reading `self.module_api`) so it is unit-testable
+    /// against a synthetic implementation without a live federation -- see
+    /// the `mod tests` `FakeRecoveryApi`.
+    async fn recover_deposits_scan<A>(
+        db: &Database,
+        api: &A,
+        module_root_secret: &DerivableSecret,
+        gap_limit: u64,
+        check_uncredited: bool,
+    ) -> anyhow::Result<RecoverySummary>
+    where
+        A: UsdtFederationApi + ?Sized,
+    {
         let mut accounts = Vec::new();
+        let mut checked = Vec::new();
         let mut total_credited = UsdtAmount(0);
         let mut total_claimable = UsdtAmount(0);
         let mut highest_used_index: Option<u64> = None;
@@ -559,12 +640,12 @@ impl UsdtClientModule {
 
         let mut index = 0u64;
         while consecutive_misses < gap_limit {
-            let claim_keypair = self.claim_keypair_for_index(index);
+            let claim_keypair = Self::claim_keypair_static(module_root_secret, index);
             let claim_pk = claim_keypair.public_key();
-            let status = self.module_api.deposit_status(claim_pk).await?;
+            let status = api.deposit_status(claim_pk).await?;
 
             if status.credited.0 > 0 {
-                let mut dbtx = self.db.begin_transaction().await;
+                let mut dbtx = db.begin_transaction().await;
                 dbtx.insert_entry(&ClaimKeyKey(status.account), &claim_keypair)
                     .await;
                 dbtx.commit_tx().await;
@@ -582,6 +663,33 @@ impl UsdtClientModule {
                 highest_used_index = Some(index);
                 consecutive_misses = 0;
             } else {
+                // Security finding 08: `deposit_status` alone cannot
+                // distinguish a truly unused index from one that was funded
+                // on-chain but never checked (or checked but not yet
+                // credited) -- both report `credited == 0` here. Rather than
+                // silently discarding the index, persist its claim key
+                // unconditionally (so `claim`/`check_and_claim` can use it
+                // the moment the deposit IS credited) and, if
+                // `check_uncredited`, also enqueue a federation-side check --
+                // this does NOT auto-claim (the caller still decides when to
+                // run `claim`), it only ensures the funds are not
+                // practically stranded. The miss counter still advances so
+                // the scan terminates at `gap_limit`.
+                if check_uncredited {
+                    let mut dbtx = db.begin_transaction().await;
+                    dbtx.insert_entry(&ClaimKeyKey(status.account), &claim_keypair)
+                        .await;
+                    dbtx.commit_tx().await;
+
+                    let check = api.check_deposit(claim_pk).await?;
+                    checked.push(CheckedAccount {
+                        index,
+                        account: status.account,
+                        claim_pk,
+                        check_ready: check.ready,
+                    });
+                }
+
                 consecutive_misses += 1;
             }
 
@@ -589,7 +697,7 @@ impl UsdtClientModule {
         }
 
         if let Some(highest) = highest_used_index {
-            let mut dbtx = self.db.begin_transaction().await;
+            let mut dbtx = db.begin_transaction().await;
             // Never LOWER the counter: on a partially-intact DB the existing
             // `NextDepositIndexKey` may already sit above `highest + 1` (e.g.
             // allocations that were never funded), and regressing it would
@@ -608,6 +716,7 @@ impl UsdtClientModule {
             total_credited,
             total_claimable,
             accounts,
+            checked,
         })
     }
 
@@ -1341,12 +1450,23 @@ impl ClientModuleInit for UsdtClientInit {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use fedimint_api_client::api::FederationResult;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::module::registry::ModuleDecoderRegistry;
     use fedimint_derive_secret::DerivableSecret;
 
     use super::{
-        Amount, Amounts, EvmAddress, FEE_QUOTE_UNAVAILABLE_MESSAGE, Keypair, SECP256K1, USDT_UNIT,
-        UsdtAmount, UsdtClientModule, UsdtInput, check_fee_cap, ensure_fee_quote_available,
+        Amount, Amounts, CheckDepositResponse, Database, DepositFeeQuoteResponse,
+        DepositStatusResponse, EvmAddress, FEE_QUOTE_UNAVAILABLE_MESSAGE,
+        IDatabaseTransactionOpsCoreTyped, Keypair, OutPoint, PeerId, PoolStateResponse,
+        RefundStatusResponse, SECP256K1, StatusResponse, USDT_UNIT, UsdtAmount, UsdtClientModule,
+        UsdtFederationApi, UsdtInput, UserOpStatusResponse, WithdrawFeeQuoteResponse,
+        WithdrawalStatusResponse, check_fee_cap, ensure_fee_quote_available, secp256k1,
     };
+    use crate::db::{ClaimKeyKey, NextDepositIndexKey};
 
     /// Deterministic test keypair (mirrors
     /// [`UsdtClientModule::claim_keypair_static`]'s derivation, but with an
@@ -1618,5 +1738,308 @@ mod tests {
     fn default_sanity_guard_blocks_any_fee_on_zero_amount() {
         check_fee_cap(UsdtAmount(1), UsdtAmount(0), None, false, "--max-fee")
             .expect_err("any nonzero fee against a zero amount must be blocked");
+    }
+
+    // --- security finding 08: `recover_deposits_scan` -----------------------
+
+    fn zero_status(account: EvmAddress) -> DepositStatusResponse {
+        DepositStatusResponse {
+            account,
+            credited: UsdtAmount(0),
+            claimed: UsdtAmount(0),
+            claimable: UsdtAmount(0),
+        }
+    }
+
+    fn mem_db() -> Database {
+        Database::new(MemDatabase::new(), ModuleDecoderRegistry::default())
+    }
+
+    /// A synthetic [`UsdtFederationApi`] for exercising
+    /// [`UsdtClientModule::recover_deposits_scan`] without a live federation.
+    /// Only `deposit_status`/`check_deposit` are exercised by the scan loop;
+    /// every other trait method panics if called -- a panic there would mean
+    /// the loop grew a dependency this fake needs updating for, not a bug in
+    /// the test itself.
+    struct FakeRecoveryApi {
+        /// `claim_pk -> deposit_status` response for indices configured by
+        /// the test. Any `claim_pk` not present here reports an all-zero
+        /// response at a synthetic account, mirroring a genuinely unused
+        /// index.
+        responses: BTreeMap<secp256k1::PublicKey, DepositStatusResponse>,
+        /// Whether `check_deposit` reports the federation ready to enqueue a
+        /// watch (Task 2.3's readiness gate, security finding 13's r2
+        /// facet).
+        ready: bool,
+        /// Every `claim_pk` `check_deposit` was called with, in call order.
+        check_calls: Mutex<Vec<secp256k1::PublicKey>>,
+    }
+
+    impl FakeRecoveryApi {
+        fn new(
+            responses: BTreeMap<secp256k1::PublicKey, DepositStatusResponse>,
+            ready: bool,
+        ) -> Self {
+            Self {
+                responses,
+                ready,
+                check_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn check_calls(&self) -> Vec<secp256k1::PublicKey> {
+            self.check_calls.lock().expect("not poisoned").clone()
+        }
+
+        fn status_for(&self, claim_pk: &secp256k1::PublicKey) -> DepositStatusResponse {
+            self.responses
+                .get(claim_pk)
+                .cloned()
+                .unwrap_or_else(|| zero_status(EvmAddress([0u8; 20])))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UsdtFederationApi for FakeRecoveryApi {
+        async fn group_public_key(&self) -> FederationResult<secp256k1::PublicKey> {
+            unimplemented!("recover_deposits_scan never calls group_public_key")
+        }
+
+        async fn check_deposit(
+            &self,
+            claim_pk: secp256k1::PublicKey,
+        ) -> FederationResult<CheckDepositResponse> {
+            self.check_calls
+                .lock()
+                .expect("not poisoned")
+                .push(claim_pk);
+            Ok(CheckDepositResponse {
+                account: self.status_for(&claim_pk).account,
+                ready: self.ready,
+            })
+        }
+
+        async fn deposit_status(
+            &self,
+            claim_pk: secp256k1::PublicKey,
+        ) -> FederationResult<DepositStatusResponse> {
+            Ok(self.status_for(&claim_pk))
+        }
+
+        async fn pool_state(&self, _peer: PeerId) -> FederationResult<PoolStateResponse> {
+            unimplemented!("recover_deposits_scan never calls pool_state")
+        }
+
+        async fn userop_status(
+            &self,
+            _peer: PeerId,
+            _op_hash: [u8; 32],
+        ) -> FederationResult<UserOpStatusResponse> {
+            unimplemented!("recover_deposits_scan never calls userop_status")
+        }
+
+        async fn withdraw_fee_quote(
+            &self,
+            _amount: UsdtAmount,
+        ) -> FederationResult<WithdrawFeeQuoteResponse> {
+            unimplemented!("recover_deposits_scan never calls withdraw_fee_quote")
+        }
+
+        async fn deposit_fee_quote(&self) -> FederationResult<DepositFeeQuoteResponse> {
+            unimplemented!("recover_deposits_scan never calls deposit_fee_quote")
+        }
+
+        async fn withdrawal_status(
+            &self,
+            _out_point: OutPoint,
+        ) -> FederationResult<WithdrawalStatusResponse> {
+            unimplemented!("recover_deposits_scan never calls withdrawal_status")
+        }
+
+        async fn refund_status(
+            &self,
+            _out_point: OutPoint,
+        ) -> FederationResult<RefundStatusResponse> {
+            unimplemented!("recover_deposits_scan never calls refund_status")
+        }
+
+        async fn status(&self) -> FederationResult<StatusResponse> {
+            unimplemented!("recover_deposits_scan never calls status")
+        }
+    }
+
+    /// The crux of security finding 08's fix: a funded-but-never-checked
+    /// deposit (`credited == 0` at scan time, indistinguishable via
+    /// `deposit_status` alone from a genuinely unused index) must, with
+    /// `check_uncredited: true`, have its claim key persisted AND a
+    /// federation-side `check_deposit` enqueued -- rather than being
+    /// silently discarded as a "miss".
+    #[tokio::test]
+    async fn recovery_persists_and_checks_uncredited_indices_when_enabled() {
+        let secret = DerivableSecret::new_root(b"usdt-recovery-uncredited-test-seed", b"salt");
+        let db = mem_db();
+
+        let claim_keypair0 = UsdtClientModule::claim_keypair_static(&secret, 0);
+        let claim_pk0 = claim_keypair0.public_key();
+        let account0 = EvmAddress([0x42; 20]);
+        let mut responses = BTreeMap::new();
+        responses.insert(claim_pk0, zero_status(account0));
+        let api = FakeRecoveryApi::new(responses, true);
+
+        let gap_limit = 3;
+        let summary = UsdtClientModule::recover_deposits_scan(&db, &api, &secret, gap_limit, true)
+            .await
+            .expect("recovery must not fail even though nothing is credited");
+
+        // Nothing was CREDITED, so the "recovered"/`accounts` side stays empty.
+        assert_eq!(summary.recovered, 0);
+        assert!(summary.accounts.is_empty());
+
+        // Every scanned index (0..gap_limit, all misses) was checked, index 0
+        // among them.
+        assert_eq!(
+            summary.checked.len(),
+            usize::try_from(gap_limit).expect("gap_limit fits in usize in this test")
+        );
+        let checked0 = summary
+            .checked
+            .iter()
+            .find(|c| c.index == 0)
+            .expect("index 0 must be in the checked list");
+        assert_eq!(checked0.account, account0);
+        assert_eq!(checked0.claim_pk, claim_pk0);
+        assert!(checked0.check_ready);
+
+        // `check_deposit` was actually issued for index 0's claim_pk (the
+        // federation-side enqueue that eventually credits the deposit).
+        assert!(
+            api.check_calls().contains(&claim_pk0),
+            "check_deposit must be issued for a funded-but-uncredited index"
+        );
+
+        // The claim key was persisted, so a later `claim`/`check_and_claim`
+        // can use it the moment the deposit becomes credited -- this is the
+        // crux of the fix: seed-only recovery no longer discards uncredited
+        // indices.
+        let mut dbtx = db.begin_transaction_nc().await;
+        let stored = dbtx
+            .get_value(&ClaimKeyKey(account0))
+            .await
+            .expect("claim key for the uncredited index must be persisted");
+        assert_eq!(stored.public_key(), claim_pk0);
+    }
+
+    /// Contrast with
+    /// [`recovery_persists_and_checks_uncredited_indices_when_enabled`]:
+    /// `check_uncredited: false` must restore the exact pre-fix behavior --
+    /// uncredited indices are neither checked nor persisted.
+    #[tokio::test]
+    async fn recovery_skips_uncredited_indices_when_check_uncredited_is_false() {
+        let secret = DerivableSecret::new_root(b"usdt-recovery-opt-out-test-seed", b"salt");
+        let db = mem_db();
+
+        let claim_keypair0 = UsdtClientModule::claim_keypair_static(&secret, 0);
+        let claim_pk0 = claim_keypair0.public_key();
+        let account0 = EvmAddress([0x43; 20]);
+        let mut responses = BTreeMap::new();
+        responses.insert(claim_pk0, zero_status(account0));
+        let api = FakeRecoveryApi::new(responses, true);
+
+        let gap_limit = 3;
+        let summary = UsdtClientModule::recover_deposits_scan(&db, &api, &secret, gap_limit, false)
+            .await
+            .expect("recovery must not fail");
+
+        assert!(summary.checked.is_empty());
+        assert!(api.check_calls().is_empty());
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert!(
+            dbtx.get_value(&ClaimKeyKey(account0)).await.is_none(),
+            "with check_uncredited=false, an uncredited index's claim key must NOT be persisted"
+        );
+    }
+
+    /// Handles the Task 2.3 readiness gate gracefully: `check_deposit`
+    /// reporting `ready: false` (no guardian enqueued a watch yet) must not
+    /// fail recovery, and the claim key must still be persisted so a later
+    /// retry (once the federation is ready) can enqueue the check.
+    #[tokio::test]
+    async fn recovery_persists_key_even_when_federation_not_ready() {
+        let secret = DerivableSecret::new_root(b"usdt-recovery-not-ready-test-seed", b"salt");
+        let db = mem_db();
+
+        let claim_keypair0 = UsdtClientModule::claim_keypair_static(&secret, 0);
+        let claim_pk0 = claim_keypair0.public_key();
+        let account0 = EvmAddress([0x44; 20]);
+        let mut responses = BTreeMap::new();
+        responses.insert(claim_pk0, zero_status(account0));
+        let api = FakeRecoveryApi::new(responses, false);
+
+        let summary = UsdtClientModule::recover_deposits_scan(&db, &api, &secret, 2, true)
+            .await
+            .expect("a not-ready federation must not fail recovery");
+
+        let checked0 = summary
+            .checked
+            .iter()
+            .find(|c| c.index == 0)
+            .expect("index 0 must still be recorded as checked (attempted)");
+        assert!(
+            !checked0.check_ready,
+            "not-ready must be reflected, not swallowed"
+        );
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert!(
+            dbtx.get_value(&ClaimKeyKey(account0)).await.is_some(),
+            "the claim key must be persisted regardless of federation readiness"
+        );
+    }
+
+    /// `NextDepositIndexKey` must advance only past the highest CREDITED
+    /// index, never past a merely-checked-but-uncredited one -- otherwise a
+    /// later `allocate_deposit` would skip past indices whose deposits might
+    /// still be pending credit.
+    #[tokio::test]
+    async fn recovery_advances_next_deposit_index_only_past_credited_indices() {
+        let secret = DerivableSecret::new_root(b"usdt-recovery-index-advance-test-seed", b"salt");
+        let db = mem_db();
+
+        let claim_keypair0 = UsdtClientModule::claim_keypair_static(&secret, 0);
+        let account0 = EvmAddress([0x45; 20]);
+        let mut responses = BTreeMap::new();
+        responses.insert(
+            claim_keypair0.public_key(),
+            DepositStatusResponse {
+                account: account0,
+                credited: UsdtAmount(1_000_000),
+                claimed: UsdtAmount(0),
+                claimable: UsdtAmount(1_000_000),
+            },
+        );
+        let api = FakeRecoveryApi::new(responses, true);
+
+        let gap_limit = 3;
+        let summary = UsdtClientModule::recover_deposits_scan(&db, &api, &secret, gap_limit, true)
+            .await
+            .expect("recovery must not fail");
+
+        assert_eq!(summary.recovered, 1);
+        // Indices 1..=3 are misses (checked but uncredited).
+        assert_eq!(
+            summary.checked.len(),
+            usize::try_from(gap_limit).expect("gap_limit fits in usize in this test")
+        );
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let next_index = dbtx
+            .get_value(&NextDepositIndexKey)
+            .await
+            .expect("NextDepositIndexKey must be set after a credited recovery");
+        assert_eq!(
+            next_index, 1,
+            "NextDepositIndexKey must advance only past the highest CREDITED index"
+        );
     }
 }

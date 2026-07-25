@@ -97,10 +97,84 @@ enum Opts {
     /// `claim` can then be run per account) and printing a summary. Scans
     /// seed-derivation indices from 0, stopping after `gap_limit` consecutive
     /// unused indices.
+    ///
+    /// By default (security finding 08), every scanned index reporting
+    /// `credited == 0` -- a deposit that was funded on-chain but never
+    /// `check-deposit`'d, or checked but not yet credited -- ALSO has its
+    /// claim key persisted and a federation check enqueued, so it is no
+    /// longer practically stranded; see the `checked` field of the printed
+    /// summary. Pass `--check-uncredited=false` to restore the old
+    /// credited-only behavior.
     Recover {
         #[arg(long, default_value = "20")]
         gap_limit: u64,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        check_uncredited: bool,
     },
+    /// Derive `claim_pk`/`account` for seed-derivation `index` WITHOUT
+    /// persisting anything or advancing the next-deposit-index counter
+    /// (security finding 08). Lets a seed-only user (after client-DB loss)
+    /// recompute the `claim_pk` needed for a manual
+    /// `check-deposit`/`deposit-status`/`claim`, e.g. for an index a
+    /// `recover` scan reported under `checked`.
+    DeriveDeposit {
+        #[arg(long)]
+        index: u64,
+    },
+}
+
+/// Handles `Opts::Withdraw`, factored out of [`handle_cli_command`] purely to
+/// keep that function under clippy's `too_many_lines` pedantic limit -- no
+/// behavior change from when this was inlined.
+async fn handle_withdraw(
+    usdt: &UsdtClientModule,
+    recipient: EvmAddress,
+    amount: u64,
+    max_fee: Option<u64>,
+    accept_high_fee: bool,
+) -> anyhow::Result<Value> {
+    let amount = UsdtAmount(amount);
+    let quote = usdt.withdraw_fee_quote(amount).await?;
+    // Security finding 07: the fee-cap guard runs BEFORE `usdt.withdraw`
+    // ever burns e-cash -- a rejection here never reaches the library's
+    // transaction submission.
+    check_fee_cap(
+        quote.max_fee,
+        amount,
+        max_fee.map(UsdtAmount),
+        accept_high_fee,
+        "--max-fee",
+    )?;
+    let total_debit = UsdtAmount(amount.0.saturating_add(quote.max_fee.0));
+    let range = usdt.withdraw(recipient, amount, quote.max_fee).await?;
+    let out_point = UsdtClientModule::withdrawal_out_point(&range);
+    Ok(json(serde_json::json!({
+        "out_point": out_point.to_string(),
+        "recipient": recipient.to_string(),
+        "amount": amount.0,
+        "max_fee": quote.max_fee.0,
+        "total_debit": total_debit.0,
+    })))
+}
+
+/// Handles `Opts::WithdrawalStatus`, factored out of [`handle_cli_command`]
+/// for the same reason as [`handle_withdraw`].
+async fn handle_withdrawal_status(
+    usdt: &UsdtClientModule,
+    out_point: OutPoint,
+) -> anyhow::Result<Value> {
+    let status = usdt.withdrawal_status(out_point).await?;
+    // Security finding 09: on a terminal failure, also surface the
+    // reissued-e-cash refund (amount + reason) the withdrawal's refund
+    // state machine will claim (or has claimed) back to this client.
+    let refund = usdt.refund_status(out_point).await?.refund;
+    Ok(json(serde_json::json!({
+        "status": status.status,
+        "refund": refund.map(|info| serde_json::json!({
+            "amount": info.amount.0,
+            "reason": info.reason,
+        })),
+    })))
 }
 
 pub(crate) async fn handle_cli_command(
@@ -161,44 +235,9 @@ pub(crate) async fn handle_cli_command(
             amount,
             max_fee,
             accept_high_fee,
-        } => {
-            let amount = UsdtAmount(amount);
-            let quote = usdt.withdraw_fee_quote(amount).await?;
-            // Security finding 07: the fee-cap guard runs BEFORE
-            // `usdt.withdraw` ever burns e-cash -- a rejection here never
-            // reaches the library's transaction submission.
-            check_fee_cap(
-                quote.max_fee,
-                amount,
-                max_fee.map(UsdtAmount),
-                accept_high_fee,
-                "--max-fee",
-            )?;
-            let total_debit = UsdtAmount(amount.0.saturating_add(quote.max_fee.0));
-            let range = usdt.withdraw(recipient, amount, quote.max_fee).await?;
-            let out_point = UsdtClientModule::withdrawal_out_point(&range);
-            json(serde_json::json!({
-                "out_point": out_point.to_string(),
-                "recipient": recipient.to_string(),
-                "amount": amount.0,
-                "max_fee": quote.max_fee.0,
-                "total_debit": total_debit.0,
-            }))
-        }
+        } => handle_withdraw(usdt, recipient, amount, max_fee, accept_high_fee).await?,
         Opts::WithdrawalStatus { txid, out_idx } => {
-            let out_point = OutPoint { txid, out_idx };
-            let status = usdt.withdrawal_status(out_point).await?;
-            // Security finding 09: on a terminal failure, also surface the
-            // reissued-e-cash refund (amount + reason) the withdrawal's refund
-            // state machine will claim (or has claimed) back to this client.
-            let refund = usdt.refund_status(out_point).await?.refund;
-            json(serde_json::json!({
-                "status": status.status,
-                "refund": refund.map(|info| serde_json::json!({
-                    "amount": info.amount.0,
-                    "reason": info.reason,
-                })),
-            }))
+            handle_withdrawal_status(usdt, OutPoint { txid, out_idx }).await?
         }
         Opts::PoolState => {
             // Any guardian answers identically (config-derived account +
@@ -218,7 +257,19 @@ pub(crate) async fn handle_cli_command(
             }))
         }
         Opts::Status => json(usdt.status().await?),
-        Opts::Recover { gap_limit } => json(usdt.recover_deposits(gap_limit).await?),
+        Opts::Recover {
+            gap_limit,
+            check_uncredited,
+        } => json(usdt.recover_deposits(gap_limit, check_uncredited).await?),
+        Opts::DeriveDeposit { index } => {
+            let claim_keypair = usdt.claim_keypair_for_index(index);
+            let account = usdt.deposit_address(&claim_keypair.public_key());
+            json(serde_json::json!({
+                "index": index,
+                "claim_pk": claim_keypair.public_key(),
+                "account": account.to_string(),
+            }))
+        }
     };
 
     Ok(value)
@@ -401,9 +452,15 @@ mod tests {
 
     #[test]
     fn parses_recover_default_gap_limit() {
+        // Security finding 08: `check_uncredited` defaults to `true` -- a
+        // bare `recover` must check+persist uncredited indices by default,
+        // not require an explicit opt-in flag.
         assert!(matches!(
             Opts::try_parse_from(["usdt", "recover"]).expect("parses"),
-            Opts::Recover { gap_limit: 20 }
+            Opts::Recover {
+                gap_limit: 20,
+                check_uncredited: true,
+            }
         ));
     }
 
@@ -411,7 +468,34 @@ mod tests {
     fn parses_recover_explicit_gap_limit() {
         assert!(matches!(
             Opts::try_parse_from(["usdt", "recover", "--gap-limit", "5"]).expect("parses"),
-            Opts::Recover { gap_limit: 5 }
+            Opts::Recover {
+                gap_limit: 5,
+                check_uncredited: true,
+            }
+        ));
+    }
+
+    /// `--check-uncredited=false` must restore the pre-finding-08 behavior:
+    /// scanned-but-uncredited indices are neither persisted nor checked.
+    #[test]
+    fn parses_recover_check_uncredited_false() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "recover", "--check-uncredited", "false"])
+                .expect("parses"),
+            Opts::Recover {
+                gap_limit: 20,
+                check_uncredited: false,
+            }
+        ));
+    }
+
+    /// `derive-deposit --index N` must parse without requiring a live
+    /// federation -- pure clap parsing, mirroring `help_renders` below.
+    #[test]
+    fn parses_derive_deposit() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "derive-deposit", "--index", "7"]).expect("parses"),
+            Opts::DeriveDeposit { index: 7 }
         ));
     }
 
