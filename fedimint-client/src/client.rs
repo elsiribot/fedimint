@@ -929,6 +929,45 @@ impl Client {
         })
     }
 
+    /// Returns a reference to a typed module client instance for a specific
+    /// `instance` id.
+    ///
+    /// Unlike [`Self::get_first_module`], which picks an arbitrary instance
+    /// of the given module kind, this looks up the exact instance
+    /// requested. Useful when a federation runs multiple instances of the
+    /// same module kind (e.g. two `mintv2` instances for different amount
+    /// units) and the caller needs a specific one.
+    pub fn get_module_by_instance<M: ClientModule>(
+        &'_ self,
+        instance: ModuleInstanceId,
+    ) -> anyhow::Result<ClientModuleInstance<'_, M>> {
+        let module_kind = M::kind();
+        let actual_kind = self
+            .modules
+            .iter_modules()
+            .find(|(id, _, _)| *id == instance)
+            .map(|(_, kind, _)| kind.clone())
+            .ok_or_else(|| format_err!("Unknown module instance {instance}"))?;
+        if actual_kind != module_kind {
+            bail!(
+                "Module kind mismatch for instance {instance}: expected {module_kind}, found {actual_kind}"
+            );
+        }
+        let module: &M = self
+            .try_get_module(instance)
+            .ok_or_else(|| format_err!("Unknown module instance {instance}"))?
+            .as_any()
+            .downcast_ref::<M>()
+            .ok_or_else(|| format_err!("Module is not of type {}", std::any::type_name::<M>()))?;
+        let (db, _) = self.db().with_prefix_module_id(instance);
+        Ok(ClientModuleInstance {
+            id: instance,
+            db,
+            api: self.api().with_module(instance),
+            module,
+        })
+    }
+
     pub fn get_module_client_dyn(
         &self,
         instance_id: ModuleInstanceId,
