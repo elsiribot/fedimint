@@ -6,12 +6,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "cli")]
 use std::ffi;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use api::UsdtFederationApi;
 use db::{
     ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix, NextDepositIndexKey, NextDepositIndexPrefixAll,
+    NextRefundIndexKey, NextRefundIndexPrefixAll, RefundKeyKey, RefundKeyPrefixAll,
 };
 use fedimint_api_client::api::DynModuleApi;
 use fedimint_client_module::db::ClientModuleMigrationFn;
@@ -20,7 +22,8 @@ use fedimint_client_module::module::recovery::NoModuleBackup;
 use fedimint_client_module::module::{ClientContext, ClientModule, IClientModule};
 use fedimint_client_module::sm::Context;
 use fedimint_client_module::transaction::{
-    ClientInput, ClientInputBundle, ClientOutput, ClientOutputBundle, TransactionBuilder,
+    ClientInput, ClientInputBundle, ClientOutput, ClientOutputBundle, ClientOutputSM,
+    TransactionBuilder,
 };
 use fedimint_core::core::{Decoder, ModuleKind, OperationId};
 use fedimint_core::db::{
@@ -40,13 +43,14 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
     BootstrapState, CheckDepositResponse, DepositFeeQuoteResponse, DepositStatusResponse,
-    EvmAddress, KIND, PoolStateResponse, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
-    UsdtInput, UsdtInputV0, UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse,
-    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse, usdt_amount,
+    EvmAddress, KIND, PoolStateResponse, RefundStatusResponse, StatusResponse, USDT_UNIT,
+    UsdtAmount, UsdtCommonInit, UsdtInput, UsdtInputV0, UsdtModuleTypes, UsdtOutput, UsdtOutputV0,
+    UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse,
+    usdt_amount,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use states::UsdtStateMachine;
+use states::{UsdtStateMachine, WithdrawalRefundCommon, WithdrawalRefundState};
 use strum::IntoEnumIterator;
 
 pub mod api;
@@ -71,6 +75,14 @@ const AWAIT_WITHDRAWAL_CONFIRMED_MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// claim keys from any future key type derived from the same module root
 /// secret.
 const DEPOSIT_CLAIM_KEY_CHILD: ChildId = ChildId(0);
+
+/// Namespaces withdrawal refund keys under the module root secret (security
+/// finding 09): every refund key is derived as `module_root_secret.child_key(
+/// REFUND_KEY_CHILD).child_key(ChildId(index))` (see
+/// [`UsdtClientModule::refund_keypair_for_index`]). A distinct child from
+/// [`DEPOSIT_CLAIM_KEY_CHILD`] so refund keys can never collide with deposit
+/// claim keys derived from the same seed.
+const REFUND_KEY_CHILD: ChildId = ChildId(1);
 
 /// Shared by [`UsdtClientModule::deposit_fee_quote`]/
 /// [`UsdtClientModule::withdraw_fee_quote`] (misc #4, finding 06's
@@ -226,6 +238,9 @@ pub struct RecoveredAccount {
 #[derive(Debug, Clone)]
 pub struct UsdtClientContext {
     pub usdt_decoder: Decoder,
+    /// The federation module API, so the withdrawal refund state machine can
+    /// poll `withdrawal_status`/`refund_status` (security finding 09).
+    pub module_api: DynModuleApi,
 }
 
 // TODO: Boiler-plate
@@ -272,6 +287,7 @@ impl ClientModule for UsdtClientModule {
     fn context(&self) -> Self::ModuleStateMachineContext {
         UsdtClientContext {
             usdt_decoder: self.decoder(),
+            module_api: self.module_api.clone(),
         }
     }
 
@@ -385,6 +401,56 @@ impl UsdtClientModule {
     #[must_use]
     fn claim_keypair_for_index(&self, index: u64) -> Keypair {
         Self::claim_keypair_static(&self.module_root_secret, index)
+    }
+
+    /// The deterministic withdrawal-refund keypair for seed-derivation `index`,
+    /// derived purely from `module_root_secret` under [`REFUND_KEY_CHILD`]
+    /// (security finding 09). Mirrors [`Self::claim_keypair_static`]: the same
+    /// seed and `index` always yield the same keypair, and distinct indices
+    /// yield distinct keypairs, so a refund key is (in principle)
+    /// seed-recoverable.
+    #[must_use]
+    fn refund_keypair_static(module_root_secret: &DerivableSecret, index: u64) -> Keypair {
+        module_root_secret
+            .child_key(REFUND_KEY_CHILD)
+            .child_key(ChildId(index))
+            .to_secp_key(SECP256K1)
+    }
+
+    /// The deterministic withdrawal-refund keypair for seed-derivation `index`
+    /// under this module's root secret (see [`Self::refund_keypair_static`]).
+    #[must_use]
+    fn refund_keypair_for_index(&self, index: u64) -> Keypair {
+        Self::refund_keypair_static(&self.module_root_secret, index)
+    }
+
+    /// Atomically reads and increments the [`NextRefundIndexKey`] counter,
+    /// returning the index to derive a fresh withdrawal refund keypair at
+    /// (security finding 09). Mirrors [`Self::allocate_deposit`]'s
+    /// counter-bump pattern.
+    async fn allocate_refund_index(&self) -> anyhow::Result<u64> {
+        self.db
+            .autocommit(
+                |dbtx, _| {
+                    Box::pin(async {
+                        let index = dbtx
+                            .get_value(&NextRefundIndexKey)
+                            .await
+                            .unwrap_or_default();
+                        dbtx.insert_entry(&NextRefundIndexKey, &index.saturating_add(1))
+                            .await;
+                        Ok::<_, anyhow::Error>(index)
+                    })
+                },
+                None,
+            )
+            .await
+            .map_err(|e| match e {
+                AutocommitError::ClosureError { error, .. } => error,
+                AutocommitError::CommitFailed { last_error, .. } => {
+                    anyhow::anyhow!("Commit to DB failed: {last_error}")
+                }
+            })
     }
 
     /// Derives the next seed-indexed claim keypair, persists it keyed by its
@@ -1083,17 +1149,55 @@ impl UsdtClientModule {
         amount: UsdtAmount,
         max_fee: UsdtAmount,
     ) -> anyhow::Result<OutPointRange> {
-        let output = ClientOutputBundle::new_no_sm(vec![ClientOutput {
-            output: UsdtOutput::V0(UsdtOutputV0 {
-                recipient,
-                amount,
-                max_fee,
-            }),
-            amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(amount)),
-        }]);
-        let output = self.client_ctx.make_client_outputs(output);
+        // Derive a fresh, seed-deterministic refund keypair (security finding
+        // 09) and commit its PUBLIC key in the withdrawal output. If the
+        // withdrawal ever fails terminally, the server reissues its e-cash as
+        // a refund claimable ONLY by this key -- so only this client can
+        // recover it. The SECRET stays local (embedded in the attached state
+        // machine and persisted under `RefundKeyKey` below).
+        let refund_index = self.allocate_refund_index().await?;
+        let refund_keypair = self.refund_keypair_for_index(refund_index);
+        let refund_pubkey = refund_keypair.public_key();
 
         let operation_id = OperationId::new_random();
+
+        // A state machine, generated once the output's `OutPoint` is known,
+        // that watches this withdrawal and claims the reissued e-cash refund
+        // if it fails (see `UsdtStateMachine`).
+        let sm_gen = {
+            move |out_point_range: OutPointRange| {
+                let out_point = OutPoint {
+                    txid: out_point_range.txid(),
+                    out_idx: 0,
+                };
+                vec![UsdtStateMachine {
+                    common: WithdrawalRefundCommon {
+                        operation_id,
+                        txid: out_point_range.txid(),
+                        out_point,
+                        refund_keypair,
+                    },
+                    state: WithdrawalRefundState::Pending,
+                }]
+            }
+        };
+
+        let output = ClientOutputBundle::new(
+            vec![ClientOutput {
+                output: UsdtOutput::V0(UsdtOutputV0 {
+                    recipient,
+                    amount,
+                    max_fee,
+                    refund_pubkey,
+                }),
+                amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(amount)),
+            }],
+            vec![ClientOutputSM {
+                state_machines: Arc::new(sm_gen),
+            }],
+        );
+        let output = self.client_ctx.make_client_outputs(output);
+
         let tx = TransactionBuilder::new().with_outputs(output);
 
         let range = self
@@ -1111,6 +1215,16 @@ impl UsdtClientModule {
             )
             .await?;
 
+        // Persist the refund keypair keyed by the withdrawal's `OutPoint` so a
+        // restarted client (or the CLI) can look it up (security finding 09).
+        // The withdrawal output is always at `out_idx` 0 (see
+        // `withdrawal_out_point`).
+        let out_point = Self::withdrawal_out_point(&range);
+        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.insert_entry(&RefundKeyKey(out_point), &refund_keypair)
+            .await;
+        dbtx.commit_tx().await;
+
         // Await consensus acceptance of the withdrawal tx: this both
         // guarantees `process_output` has run (so the server-side
         // `WithdrawalState` exists) and turns a consensus-level rejection
@@ -1125,6 +1239,81 @@ impl UsdtClientModule {
 
         Ok(range)
     }
+
+    /// Reports the live refund record for a terminally-failed withdrawal
+    /// (security finding 09): `Some((amount, reason))` for the reissued e-cash
+    /// the refund state machine will claim (or has claimed), or `None` if the
+    /// withdrawal never failed or its refund was already claimed and settled.
+    /// Thin wrapper around [`UsdtFederationApi::refund_status`].
+    pub async fn refund_status(&self, out_point: OutPoint) -> anyhow::Result<RefundStatusResponse> {
+        Ok(self.module_api.refund_status(out_point).await?)
+    }
+
+    /// Polls the withdrawal at `out_point` until it reaches a terminal outcome
+    /// (paid on-chain, or terminally failed and refunded) or `deadline`
+    /// elapses (security finding 09), reporting the three cases distinctly.
+    /// Complements [`Self::await_withdrawal_confirmed`], which only ever
+    /// treats a failure as an error; here a failure resolves to
+    /// [`WithdrawalOutcome::Refunded`] with the reissued amount and reason.
+    /// The refund claim itself is driven by the attached state machine, so a
+    /// caller only needs to poll their `USDT_UNIT` balance for the reissued
+    /// e-cash to arrive after this returns `Refunded`.
+    pub async fn await_withdrawal_outcome(
+        &self,
+        out_point: OutPoint,
+        deadline: Duration,
+    ) -> anyhow::Result<WithdrawalOutcome> {
+        let deadline_at = Instant::now() + deadline;
+        let mut backoff = Duration::from_millis(250);
+
+        loop {
+            match self.module_api.withdrawal_status(out_point).await?.status {
+                WithdrawalStatus::Confirmed { block } => {
+                    return Ok(WithdrawalOutcome::Paid { block });
+                }
+                WithdrawalStatus::Failed { reason } => {
+                    // Report the refunded amount if the refund record is still
+                    // live; if it was already claimed, report `None` amount.
+                    let amount = self
+                        .module_api
+                        .refund_status(out_point)
+                        .await?
+                        .refund
+                        .map(|info| info.amount);
+                    return Ok(WithdrawalOutcome::Refunded { amount, reason });
+                }
+                WithdrawalStatus::Unknown
+                | WithdrawalStatus::Queued
+                | WithdrawalStatus::Signing { .. }
+                | WithdrawalStatus::Submitted { .. } => {}
+            }
+
+            if Instant::now() >= deadline_at {
+                bail!(
+                    "withdrawal {out_point} did not reach a terminal outcome before the deadline"
+                );
+            }
+
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(AWAIT_WITHDRAWAL_CONFIRMED_MAX_BACKOFF);
+        }
+    }
+}
+
+/// The terminal outcome of a withdrawal as reported by
+/// [`UsdtClientModule::await_withdrawal_outcome`] (security finding 09).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum WithdrawalOutcome {
+    /// The withdrawal was paid out on-chain at `block`.
+    Paid { block: u64 },
+    /// The withdrawal failed terminally and its e-cash was reissued as a
+    /// refund. `amount` is the reissued e-cash (present while the refund is
+    /// unclaimed; `None` if it was already claimed) and `reason` is the
+    /// failure reason.
+    Refunded {
+        amount: Option<UsdtAmount>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1164,6 +1353,26 @@ impl ModuleInit for UsdtClientInit {
                         u64,
                         items,
                         "Usdt Next Deposit Index"
+                    );
+                }
+                DbKeyPrefix::RefundKey => {
+                    push_db_pair_items!(
+                        dbtx,
+                        RefundKeyPrefixAll,
+                        RefundKeyKey,
+                        Keypair,
+                        items,
+                        "Usdt Refund Keys"
+                    );
+                }
+                DbKeyPrefix::NextRefundIndex => {
+                    push_db_pair_items!(
+                        dbtx,
+                        NextRefundIndexPrefixAll,
+                        NextRefundIndexKey,
+                        u64,
+                        items,
+                        "Usdt Next Refund Index"
                     );
                 }
             }
@@ -1237,7 +1446,9 @@ mod tests {
                 assert_eq!(v0.amount, amount);
                 assert_eq!(v0.fee, fee);
             }
-            UsdtInput::Default { .. } => panic!("claim_input must build a V0 input"),
+            UsdtInput::RefundV0 { .. } | UsdtInput::Default { .. } => {
+                panic!("claim_input must build a V0 input")
+            }
         }
         assert_eq!(input.keys, vec![keypair]);
         assert_eq!(
@@ -1331,6 +1542,39 @@ mod tests {
             UsdtClientModule::claim_keypair_static(&other, 0),
             "a different seed must derive a different claim key"
         );
+    }
+
+    /// Security finding 09: the withdrawal-refund key derivation must be
+    /// deterministic from the seed (so a refund key is recoverable) AND must
+    /// never collide with the deposit claim key at the same index (they live
+    /// under distinct child domains).
+    #[test]
+    fn refund_keypair_is_deterministic_and_disjoint_from_claim_keys() {
+        let secret = DerivableSecret::new_root(b"usdt-refund-test-seed", b"salt");
+
+        // Same secret + index => identical refund key; distinct indices differ.
+        for index in [0u64, 1, 7, u64::MAX] {
+            assert_eq!(
+                UsdtClientModule::refund_keypair_static(&secret, index),
+                UsdtClientModule::refund_keypair_static(&secret, index),
+                "refund key for index {index} must be reproducible from the seed"
+            );
+        }
+        assert_ne!(
+            UsdtClientModule::refund_keypair_static(&secret, 0),
+            UsdtClientModule::refund_keypair_static(&secret, 1),
+        );
+
+        // A refund key must NEVER equal the deposit claim key at the same
+        // index (distinct child domains) -- otherwise a refund could be
+        // spent/observed via the deposit-claim path.
+        for index in [0u64, 1, 2, 7, 100] {
+            assert_ne!(
+                UsdtClientModule::refund_keypair_static(&secret, index).public_key(),
+                UsdtClientModule::claim_keypair_static(&secret, index).public_key(),
+                "refund and claim keys must be disjoint at index {index}"
+            );
+        }
     }
 
     // --- security finding 07: `check_fee_cap` -----------------------------

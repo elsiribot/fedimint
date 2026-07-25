@@ -44,6 +44,15 @@ pub const DEPOSIT_FEE_QUOTE_ENDPOINT: &str = "deposit_fee_quote";
 /// mirroring [`DEPOSIT_STATUS_ENDPOINT`]/[`WITHDRAW_FEE_QUOTE_ENDPOINT`]).
 pub const WITHDRAWAL_STATUS_ENDPOINT: &str = "withdrawal_status";
 
+/// Reports the live refund record of a terminally-failed withdrawal
+/// (security finding 09): `(amount, reason)` for the reissued e-cash a
+/// `UsdtInput::RefundV0` can claim, or `None` if none exists (never failed,
+/// or already claimed), identified by the `OutPoint` of the `UsdtOutput::V0`
+/// that enqueued it. Read from consensus DB, so any guardian answers
+/// identically (threshold-agreement via `request_current_consensus`,
+/// mirroring [`WITHDRAWAL_STATUS_ENDPOINT`]).
+pub const REFUND_STATUS_ENDPOINT: &str = "refund_status";
+
 /// Reports the module's consensus-agreed readiness state (Part C):
 /// `AwaitingInfra`/`Ready`/`Degraded`, plus the per-condition tally it was
 /// derived from. Read from the threshold-aggregated `BootstrapObservation`
