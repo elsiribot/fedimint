@@ -342,8 +342,11 @@ async fn dump_usdt_module_db(
 /// **Phase 7 Task 5 gating acceptance test.** Drives the automatic,
 /// deterministic deposit -> sweep pipeline end to end over a hermetic
 /// 4-guardian federation (a shared [`MockEvmRpc`] stands in for the EVM
-/// chain, and guardian 3 never signs -- `signer_subset(0)` is the fixed
-/// lowest-`t` subset `{0,1,2}`):
+/// chain; which 3-of-4 guardians sign is digest-seeded by `signer_subset`
+/// (sec-10 hardening) rather than always the lowest-`t` guardians, but the
+/// federation-wide consensus state this test asserts on -- `PoolState`,
+/// `UserOpStatus` -- converges identically on every guardian regardless of
+/// whether it happened to sign):
 ///
 /// 1. Allocate + fund a deposit; the federation credits it.
 /// 2. Assert a `DeployAndSweep` `PendingUserOp` and its `SigningPurpose::
@@ -403,7 +406,12 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
         4,
         "this test assumes the default 4-guardian fixture"
     );
-    let non_signer = PeerId::from(3); // signer_subset(0) is the fixed {0,1,2}
+    // Arbitrary guardian used to double-check federation-wide consensus
+    // state below. Named `non_signer` for readability, but which guardians
+    // actually sign is digest-seeded by `signer_subset` (sec-10 hardening),
+    // not a fixed lowest-`t` subset -- the assertions below hold on this
+    // peer's view regardless of whether it happened to be a signer.
+    let non_signer = PeerId::from(3);
 
     // Part C: drive the module to Ready before allocating a deposit.
     let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
@@ -1109,7 +1117,12 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
     let module_instance_id = usdt.id;
     let peers: Vec<PeerId> = usdt.all_peers().into_iter().collect();
     assert_eq!(peers.len(), 4, "this test assumes the 4-guardian fixture");
-    let non_signer = PeerId::from(3); // signer_subset(0) is the fixed {0,1,2}
+    // Arbitrary guardian used to double-check federation-wide consensus
+    // state below. Named `non_signer` for readability, but which guardians
+    // actually sign is digest-seeded by `signer_subset` (sec-10 hardening),
+    // not a fixed lowest-`t` subset -- the assertions below hold on this
+    // peer's view regardless of whether it happened to be a signer.
+    let non_signer = PeerId::from(3);
 
     // 0. Wait for the fee-vote median quote to converge (needed to compute a valid
     //    `max_fee` below), mirroring the Task-1 test's own step 1. Retries PAST an
