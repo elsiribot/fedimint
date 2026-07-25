@@ -165,8 +165,10 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     let client2 = join_with_root_secret(&fed, root_secret.clone()).await;
     let usdt2 = client2.get_first_module::<UsdtClientModule>()?;
 
-    // Recover from the seed alone.
-    let summary = usdt2.recover_deposits(20).await?;
+    // Recover from the seed alone. `check_uncredited: true` mirrors the CLI's
+    // default (security finding 08) -- harmless here since the only
+    // seed-derived index in range is already credited before this call.
+    let summary = usdt2.recover_deposits(20, true).await?;
 
     // The single credited deposit is rediscovered, at index 0, with the same
     // account, claim key, and claimable balance.
