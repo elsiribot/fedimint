@@ -1,7 +1,8 @@
-use fedimint_core::Amount;
 use fedimint_core::config::FederationId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::invite_code::InviteCode;
+use fedimint_core::module::AmountUnit;
+use fedimint_core::Amount;
 
 use crate::SpendableNote;
 
@@ -15,6 +16,11 @@ enum ECashField {
     /// Optional federation invite so a non-member recipient can join and
     /// claim. Clients predating this variant skip it via the default field.
     Invite(InviteCode),
+    /// Self-describes the [`AmountUnit`] (Bitcoin vs. a custom unit like
+    /// USDT) these notes are denominated in, so apps can display/route
+    /// notes from federations the user hasn't joined. Clients predating
+    /// this variant skip it via the default field.
+    Unit(AmountUnit),
     #[encodable_default]
     Default {
         variant: u64,
@@ -45,6 +51,20 @@ impl ECash {
         })
     }
 
+    /// Attaches the [`AmountUnit`] these notes are denominated in.
+    #[must_use]
+    pub fn with_unit(mut self, unit: AmountUnit) -> Self {
+        self.0.push(ECashField::Unit(unit));
+        self
+    }
+
+    pub fn unit(&self) -> Option<AmountUnit> {
+        self.0.iter().find_map(|field| match field {
+            ECashField::Unit(unit) => Some(*unit),
+            _ => None,
+        })
+    }
+
     pub fn amount(&self) -> Amount {
         self.0
             .iter()
@@ -70,5 +90,31 @@ impl ECash {
                 _ => None,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::config::FederationId;
+    use fedimint_core::module::registry::ModuleDecoderRegistry;
+    use fedimint_core::module::AmountUnit;
+
+    use super::*;
+
+    fn test_ecash() -> ECash {
+        ECash::new(FederationId::dummy(), vec![])
+    }
+
+    #[test]
+    fn unit_field_roundtrips_and_defaults_to_none() {
+        let ecash = test_ecash();
+        assert_eq!(ecash.unit(), None);
+        let with_unit = ecash.clone().with_unit(AmountUnit::new_custom(1));
+        let decoded = ECash::consensus_decode_whole(
+            &with_unit.consensus_encode_to_vec(),
+            &ModuleDecoderRegistry::default(),
+        )
+        .unwrap();
+        assert_eq!(decoded.unit(), Some(AmountUnit::new_custom(1)));
     }
 }
