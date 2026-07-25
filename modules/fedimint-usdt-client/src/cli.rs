@@ -187,7 +187,18 @@ pub(crate) async fn handle_cli_command(
         }
         Opts::WithdrawalStatus { txid, out_idx } => {
             let out_point = OutPoint { txid, out_idx };
-            json(usdt.withdrawal_status(out_point).await?)
+            let status = usdt.withdrawal_status(out_point).await?;
+            // Security finding 09: on a terminal failure, also surface the
+            // reissued-e-cash refund (amount + reason) the withdrawal's refund
+            // state machine will claim (or has claimed) back to this client.
+            let refund = usdt.refund_status(out_point).await?.refund;
+            json(serde_json::json!({
+                "status": status.status,
+                "refund": refund.map(|info| serde_json::json!({
+                    "amount": info.amount.0,
+                    "reason": info.reason,
+                })),
+            }))
         }
         Opts::PoolState => {
             // Any guardian answers identically (config-derived account +

@@ -47,22 +47,23 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT,
-    GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
-    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT,
+    USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
     BootstrapObservation, BootstrapState, CheckDepositRequest, CheckDepositResponse,
     DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation, DepositStatusRequest,
     DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES, MAX_PENDING_CHECKS,
-    MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse,
-    SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
-    UsdtGenParams, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
-    UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
-    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
-    WithdrawalStatusResponse, deposit_fee_quote, deposit_salt, derive_deposit_account,
-    derive_pool_account, evm_address, fee_vote_in_sane_range, pool_salt, signing_session_id,
-    usdt_amount, validate_usdt_params, withdrawal_fee_quote,
+    MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse, RefundInfo,
+    RefundStatusRequest, RefundStatusResponse, SigningSessionId, StatusResponse, USDT_UNIT,
+    UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtGenParams, UsdtInput, UsdtInputError,
+    UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome, UserOpStatus,
+    UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
+    WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse, deposit_fee_quote,
+    deposit_salt, derive_deposit_account, derive_pool_account, evm_address, fee_vote_in_sane_range,
+    pool_salt, signing_session_id, usdt_amount, validate_usdt_params, wei_gas_cost_to_usdt,
+    withdrawal_fee_quote,
 };
 use futures::{FutureExt as _, StreamExt as _};
 use rand::rngs::OsRng;
@@ -78,12 +79,14 @@ use crate::db::{
     MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix, MpcRoundChunkSessionPrefix,
     MpcRoundChunkSessionRoundPeerPrefix, MpcRoundChunkSessionRoundPrefix, PendingCheck,
     PendingCheckKey, PendingCheckPrefix, PendingUserOp, PendingUserOpKey, PendingUserOpPrefix,
-    PoolState, PoolStateKey, PoolStatePrefix, SessionState, SigningPurpose, SigningSession,
+    PoolState, PoolStateKey, PoolStatePrefix, Refund, RefundKey, RefundPrefix, SessionState,
+    SigningPurpose, SigningSession,
     SigningSessionKey, SigningSessionPrefix, StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey,
     SubmittedUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
     UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
     UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalBatchCapKey, WithdrawalBatchCapPrefix,
-    WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
+    WithdrawalIncurredFeeKey, WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey,
+    WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -326,6 +329,26 @@ impl ModuleInit for UsdtInit {
                         u32,
                         items,
                         "Withdrawal Batch Caps"
+                    );
+                }
+                DbKeyPrefix::Refund => {
+                    push_db_pair_items!(
+                        dbtx,
+                        RefundPrefix,
+                        RefundKey,
+                        Refund,
+                        items,
+                        "Withdrawal Refunds"
+                    );
+                }
+                DbKeyPrefix::WithdrawalIncurredFee => {
+                    push_db_pair_items!(
+                        dbtx,
+                        WithdrawalIncurredFeePrefix,
+                        WithdrawalIncurredFeeKey,
+                        UsdtAmount,
+                        items,
+                        "Withdrawal Incurred Fees"
                     );
                 }
                 DbKeyPrefix::LastSweepBlock => {
@@ -906,6 +929,15 @@ impl ServerModuleInit for UsdtInit {
     /// `superseded: bool` field (the reprice/replacement RBF-nonce-safety
     /// flag). See [`migrate_db_v2`] for why this REWRITES (rather than drops)
     /// the existing rows.
+    ///
+    /// `DatabaseVersion(3)` (security finding 09, terminal-withdrawal refund):
+    /// [`UserOpConfirmedObservation`](crate::db::UserOpConfirmedObservation)
+    /// gained `actual_gas_cost_wei` (its transient `UserOpConfirmedVote` table
+    /// is DROPPED like [`migrate_db_v1`]), and the persistent
+    /// [`UsdtWithdrawalV0`](crate::db::UsdtWithdrawalV0) gained a trailing
+    /// `refund_pubkey` (its `UnclaimedWithdrawal` rows are REWRITTEN in place,
+    /// like [`migrate_db_v2`], appending a placeholder key). See
+    /// [`migrate_db_v3`].
     fn get_database_migrations(
         &self,
     ) -> BTreeMap<DatabaseVersion, ServerModuleDbMigrationFn<Usdt>> {
@@ -922,6 +954,10 @@ impl ServerModuleInit for UsdtInit {
         migrations.insert(
             DatabaseVersion(2),
             Box::new(|ctx| migrate_db_v2(ctx).boxed()),
+        );
+        migrations.insert(
+            DatabaseVersion(3),
+            Box::new(|ctx| migrate_db_v3(ctx).boxed()),
         );
         migrations
     }
@@ -1015,6 +1051,71 @@ async fn migrate_db_v2(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> a
         // Append `superseded: false` (bool `false` encodes to the single byte
         // `0x00`).
         value.push(0u8);
+        ctx.dbtx()
+            .raw_insert_bytes(&key, &value)
+            .await
+            .expect("DB error");
+    }
+    Ok(())
+}
+
+/// The placeholder `refund_pubkey` [`migrate_db_v3`] appends to pre-0.8
+/// in-flight [`UsdtWithdrawalV0`](crate::db::UsdtWithdrawalV0) rows (security
+/// finding 09): the BIP-341 nothing-up-my-sleeve secp256k1 point `H =
+/// lift_x(sha256(G))`, a valid compressed public key with NO known discrete
+/// logarithm. Pre-0.8 withdrawals were enqueued by clients that never derived
+/// a refund key, so there is no real key to migrate to. Defaulting to an
+/// unspendable point (rather than, say, the generator `G`, whose private key
+/// `1` is public) keeps the withdrawal record valid and audit-correct -- if
+/// it settles it is paid normally and this is never read; if it ever fails,
+/// the resulting refund is a still-tracked federation liability that no
+/// attacker can steal (nobody can sign for `H`). This is strictly no worse
+/// than pre-0.8 behavior, where a failed withdrawal had no refund path at all.
+pub const LEGACY_REFUND_PLACEHOLDER_PUBKEY: [u8; 33] =
+    alloy::primitives::hex!("0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0");
+
+/// Migrates for security finding 09 (terminal-withdrawal refund).
+///
+/// Two consensus-serialized shapes changed:
+///
+/// - [`UserOpConfirmedObservation`](crate::db::UserOpConfirmedObservation) (the
+///   `UserOpConfirmedVote` table's value) gained `actual_gas_cost_wei`. Like
+///   [`migrate_db_v1`], this DROPS every row of that transient, re-proposed
+///   vote table rather than reinterpreting old bytes: the user-op submitter
+///   re-polls every `SubmittedUserOp`'s receipt and re-proposes it -- now
+///   carrying `actual_gas_cost_wei` -- within one tick of upgrading, so the
+///   quorum re-establishes itself immediately. Fabricating a gas cost for the
+///   old rows would be worse than dropping (an all-zero gas figure would never
+///   full-field-equal a freshly-observed vote and would linger as dead weight
+///   until expired).
+///
+/// - The persistent [`UsdtWithdrawalV0`](crate::db::UsdtWithdrawalV0) (the
+///   `UnclaimedWithdrawal` table's value) gained a trailing `refund_pubkey`.
+///   These rows CANNOT be dropped -- each is a still-funded obligation whose
+///   e-cash was already burned, and `audit` must keep subtracting it -- so this
+///   REWRITES each in place (like [`migrate_db_v2`]) by byte-appending
+///   [`LEGACY_REFUND_PLACEHOLDER_PUBKEY`]. A struct's `Encodable` is its fields
+///   concatenated in declaration order and a `PublicKey` encodes as a fixed 33
+///   compressed bytes with no length prefix, so a pre-0.8 row's bytes are
+///   exactly the new encoding minus the trailing key; appending the
+///   placeholder's 33 bytes yields a valid 0.8 row. See
+///   [`LEGACY_REFUND_PLACEHOLDER_PUBKEY`] for why the placeholder is an
+///   unspendable point rather than a real key.
+async fn migrate_db_v3(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> anyhow::Result<()> {
+    ctx.dbtx()
+        .raw_remove_by_prefix(&[DbKeyPrefix::UserOpConfirmedVote as u8])
+        .await
+        .expect("DB error");
+
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = ctx
+        .dbtx()
+        .raw_find_by_prefix(&[DbKeyPrefix::UnclaimedWithdrawal as u8])
+        .await
+        .expect("DB error")
+        .collect()
+        .await;
+    for (key, mut value) in entries {
+        value.extend_from_slice(&LEGACY_REFUND_PLACEHOLDER_PUBKEY);
         ctx.dbtx()
             .raw_insert_bytes(&key, &value)
             .await
@@ -1124,6 +1225,10 @@ struct UserOpConfirmedProposal {
     /// [`crate::rpc::IServerEvmRpc::get_user_op_receipt`]).
     block_hash: [u8; 32],
     swept: UsdtAmount,
+    /// The op's on-chain gas cost in WEI (security finding 09), read verbatim
+    /// from the `EntryPoint` `UserOperationEvent` log's `actualGasCost` (see
+    /// [`crate::rpc::IServerEvmRpc::get_user_op_receipt`]). Wei, not USDT.
+    actual_gas_cost_wei: UsdtAmount,
 }
 
 /// Per-field tally of the [`BootstrapObservation`] votes currently in the
@@ -1409,6 +1514,7 @@ impl ServerModule for Usdt {
                 block: proposal.block,
                 block_hash: proposal.block_hash,
                 swept: proposal.swept,
+                actual_gas_cost_wei: proposal.actual_gas_cost_wei,
             };
             let current_vote = dbtx
                 .get_value(&UserOpConfirmedVoteKey(proposal.op_hash, self.our_peer_id))
@@ -1420,6 +1526,7 @@ impl ServerModule for Usdt {
                     block: proposal.block,
                     block_hash: proposal.block_hash,
                     swept: proposal.swept,
+                    actual_gas_cost_wei: proposal.actual_gas_cost_wei,
                 });
             }
         }
@@ -1576,6 +1683,7 @@ impl ServerModule for Usdt {
                 block,
                 block_hash,
                 swept,
+                actual_gas_cost_wei,
             } => {
                 // DETERMINISTIC, mirrors the `Deposit` arm's exact
                 // observation-quorum shape: store this peer's vote
@@ -1603,6 +1711,7 @@ impl ServerModule for Usdt {
                     block,
                     block_hash,
                     swept,
+                    actual_gas_cost_wei,
                 };
                 let key = UserOpConfirmedVoteKey(op_hash, peer_id);
                 if dbtx.insert_entry(&key, &obs).await.as_ref() == Some(&obs) {
@@ -1734,8 +1843,44 @@ impl ServerModule for Usdt {
         input: &'b UsdtInput,
         _in_point: InPoint,
     ) -> Result<InputMeta, UsdtInputError> {
-        let UsdtInput::V0(input) = input else {
-            return Err(UsdtInputError::UnknownDepositAccount); // unknown/default variant
+        let input = match input {
+            UsdtInput::V0(input) => input,
+            UsdtInput::RefundV0 { out_point } => {
+                // Security finding 09: claim a terminally-failed withdrawal's
+                // reissued e-cash. Look up (and REMOVE) the refund record so it
+                // can be claimed EXACTLY ONCE -- a second `RefundV0` for the
+                // same `out_point` finds it absent and errors below. Returning
+                // `refund.refund_pubkey` as `InputMeta.pub_key` makes the
+                // fedimint transaction framework verify the claim is signed by
+                // the original withdrawer's client-controlled refund key, so
+                // NO ONE else can claim it (never by `out_point` alone). The
+                // reissued amount balances against the mint primary module,
+                // which mints `refund.amount` of `USDT_UNIT` e-cash; `fees` is
+                // `ZERO` (the incurred gas was already netted out when the
+                // refund was created). A pure consensus-DB read+remove: every
+                // guardian computes the identical `InputMeta` and clears the
+                // same record.
+                let Some(refund) = dbtx.get_value(&RefundKey(*out_point)).await else {
+                    return Err(UsdtInputError::UnknownRefund);
+                };
+                dbtx.remove_entry(&RefundKey(*out_point)).await;
+                info!(
+                    target: "usdt",
+                    %out_point,
+                    amount = refund.amount.0,
+                    "withdrawal refund CLAIMED; reissued e-cash minted to the original withdrawer"
+                );
+                return Ok(InputMeta {
+                    amount: TransactionItemAmounts {
+                        amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(refund.amount)),
+                        fees: Amounts::ZERO,
+                    },
+                    pub_key: refund.refund_pubkey,
+                });
+            }
+            UsdtInput::Default { .. } => {
+                return Err(UsdtInputError::UnknownDepositAccount); // unknown/default variant
+            }
         };
         let mut record = dbtx
             .get_value(&DepositRecordKey(input.account))
@@ -1847,6 +1992,11 @@ impl ServerModule for Usdt {
                 amount: withdrawal.amount,
                 max_fee: withdrawal.max_fee,
                 requested_block,
+                // Carried onto the queued withdrawal so a later terminal
+                // failure can write a refund claimable only by the original
+                // withdrawer (security finding 09), without re-reading the
+                // consumed output.
+                refund_pubkey: withdrawal.refund_pubkey,
             },
         )
         .await;
@@ -1966,6 +2116,24 @@ impl ServerModule for Usdt {
                 &UnclaimedWithdrawalPrefix,
                 |_k, v| -i64::try_from(v.amount.0).unwrap_or(i64::MAX),
             )
+            .await;
+        // WITHDRAWAL REFUND OBLIGATION (security finding 09, SOLVENCY-CRITICAL):
+        // a terminally-failed withdrawal's `UnclaimedWithdrawal` is replaced by
+        // a `Refund` (see `create_withdrawal_refund`), an unclaimed liability
+        // for the reissued e-cash the original withdrawer can still claim. It
+        // must be subtracted for the same reason the `UnclaimedWithdrawal`
+        // above is: the pool still backs the amount, but the federation now
+        // owes it back as e-cash rather than an on-chain payout. The two are
+        // mutually exclusive per `out_point` (the swap is atomic), so at most
+        // one is ever subtracted for a given withdrawal at a time -- and the
+        // instant the `RefundV0` claim removes the `RefundKey` (minting the
+        // e-cash via the mint module), this subtraction stops, keeping net
+        // assets consistent across the full withdraw -> fail -> refund -> claim
+        // lifecycle.
+        audit
+            .add_items(dbtx, module_instance_id, &RefundPrefix, |_k, v| {
+                -i64::try_from(v.amount.0).unwrap_or(i64::MAX)
+            })
             .await;
     }
 
@@ -2111,6 +2279,22 @@ impl ServerModule for Usdt {
 
                     Ok(module
                         .handle_withdrawal_status(&mut dbtx.to_ref_nc(), req.out_point)
+                        .await)
+                }
+            },
+            api_endpoint! {
+                REFUND_STATUS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, req: RefundStatusRequest| -> RefundStatusResponse {
+                    // Read-only (security finding 09): mirrors
+                    // `withdrawal_status` -- reads consensus DB, so any
+                    // guardian answers identically (threshold-agreement via
+                    // `request_current_consensus`).
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+
+                    Ok(module
+                        .handle_refund_status(&mut dbtx.to_ref_nc(), req.out_point)
                         .await)
                 }
             },
@@ -2926,6 +3110,12 @@ impl Usdt {
                                             block: receipt.block,
                                             block_hash: receipt.block_hash,
                                             swept,
+                                            // Security finding 09: carry the
+                                            // authoritative `actualGasCost`
+                                            // (wei) so a failed withdrawal
+                                            // batch can deduct its on-chain
+                                            // gas from the refund.
+                                            actual_gas_cost_wei: receipt.actual_gas_cost_wei,
                                         });
                                 }
                                 Ok(None) => {}
@@ -4154,12 +4344,13 @@ impl Usdt {
     /// - `n <= 1` (a singleton batch failed -- this withdrawal alone, isolated
     ///   from every other queued withdrawal, still reverts): this IS the
     ///   poisoned withdrawal. Move it to terminal `WithdrawalState::Failed {
-    ///   reason }` and remove its [`WithdrawalBatchCapKey`] (housekeeping).
-    ///   `UnclaimedWithdrawal` is left in place -- still a real, still-funded
-    ///   obligation -- for Phase 6.1's refund path to reissue e-cash against.
-    ///   It is NOT re-queued: re-queueing a batch that already failed alone
-    ///   would rebuild the byte-identical singleton forever (the original `DoS`
-    ///   this finding reports, just shrunk to size 1).
+    ///   reason }` and REFUND it: [`Usdt::create_withdrawal_refund`] replaces
+    ///   its `UnclaimedWithdrawal` with a [`Refund`] (security finding 09)
+    ///   reissuing `(amount + max_fee)` minus the gas already incurred, then
+    ///   removes its [`WithdrawalBatchCapKey`]/`WithdrawalIncurredFeeKey`
+    ///   (housekeeping). It is NOT re-queued: re-queueing a batch that already
+    ///   failed alone would rebuild the byte-identical singleton forever (the
+    ///   original `DoS` this finding reports, just shrunk to size 1).
     /// - `n > 1`: NOT the poison alone -- one or more of these `n` withdrawals
     ///   fail together, but which one is unknown. Revert every covered outpoint
     ///   to `WithdrawalState::Queued` (as before) AND set its
@@ -4173,9 +4364,12 @@ impl Usdt {
     ///   floors at 1, so the isolation always terminates within `ceil(log2(n))`
     ///   failed rounds.
     ///
-    /// `UnclaimedWithdrawal` is left in place in both branches (still a
-    /// real, still-funded obligation); a permanent `Failed` terminal state's
-    /// refund is Phase 6.1's job, not this method's.
+    /// On the `n > 1` branch `UnclaimedWithdrawal` is left in place (still a
+    /// real, still-funded obligation being re-queued); on the `n <= 1` branch
+    /// it becomes a [`Refund`] (security finding 09). Both failure branches
+    /// first accumulate each covered withdrawal's SHARE of this batch's
+    /// `obs.actual_gas_cost_wei` into its `WithdrawalIncurredFeeKey`, so the
+    /// eventual refund is net of every failed batch's gas.
     ///
     /// `swept` (Phase 9 hardening, security finding 21): the AUTHORITATIVE
     /// amount to debit, computed by the caller
@@ -4224,35 +4418,76 @@ impl Usdt {
                 .await;
                 dbtx.remove_entry(&UnclaimedWithdrawalKey(out_point)).await;
                 dbtx.remove_entry(&WithdrawalBatchCapKey(out_point)).await;
-            }
-        } else if n <= 1 {
-            // Isolated (singleton) failure: this withdrawal alone reverts
-            // even with no other withdrawal sharing its batch -- it IS the
-            // poison. Terminal, not re-queued (see the doc comment above for
-            // why re-queueing here would rebuild the identical failing
-            // singleton forever).
-            for &out_point in outpoints {
-                dbtx.insert_entry(
-                    &WithdrawalStateKey(out_point),
-                    &WithdrawalState::Failed {
-                        reason: "transfer reverts when isolated (recipient likely \
-                                 blacklisted/paused)"
-                            .to_string(),
-                    },
-                )
-                .await;
-                dbtx.remove_entry(&WithdrawalBatchCapKey(out_point)).await;
+                // Only refunded (terminally-failed) withdrawals ever read the
+                // incurred-fee accumulator; a settled one drops it (security
+                // finding 09 housekeeping).
+                dbtx.remove_entry(&WithdrawalIncurredFeeKey(out_point))
+                    .await;
             }
         } else {
-            // Not yet isolated: re-queue every covered withdrawal, but cap
-            // the next batch that may include any of them to half this
-            // batch's size, deterministically splitting the failing group
-            // down towards singletons.
+            // Security finding 09: this batch reverted on-chain but STILL
+            // consumed gas (the `EntryPoint` validated/included it before the
+            // transfer reverted). Charge each covered withdrawal its equal
+            // SHARE of that gas into its `WithdrawalIncurredFeeKey`
+            // accumulator, so that when the withdrawal eventually goes
+            // terminal-`Failed` its refund is reduced by the gas the
+            // federation actually burned on its behalf. Deterministic: the
+            // wei figure is the threshold-agreed `obs.actual_gas_cost_wei`,
+            // the rate is the consensus `FeeVote` median, and `n` is the
+            // committed batch size -- no RPC/wall-clock. An absent/overflowing
+            // median yields a `0` share (the user is refunded slightly more,
+            // never less -- the solvency-safe direction).
+            let share = if n == 0 {
+                UsdtAmount(0)
+            } else {
+                self.fee_vote_median(dbtx)
+                    .await
+                    .and_then(|median| {
+                        wei_gas_cost_to_usdt(
+                            u128::from(obs.actual_gas_cost_wei.0),
+                            median.usdt_per_eth_e6,
+                        )
+                    })
+                    .map_or(UsdtAmount(0), |total| UsdtAmount(total.0 / (n as u64)))
+            };
             for &out_point in outpoints {
-                dbtx.insert_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+                let accrued = dbtx
+                    .get_value(&WithdrawalIncurredFeeKey(out_point))
+                    .await
+                    .map_or(0, |f| f.0)
+                    .saturating_add(share.0);
+                dbtx.insert_entry(&WithdrawalIncurredFeeKey(out_point), &UsdtAmount(accrued))
                     .await;
-                dbtx.insert_entry(&WithdrawalBatchCapKey(out_point), &split_cap)
+            }
+
+            if n <= 1 {
+                // Isolated (singleton) failure: this withdrawal alone reverts
+                // even with no other withdrawal sharing its batch -- it IS the
+                // poison. Terminal, and now REFUNDED: reissue its e-cash minus
+                // the incurred gas accumulated above (security finding 09).
+                // Not re-queued (see the doc comment above for why re-queueing
+                // here would rebuild the identical failing singleton forever).
+                for &out_point in outpoints {
+                    self.create_withdrawal_refund(
+                        dbtx,
+                        out_point,
+                        "transfer reverts when isolated (recipient likely blacklisted/paused)"
+                            .to_string(),
+                    )
                     .await;
+                }
+            } else {
+                // Not yet isolated: re-queue every covered withdrawal, but cap
+                // the next batch that may include any of them to half this
+                // batch's size, deterministically splitting the failing group
+                // down towards singletons. The incurred-fee accumulator above
+                // persists across these re-queues.
+                for &out_point in outpoints {
+                    dbtx.insert_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+                        .await;
+                    dbtx.insert_entry(&WithdrawalBatchCapKey(out_point), &split_cap)
+                        .await;
+                }
             }
         }
 
@@ -4273,7 +4508,7 @@ impl Usdt {
                 block = obs.block,
                 new_pool_nonce = pool.nonce,
                 "singleton withdrawal batch REVERTED on-chain in isolation; withdrawal marked \
-                 terminal Failed (refundable in Phase 6.1)"
+                 terminal Failed and its e-cash reissued as a refund minus incurred gas (sec-09)"
             );
         } else {
             warn!(
@@ -4286,6 +4521,94 @@ impl Usdt {
                  halved batch cap for isolation retry (pool balance untouched)"
             );
         }
+    }
+
+    /// Turns a terminally-failed withdrawal into a reissued-e-cash refund
+    /// (security finding 09), the shared body of BOTH terminal-`Failed` sites
+    /// ([`Usdt::apply_withdraw_confirmed`]'s isolated-singleton revert and
+    /// [`Usdt::process_replace_user_op`]'s over-ceiling reprice-abort).
+    ///
+    /// The withdrawal's `(amount + max_fee)` e-cash was burned the instant
+    /// `process_output` accepted it; here it is reissued MINUS the gas already
+    /// incurred on-chain (`WithdrawalIncurredFeeKey`, clamped so the refund is
+    /// never negative) as a [`Refund`] record claimable ONLY by the original
+    /// withdrawer's `refund_pubkey` (see [`UsdtInput::RefundV0`]). Concretely:
+    ///
+    /// 1. Load the queued [`UsdtWithdrawalV0`] (its `amount`/`max_fee`/
+    ///    `refund_pubkey`) and the incurred-fee accumulator (absent == 0).
+    /// 2. `refund = (amount + max_fee) - min(incurred, amount + max_fee)`.
+    /// 3. Write `RefundKey(out_point) -> Refund { refund, refund_pubkey, reason
+    ///    }` (the liability now tracked as the refund).
+    /// 4. Remove `UnclaimedWithdrawalKey`, `WithdrawalIncurredFeeKey`, and
+    ///    `WithdrawalBatchCapKey` for `out_point` (the withdrawal is terminal).
+    /// 5. Set `WithdrawalStateKey(out_point) = Failed { reason }` for status.
+    ///
+    /// The `UnclaimedWithdrawal` -> `Refund` swap is atomic within `dbtx`, so
+    /// `audit` (which subtracts each live `UnclaimedWithdrawal.amount` AND each
+    /// live `Refund.amount`) never double-counts: exactly one of the two
+    /// exists for a given `out_point` at any time, and the refund is settled
+    /// the instant its `RefundV0` claim removes the `RefundKey`.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of committed DB state + the passed `reason`: reads only
+    /// the withdrawal and incurred-fee records, writes deterministically. No
+    /// RPC, no wall-clock, no `our_peer_id` -- every guardian processing the
+    /// same terminal transition writes the identical `Refund`.
+    async fn create_withdrawal_refund(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        out_point: OutPoint,
+        reason: String,
+    ) {
+        let Some(withdrawal) = dbtx.get_value(&UnclaimedWithdrawalKey(out_point)).await else {
+            // Defensive: nothing left to refund for this out_point (already
+            // settled or refunded). Still record the terminal state so
+            // `withdrawal_status` reports it, but never fabricate a second
+            // refund -- that would risk reissuing e-cash twice.
+            dbtx.insert_entry(
+                &WithdrawalStateKey(out_point),
+                &WithdrawalState::Failed { reason },
+            )
+            .await;
+            return;
+        };
+
+        let gross = withdrawal.amount.0.saturating_add(withdrawal.max_fee.0);
+        let incurred = dbtx
+            .get_value(&WithdrawalIncurredFeeKey(out_point))
+            .await
+            .map_or(0, |f| f.0)
+            .min(gross);
+        let refund_amount = UsdtAmount(gross.saturating_sub(incurred));
+
+        dbtx.insert_entry(
+            &RefundKey(out_point),
+            &Refund {
+                amount: refund_amount,
+                refund_pubkey: withdrawal.refund_pubkey,
+                reason: reason.clone(),
+            },
+        )
+        .await;
+        dbtx.remove_entry(&UnclaimedWithdrawalKey(out_point)).await;
+        dbtx.remove_entry(&WithdrawalIncurredFeeKey(out_point))
+            .await;
+        dbtx.remove_entry(&WithdrawalBatchCapKey(out_point)).await;
+        dbtx.insert_entry(
+            &WithdrawalStateKey(out_point),
+            &WithdrawalState::Failed { reason },
+        )
+        .await;
+
+        info!(
+            target: "usdt",
+            %out_point,
+            refund_amount = refund_amount.0,
+            incurred_gas = incurred,
+            "withdrawal terminally FAILED; reissued e-cash refund created (claimable once by the \
+             original withdrawer)"
+        );
     }
 
     /// Derives `claim_pk`'s deposit account and enqueues a guardian-local
@@ -4426,6 +4749,30 @@ impl Usdt {
         };
 
         WithdrawalStatusResponse { status }
+    }
+
+    /// Reports the live refund record for `out_point` (security finding 09):
+    /// the reissued-e-cash `(amount, reason)` a `UsdtInput::RefundV0` can
+    /// claim, or `None` if no [`RefundKey`] exists (the withdrawal never
+    /// failed, or its refund was already claimed and the record removed). A
+    /// client uses `amount` to set its `ClientInput.amounts` so the reissued
+    /// e-cash mints and the claim transaction balances. Read-only, mirrors
+    /// [`Self::handle_withdrawal_status`] -- reads consensus DB, so any
+    /// guardian answers identically.
+    async fn handle_refund_status(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        out_point: OutPoint,
+    ) -> RefundStatusResponse {
+        let refund = dbtx
+            .get_value(&RefundKey(out_point))
+            .await
+            .map(|r| RefundInfo {
+                amount: r.amount,
+                reason: r.reason,
+            });
+
+        RefundStatusResponse { refund }
     }
 
     /// Reports the federation's current withdrawal fee quote (Phase 8, Task
@@ -5128,9 +5475,9 @@ impl Usdt {
                 // Ceiling = the sum of the covered withdrawals' committed
                 // `max_fee` (what the users agreed to pay). If the repriced op
                 // would cost more USDT than that, DON'T replace: terminal-fail
-                // every covered withdrawal (Phase 6.1 turns `Failed` into an
-                // e-cash refund), leave each `UnclaimedWithdrawal` for that
-                // refund, and remove the stuck op (+ its votes).
+                // every covered withdrawal, reissuing its e-cash as a refund
+                // (security finding 09, via `create_withdrawal_refund`), and
+                // remove the stuck op (+ its votes).
                 let mut ceiling: u64 = 0;
                 for &out_point in outpoints {
                     if let Some(w) = dbtx.get_value(&UnclaimedWithdrawalKey(out_point)).await {
@@ -5149,11 +5496,17 @@ impl Usdt {
                 };
                 if over_ceiling {
                     for &out_point in outpoints {
-                        dbtx.insert_entry(
-                            &WithdrawalStateKey(out_point),
-                            &WithdrawalState::Failed {
-                                reason: "gas exceeds committed max_fee".to_string(),
-                            },
+                        // Security finding 09: terminal failure -> reissue the
+                        // withdrawal's e-cash as a refund. This repriced op
+                        // TIMED OUT and never confirmed on-chain, so it
+                        // incurred no gas of its own; the refund deducts only
+                        // whatever gas prior confirmed-failed batches already
+                        // accumulated into `WithdrawalIncurredFeeKey` (0 for a
+                        // withdrawal that only ever timed out).
+                        self.create_withdrawal_refund(
+                            dbtx,
+                            out_point,
+                            "gas exceeds committed max_fee".to_string(),
                         )
                         .await;
                     }
@@ -5172,9 +5525,9 @@ impl Usdt {
                     // (Submitted/Pending ops + votes + signing sessions) with the
                     // same helper the confirmation path uses -- `op_hash` was
                     // already removed above, so pass it as the `except`. The
-                    // covered withdrawals stay `Failed` and their
-                    // `UnclaimedWithdrawal`s are left intact for the Phase 6.1
-                    // refund. Deterministic: reads only the committed DB.
+                    // covered withdrawals are already terminal-`Failed` with a
+                    // refund created above. Deterministic: reads only the
+                    // committed DB.
                     self.purge_user_op_nonce_chain(
                         dbtx,
                         submitted.signed.unsigned.sender,
@@ -9052,6 +9405,7 @@ mod tests {
                     recipient: EvmAddress([0x22; 20]),
                     amount: UsdtAmount(1_000_000),
                     max_fee: UsdtAmount(u64::MAX),
+                    refund_pubkey: sample_claim_pk(),
                 }),
                 test_out_point(0),
             )
@@ -9076,6 +9430,7 @@ mod tests {
                     recipient: EvmAddress([0x22; 20]),
                     amount: UsdtAmount(1_000_000),
                     max_fee: UsdtAmount(quote.0 - 1),
+                    refund_pubkey: sample_claim_pk(),
                 }),
                 test_out_point(0),
             )
@@ -9138,6 +9493,7 @@ mod tests {
                     recipient,
                     amount,
                     max_fee: quote,
+                    refund_pubkey: sample_claim_pk(),
                 }),
                 out_point,
             )
@@ -9222,6 +9578,7 @@ mod tests {
                     recipient: EvmAddress([0x44; 20]),
                     amount: UsdtAmount(1_000_000),
                     max_fee: quote,
+                    refund_pubkey: sample_claim_pk(),
                 }),
                 out_point,
             )
@@ -11220,6 +11577,7 @@ mod tests {
             block: 20,
             block_hash: [0u8; 32],
             swept: UsdtAmount(4_000_000),
+            actual_gas_cost_wei: UsdtAmount(0),
         };
         let mut dbtx = db.begin_transaction().await;
 
@@ -11247,6 +11605,7 @@ mod tests {
                     block: 20,
                     block_hash: [0u8; 32],
                     swept: UsdtAmount(1),
+                    actual_gas_cost_wei: UsdtAmount(0),
                 },
                 PeerId::from(2),
             )
@@ -11335,6 +11694,7 @@ mod tests {
                     block: 20,
                     block_hash: [0u8; 32],
                     swept: UsdtAmount(4_000_000),
+                    actual_gas_cost_wei: UsdtAmount(0),
                 },
             )
             .await;
@@ -11380,6 +11740,7 @@ mod tests {
             block: 20,
             block_hash: [0u8; 32],
             swept: UsdtAmount(1_000_000),
+            actual_gas_cost_wei: UsdtAmount(0),
         };
 
         // Positive-control fixture (a REAL submitted op), inserted and
@@ -11439,6 +11800,7 @@ mod tests {
                     block: 20,
                     block_hash: [0u8; 32],
                     swept: UsdtAmount(1_000_000),
+                    actual_gas_cost_wei: UsdtAmount(0),
                 },
                 PeerId::from(0),
             )
@@ -11504,6 +11866,7 @@ mod tests {
             block: 21,
             block_hash: [0u8; 32],
             swept: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
         };
         let mut dbtx = db.begin_transaction().await;
         for p in [0u16, 1, 2] {
@@ -11895,6 +12258,7 @@ mod tests {
                         block: 20,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(100_000_000),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                 )
                 .await;
@@ -11972,6 +12336,7 @@ mod tests {
                         block: 30,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(100_000_000),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                 )
                 .await;
@@ -12357,6 +12722,7 @@ mod tests {
                         block: 25,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(100_000_000),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                 )
                 .await;
@@ -12433,6 +12799,7 @@ mod tests {
                         block: 21,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(0),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                 )
                 .await;
@@ -12583,12 +12950,14 @@ mod tests {
             amount: UsdtAmount(1_000_000),
             max_fee: UsdtAmount(1_000),
             requested_block: 0,
+            refund_pubkey: sample_claim_pk(),
         };
         let withdrawal_b = UsdtWithdrawalV0 {
             recipient: EvmAddress([0xb1; 20]),
             amount: UsdtAmount(2_000_000),
             max_fee: UsdtAmount(2_000),
             requested_block: 0,
+            refund_pubkey: sample_claim_pk(),
         };
 
         {
@@ -12710,6 +13079,7 @@ mod tests {
                 amount: UsdtAmount(3_000_000),
                 max_fee: UsdtAmount(3_000),
                 requested_block: 0,
+                refund_pubkey: sample_claim_pk(),
             },
         )
         .await;
@@ -12761,6 +13131,7 @@ mod tests {
                     amount: UsdtAmount(1_000_000),
                     max_fee: UsdtAmount(1_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -12820,6 +13191,7 @@ mod tests {
                     amount: amount_a,
                     max_fee: UsdtAmount(1_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -12832,6 +13204,7 @@ mod tests {
                     amount: amount_b,
                     max_fee: UsdtAmount(2_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -13021,6 +13394,7 @@ mod tests {
                     amount: amount_a,
                     max_fee: UsdtAmount(1_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -13036,6 +13410,7 @@ mod tests {
                     amount: amount_b,
                     max_fee: UsdtAmount(2_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -13072,6 +13447,7 @@ mod tests {
             block: 99,
             block_hash: [0u8; 32],
             swept: total,
+            actual_gas_cost_wei: UsdtAmount(0),
         };
         let mut dbtx = db.begin_transaction().await;
         for p in [0u16, 1, 2] {
@@ -13121,6 +13497,7 @@ mod tests {
                     block: 99,
                     block_hash: [0u8; 32],
                     swept: total,
+                    actual_gas_cost_wei: UsdtAmount(0),
                 },
             )
             .await;
@@ -13165,12 +13542,14 @@ mod tests {
             amount: UsdtAmount(1_500_000),
             max_fee: UsdtAmount(500),
             requested_block: 0,
+            refund_pubkey: sample_claim_pk(),
         };
         let withdrawal_b = UsdtWithdrawalV0 {
             recipient: EvmAddress([0xd2; 20]),
             amount: UsdtAmount(500_000),
             max_fee: UsdtAmount(200),
             requested_block: 0,
+            refund_pubkey: sample_claim_pk(),
         };
 
         {
@@ -13219,6 +13598,7 @@ mod tests {
             block: 101,
             block_hash: [0u8; 32],
             swept: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
         };
         let mut dbtx = db.begin_transaction().await;
         for p in [0u16, 1, 2] {
@@ -13288,6 +13668,7 @@ mod tests {
     /// `UnclaimedWithdrawal` is kept (Phase 6.1 refunds it) and its
     /// `WithdrawalBatchCapKey` is removed (terminal, never read again).
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn single_member_failed_batch_is_terminal_failed() {
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
         let db = module.db_for_test();
@@ -13299,6 +13680,7 @@ mod tests {
             amount: UsdtAmount(1_000_000),
             max_fee: UsdtAmount(300),
             requested_block: 0,
+            refund_pubkey: sample_claim_pk(),
         };
 
         {
@@ -13347,6 +13729,7 @@ mod tests {
             block: 101,
             block_hash: [0u8; 32],
             swept: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
         };
         let mut dbtx = db.begin_transaction().await;
         for p in [0u16, 1, 2] {
@@ -13365,13 +13748,27 @@ mod tests {
             matches!(state, WithdrawalState::Failed { .. }),
             "a failed singleton batch must isolate its withdrawal as terminal Failed, got {state:?}"
         );
-        assert_eq!(
+        // Security finding 09: on terminal failure the `UnclaimedWithdrawal` is
+        // REPLACED by a reissued-e-cash `Refund` (claimable by the withdrawer's
+        // refund key), not kept.
+        assert!(
             dbtx.to_ref_nc()
                 .get_value(&UnclaimedWithdrawalKey(out_point))
-                .await,
-            Some(withdrawal),
-            "UnclaimedWithdrawal must be KEPT on terminal Failed, for the Phase 6.1 refund"
+                .await
+                .is_none(),
+            "UnclaimedWithdrawal must be removed once the withdrawal is refunded"
         );
+        let refund = dbtx
+            .to_ref_nc()
+            .get_value(&RefundKey(out_point))
+            .await
+            .expect("a refund must exist for the terminally-failed withdrawal");
+        assert_eq!(
+            refund.amount,
+            UsdtAmount(withdrawal.amount.0 + withdrawal.max_fee.0),
+            "no gas was recorded (actual_gas_cost_wei = 0) -> full amount + max_fee refunded"
+        );
+        assert_eq!(refund.refund_pubkey, withdrawal.refund_pubkey);
         assert_eq!(
             dbtx.to_ref_nc()
                 .get_value(&WithdrawalBatchCapKey(out_point))
@@ -13430,6 +13827,7 @@ mod tests {
                         amount: UsdtAmount(1_000_000),
                         max_fee: UsdtAmount(1_000),
                         requested_block: 0,
+                        refund_pubkey: sample_claim_pk(),
                     },
                 )
                 .await;
@@ -13463,6 +13861,7 @@ mod tests {
             block: 101,
             block_hash: [0u8; 32],
             swept: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
         };
         {
             let mut dbtx = db.begin_transaction().await;
@@ -13552,6 +13951,7 @@ mod tests {
             amount: UsdtAmount(1_000_000),
             max_fee: UsdtAmount(1_000),
             requested_block: 0,
+            refund_pubkey: sample_claim_pk(),
         };
 
         {
@@ -13599,6 +13999,7 @@ mod tests {
             block: 101,
             block_hash: [0u8; 32],
             swept: withdrawal.amount,
+            actual_gas_cost_wei: UsdtAmount(0),
         };
         let mut dbtx = db.begin_transaction().await;
         for p in [0u16, 1, 2] {
@@ -13677,6 +14078,7 @@ mod tests {
                         amount: UsdtAmount(1_000_000),
                         max_fee: UsdtAmount(1_000),
                         requested_block: 0,
+                        refund_pubkey: sample_claim_pk(),
                     },
                 )
                 .await;
@@ -13700,6 +14102,7 @@ mod tests {
                         block: 10,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(0),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                     UsdtAmount(0),
                 )
@@ -13751,6 +14154,7 @@ mod tests {
                         block: 11,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(2_000_000),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                     UsdtAmount(2_000_000),
                 )
@@ -13764,6 +14168,7 @@ mod tests {
                         block: 11,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(0),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                     UsdtAmount(0),
                 )
@@ -13817,6 +14222,7 @@ mod tests {
                         block: 12,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(1_000_000),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                     UsdtAmount(1_000_000),
                 )
@@ -13830,6 +14236,7 @@ mod tests {
                         block: 12,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(0),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                     UsdtAmount(0),
                 )
@@ -13868,12 +14275,21 @@ mod tests {
                 matches!(poison_state, WithdrawalState::Failed { .. }),
                 "the poison must reach terminal Failed, got {poison_state:?}"
             );
+            // Security finding 09: the poison's UnclaimedWithdrawal is REPLACED
+            // by a reissued-e-cash Refund on terminal failure.
             assert!(
                 dbtx.to_ref_nc()
                     .get_value(&UnclaimedWithdrawalKey(poison))
                     .await
+                    .is_none(),
+                "the poison's UnclaimedWithdrawal must be replaced by a Refund"
+            );
+            assert!(
+                dbtx.to_ref_nc()
+                    .get_value(&RefundKey(poison))
+                    .await
                     .is_some(),
-                "the poison's UnclaimedWithdrawal must survive for the Phase 6.1 refund"
+                "the terminally-failed poison must have a reissued-e-cash Refund"
             );
             assert_eq!(
                 dbtx.to_ref_nc()
@@ -13901,6 +14317,7 @@ mod tests {
                     amount: UsdtAmount(1_000_000),
                     max_fee: UsdtAmount(1_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -13985,6 +14402,7 @@ mod tests {
                 amount,
                 max_fee,
                 requested_block: 0,
+                refund_pubkey: sample_claim_pk(),
             },
         )
         .await;
@@ -14057,6 +14475,7 @@ mod tests {
                     block: 55,
                     block_hash: [0u8; 32],
                     swept: amount,
+                    actual_gas_cost_wei: UsdtAmount(0),
                 },
             )
             .await;
@@ -14066,6 +14485,398 @@ mod tests {
             after_queue,
             "confirming must not move net assets -- it only reconciles which record accounts \
              for the already-excluded amount"
+        );
+    }
+
+    /// The USDT module's own `audit` net-assets figure (in the custom
+    /// `USDT_UNIT`'s smallest unit), a shared helper for the
+    /// security-finding-09 refund tests below.
+    async fn usdt_net_assets(module: &Usdt, db: &fedimint_core::db::Database) -> i64 {
+        let mut dbtx = db.begin_transaction().await;
+        let mut audit = fedimint_core::module::audit::Audit::default();
+        module.audit(&mut dbtx.to_ref_nc(), &mut audit, 0).await;
+        audit.net_assets().expect("no overflow").milli_sat
+    }
+
+    /// **Security finding 09, Step 1.** A withdrawal that reverts on-chain in
+    /// an isolated (singleton) batch goes terminal-`Failed` AND is refunded:
+    /// its `(amount + max_fee)` e-cash is reissued as a `Refund` record MINUS
+    /// the gas already incurred (accumulated from the failed batch's
+    /// `actual_gas_cost_wei`), the `UnclaimedWithdrawal`/incurred-fee records
+    /// are removed, and the module stays solvent.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn terminally_failed_withdrawal_is_refundable_minus_incurred() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        // 1 USDT/ETH exchange rate: makes `wei_gas_cost_to_usdt` a clean
+        // divide-by-1e12, so `actual_gas_cost_wei = 1e17` -> 100_000 raw USDT.
+        seed_fee_votes(
+            db,
+            4,
+            FeeVote {
+                max_fee_per_gas_wei: 1_000_000_000,
+                usdt_per_eth_e6: 1_000_000,
+            },
+        )
+        .await;
+
+        let out_point = test_out_point(0);
+        let op_hash = [0x91; 32];
+        let amount = UsdtAmount(3_000_000);
+        let max_fee = UsdtAmount(200_000);
+        let refund_pubkey = sample_claim_pk();
+        let gas_wei = UsdtAmount(100_000_000_000_000_000); // 1e17 wei
+        let expected_incurred = 100_000u64; // 1e17 * 1e6 / 1e18
+        let expected_refund = amount.0 + max_fee.0 - expected_incurred;
+
+        let mut dbtx = db.begin_transaction().await;
+        // A fully-swept deposit's worth of pool balance backs the withdrawal.
+        dbtx.insert_new_entry(
+            &PoolStateKey,
+            &PoolState {
+                account: module.pool_account(),
+                balance: UsdtAmount(10_000_000),
+                nonce: 0,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &UnclaimedWithdrawalKey(out_point),
+            &UsdtWithdrawalV0 {
+                recipient: EvmAddress([0x55; 20]),
+                amount,
+                max_fee,
+                requested_block: 0,
+                refund_pubkey,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &WithdrawalStateKey(out_point),
+            &WithdrawalState::Submitted(op_hash),
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &SubmittedUserOpKey(op_hash),
+            &SubmittedUserOp {
+                signed: fedimint_usdt_common::user_op::SignedUserOp {
+                    unsigned: real_withdraw_op_for_test(amount),
+                    signature: vec![0x11; 65],
+                },
+                purpose: UserOpPurpose::Withdraw {
+                    outpoints: vec![out_point],
+                },
+                submitted_block: 1,
+                superseded: false,
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+
+        let before_fail = usdt_net_assets(&module, db).await;
+
+        // The batch's UserOp reverted on-chain (success = false), consuming
+        // `gas_wei` of gas.
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .apply_user_op_confirmed(
+                &mut dbtx.to_ref_nc(),
+                op_hash,
+                &UserOpConfirmedObservation {
+                    success: false,
+                    block: 55,
+                    block_hash: [0u8; 32],
+                    swept: UsdtAmount(0),
+                    actual_gas_cost_wei: gas_wei,
+                },
+            )
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        // The refund is present, claimable only by the original withdrawer's
+        // refund key, and reduced by the incurred gas.
+        let refund = dbtx
+            .get_value(&RefundKey(out_point))
+            .await
+            .expect("a refund must exist after a terminal failure");
+        assert_eq!(refund.amount, UsdtAmount(expected_refund));
+        assert_eq!(refund.refund_pubkey, refund_pubkey);
+        // UnclaimedWithdrawal + incurred-fee records are cleared; the state is
+        // terminal Failed.
+        assert!(
+            dbtx.get_value(&UnclaimedWithdrawalKey(out_point))
+                .await
+                .is_none(),
+            "UnclaimedWithdrawal must be removed once refunded"
+        );
+        assert!(
+            dbtx.get_value(&WithdrawalIncurredFeeKey(out_point))
+                .await
+                .is_none(),
+            "the incurred-fee accumulator must be removed once refunded"
+        );
+        assert!(matches!(
+            dbtx.get_value(&WithdrawalStateKey(out_point)).await,
+            Some(WithdrawalState::Failed { .. })
+        ));
+        drop(dbtx);
+
+        let after_refund = usdt_net_assets(&module, db).await;
+        // Net assets stay solvent, and drop by exactly the fee the federation
+        // now owes back (max_fee) net of the gas it actually kept (incurred) --
+        // never a spurious increase.
+        assert!(after_refund >= 0, "module must stay solvent after refund");
+        assert_eq!(
+            after_refund,
+            before_fail - i64::try_from(max_fee.0 - expected_incurred).expect("fits"),
+            "refund liability = amount + max_fee - incurred (only `amount` was excluded while \
+             queued)"
+        );
+        assert_eq!(
+            after_refund,
+            10_000_000 - i64::try_from(expected_refund).expect("fits")
+        );
+    }
+
+    /// **Security finding 09, Step 2.** The 5.2 over-ceiling reprice-abort path
+    /// (a withdrawal whose repriced batch would exceed its committed `max_fee`)
+    /// terminal-fails with NO confirmed on-chain attempt, so its incurred gas
+    /// is `0` and the refund is the FULL `(amount + max_fee)`.
+    #[tokio::test]
+    async fn over_ceiling_refund_has_zero_incurred_full_refund() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let out_point = test_out_point(0);
+        let amount = UsdtAmount(2_000_000);
+        let max_fee = UsdtAmount(150_000);
+        let refund_pubkey = sample_claim_pk();
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &UnclaimedWithdrawalKey(out_point),
+            &UsdtWithdrawalV0 {
+                recipient: EvmAddress([0x66; 20]),
+                amount,
+                max_fee,
+                requested_block: 0,
+                refund_pubkey,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &WithdrawalStateKey(out_point),
+            &WithdrawalState::Submitted([0x077; 32]),
+        )
+        .await;
+        // No WithdrawalIncurredFeeKey -> the withdrawal never confirmed-failed.
+        module
+            .create_withdrawal_refund(
+                &mut dbtx.to_ref_nc(),
+                out_point,
+                "gas exceeds committed max_fee".to_string(),
+            )
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        let refund = dbtx
+            .get_value(&RefundKey(out_point))
+            .await
+            .expect("refund present");
+        assert_eq!(
+            refund.amount,
+            UsdtAmount(amount.0 + max_fee.0),
+            "zero incurred gas -> full amount + max_fee refunded"
+        );
+        assert_eq!(refund.reason, "gas exceeds committed max_fee");
+    }
+
+    /// **Security finding 09, Step 3.** A `RefundV0` input claims a refund
+    /// EXACTLY ONCE: `process_input` returns the reissued amount + the refund
+    /// pubkey and removes the `RefundKey`; a second claim finds it absent and
+    /// errors `UnknownRefund`.
+    #[tokio::test]
+    async fn refund_claim_mints_once_and_rejects_replay() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let out_point = test_out_point(0);
+        let refund_pubkey = sample_claim_pk();
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &RefundKey(out_point),
+            &Refund {
+                amount: UsdtAmount(3_100_000),
+                refund_pubkey,
+                reason: "transfer reverts".to_string(),
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        let meta = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::RefundV0 { out_point },
+                test_in_point(),
+            )
+            .await
+            .expect("first refund claim succeeds");
+        // The reissued e-cash equals the refund amount, no fee, and is
+        // authorized by the refund pubkey (so only the original withdrawer can
+        // claim).
+        assert_eq!(
+            meta.amount.amounts,
+            Amounts::new_custom(USDT_UNIT, usdt_amount(UsdtAmount(3_100_000)))
+        );
+        assert_eq!(meta.amount.fees, Amounts::ZERO);
+        assert_eq!(meta.pub_key, refund_pubkey);
+        // The record is gone -> claimed exactly once.
+        assert!(
+            dbtx.get_value(&RefundKey(out_point)).await.is_none(),
+            "the RefundKey must be removed on claim"
+        );
+
+        // A replay finds nothing and errors.
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::RefundV0 { out_point },
+                test_in_point(),
+            )
+            .await
+            .expect_err("a second claim must be rejected");
+        assert_eq!(err, UsdtInputError::UnknownRefund);
+    }
+
+    /// **Security finding 09, Step 4.** The claim is authorized ONLY by the
+    /// refund pubkey: `process_input` returns exactly that pubkey as
+    /// `InputMeta.pub_key`, which the fedimint transaction framework verifies
+    /// the input signature against -- so a wrong signer's transaction cannot
+    /// balance/settle.
+    #[tokio::test]
+    async fn refund_claim_requires_correct_key() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let out_point = test_out_point(1);
+        // A DISTINCT refund pubkey (not `sample_claim_pk`).
+        let refund_pubkey = secp256k1::SecretKey::from_slice(&[0x7c; 32])
+            .expect("valid scalar")
+            .public_key(secp256k1::SECP256K1);
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &RefundKey(out_point),
+            &Refund {
+                amount: UsdtAmount(500_000),
+                refund_pubkey,
+                reason: "gas exceeds committed max_fee".to_string(),
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        let meta = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::RefundV0 { out_point },
+                test_in_point(),
+            )
+            .await
+            .expect("claim resolves");
+        assert_eq!(
+            meta.pub_key, refund_pubkey,
+            "process_input must return the withdrawal's own refund_pubkey so only that key can \
+             sign the claim"
+        );
+        assert_ne!(meta.pub_key, sample_claim_pk());
+    }
+
+    /// **Security finding 09, Step 5 (SOLVENCY-CRITICAL).** Net assets are
+    /// invariant across the FULL `withdraw -> fail -> refund -> claim`
+    /// lifecycle: the round trip returns the module to its pre-withdrawal
+    /// figure, and at no intermediate stage is more than one of
+    /// `UnclaimedWithdrawal`/`Refund` subtracted for the same withdrawal.
+    #[tokio::test]
+    async fn audit_net_assets_invariant_across_withdraw_fail_refund_claim() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let out_point = test_out_point(0);
+        let amount = UsdtAmount(3_000_000);
+        let max_fee = UsdtAmount(200_000);
+        let refund_pubkey = sample_claim_pk();
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &PoolStateKey,
+            &PoolState {
+                account: module.pool_account(),
+                balance: UsdtAmount(10_000_000),
+                nonce: 0,
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+        let baseline = usdt_net_assets(&module, db).await;
+
+        // Queue: only `amount` is excluded (max_fee is federation revenue).
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &UnclaimedWithdrawalKey(out_point),
+            &UsdtWithdrawalV0 {
+                recipient: EvmAddress([0x55; 20]),
+                amount,
+                max_fee,
+                requested_block: 0,
+                refund_pubkey,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
+            .await;
+        dbtx.commit_tx().await;
+        assert_eq!(
+            usdt_net_assets(&module, db).await,
+            baseline - i64::try_from(amount.0).expect("fits")
+        );
+
+        // Fail + refund (no incurred gas): UnclaimedWithdrawal -> Refund, and
+        // exactly ONE of the two is subtracted (not both).
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .create_withdrawal_refund(&mut dbtx.to_ref_nc(), out_point, "boom".to_string())
+            .await;
+        dbtx.commit_tx().await;
+        assert_eq!(
+            usdt_net_assets(&module, db).await,
+            baseline - i64::try_from(amount.0 + max_fee.0).expect("fits"),
+            "the Refund (amount + max_fee) replaces the UnclaimedWithdrawal (amount); no \
+             double-subtraction"
+        );
+
+        // Claim: process_input removes the RefundKey, minting the e-cash via
+        // the mint module -> the USDT module's net assets return to baseline.
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::RefundV0 { out_point },
+                test_in_point(),
+            )
+            .await
+            .expect("refund claim succeeds");
+        dbtx.commit_tx().await;
+        assert_eq!(
+            usdt_net_assets(&module, db).await,
+            baseline,
+            "claiming the refund restores the pre-withdrawal net-assets figure (full round-trip \
+             invariant)"
         );
     }
 
@@ -14194,6 +15005,7 @@ mod tests {
                 block: 1,
                 block_hash: [0u8; 32],
                 swept: UsdtAmount(1_000_000),
+                actual_gas_cost_wei: UsdtAmount(0),
             },
         )
         .await;
@@ -14204,6 +15016,7 @@ mod tests {
                 amount: UsdtAmount(1_000_000),
                 max_fee: UsdtAmount(20_000),
                 requested_block: 1,
+                refund_pubkey: sample_claim_pk(),
             },
         )
         .await;
@@ -14222,6 +15035,17 @@ mod tests {
         .await;
         dbtx.insert_new_entry(&HasEverBeenReadyKey, &()).await;
         dbtx.insert_new_entry(&WithdrawalBatchCapKey(out_point), &2u32)
+            .await;
+        dbtx.insert_new_entry(
+            &RefundKey(out_point),
+            &Refund {
+                amount: UsdtAmount(1_020_000),
+                refund_pubkey: sample_claim_pk(),
+                reason: "transfer reverts".to_string(),
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(&WithdrawalIncurredFeeKey(out_point), &UsdtAmount(12_345))
             .await;
         dbtx.insert_new_entry(&LastSweepBlockKey(account), &7u64)
             .await;
@@ -14251,6 +15075,8 @@ mod tests {
             "Bootstrap Votes",
             "Has Ever Been Ready",
             "Withdrawal Batch Caps",
+            "Withdrawal Refunds",
+            "Withdrawal Incurred Fees",
             "Last Sweep Blocks",
         ];
         assert_eq!(
@@ -14713,6 +15539,7 @@ mod tests {
                         block: 10,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(999_999_999),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                 )
                 .await;
@@ -14754,6 +15581,7 @@ mod tests {
                         block: 11,
                         block_hash: [0u8; 32],
                         swept: real_amount,
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                 )
                 .await;
@@ -14806,6 +15634,7 @@ mod tests {
                     amount: real_total,
                     max_fee: UsdtAmount(1_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -14846,6 +15675,7 @@ mod tests {
                         block: 20,
                         block_hash: [0u8; 32],
                         swept: UsdtAmount(1),
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                 )
                 .await;
@@ -14900,6 +15730,7 @@ mod tests {
                         block: 21,
                         block_hash: [0u8; 32],
                         swept: real_total,
+                        actual_gas_cost_wei: UsdtAmount(0),
                     },
                 )
                 .await;
@@ -15068,6 +15899,7 @@ mod tests {
             block: 10,
             block_hash,
             swept: amount,
+            actual_gas_cost_wei: UsdtAmount(0),
         };
 
         let mut dbtx = db.begin_transaction().await;
@@ -15448,6 +16280,7 @@ mod tests {
                     // ~118.8M-unit USDT gas cost, so this replaces (not fails).
                     max_fee: UsdtAmount(300_000_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -15560,6 +16393,7 @@ mod tests {
                     amount: total,
                     max_fee: UsdtAmount(300_000_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -15583,6 +16417,7 @@ mod tests {
                     amount: UsdtAmount(500_000),
                     max_fee: UsdtAmount(300_000_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -15602,6 +16437,7 @@ mod tests {
                     block: 99,
                     block_hash: [0u8; 32],
                     swept: total,
+                    actual_gas_cost_wei: UsdtAmount(0),
                 },
             )
             .await;
@@ -15674,6 +16510,7 @@ mod tests {
                     // cost, so the reprice cannot proceed.
                     max_fee: UsdtAmount(50_000_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -15703,12 +16540,18 @@ mod tests {
                 reason: "gas exceeds committed max_fee".to_string()
             })
         );
+        // Security finding 09: the over-ceiling terminal failure replaces the
+        // UnclaimedWithdrawal with a reissued-e-cash Refund.
         assert!(
             dbtx.to_ref_nc()
                 .get_value(&UnclaimedWithdrawalKey(out1))
                 .await
-                .is_some(),
-            "UnclaimedWithdrawal must be KEPT for the Phase 6.1 refund"
+                .is_none(),
+            "UnclaimedWithdrawal must be replaced by a Refund"
+        );
+        assert!(
+            dbtx.to_ref_nc().get_value(&RefundKey(out1)).await.is_some(),
+            "the terminally-failed withdrawal must have a reissued-e-cash Refund"
         );
         assert!(
             dbtx.to_ref_nc()
@@ -15775,6 +16618,7 @@ mod tests {
                     // over the ceiling.
                     max_fee: UsdtAmount(50_000_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -15800,6 +16644,7 @@ mod tests {
                     amount: UsdtAmount(500_000),
                     max_fee: UsdtAmount(300_000_000),
                     requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
                 },
             )
             .await;
@@ -15819,7 +16664,8 @@ mod tests {
             .await
             .expect("over-ceiling reprice is a state change (Failed), returns Ok");
 
-        // out1 is terminal-Failed, its UnclaimedWithdrawal KEPT (Phase 6.1).
+        // out1 is terminal-Failed; its UnclaimedWithdrawal is replaced by a
+        // reissued-e-cash Refund (security finding 09).
         assert_eq!(
             dbtx.to_ref_nc().get_value(&WithdrawalStateKey(out1)).await,
             Some(WithdrawalState::Failed {
@@ -15830,8 +16676,12 @@ mod tests {
             dbtx.to_ref_nc()
                 .get_value(&UnclaimedWithdrawalKey(out1))
                 .await
-                .is_some(),
-            "UnclaimedWithdrawal must be KEPT for the Phase 6.1 refund"
+                .is_none(),
+            "UnclaimedWithdrawal must be replaced by a Refund"
+        );
+        assert!(
+            dbtx.to_ref_nc().get_value(&RefundKey(out1)).await.is_some(),
+            "the terminally-failed withdrawal must have a reissued-e-cash Refund"
         );
 
         // The WHOLE chain is gone -- both B (current) AND the superseded
@@ -15915,6 +16765,7 @@ mod tests {
                         amount: UsdtAmount(1_500_000),
                         max_fee: UsdtAmount(300_000_000),
                         requested_block: 0,
+                        refund_pubkey: sample_claim_pk(),
                     },
                 )
                 .await;
@@ -15957,6 +16808,7 @@ mod tests {
             block: 99,
             block_hash: [0u8; 32],
             swept: total,
+            actual_gas_cost_wei: UsdtAmount(0),
         };
         let mut dbtx = db.begin_transaction().await;
         for p in [0u16, 1, 2] {
@@ -16013,6 +16865,7 @@ mod tests {
                     block: 99,
                     block_hash: [0u8; 32],
                     swept: total,
+                    actual_gas_cost_wei: UsdtAmount(0),
                 },
                 PeerId::from(0),
             )

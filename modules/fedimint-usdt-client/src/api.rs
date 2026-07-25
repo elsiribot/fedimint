@@ -6,14 +6,15 @@ use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::{OutPoint, PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
     CHECK_DEPOSIT_ENDPOINT, DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT,
-    GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
-    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT,
+    USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     CheckDepositRequest, CheckDepositResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse,
-    DepositStatusRequest, DepositStatusResponse, PoolStateResponse, StatusResponse, UsdtAmount,
-    UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
-    WithdrawalStatusRequest, WithdrawalStatusResponse,
+    DepositStatusRequest, DepositStatusResponse, PoolStateResponse, RefundStatusRequest,
+    RefundStatusResponse, StatusResponse, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse,
+    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatusRequest,
+    WithdrawalStatusResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -77,6 +78,13 @@ pub trait UsdtFederationApi {
         &self,
         out_point: OutPoint,
     ) -> FederationResult<WithdrawalStatusResponse>;
+
+    /// Reports the live refund record of a terminally-failed withdrawal
+    /// (security finding 09): `(amount, reason)` for the reissued e-cash a
+    /// `UsdtInput::RefundV0` can claim, or `None` if none exists (never
+    /// failed, or already claimed). Threshold-agreement
+    /// (`request_current_consensus`, mirroring [`Self::withdrawal_status`]).
+    async fn refund_status(&self, out_point: OutPoint) -> FederationResult<RefundStatusResponse>;
 
     /// Reports the module's consensus-agreed readiness state (Part C):
     /// `AwaitingInfra`/`Ready`/`Degraded`, plus the per-condition tally.
@@ -172,6 +180,14 @@ where
         self.request_current_consensus(
             WITHDRAWAL_STATUS_ENDPOINT.to_string(),
             ApiRequestErased::new(WithdrawalStatusRequest { out_point }),
+        )
+        .await
+    }
+
+    async fn refund_status(&self, out_point: OutPoint) -> FederationResult<RefundStatusResponse> {
+        self.request_current_consensus(
+            REFUND_STATUS_ENDPOINT.to_string(),
+            ApiRequestErased::new(RefundStatusRequest { out_point }),
         )
         .await
     }
