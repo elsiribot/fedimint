@@ -21,10 +21,11 @@ use fedimint_core::db::{
 use fedimint_core::envs::{
     FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV,
     FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
-    FM_USDT_CHAIN_ID_ENV, FM_USDT_CONFIRMATION_DEPTH_ENV, FM_USDT_CONTRACT_ENV,
-    FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV, FM_USDT_EVM_RPC_API_KEY_ENV,
-    FM_USDT_EVM_RPC_URL_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
-    FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV, is_env_var_set_opt, is_running_in_test_env,
+    FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV, FM_USDT_CHAIN_ID_ENV, FM_USDT_CONFIRMATION_DEPTH_ENV,
+    FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV,
+    FM_USDT_EVM_RPC_API_KEY_ENV, FM_USDT_EVM_RPC_API_KEY_FILE_ENV, FM_USDT_EVM_RPC_URL_ENV,
+    FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV, env_secret_or_file,
+    is_env_var_set_opt, is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -652,10 +653,13 @@ impl ServerModuleInit for UsdtInit {
             // Optional API key appended as the RPC URL's final path segment
             // (Alchemy/Infura/... style), so the secret key can live in its own
             // env var rather than baked into the URL. No-op when unset.
-            let evm_rpc_url = match std::env::var(FM_USDT_EVM_RPC_API_KEY_ENV)
-                .ok()
-                .filter(|s| !s.is_empty())
-            {
+            // `env_secret_or_file` also accepts the key via
+            // `FM_USDT_EVM_RPC_API_KEY_FILE` (a path to a file containing the
+            // key), keeping it out of the process environment (sec-misc#8).
+            let evm_rpc_url = match env_secret_or_file(
+                FM_USDT_EVM_RPC_API_KEY_ENV,
+                FM_USDT_EVM_RPC_API_KEY_FILE_ENV,
+            )? {
                 Some(key) => format!("{}/{key}", evm_rpc_url.trim_end_matches('/')),
                 None => evm_rpc_url,
             };
@@ -665,10 +669,13 @@ impl ServerModuleInit for UsdtInit {
                     cfg.consensus.eth_usd_price_feed,
                     cfg.consensus.price_feed_max_staleness_secs,
                 );
-            let broadcaster_private_key = std::env::var(FM_USDT_BROADCASTER_PRIVATE_KEY_ENV)
-                .ok()
-                .filter(|s| !s.is_empty())
-                .or_else(|| cfg.private.local.broadcaster_private_key.clone());
+            // Same file-based fallback as above, via
+            // `FM_USDT_BROADCASTER_PRIVATE_KEY_FILE` (sec-misc#8).
+            let broadcaster_private_key = env_secret_or_file(
+                FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
+                FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV,
+            )?
+            .or_else(|| cfg.private.local.broadcaster_private_key.clone());
             if let Some(broadcaster_private_key) = &broadcaster_private_key {
                 rpc = rpc.with_broadcaster(broadcaster_private_key)?;
             }
@@ -6841,6 +6848,97 @@ mod tests {
         let params = result.expect("valid env overrides must parse cleanly");
         assert_eq!(params.chain_id, 1);
         assert_eq!(params.confirmation_depth, 6);
+    }
+
+    /// Returns a path in the OS temp dir unique to this call, so parallel
+    /// test binaries never collide on the same secret file.
+    fn unique_secret_file_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "fedimint-usdt-server-test-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    /// The `init()` consuming site for the RPC API key
+    /// (`FM_USDT_EVM_RPC_API_KEY_ENV`) delegates to `env_secret_or_file` with
+    /// `FM_USDT_EVM_RPC_API_KEY_FILE_ENV` as the file fallback (sec-misc#8).
+    /// This pins that exact const pairing so a future refactor cannot
+    /// silently swap in the wrong `_FILE` env var.
+    #[test]
+    fn rpc_api_key_can_come_from_file() {
+        let _lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::remove_var(FM_USDT_EVM_RPC_API_KEY_ENV);
+            std::env::remove_var(FM_USDT_EVM_RPC_API_KEY_FILE_ENV);
+        }
+
+        let path = unique_secret_file_path("rpc-api-key");
+        // nosemgrep: ban-fs-write -- test-only: create a throwaway temp secret file
+        std::fs::write(&path, "my-rpc-api-key\n").expect("can write temp secret file");
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::set_var(FM_USDT_EVM_RPC_API_KEY_FILE_ENV, &path);
+        }
+
+        let result = env_secret_or_file(
+            FM_USDT_EVM_RPC_API_KEY_ENV,
+            FM_USDT_EVM_RPC_API_KEY_FILE_ENV,
+        );
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(FM_USDT_EVM_RPC_API_KEY_FILE_ENV);
+        }
+        std::fs::remove_file(&path).expect("can remove temp secret file");
+
+        assert_eq!(
+            result.expect("file-backed RPC API key must read cleanly"),
+            Some("my-rpc-api-key".to_owned())
+        );
+    }
+
+    /// Same as `rpc_api_key_can_come_from_file`, for the broadcaster private
+    /// key's `init()` consuming site.
+    #[test]
+    fn broadcaster_key_can_come_from_file() {
+        let _lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::remove_var(FM_USDT_BROADCASTER_PRIVATE_KEY_ENV);
+            std::env::remove_var(FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV);
+        }
+
+        let path = unique_secret_file_path("broadcaster-key");
+        // nosemgrep: ban-fs-write -- test-only: create a throwaway temp secret file
+        std::fs::write(&path, "  0xdeadbeef\n").expect("can write temp secret file");
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::set_var(FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV, &path);
+        }
+
+        let result = env_secret_or_file(
+            FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
+            FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV,
+        );
+
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV);
+        }
+        std::fs::remove_file(&path).expect("can remove temp secret file");
+
+        assert_eq!(
+            result.expect("file-backed broadcaster key must read cleanly"),
+            Some("0xdeadbeef".to_owned())
+        );
     }
 
     /// Builds a [`Usdt`] module (via [`Usdt::new_for_test`], so no poller
