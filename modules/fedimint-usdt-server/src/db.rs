@@ -83,6 +83,23 @@ pub enum DbKeyPrefix {
     /// reaches a terminal state (`Confirmed` or `Failed`). See
     /// [`WithdrawalBatchCapKey`].
     WithdrawalBatchCap = 0x10,
+    /// The reissued-e-cash refund obligation for a terminally-failed
+    /// withdrawal (security finding 09). Written by
+    /// `Usdt::create_withdrawal_refund` when a withdrawal goes terminal
+    /// `Failed` (replacing its [`UnclaimedWithdrawalKey`]); removed when its
+    /// `UsdtInput::RefundV0` claim is processed (`Usdt::process_input`) so it
+    /// is claimed EXACTLY ONCE. `Usdt::audit` subtracts every live
+    /// `Refund.amount` as a federation liability. See [`RefundKey`].
+    Refund = 0x11,
+    /// The per-withdrawal accumulated on-chain gas already incurred by failed
+    /// batches that covered it (security finding 09), in [`UsdtAmount`]'s
+    /// smallest USDT unit. Absent means `0`. Accumulated (a saturating
+    /// per-outpoint SHARE of each reverted batch's gas) by
+    /// `Usdt::apply_withdraw_confirmed`'s failure path, deducted from the
+    /// refund by `Usdt::create_withdrawal_refund`, and removed on the SUCCESS
+    /// settlement path or when the refund is created. See
+    /// [`WithdrawalIncurredFeeKey`].
+    WithdrawalIncurredFee = 0x12,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -519,6 +536,15 @@ pub struct UserOpConfirmedObservation {
     /// never aggregate toward threshold.
     pub block_hash: [u8; 32],
     pub swept: UsdtAmount,
+    /// The op's on-chain gas cost in WEI (security finding 09), read verbatim
+    /// from the authoritative `EntryPoint` `UserOperationEvent` log's
+    /// `actualGasCost` (see
+    /// [`UserOpReceipt::actual_gas_cost_wei`](fedimint_usdt_common::user_op::UserOpReceipt)).
+    /// A `UsdtAmount` is reused only as a convenient `u64` newtype -- this is
+    /// wei, not USDT. Part of the full-field `#[derive(PartialEq)]` tally like
+    /// `swept`, so only a threshold-agreed gas figure is ever deducted from a
+    /// failed withdrawal's refund (see `Usdt::apply_withdraw_confirmed`).
+    pub actual_gas_cost_wei: UsdtAmount,
 }
 
 /// A single peer's vote on `UserOp` `[u8; 32]`'s (its `op_hash`) on-chain
@@ -561,6 +587,17 @@ pub struct UsdtWithdrawalV0 {
     /// [`PendingUserOp::created_block`](crate::db::PendingUserOp)), no
     /// consensus decision reads it today.
     pub requested_block: u64,
+    /// The client-controlled public key that will own the e-cash reissued if
+    /// this withdrawal goes terminally `Failed` (security finding 09), copied
+    /// verbatim from the accepting
+    /// [`UsdtOutputV0::refund_pubkey`](fedimint_usdt_common::UsdtOutputV0) by
+    /// `Usdt::process_output`. Carried on the queued withdrawal (not just in
+    /// the output) so `Usdt::create_withdrawal_refund` can write a
+    /// [`Refund`] claimable only by the original withdrawer's signature
+    /// without re-reading the (long-consumed) output. Added in
+    /// `MODULE_CONSENSUS_VERSION` 0.8; `migrate_db_v3` handles pre-0.8
+    /// persistent rows.
+    pub refund_pubkey: PublicKey,
 }
 
 #[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
@@ -699,6 +736,72 @@ impl_db_record!(
 impl_db_lookup!(
     key = WithdrawalBatchCapKey,
     query_prefix = WithdrawalBatchCapPrefix
+);
+
+/// The reissued-e-cash refund obligation created when a withdrawal goes
+/// terminally `Failed` (security finding 09), keyed by the `OutPoint` of the
+/// `UsdtOutput::V0` that enqueued it (see [`RefundKey`]).
+///
+/// `amount` is `(withdrawal.amount + withdrawal.max_fee)` MINUS the gas
+/// already incurred on-chain (`WithdrawalIncurredFeeKey`, clamped so the
+/// refund is never negative) -- what the original withdrawer gets back as
+/// reissued e-cash. `refund_pubkey` is copied from the withdrawal
+/// ([`UsdtWithdrawalV0::refund_pubkey`]); `Usdt::process_input`'s `RefundV0`
+/// arm returns it as the `InputMeta.pub_key` the fedimint transaction
+/// framework verifies the claim is signed by, so ONLY the original
+/// withdrawer can claim. The record is removed the instant that claim is
+/// processed, so a second claim finds it absent and errors
+/// (`UsdtInputError::UnknownRefund`) -- reissued EXACTLY ONCE. While it lives
+/// it is a federation liability `Usdt::audit` subtracts (mirroring the
+/// [`UnclaimedWithdrawalKey`] it replaces).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
+pub struct Refund {
+    pub amount: UsdtAmount,
+    pub refund_pubkey: PublicKey,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct RefundKey(pub OutPoint);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct RefundPrefix;
+
+impl_db_record!(
+    key = RefundKey,
+    value = Refund,
+    db_prefix = DbKeyPrefix::Refund,
+);
+impl_db_lookup!(key = RefundKey, query_prefix = RefundPrefix);
+
+/// The on-chain gas a withdrawal has already caused to be spent across the
+/// failed batches it participated in (security finding 09), keyed by its
+/// `OutPoint`; absent is equivalent to `UsdtAmount(0)`.
+///
+/// `Usdt::apply_withdraw_confirmed`'s failure path adds each covered
+/// withdrawal's SHARE (`wei_gas_cost_to_usdt(obs.actual_gas_cost_wei, median)
+/// / n`, where `n` is the reverted batch's size) into this accumulator, so a
+/// withdrawal that fails in several progressively-smaller batches before
+/// being isolated accrues its cumulative gas here.
+/// `Usdt::create_withdrawal_refund` reads it (clamped to `amount + max_fee`) to
+/// shrink the refund by the gas the federation actually burned on the user's
+/// behalf, then removes it. The SUCCESS settlement path removes it too (only
+/// refunded withdrawals ever read it). A new prefix holding only new
+/// `UsdtAmount` data.
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct WithdrawalIncurredFeeKey(pub OutPoint);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct WithdrawalIncurredFeePrefix;
+
+impl_db_record!(
+    key = WithdrawalIncurredFeeKey,
+    value = UsdtAmount,
+    db_prefix = DbKeyPrefix::WithdrawalIncurredFee,
+);
+impl_db_lookup!(
+    key = WithdrawalIncurredFeeKey,
+    query_prefix = WithdrawalIncurredFeePrefix
 );
 
 #[cfg(test)]
@@ -1069,6 +1172,7 @@ mod tests {
             block,
             block_hash: [0u8; 32],
             swept: UsdtAmount(2_000_000),
+            actual_gas_cost_wei: UsdtAmount(0),
         };
 
         let mut dbtx = db.begin_transaction().await;
@@ -1137,6 +1241,7 @@ mod tests {
             amount: UsdtAmount(5_000_000),
             max_fee: UsdtAmount(20_000),
             requested_block: 12,
+            refund_pubkey: test_pubkey(),
         };
 
         let mut dbtx = db.begin_transaction().await;
@@ -1206,6 +1311,38 @@ mod tests {
         assert_eq!(dbtx.get_value(&HasEverBeenReadyKey).await, Some(()));
         assert_eq!(
             dbtx.find_by_prefix(&HasEverBeenReadyPrefix)
+                .await
+                .count()
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn refund_and_incurred_fee_round_trip() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let out_point = test_out_point(0);
+        let refund = Refund {
+            amount: UsdtAmount(5_100_000),
+            refund_pubkey: test_pubkey(),
+            reason: "transfer reverts when isolated".to_string(),
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&RefundKey(out_point), &refund).await;
+        dbtx.insert_new_entry(&WithdrawalIncurredFeeKey(out_point), &UsdtAmount(1_234))
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(dbtx.get_value(&RefundKey(out_point)).await, Some(refund));
+        assert_eq!(
+            dbtx.get_value(&WithdrawalIncurredFeeKey(out_point)).await,
+            Some(UsdtAmount(1_234))
+        );
+        assert_eq!(dbtx.find_by_prefix(&RefundPrefix).await.count().await, 1);
+        assert_eq!(
+            dbtx.find_by_prefix(&WithdrawalIncurredFeePrefix)
                 .await
                 .count()
                 .await,

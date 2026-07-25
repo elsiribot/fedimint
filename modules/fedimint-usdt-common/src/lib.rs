@@ -59,7 +59,22 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// (server's `db.rs`). It is a new prefix holding only new data -- no
 /// existing stored value's shape changed -- so no `get_database_migrations`
 /// entry/snapshot was needed, only `dump_database` coverage.
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 7);
+///
+/// Bumped to `0.8` (sec-09 hardening, terminal-withdrawal refund): several
+/// consensus-serialized types changed shape to reissue e-cash for a
+/// terminally-failed withdrawal. [`UsdtOutputV0`] gained a client-controlled
+/// `refund_pubkey`; [`UsdtInput`] gained a `RefundV0 { out_point }` variant
+/// (and [`UsdtInputError`] an `UnknownRefund`); the
+/// [`UsdtConsensusItem::UserOpConfirmed`] item and the server's
+/// `UserOpConfirmedObservation` gained `actual_gas_cost_wei` (so a failed
+/// batch's on-chain gas can be deducted from the refund). Two new server
+/// consensus-DB records were added -- `RefundKey(OutPoint) -> Refund` (the
+/// reissuance obligation, subtracted by `audit` and cleared exactly once on
+/// claim) and `WithdrawalIncurredFeeKey(OutPoint) -> UsdtAmount` (the
+/// per-withdrawal accumulated incurred gas) -- and the persistent
+/// `UsdtWithdrawalV0` record gained `refund_pubkey`. See `migrate_db_v3` for
+/// how the persistent `UsdtWithdrawalV0` change is handled.
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 8);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
@@ -1127,6 +1142,39 @@ pub struct WithdrawalStatusResponse {
     pub status: WithdrawalStatus,
 }
 
+/// Request for the live refund record of a terminally-failed withdrawal
+/// (security finding 09), identified by the `OutPoint` of the
+/// `UsdtOutput::V0` that enqueued it.
+#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
+pub struct RefundStatusRequest {
+    pub out_point: OutPoint,
+}
+
+/// A terminally-failed withdrawal's reissued-e-cash refund (security finding
+/// 09), as surfaced to the client. Wasm-safe mirror of the server-only
+/// `fedimint_usdt_server::db::Refund` record: present from the moment the
+/// withdrawal goes terminal-`Failed` until its `RefundV0` claim removes it
+/// (claimed exactly once). `amount` is `(amount + max_fee)` minus the gas
+/// already incurred on-chain; a client builds a [`UsdtInput::RefundV0`] with
+/// its `ClientInput.amounts` set to exactly this so the reissued e-cash mints
+/// and the transaction balances.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct RefundInfo {
+    pub amount: UsdtAmount,
+    pub reason: String,
+}
+
+/// Response to the `refund_status` endpoint (security finding 09): the live
+/// [`RefundInfo`] for `out_point`, or `None` if no refund record exists (the
+/// withdrawal never failed, or its refund was already claimed). Read directly
+/// from consensus DB, so any guardian answers identically (threshold-
+/// agreement via `request_current_consensus`, mirroring
+/// [`WithdrawalStatusResponse`]).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct RefundStatusResponse {
+    pub refund: Option<RefundInfo>,
+}
+
 /// Per-instance config-gen params for the USDT module (Phase 4.5 mechanism).
 ///
 /// `Default` targets a local `anvil` dev federation: chain id 31337 and a
@@ -1364,6 +1412,18 @@ pub enum UsdtConsensusItem {
         /// never aggregate toward the confirmation threshold.
         block_hash: [u8; 32],
         swept: UsdtAmount,
+        /// The op's on-chain gas cost in wei (security finding 09), read
+        /// verbatim from the authoritative `EntryPoint` `UserOperationEvent`
+        /// log's `actualGasCost` via `IServerEvmRpc::get_user_op_receipt`
+        /// (a `UsdtAmount` reused only as a convenient `u64` newtype -- this
+        /// carries WEI, not USDT; see
+        /// [`user_op::UserOpReceipt::actual_gas_cost_wei`]). Part of the
+        /// full-field equality tally like `swept`, so guardians only ever
+        /// deduct a threshold-agreed gas figure. Used by
+        /// `apply_withdraw_confirmed`'s failure path to accumulate each
+        /// covered withdrawal's SHARE of the reverted batch's gas into its
+        /// `WithdrawalIncurredFeeKey`, which the refund then deducts.
+        actual_gas_cost_wei: UsdtAmount,
     },
     /// One guardian's vote on the current EVM fee market and USDT/ETH
     /// exchange rate (Phase 8, Task 1), mirroring [`Self::BlockCount`]'s
@@ -1423,6 +1483,18 @@ pub enum UsdtInput {
     /// signed by `InputMeta.pub_key` = the deposit's claim key; there is no
     /// extra signature inside the input.
     V0(UsdtInputV0),
+    /// Claim the reissued e-cash of a terminally-failed withdrawal (security
+    /// finding 09), identified by the `OutPoint` of the `UsdtOutput::V0` that
+    /// originally enqueued it. The server's `process_input` looks up the
+    /// `RefundKey(out_point)` refund record (created when the withdrawal went
+    /// terminal-`Failed`), returns `InputMeta { amounts: refund.amount, fees:
+    /// ZERO, pub_key: refund.refund_pubkey }`, and REMOVES the refund record
+    /// so it can be claimed EXACTLY ONCE (a second claim finds it absent ->
+    /// [`UsdtInputError::UnknownRefund`]). Core verifies the fedimint
+    /// transaction is signed by `pub_key` = the withdrawal's
+    /// client-controlled `refund_pubkey`, so ONLY the original withdrawer can
+    /// claim the refund -- never by `out_point` alone.
+    RefundV0 { out_point: OutPoint },
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -1475,6 +1547,17 @@ pub struct UsdtOutputV0 {
     pub recipient: EvmAddress,
     pub amount: UsdtAmount,
     pub max_fee: UsdtAmount,
+    /// A client-controlled public key that will own the e-cash reissued if
+    /// this withdrawal ever goes terminally `Failed` (security finding 09).
+    /// The client derives the matching secret deterministically from its seed
+    /// (see `fedimint_usdt_client`'s `refund_keypair_for_index`) and keeps it
+    /// locally; the server stores this pubkey alongside the withdrawal
+    /// (`UsdtWithdrawalV0::refund_pubkey`) and, on a terminal failure, writes a
+    /// refund record claimable ONLY by a transaction signed by it (see
+    /// [`UsdtInput::RefundV0`]). Making the refund key client-controlled (not
+    /// the federation) is what guarantees the reissued e-cash can only be
+    /// claimed by the original withdrawer.
+    pub refund_pubkey: secp256k1::PublicKey,
 }
 
 /// Information needed by a client to update output funds.
@@ -1512,6 +1595,8 @@ pub enum UsdtInputError {
     NoFeeQuoteAvailable,
     #[error("Computing the deposit fee quote overflowed")]
     FeeQuoteOverflow,
+    #[error("No refund record exists for this out_point (never failed, or already claimed)")]
+    UnknownRefund,
 }
 
 /// Errors that might be returned by the server
@@ -1874,6 +1959,7 @@ mod tests {
             block: 77,
             block_hash: [0xCD; 32],
             swept: UsdtAmount(1_234_000),
+            actual_gas_cost_wei: UsdtAmount(5_000_000_000_000_000),
         };
         let bytes = item.consensus_encode_to_vec();
         let decoded =
@@ -1985,18 +2071,42 @@ mod tests {
         assert_eq!(input, decoded);
     }
 
+    /// A fixed, valid secp256k1 public key for encoding round-trip tests.
+    fn test_refund_pubkey() -> secp256k1::PublicKey {
+        secp256k1::SecretKey::from_slice(&[0x24; 32])
+            .expect("valid scalar")
+            .public_key(secp256k1::SECP256K1)
+    }
+
     #[test]
     fn test_usdt_output_v0_round_trips_through_consensus_encoding() {
         let output = UsdtOutput::V0(UsdtOutputV0 {
             recipient: EvmAddress([7; 20]),
             amount: UsdtAmount(2_000_000),
             max_fee: UsdtAmount(1_000),
+            refund_pubkey: test_refund_pubkey(),
         });
         let bytes = output.consensus_encode_to_vec();
         let decoded = UsdtOutput::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
             .expect("UsdtOutput::V0 should decode what it just encoded");
 
         assert_eq!(output, decoded);
+    }
+
+    #[test]
+    fn test_usdt_input_refund_v0_round_trips_through_consensus_encoding() {
+        use fedimint_core::{BitcoinHash as _, OutPoint, TransactionId};
+        let input = UsdtInput::RefundV0 {
+            out_point: OutPoint {
+                txid: TransactionId::all_zeros(),
+                out_idx: 3,
+            },
+        };
+        let bytes = input.consensus_encode_to_vec();
+        let decoded = UsdtInput::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+            .expect("UsdtInput::RefundV0 should decode what it just encoded");
+
+        assert_eq!(input, decoded);
     }
 
     #[test]

@@ -27,8 +27,8 @@ use fedimint_usdt_common::{
 };
 use fedimint_usdt_server::UsdtInit;
 use fedimint_usdt_server::db::{
-    PendingUserOpKey, PendingUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix,
-    UsdtWithdrawalV0, WithdrawalState, WithdrawalStateKey,
+    PendingUserOpKey, PendingUserOpPrefix, RefundKey, UnclaimedWithdrawalKey,
+    UnclaimedWithdrawalPrefix, UsdtWithdrawalV0, WithdrawalState, WithdrawalStateKey,
 };
 use futures::StreamExt as _;
 
@@ -1496,6 +1496,244 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
     Ok(())
 }
 
+/// **Security finding 09 (terminal-withdrawal refund) end-to-end acceptance.**
+/// A single withdrawal is queued, batched into a SINGLETON `UserOp`, MPC-
+/// signed and submitted, then observed as REVERTED on-chain (a failing
+/// `UserOpReceipt`). Because the singleton reverted in isolation, the server
+/// marks it terminal `Failed` and reissues its `(amount + max_fee)` e-cash as
+/// a `Refund` (with zero incurred gas here, so the FULL amount). The client's
+/// attached withdrawal state machine then claims that refund via a
+/// `UsdtInput::RefundV0` and the burned e-cash is restored to the client's
+/// spendable balance -- without any manual intervention.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_claims_refund_on_terminal_failure() -> anyhow::Result<()> {
+    let mock = Arc::new(MockEvmRpc::new());
+    let usdt_contract = EvmAddress([0u8; 20]);
+    mock.set_chain_id(31337);
+    mock.set_block_number(100);
+    let scripted_fee = FeeVote {
+        max_fee_per_gas_wei: 20_000_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
+    let expected_quote =
+        withdrawal_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
+
+    let fed = dual_mint_fixtures(mock.clone())
+        .new_fed_builder(0)
+        .disable_mint_fees()
+        .build()
+        .await;
+    let client: ClientHandleArc = fed.new_client().await;
+    let usdt = client.get_first_module::<UsdtClientModule>()?;
+    let module_instance_id = usdt.id;
+    let peers: Vec<PeerId> = usdt.all_peers().into_iter().collect();
+
+    // Wait for the fee-vote median quote to converge.
+    let quote_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(quote) = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await
+            && quote.max_fee == expected_quote
+        {
+            break;
+        }
+        if Instant::now() >= quote_deadline {
+            bail!("withdraw_fee_quote never converged before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+    let deposit_fee = usdt.deposit_fee_quote().await?.fee;
+
+    // Fund + sweep: deposit -> claim -> pool funded.
+    let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
+    common::mock_ready_stack(
+        &mock,
+        &group_public_key,
+        usdt.config().entry_point,
+        usdt.config().account_factory,
+        usdt.config().simple_account_impl,
+    );
+    common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
+    let net_deposit_amount = UsdtAmount(61_440_000);
+    let deposit_amount = UsdtAmount(net_deposit_amount.0 + deposit_fee.0);
+    let (claim_keypair, account) = usdt.allocate_deposit().await?;
+    mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
+    usdt.check_and_claim(&claim_keypair, Duration::from_secs(120))
+        .await?;
+    let fund_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if client.get_balance_for_unit(USDT_UNIT).await? == Amount::from_msats(net_deposit_amount.0)
+        {
+            break;
+        }
+        if Instant::now() >= fund_deadline {
+            bail!("USDT e-cash was never minted before the deadline");
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    let submit_deadline = Instant::now() + Duration::from_secs(600);
+    let sweep_op_hash = loop {
+        if let Some(hash) = find_sole_pending_user_op_hash(&fed, peers[0], module_instance_id).await
+        {
+            break hash;
+        }
+        if Instant::now() >= submit_deadline {
+            bail!("no sweep PendingUserOp appeared before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    };
+    loop {
+        if !mock.submitted_user_ops().is_empty() {
+            break;
+        }
+        if Instant::now() >= submit_deadline {
+            bail!("no sweep UserOp submission was recorded before the deadline");
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    mock.set_user_op_receipt(
+        sweep_op_hash,
+        UserOpReceipt {
+            success: true,
+            block: 42,
+            block_hash: [0u8; 32],
+            actual_gas_cost_wei: UsdtAmount(0),
+        },
+    );
+    for &peer in &peers {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if usdt.pool_state(peer).await?.balance == deposit_amount {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("guardian {peer} pool balance never converged before the deadline");
+            }
+            sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    // Queue a SINGLE withdrawal (amount + quote is 512-aligned).
+    let recipient = EvmAddress([0x11; 20]);
+    let amount = UsdtAmount(2_048_000);
+    let out_point = {
+        let range = usdt.withdraw(recipient, amount, expected_quote).await?;
+        fedimint_core::OutPoint {
+            txid: range.txid(),
+            out_idx: 0,
+        }
+    };
+    // Balance after burning `amount + quote` (before any refund lands).
+    let after_burn = Amount::from_msats(net_deposit_amount.0 - amount.0 - expected_quote.0);
+    let settle_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if client.get_balance_for_unit(USDT_UNIT).await? == after_burn {
+            break;
+        }
+        if Instant::now() >= settle_deadline {
+            bail!("withdrawal burn/change never settled before the deadline");
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // Trigger the (singleton) batch.
+    mock.set_block_number(400);
+    let batch_deadline = Instant::now() + Duration::from_secs(120);
+    let batch_op_hash = loop {
+        if let Some(hash) = find_sole_pending_user_op_hash(&fed, peers[0], module_instance_id).await
+        {
+            break hash;
+        }
+        if Instant::now() >= batch_deadline {
+            bail!("no withdrawal-batch PendingUserOp appeared before the deadline");
+        }
+        sleep(Duration::from_millis(300)).await;
+    };
+    let submit_deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        if mock.submitted_user_ops().len() >= 2 {
+            break;
+        }
+        if Instant::now() >= submit_deadline {
+            bail!("no withdrawal-batch UserOp submission was recorded before the deadline");
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    // The batch UserOp REVERTS on-chain (success = false), with zero recorded
+    // gas so the refund is the full `amount + max_fee`.
+    mock.set_user_op_receipt(
+        batch_op_hash,
+        UserOpReceipt {
+            success: false,
+            block: 88,
+            block_hash: [0u8; 32],
+            actual_gas_cost_wei: UsdtAmount(0),
+        },
+    );
+
+    // Every guardian marks the withdrawal terminal Failed and creates a
+    // reissued-e-cash Refund (UnclaimedWithdrawal replaced by RefundKey).
+    for &peer in &peers {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (state, refund) = {
+                let db = fed.server_db(peer);
+                let mut dbtx = db.begin_transaction_nc().await;
+                let (mut isolated, _) = dbtx.to_ref_with_prefix_module_id(module_instance_id);
+                (
+                    isolated.get_value(&WithdrawalStateKey(out_point)).await,
+                    isolated.get_value(&RefundKey(out_point)).await,
+                )
+            };
+            if let (Some(WithdrawalState::Failed { .. }), Some(refund)) = (&state, refund) {
+                assert_eq!(
+                    refund.amount,
+                    UsdtAmount(amount.0 + expected_quote.0),
+                    "zero incurred gas -> the full amount + max_fee is refunded"
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("guardian {peer} never reached terminal Failed + Refund (last {state:?})");
+            }
+            sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    // The client's attached withdrawal state machine claims the refund on its
+    // own; the burned e-cash is restored to the client's spendable balance.
+    let refund_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if client.get_balance_for_unit(USDT_UNIT).await? == Amount::from_msats(net_deposit_amount.0)
+        {
+            break;
+        }
+        if Instant::now() >= refund_deadline {
+            bail!(
+                "client balance was not restored by the refund before the deadline (last {})",
+                client.get_balance_for_unit(USDT_UNIT).await?
+            );
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+
+    // Once claimed, the refund record is gone (claimed exactly once) and the
+    // client-facing `refund_status` reports it as no longer live.
+    let claimed_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if usdt.refund_status(out_point).await?.refund.is_none() {
+            break;
+        }
+        if Instant::now() >= claimed_deadline {
+            bail!("refund record was never cleared after the client claimed it");
+        }
+        sleep(Duration::from_millis(300)).await;
+    }
+
+    Ok(())
+}
+
 /// Server DB migration coverage for the `usdt` module (security finding 06):
 /// its first-ever migration, `migrate_db_v0`, changes `FeeVoteKey`'s value
 /// shape from a bare `FeeVote` to `StoredFeeVote` (adds the `recorded_block`
@@ -1523,8 +1761,8 @@ mod fedimint_migration_tests {
         DepositRecordKey, FeeVoteKey, FeeVotePrefix, HasEverBeenReadyKey, MpcRoundChunk,
         MpcRoundChunkKey, PendingCheck, PendingCheckKey, PendingUserOp, PendingUserOpKey,
         PoolState, PoolStateKey, SessionState, SigningPurpose, SigningSession, SigningSessionKey,
-        StoredFeeVote, SubmittedUserOpKey, UsdtWithdrawalV0, UserOpConfirmedObservation,
-        UserOpConfirmedVoteKey, UserOpPurpose, WithdrawalState, WithdrawalStateKey,
+        StoredFeeVote, SubmittedUserOpKey, UserOpConfirmedObservation, UserOpConfirmedVoteKey,
+        UserOpPurpose, WithdrawalState, WithdrawalStateKey,
     };
     use futures::StreamExt as _;
     use strum::IntoEnumIterator;
@@ -1719,16 +1957,28 @@ mod fedimint_migration_tests {
         dbtx.raw_insert_bytes(&old_userop_vote_key_bytes, &old_userop_vote_value_bytes)
             .await
             .expect("DB error");
-        dbtx.insert_new_entry(
-            &fedimint_usdt_server::db::UnclaimedWithdrawalKey(out_point),
-            &UsdtWithdrawalV0 {
-                recipient: account,
-                amount: UsdtAmount(1_000_000),
-                max_fee: UsdtAmount(20_000),
-                requested_block: 1,
-            },
-        )
-        .await;
+        // The pre-0.8 `UnclaimedWithdrawalKey -> UsdtWithdrawalV0` shape
+        // (security finding 09), written RAW (like the vote/SubmittedUserOp
+        // rows above) because the current `UsdtWithdrawalV0` now carries a
+        // trailing `refund_pubkey` the old on-disk rows did not. A derived
+        // struct encodes as the concatenation of its fields in order, so this
+        // is exactly the old four-field layout `migrate_db_v3` upgrades by
+        // APPENDING the placeholder refund pubkey. Writing the typed struct
+        // here would embed a `refund_pubkey` and make `migrate_db_v3`'s
+        // byte-append double-append -> trailing-bytes decode failure.
+        let mut old_unclaimed_key_bytes = vec![DbKeyPrefix::UnclaimedWithdrawal as u8];
+        old_unclaimed_key_bytes.extend_from_slice(
+            &fedimint_usdt_server::db::UnclaimedWithdrawalKey(out_point).consensus_encode_to_vec(),
+        );
+        let mut old_unclaimed_value_bytes = Vec::new();
+        old_unclaimed_value_bytes.extend_from_slice(&account.consensus_encode_to_vec());
+        old_unclaimed_value_bytes
+            .extend_from_slice(&UsdtAmount(1_000_000).consensus_encode_to_vec());
+        old_unclaimed_value_bytes.extend_from_slice(&UsdtAmount(20_000).consensus_encode_to_vec());
+        old_unclaimed_value_bytes.extend_from_slice(&1u64.consensus_encode_to_vec());
+        dbtx.raw_insert_bytes(&old_unclaimed_key_bytes, &old_unclaimed_value_bytes)
+            .await
+            .expect("DB error");
         dbtx.insert_new_entry(&WithdrawalStateKey(out_point), &WithdrawalState::Queued)
             .await;
         dbtx.insert_new_entry(
@@ -1890,13 +2140,61 @@ mod fedimint_migration_tests {
                         info!("Validated UserOpConfirmedVote (dropped, not rewritten)");
                     }
                     DbKeyPrefix::UnclaimedWithdrawal => {
+                        // Security finding 09: `migrate_db_v3` REWRITES each
+                        // pre-0.8 `UsdtWithdrawalV0` row by APPENDING the
+                        // placeholder `refund_pubkey` (these are still-funded
+                        // obligations that must survive the upgrade, not be
+                        // dropped). Assert the row decodes cleanly in the NEW
+                        // shape AND carries exactly the placeholder key.
                         let withdrawals = dbtx
                             .find_by_prefix(&fedimint_usdt_server::db::UnclaimedWithdrawalPrefix)
                             .await
                             .collect::<Vec<_>>()
                             .await;
                         ensure!(!withdrawals.is_empty(), "no UnclaimedWithdrawals read back");
-                        info!("Validated UnclaimedWithdrawal");
+                        let placeholder = fedimint_core::secp256k1::PublicKey::from_slice(
+                            &fedimint_usdt_server::LEGACY_REFUND_PLACEHOLDER_PUBKEY,
+                        )
+                        .expect("placeholder is a valid pubkey");
+                        for (_k, w) in &withdrawals {
+                            ensure!(
+                                w.refund_pubkey == placeholder,
+                                "migrate_db_v3 must default a pre-0.8 withdrawal's refund_pubkey \
+                                 to the unspendable placeholder"
+                            );
+                        }
+                        info!("Validated UnclaimedWithdrawal (migrate_db_v3 refund_pubkey append)");
+                    }
+                    DbKeyPrefix::Refund => {
+                        // Security finding 09: a brand-new prefix; the
+                        // pre-migration snapshot predates it and no migration
+                        // writes to it, so it must read back cleanly as EMPTY.
+                        let refunds = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::RefundPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(
+                            refunds.is_empty(),
+                            "Refund is a brand-new prefix; the pre-migration snapshot must not \
+                             contain any rows for it"
+                        );
+                        info!("Validated Refund (new prefix, empty)");
+                    }
+                    DbKeyPrefix::WithdrawalIncurredFee => {
+                        // Security finding 09: a brand-new prefix; empty in the
+                        // pre-migration snapshot, like `Refund` above.
+                        let fees = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::WithdrawalIncurredFeePrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(
+                            fees.is_empty(),
+                            "WithdrawalIncurredFee is a brand-new prefix; the pre-migration \
+                             snapshot must not contain any rows for it"
+                        );
+                        info!("Validated WithdrawalIncurredFee (new prefix, empty)");
                     }
                     DbKeyPrefix::WithdrawalState => {
                         let states = dbtx
