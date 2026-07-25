@@ -8,7 +8,7 @@ use fedimint_derive::{Decodable, Encodable};
 use fedimint_logging::LOG_CORE;
 use jsonrpsee_core::Serialize;
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::util::FmtCompact as _;
 
@@ -51,6 +51,15 @@ pub const FM_USDT_EVM_RPC_URL_ENV: &str = "FM_USDT_EVM_RPC_URL";
 /// does not implement that method.
 pub const FM_USDT_EVM_RPC_API_KEY_ENV: &str = "FM_USDT_EVM_RPC_API_KEY";
 
+/// File-based fallback for [`FM_USDT_EVM_RPC_API_KEY_ENV`].
+///
+/// If [`FM_USDT_EVM_RPC_API_KEY_ENV`] is unset or empty and this env var is
+/// set, the API key is instead read (and trimmed) from the file at the given
+/// path. Avoids putting the secret directly in the process environment,
+/// where it is visible to other same-user processes via
+/// `/proc/<pid>/environ`. See [`env_secret_or_file`].
+pub const FM_USDT_EVM_RPC_API_KEY_FILE_ENV: &str = "FM_USDT_EVM_RPC_API_KEY_FILE";
+
 /// Env var to override the USDT module's `usdt_contract` config-gen param
 /// (a `0x`-prefixed 20-byte hex EVM address).
 ///
@@ -87,6 +96,11 @@ pub const FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV: &str = "FM_USDT_SIMPLE_ACCOUNT_IMPL";
 /// a key into config-gen. Any guardian's broadcaster may submit a given op, so
 /// a shared key across guardians is fine.
 pub const FM_USDT_BROADCASTER_PRIVATE_KEY_ENV: &str = "FM_USDT_BROADCASTER_PRIVATE_KEY";
+
+/// File-based fallback for [`FM_USDT_BROADCASTER_PRIVATE_KEY_ENV`]. See
+/// [`FM_USDT_EVM_RPC_API_KEY_FILE_ENV`] for the rationale and
+/// [`env_secret_or_file`] for the resolution order.
+pub const FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV: &str = "FM_USDT_BROADCASTER_PRIVATE_KEY_FILE";
 
 /// Overrides the ERC-4337 USDT module's Chainlink ETH/USD price-feed address
 /// (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.
@@ -203,6 +217,43 @@ pub fn is_running_in_test_env() -> bool {
     let unit_test = cfg!(test);
 
     unit_test || is_env_var_set("NEXTEST") || is_env_var_set(FM_IN_DEVIMINT_ENV)
+}
+
+/// Read a secret from an env var, falling back to a file whose path is given
+/// by a second env var when the first is unset or empty.
+///
+/// Mirrors the `_FILE` fallback convention already used elsewhere in
+/// fedimint (see `fedimintd`'s `bitcoind_url_password_file` /
+/// `FM_BITCOIND_URL_PASSWORD_FILE_ENV`), so an operator can keep a secret
+/// out of the process environment -- which is visible to other same-user
+/// processes via `/proc/<pid>/environ` -- by instead pointing at a file only
+/// the process needs to read.
+///
+/// Resolution order:
+/// 1. If `inline_env` is set to a non-empty value, that value is returned.
+/// 2. Else, if `file_env` is set (to a non-empty path), the file at that path
+///    is read and its TRIMMED contents are returned -- most tooling that writes
+///    a secret to a file appends a trailing newline.
+/// 3. Else, `Ok(None)`.
+///
+/// Logs at `debug` which source supplied the secret (`"inline"` or
+/// `"file"`), but NEVER the secret value itself.
+pub fn env_secret_or_file(inline_env: &str, file_env: &str) -> anyhow::Result<Option<String>> {
+    if let Some(val) = std::env::var(inline_env).ok().filter(|s| !s.is_empty()) {
+        debug!(target: LOG_CORE, env = %inline_env, source = "inline", "Secret sourced from inline env var");
+        return Ok(Some(val));
+    }
+
+    let Some(path) = std::env::var(file_env).ok().filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read secret file at path from {file_env}"))?;
+
+    debug!(target: LOG_CORE, env = %file_env, source = "file", "Secret sourced from file");
+
+    Ok(Some(contents.trim().to_owned()))
 }
 
 /// Use to allow `process_output` to process RBF withdrawal outputs.
@@ -423,4 +474,132 @@ where
     }
 
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::env_secret_or_file;
+
+    /// Serializes tests that touch process-wide env vars so they cannot race
+    /// under `cargo test`'s default parallel-test execution.
+    static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
+
+    const INLINE_ENV: &str = "FM_TEST_ENV_SECRET_OR_FILE_INLINE";
+    const FILE_ENV: &str = "FM_TEST_ENV_SECRET_OR_FILE_FILE";
+
+    /// Returns a path in the OS temp dir that is unique to this test
+    /// process/thread/call, so parallel test binaries (and repeated calls
+    /// within one test) never collide on the same file.
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "fedimint-envs-test-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    /// Clears both env vars used by these tests. Must only be called while
+    /// holding `ENV_VAR_LOCK`.
+    fn clear_env() {
+        // SAFETY: caller holds `ENV_VAR_LOCK`, serializing all env var
+        // mutation across this module's tests.
+        unsafe {
+            std::env::remove_var(INLINE_ENV);
+            std::env::remove_var(FILE_ENV);
+        }
+    }
+
+    #[test]
+    fn env_secret_or_file_prefers_inline_then_file_then_none() {
+        let _lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_env();
+
+        // Neither set -> None.
+        assert_eq!(
+            env_secret_or_file(INLINE_ENV, FILE_ENV)
+                .expect("no file to read when file env is unset"),
+            None
+        );
+
+        // Only file set -> trimmed file contents.
+        let path = unique_temp_path("prefers-inline-then-file");
+        // nosemgrep: ban-fs-write -- test-only: create a throwaway temp secret file
+        std::fs::write(&path, "  from-file-secret\n\n").expect("can write temp secret file");
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::set_var(FILE_ENV, &path);
+        }
+        assert_eq!(
+            env_secret_or_file(INLINE_ENV, FILE_ENV).expect("file read must succeed"),
+            Some("from-file-secret".to_owned())
+        );
+
+        // Both set -> inline wins, file is not even read (delete it to
+        // prove that: a read attempt would error, not silently proceed).
+        std::fs::remove_file(&path).expect("can remove temp secret file");
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::set_var(INLINE_ENV, "from-inline-secret");
+        }
+        assert_eq!(
+            env_secret_or_file(INLINE_ENV, FILE_ENV)
+                .expect("inline must win without touching the (now-missing) file"),
+            Some("from-inline-secret".to_owned())
+        );
+
+        clear_env();
+    }
+
+    #[test]
+    fn env_secret_or_file_empty_inline_falls_back_to_file() {
+        let _lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_env();
+
+        let path = unique_temp_path("empty-inline-falls-back");
+        // nosemgrep: ban-fs-write -- test-only: create a throwaway temp secret file
+        std::fs::write(&path, "from-file-secret").expect("can write temp secret file");
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::set_var(INLINE_ENV, "");
+            std::env::set_var(FILE_ENV, &path);
+        }
+
+        assert_eq!(
+            env_secret_or_file(INLINE_ENV, FILE_ENV).expect("file read must succeed"),
+            Some("from-file-secret".to_owned())
+        );
+
+        std::fs::remove_file(&path).expect("can remove temp secret file");
+        clear_env();
+    }
+
+    #[test]
+    fn env_secret_or_file_missing_file_path_errors() {
+        let _lock = ENV_VAR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_env();
+
+        let path = unique_temp_path("missing-file-path-errors");
+        // Deliberately do not create `path`.
+        // SAFETY: serialized by `ENV_VAR_LOCK` above.
+        unsafe {
+            std::env::set_var(FILE_ENV, &path);
+        }
+
+        let err = env_secret_or_file(INLINE_ENV, FILE_ENV).expect_err(
+            "a file env pointing at a nonexistent path must error, not silently return None",
+        );
+        assert!(err.to_string().contains(FILE_ENV));
+
+        clear_env();
+    }
 }
