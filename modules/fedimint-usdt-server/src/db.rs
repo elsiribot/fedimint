@@ -75,6 +75,12 @@ pub enum DbKeyPrefix {
     /// from `AwaitingInfra` (never `Ready`) -- a pure count over the current
     /// votes cannot.
     HasEverBeenReady = 0x0F,
+    /// Per-account record of the consensus-agreed EVM block at which the
+    /// account's most recent SUCCESSFUL sweep confirmed (see
+    /// [`LastSweepBlockKey`]). `Usdt::credit_deposit` compares each deposit
+    /// observation's block against it to pick the credit rule that lets a
+    /// NEW deposit to an already-swept address credit fully.
+    LastSweepBlock = 0x10,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -601,6 +607,38 @@ impl_db_lookup!(
     query_prefix = HasEverBeenReadyPrefix
 );
 
+/// The consensus-agreed EVM block (`value = u64`) at which this deposit
+/// account's most recent SUCCESSFUL sweep (`DeployAndSweep` `UserOp`)
+/// confirmed on-chain. Written only by `Usdt::apply_user_op_confirmed`
+/// (monotone max) from the threshold-agreed
+/// [`UserOpConfirmedObservation::block`] -- never from any guardian-local
+/// RPC read -- so it is consensus state, byte-identical on every guardian.
+///
+/// Read by `Usdt::credit_deposit` to pick the credit rule for a deposit
+/// observation: an observation at `obs.block > last_sweep_block` provably
+/// saw the post-sweep balance, so it is credited as `swept + balance`
+/// (letting a NEW deposit to an already-swept address credit fully), while
+/// an observation at or before the sweep block keeps the conservative
+/// raw-balance rule (no double credit for an observation that straddled the
+/// sweep). See `Usdt::credit_deposit`'s doc comment for the full argument.
+///
+/// Deliberately a separate record rather than a new [`DepositRecord`] field:
+/// existing federations already hold encoded `DepositRecord` rows, which
+/// must keep decoding unchanged, whereas a brand-new key simply reads as
+/// absent (i.e. "never swept") until the first post-upgrade sweep confirms.
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct LastSweepBlockKey(pub EvmAddress);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct LastSweepBlockPrefix;
+
+impl_db_record!(
+    key = LastSweepBlockKey,
+    value = u64,
+    db_prefix = DbKeyPrefix::LastSweepBlock,
+);
+impl_db_lookup!(key = LastSweepBlockKey, query_prefix = LastSweepBlockPrefix);
+
 #[cfg(test)]
 mod tests {
     use fedimint_core::PeerId;
@@ -1092,6 +1130,33 @@ mod tests {
                 .count()
                 .await,
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn last_sweep_block_round_trips_and_filters_by_prefix() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let account_a = EvmAddress([0xa1; 20]);
+        let account_b = EvmAddress([0xb2; 20]);
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&LastSweepBlockKey(account_a), &123u64)
+            .await;
+        dbtx.insert_new_entry(&LastSweepBlockKey(account_b), &456u64)
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&LastSweepBlockKey(account_a)).await,
+            Some(123u64)
+        );
+        assert_eq!(
+            dbtx.find_by_prefix(&LastSweepBlockPrefix)
+                .await
+                .count()
+                .await,
+            2
         );
     }
 
