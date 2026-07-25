@@ -4918,11 +4918,13 @@ impl Usdt {
                 .try_into()
                 .expect("digest is a fixed-size [u8; 32]; the first 8 bytes always fit"),
         );
-        // Reduce mod `period` in u64 (usize -> u64 is lossless) so the final
-        // `usize::try_from` always succeeds (result is < period, a usize) and
-        // no 32-bit-target truncation of `seed` can skip combinations.
-        let idx = usize::try_from(seed.wrapping_add(u64::from(attempt)) % period as u64)
-            .expect("value is < period, which is a usize");
+        // Reduce `(seed + attempt) mod period` in u128 so the sum can never
+        // overflow (which would shift residues by `2^64 mod period != 0` and
+        // skip combinations) and no 32-bit-target truncation of `seed` occurs.
+        // The result is < period (a usize), so `usize::try_from` always succeeds.
+        let idx =
+            usize::try_from((u128::from(seed) + u128::from(attempt)) % u128::from(period as u64))
+                .expect("value is < period, which is a usize");
         // Already sorted: `t_combinations` builds each combination from
         // ascending indices into the already-sorted `ids`.
         combos[idx].clone()
