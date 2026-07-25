@@ -109,6 +109,12 @@ mod tests {
     fn unit_field_roundtrips_and_defaults_to_none() {
         let ecash = test_ecash();
         assert_eq!(ecash.unit(), None);
+        let decoded = ECash::consensus_decode_whole(
+            &ecash.consensus_encode_to_vec(),
+            &ModuleDecoderRegistry::default(),
+        )
+        .unwrap();
+        assert_eq!(decoded.unit(), None);
         let with_unit = ecash.clone().with_unit(AmountUnit::new_custom(1));
         let decoded = ECash::consensus_decode_whole(
             &with_unit.consensus_encode_to_vec(),
