@@ -7864,9 +7864,20 @@ mod tests {
         let attempt1_id = fedimint_usdt_common::signing_session_id(&digest, 1);
         let purpose = SigningPurpose::UserOp(digest);
 
+        // The digest-seeded subsets for attempt 0 and attempt 1 — derived
+        // rather than hard-coded, since the seed depends on `digest`. The
+        // rotation must land on a *different* subset (that's the whole point
+        // of rotating).
+        let subset0 = modules[&PeerId::from(0)].signer_subset(&digest, 0);
+        let subset1 = modules[&PeerId::from(0)].signer_subset(&digest, 1);
+        assert_ne!(
+            subset0, subset1,
+            "rotation must select a different signer subset for attempt 1"
+        );
+
         // Attempt 0: every guardian starts the identical session over the
-        // lowest-`t` subset {0,1,2}. `consensus_block_count` is 0 here (no
-        // votes yet), so each session's `last_progress_block` is 0.
+        // digest-seeded subset. `consensus_block_count` is 0 here (no votes
+        // yet), so each session's `last_progress_block` is 0.
         for module in modules.values() {
             let mut dbtx = module.db_for_test().begin_transaction().await;
             module
@@ -7880,10 +7891,7 @@ mod tests {
                 .get_value(&SigningSessionKey(attempt0_id))
                 .await
                 .expect("attempt-0 session present");
-            assert_eq!(
-                session.signers,
-                vec![PeerId::from(0), PeerId::from(1), PeerId::from(2)]
-            );
+            assert_eq!(session.signers, subset0);
             assert_eq!(session.attempt, 0);
         }
 
@@ -7926,8 +7934,7 @@ mod tests {
         }
 
         // Every guardian's consensus DB is identical: attempt-0 Failed, a new
-        // attempt-1 session InProgress at round 0 under the rotated subset
-        // {1,2,3}.
+        // attempt-1 session InProgress at round 0 under the rotated subset.
         for &peer in &peers {
             let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
 
@@ -7949,9 +7956,8 @@ mod tests {
             assert_eq!(retry.round, 0);
             assert_eq!(retry.state, SessionState::InProgress);
             assert_eq!(
-                retry.signers,
-                vec![PeerId::from(1), PeerId::from(2), PeerId::from(3)],
-                "the retry must run under the rotated (offset-1) signer subset"
+                retry.signers, subset1,
+                "the retry must run under the rotated (digest-seeded attempt-1) signer subset"
             );
         }
 
@@ -8045,8 +8051,17 @@ mod tests {
         let attempt1_id = fedimint_usdt_common::signing_session_id(&digest, 1);
         let purpose = SigningPurpose::UserOp(digest);
 
+        // The digest-seeded subsets for attempt 0 and attempt 1 -- derived
+        // rather than hard-coded, since the seed depends on `digest`. Two of
+        // attempt 0's three signers act honestly; the third is Byzantine.
+        let subset0 = modules[&PeerId::from(0)].signer_subset(&digest, 0);
+        let subset1 = modules[&PeerId::from(0)].signer_subset(&digest, 1);
+        let honest_peer_a = subset0[0];
+        let honest_peer_b = subset0[1];
+        let byzantine_peer = subset0[2];
+
         // Attempt 0: every guardian starts the identical session over the
-        // lowest-`t` subset {0,1,2}.
+        // digest-seeded subset.
         for module in modules.values() {
             let mut dbtx = module.db_for_test().begin_transaction().await;
             module
@@ -8055,14 +8070,14 @@ mod tests {
             dbtx.commit_tx().await;
         }
 
-        // Round 0: two HONEST signers (peers 0, 1) each send a single,
-        // self-consistent chunk (chunk_count=1, chunk=0). The consensus-level
-        // payload bytes are opaque to `process_mpc_round` (see its own doc
-        // comment: reassembly/off-thread interpretation is guardian-local),
-        // so arbitrary content is fine here.
+        // Round 0: two HONEST signers (`honest_peer_a`, `honest_peer_b`) each
+        // send a single, self-consistent chunk (chunk_count=1, chunk=0). The
+        // consensus-level payload bytes are opaque to `process_mpc_round`
+        // (see its own doc comment: reassembly/off-thread interpretation is
+        // guardian-local), so arbitrary content is fine here.
         let honest_items = [
             (
-                PeerId::from(0),
+                honest_peer_a,
                 MpcRoundItem {
                     session_id: attempt0_id,
                     round: 0,
@@ -8072,7 +8087,7 @@ mod tests {
                 },
             ),
             (
-                PeerId::from(1),
+                honest_peer_b,
                 MpcRoundItem {
                     session_id: attempt0_id,
                     round: 0,
@@ -8082,10 +8097,10 @@ mod tests {
                 },
             ),
         ];
-        // The BYZANTINE signer (peer 2, a genuine member of attempt 0's
-        // subset) sends exactly one chunk claiming an inconsistent
-        // `chunk_count` of 5, then withholds the rest -- this is a
-        // self-inflicted stall (`0..5` can never all be present), not a
+        // The BYZANTINE signer (`byzantine_peer`, a genuine member of
+        // attempt 0's subset) sends exactly one chunk claiming an
+        // inconsistent `chunk_count` of 5, then withholds the rest -- this is
+        // a self-inflicted stall (`0..5` can never all be present), not a
         // crash or a consensus-divergence: `process_mpc_round`'s explicit
         // range check (`chunk_count >= 1 && chunk < chunk_count`) and sec-11's
         // `chunk_count <= MAX_MPC_CHUNKS` cap both accept this item as
@@ -8093,7 +8108,7 @@ mod tests {
         // any syntactically valid but semantically hostile chunk count that
         // stays within the federation-wide cap.
         let byzantine_item = (
-            PeerId::from(2),
+            byzantine_peer,
             MpcRoundItem {
                 session_id: attempt0_id,
                 round: 0,
@@ -8125,7 +8140,7 @@ mod tests {
         // Byzantine peer did not block or corrupt them)...
         for &peer in &peers {
             let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
-            for honest_peer in [PeerId::from(0), PeerId::from(1)] {
+            for honest_peer in [honest_peer_a, honest_peer_b] {
                 let chunk = dbtx
                     .get_value(&MpcRoundChunkKey(attempt0_id, 0, honest_peer, 0))
                     .await;
@@ -8195,10 +8210,10 @@ mod tests {
         // Every guardian: attempt-0 Failed (only that attempt, and only
         // because of the stall -- not a crash or divergence anywhere), a
         // fresh attempt-1 InProgress at round 0 under the rotated subset
-        // {1,2,3} (which excludes the Byzantine peer 2's OWN chunk-count
-        // shenanigans from repeating, since peer 2's position/role in the
-        // new subset restarts cleanly -- though even if it stayed a signer,
-        // a fresh attempt starts its `MpcRoundChunk` table empty).
+        // (whether or not that subset happens to still include the
+        // Byzantine peer is immaterial: a fresh attempt starts its
+        // `MpcRoundChunk` table empty, so its earlier chunk-count
+        // shenanigans do not carry over).
         for &peer in &peers {
             let mut dbtx = modules[&peer].db_for_test().begin_transaction_nc().await;
             let failed = dbtx
@@ -8215,8 +8230,7 @@ mod tests {
             assert_eq!(retry.round, 0);
             assert_eq!(retry.state, SessionState::InProgress);
             assert_eq!(
-                retry.signers,
-                vec![PeerId::from(1), PeerId::from(2), PeerId::from(3)],
+                retry.signers, subset1,
                 "the retry must run under the rotated (offset-1) signer subset"
             );
         }
@@ -10027,7 +10041,9 @@ mod tests {
         );
 
         // One module per guardian, each with its own in-memory DB and its own
-        // signing-session store. Peer 3 is outside the lowest-3 signer subset.
+        // signing-session store. Which peer ends up outside the signer
+        // subset is digest-seeded (see `signer_subset`), so it's derived
+        // below rather than assumed.
         let mut modules: BTreeMap<PeerId, Usdt> = BTreeMap::new();
         for &peer in &peers {
             let cfg = server_cfgs[&peer]
@@ -10047,6 +10063,15 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(b"usdt mpc-round consensus signing test").into();
         let session_id = fedimint_usdt_common::signing_session_id(&digest, 0);
         let purpose = SigningPurpose::UserOp(digest);
+
+        // The digest-seeded signer subset for attempt 0, and the single peer
+        // it excludes (n=4, t=3, so exactly one peer is a non-signer).
+        let subset = modules[&PeerId::from(0)].signer_subset(&digest, 0);
+        let non_signer = peers
+            .iter()
+            .copied()
+            .find(|p| !subset.contains(p))
+            .expect("t < n, so signer_subset always excludes exactly one peer here");
 
         // Every guardian starts the (identical) session: writes its own
         // consensus `SigningSession` and, if in the subset, spawns its
@@ -10129,7 +10154,7 @@ mod tests {
             .group_public_key;
         let msg = secp256k1::Message::from_digest(digest);
         let verifier = secp256k1::Secp256k1::verification_only();
-        for &peer in &peers[..3] {
+        for &peer in &subset {
             let sig_bytes = modules[&peer]
                 .completed_signatures
                 .lock()
@@ -10147,7 +10172,7 @@ mod tests {
 
         // (c) The non-signer holds NO signature (it cannot compute one).
         assert!(
-            modules[&peers[3]]
+            modules[&non_signer]
                 .completed_signatures
                 .lock()
                 .expect("not poisoned")
