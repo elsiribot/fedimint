@@ -130,6 +130,23 @@ pub const FM_USDT_CONFIRMATION_DEPTH_ENV: &str = "FM_USDT_CONFIRMATION_DEPTH";
 /// hold that much. Gas cost itself is unaffected.
 pub const FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV: &str = "FM_USDT_BROADCASTER_MIN_BALANCE_WEI";
 
+/// Per-guardian override for how often (in seconds) the USDT module's
+/// background observer loops poll the EVM RPC endpoint (block count, fee
+/// estimate, bootstrap readiness, deposit scan, UserOp receipts).
+///
+/// This is a purely guardian-local runtime knob -- it changes only how
+/// frequently this guardian refreshes its own chain view before proposing
+/// observations to consensus, not any consensus-agreed value, so guardians
+/// may safely run different intervals (e.g. matched to each provider's rate
+/// limits). Lower is more responsive but consumes more RPC quota; each
+/// guardian runs several independent loops, so total call volume scales with
+/// `1 / interval`. Defaults to `15`; values below `5` are clamped to `5` to
+/// avoid a busy loop. The slow-changing loops (fee estimate, and the
+/// bootstrap-readiness loop once its immutable contract facts are cached) run
+/// at a multiple of this. Ignored under the test harness (which uses a fixed
+/// fast interval).
+pub const FM_USDT_POLL_INTERVAL_SECS_ENV: &str = "FM_USDT_POLL_INTERVAL_SECS";
+
 /// Explicit operator acknowledgement to run a non-dev `chain_id` with a
 /// below-minimum `confirmation_depth`.
 ///
