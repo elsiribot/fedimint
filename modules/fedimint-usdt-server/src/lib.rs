@@ -24,8 +24,9 @@ use fedimint_core::envs::{
     FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV, FM_USDT_CHAIN_ID_ENV, FM_USDT_CONFIRMATION_DEPTH_ENV,
     FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV,
     FM_USDT_EVM_RPC_API_KEY_ENV, FM_USDT_EVM_RPC_API_KEY_FILE_ENV, FM_USDT_EVM_RPC_URL_ENV,
-    FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV, env_secret_or_file,
-    is_env_var_set_opt, is_running_in_test_env,
+    FM_USDT_POLL_INTERVAL_SECS_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
+    FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV, env_secret_or_file, is_env_var_set_opt,
+    is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -467,6 +468,70 @@ fn usdt_gen_params_from_env() -> anyhow::Result<UsdtGenParams> {
 /// (kept as separate literals there since those are one-shot, not recurring,
 /// checks).
 const RPC_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Default seconds between ticks of the latency-sensitive background observer
+/// loops (block count, deposit scan, `UserOp` receipts) when
+/// [`FM_USDT_POLL_INTERVAL_SECS_ENV`] is unset. See that env var's doc for the
+/// full rationale; briefly, every guardian runs several independent RPC poll
+/// loops, so lowering this multiplies total RPC quota consumption. The
+/// slow-changing loops (fee estimate, post-bootstrap readiness) run at
+/// [`SLOW_POLL_MULTIPLIER`]× this instead.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 15;
+
+/// Lower bound on the configured poll interval, guarding against a value so
+/// small it degenerates into a busy loop hammering the RPC endpoint.
+const MIN_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Multiplier applied to [`poll_interval_secs`] for loops whose data changes
+/// far slower than the base tick and so need not poll as often: the fee/price
+/// estimate (a Chainlink feed with a multi-minute heartbeat) and the
+/// bootstrap-readiness loop once its immutable contract facts are cached (it
+/// then only re-reads the slowly-changing broadcaster balance). Cuts those
+/// loops' RPC volume by this factor with no material freshness cost -- the fee
+/// refresh stays well within `FEE_VOTE_TTL_BLOCKS`.
+const SLOW_POLL_MULTIPLIER: u64 = 4;
+
+/// Seconds each background observer loop sleeps between ticks.
+///
+/// Under the test harness this is a fixed fast `1` (kept identical to the
+/// former inline `is_running_in_test_env()` literals so test timing is
+/// unchanged). In production it reads [`FM_USDT_POLL_INTERVAL_SECS_ENV`]
+/// (default [`DEFAULT_POLL_INTERVAL_SECS`], floored at
+/// [`MIN_POLL_INTERVAL_SECS`]); an unparseable value falls back to the
+/// default. Guardian-local only -- it affects observation cadence, never a
+/// consensus-agreed value, so guardians may run different intervals.
+fn poll_interval_secs() -> u64 {
+    if is_running_in_test_env() {
+        return 1;
+    }
+    resolve_poll_interval(std::env::var(FM_USDT_POLL_INTERVAL_SECS_ENV).ok())
+}
+
+/// [`poll_interval_secs`] scaled by [`SLOW_POLL_MULTIPLIER`], for the
+/// slow-changing loops (fee estimate; post-cache bootstrap readiness). Under
+/// the test harness this collapses to the same fast `1` as the base interval
+/// so test timing is unchanged.
+fn slow_poll_interval_secs() -> u64 {
+    if is_running_in_test_env() {
+        return 1;
+    }
+    poll_interval_secs().saturating_mul(SLOW_POLL_MULTIPLIER)
+}
+
+/// Pure parse/clamp for [`poll_interval_secs`], split out so it is testable
+/// without depending on `is_running_in_test_env()` (which is always true under
+/// the test harness) or on mutating the process environment: `None` or an
+/// unparseable value yields [`DEFAULT_POLL_INTERVAL_SECS`], and any parsed
+/// value is floored at [`MIN_POLL_INTERVAL_SECS`].
+fn resolve_poll_interval(raw: Option<String>) -> u64 {
+    match raw {
+        Some(secs) => match secs.trim().parse::<u64>() {
+            Ok(secs) => secs.max(MIN_POLL_INTERVAL_SECS),
+            Err(_) => DEFAULT_POLL_INTERVAL_SECS,
+        },
+        None => DEFAULT_POLL_INTERVAL_SECS,
+    }
+}
 
 /// Maximum number of submitted `UserOp`s [`Usdt::spawn_user_op_submitter`]
 /// processes concurrently (security finding 19), bounding this guardian's
@@ -2599,12 +2664,7 @@ impl Usdt {
                     }
                 }
 
-                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
-                    1
-                } else {
-                    10
-                }))
-                .await;
+                fedimint_core::runtime::sleep(Duration::from_secs(poll_interval_secs())).await;
             }
         });
     }
@@ -2649,12 +2709,11 @@ impl Usdt {
                     }
                 }
 
-                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
-                    1
-                } else {
-                    10
-                }))
-                .await;
+                // Slow cadence: the Chainlink ETH/USD feed has a multi-minute
+                // heartbeat and the refresh stays well within
+                // `FEE_VOTE_TTL_BLOCKS`, so polling it every base tick is pure
+                // waste. See `SLOW_POLL_MULTIPLIER`.
+                fedimint_core::runtime::sleep(Duration::from_secs(slow_poll_interval_secs())).await;
             }
         });
     }
@@ -2688,6 +2747,12 @@ impl Usdt {
         } = handles;
 
         task_group.spawn_cancellable("usdt-bootstrap-observer", async move {
+            // Latched once an observation reports all three immutable contract
+            // booleans true. Immutable facts (contract code + CREATE2
+            // derivations) never revert, so once verified this guardian stops
+            // re-reading them (see `observe_bootstrap`) and stops running the
+            // now-pointless self-deploy tick, and drops to the slow cadence.
+            let mut contracts_verified = false;
             loop {
                 // Part A deploy tick (guardian-local side effect, writes NO
                 // consensus): self-deploy the SimpleAccountFactory if it is not
@@ -2695,14 +2760,17 @@ impl Usdt {
                 // before observing so a just-deployed factory can be voted ready
                 // on the same tick. Best-effort: any error is logged and the
                 // observation still proceeds (a wrong/absent factory simply
-                // keeps the federation not-`Ready` via Part C's gate).
-                if let Err(err) = Self::ensure_factory_deployed(
-                    evm_rpc.as_ref(),
-                    entry_point,
-                    account_factory,
-                    broadcaster_min_balance_wei,
-                )
-                .await
+                // keeps the federation not-`Ready` via Part C's gate). Skipped
+                // entirely once the factory is verified present -- it can only
+                // be deployed once.
+                if !contracts_verified
+                    && let Err(err) = Self::ensure_factory_deployed(
+                        evm_rpc.as_ref(),
+                        entry_point,
+                        account_factory,
+                        broadcaster_min_balance_wei,
+                    )
+                    .await
                 {
                     warn!(
                         target: "usdt",
@@ -2718,20 +2786,33 @@ impl Usdt {
                     account_factory,
                     simple_account_impl,
                     broadcaster_min_balance_wei,
+                    contracts_verified,
                 )
                 .await;
+
+                // Latch once all immutable contract facts are confirmed. This
+                // read is before the move-into-`push` below.
+                let all_contracts_ok =
+                    observation.entry_point_ok && observation.factory_ok && observation.impl_ok;
 
                 bootstrap_proposals
                     .lock()
                     .expect("not poisoned")
                     .push(observation);
 
-                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
-                    1
+                if all_contracts_ok {
+                    contracts_verified = true;
+                }
+
+                // Once verified, only the slowly-changing broadcaster balance
+                // is re-read, so drop to the slow cadence; until then poll at
+                // the base interval for fast startup convergence.
+                let interval = if contracts_verified {
+                    slow_poll_interval_secs()
                 } else {
-                    10
-                }))
-                .await;
+                    poll_interval_secs()
+                };
+                fedimint_core::runtime::sleep(Duration::from_secs(interval)).await;
             }
         });
     }
@@ -2751,8 +2832,36 @@ impl Usdt {
         account_factory: fedimint_usdt_common::EvmAddress,
         simple_account_impl: fedimint_usdt_common::EvmAddress,
         broadcaster_min_balance_wei: u64,
+        contracts_verified: bool,
     ) -> BootstrapObservation {
         let observe = || async {
+            // Broadcaster funding is re-read every tick (the operator tops the
+            // gas wallet up out-of-band, so it genuinely changes) and doubles
+            // as this loop's liveness probe: if the RPC endpoint is
+            // unreachable this errors and the whole observation fails to the
+            // all-`false` unhealthy value below.
+            let broadcaster_funded = rpc_deadline(evm_rpc.broadcaster_eth_balance())
+                .await?
+                .is_some_and(|balance| balance >= u128::from(broadcaster_min_balance_wei));
+
+            // Once the immutable contract facts below have all been verified
+            // (`contracts_verified`), they can never change --
+            // entry_point/factory/impl are immutable contracts and the CREATE2
+            // derivations are deterministic -- so skip re-reading them every
+            // tick. This eliminates ~6 RPC calls per tick per guardian (3x
+            // `get_code`, 2x `factory_get_address`, 1x `accountImplementation`),
+            // the dominant idle RPC load. The caller latches this flag once an
+            // observation reports all three contract booleans true.
+            if contracts_verified {
+                return Ok(BootstrapObservation {
+                    entry_point_ok: true,
+                    factory_ok: true,
+                    impl_ok: true,
+                    broadcaster_funded,
+                    rpc_healthy: true,
+                });
+            }
+
             let entry_point_ok = rpc_deadline(evm_rpc.get_code_len(entry_point)).await? > 0;
 
             // Factory readiness (the footgun-killer): the factory must have
@@ -2812,12 +2921,6 @@ impl Usdt {
                 factory_has_code && pool_salt_ok && deposit_salt_ok && impl_matches_factory;
 
             let impl_ok = rpc_deadline(evm_rpc.get_code_len(simple_account_impl)).await? > 0;
-
-            // Broadcaster funding: `None` (no broadcaster configured) counts
-            // as not funded.
-            let broadcaster_funded = rpc_deadline(evm_rpc.broadcaster_eth_balance())
-                .await?
-                .is_some_and(|balance| balance >= u128::from(broadcaster_min_balance_wei));
 
             Ok::<BootstrapObservation, anyhow::Error>(BootstrapObservation {
                 entry_point_ok,
@@ -2974,12 +3077,7 @@ impl Usdt {
                     );
                 }
 
-                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
-                    1
-                } else {
-                    10
-                }))
-                .await;
+                fedimint_core::runtime::sleep(Duration::from_secs(poll_interval_secs())).await;
             }
         });
     }
@@ -3194,12 +3292,7 @@ impl Usdt {
                     )
                     .await;
 
-                fedimint_core::runtime::sleep(Duration::from_secs(if is_running_in_test_env() {
-                    1
-                } else {
-                    10
-                }))
-                .await;
+                fedimint_core::runtime::sleep(Duration::from_secs(poll_interval_secs())).await;
             }
         });
     }
@@ -6814,6 +6907,39 @@ mod tests {
     }
 
     #[test]
+    fn poll_interval_resolves_default_override_and_clamp() {
+        // Unset -> default.
+        assert_eq!(resolve_poll_interval(None), DEFAULT_POLL_INTERVAL_SECS);
+        // A valid override is applied verbatim (with surrounding whitespace
+        // trimmed, mirroring how operators paste env values).
+        assert_eq!(resolve_poll_interval(Some("60".to_string())), 60);
+        assert_eq!(resolve_poll_interval(Some("  45 ".to_string())), 45);
+        // Below the floor is clamped up, never a busy loop.
+        assert_eq!(
+            resolve_poll_interval(Some("1".to_string())),
+            MIN_POLL_INTERVAL_SECS
+        );
+        assert_eq!(
+            resolve_poll_interval(Some("0".to_string())),
+            MIN_POLL_INTERVAL_SECS
+        );
+        // An exactly-at-floor value is preserved.
+        assert_eq!(
+            resolve_poll_interval(Some(MIN_POLL_INTERVAL_SECS.to_string())),
+            MIN_POLL_INTERVAL_SECS
+        );
+        // Unparseable -> default (never a panic, mirroring the gen-param envs).
+        assert_eq!(
+            resolve_poll_interval(Some("not-a-number".to_string())),
+            DEFAULT_POLL_INTERVAL_SECS
+        );
+        assert_eq!(
+            resolve_poll_interval(Some(String::new())),
+            DEFAULT_POLL_INTERVAL_SECS
+        );
+    }
+
+    #[test]
     fn env_override_valid_values_are_applied() {
         let _lock = ENV_VAR_LOCK
             .lock()
@@ -7185,6 +7311,7 @@ mod tests {
             cfg.account_factory,
             cfg.simple_account_impl,
             cfg.broadcaster_min_balance_wei,
+            false,
         )
         .await;
 
@@ -7220,6 +7347,7 @@ mod tests {
             cfg.account_factory,
             cfg.simple_account_impl,
             cfg.broadcaster_min_balance_wei,
+            false,
         )
         .await;
 
@@ -7250,11 +7378,57 @@ mod tests {
             cfg.account_factory,
             cfg.simple_account_impl,
             cfg.broadcaster_min_balance_wei,
+            false,
         )
         .await;
 
         assert!(observation.rpc_healthy);
         assert!(!observation.factory_ok);
+    }
+
+    /// The immutable-read cache: once `contracts_verified` is latched,
+    /// `observe_bootstrap` must NOT re-read `entry_point`/`factory`/`impl`
+    /// code, the factory `getAddress` derivations, or
+    /// `accountImplementation()`. Proven against a completely empty mock
+    /// (no code, no scripted addresses): with the cache OFF every contract
+    /// boolean is false, but with the cache ON all three report true
+    /// against that same empty mock -- which is only possible if none of
+    /// those RPC reads happened.
+    #[tokio::test]
+    async fn readiness_skips_immutable_reads_once_contracts_verified() {
+        let module = test_module_with_block_count(4, 0).await;
+        let cfg = module.cfg.consensus.clone();
+        let mock = MockEvmRpc::default();
+
+        let uncached = Usdt::observe_bootstrap(
+            &mock,
+            &cfg.group_public_key,
+            cfg.entry_point,
+            cfg.account_factory,
+            cfg.simple_account_impl,
+            cfg.broadcaster_min_balance_wei,
+            false,
+        )
+        .await;
+        assert!(uncached.rpc_healthy);
+        assert!(!uncached.entry_point_ok);
+        assert!(!uncached.factory_ok);
+        assert!(!uncached.impl_ok);
+
+        let cached = Usdt::observe_bootstrap(
+            &mock,
+            &cfg.group_public_key,
+            cfg.entry_point,
+            cfg.account_factory,
+            cfg.simple_account_impl,
+            cfg.broadcaster_min_balance_wei,
+            true,
+        )
+        .await;
+        assert!(cached.rpc_healthy);
+        assert!(cached.entry_point_ok);
+        assert!(cached.factory_ok);
+        assert!(cached.impl_ok);
     }
 
     /// Deterministic `secp256k1::PublicKey` derived from `byte`, for tests
