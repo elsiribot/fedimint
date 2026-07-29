@@ -1057,6 +1057,22 @@ pub struct PoolStateResponse {
     pub balance: UsdtAmount,
 }
 
+/// Response to the `latest_anchored_block` endpoint: the newest height
+/// currently anchored in the consensus-agreed canonical block-hash ring
+/// (`latest`, `0` if the ring is empty -- i.e. before the first
+/// `UsdtConsensusItem::BlockHash` has reached threshold agreement) and the
+/// ring's retained window length (`window`, always [`BLOCK_HASH_RING_LEN`]).
+/// A deposit-by-proof client targets its inclusion proof at a height in
+/// `[latest - window + 1, latest]` so the guardian ring still holds the
+/// canonical hash to check the proof against. Read directly from consensus
+/// DB, so any guardian answers identically, mirroring
+/// [`PoolStateResponse`]/[`StatusResponse`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct AnchoredBlockResponse {
+    pub latest: u64,
+    pub window: u64,
+}
+
 /// Request for the [`UserOpStatus`] of a specific `UserOp`, identified by its
 /// [`user_op::user_op_hash`].
 #[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
