@@ -17,6 +17,28 @@ enum Opts {
     /// Report the credited/claimed/claimable state of `claim_pk`'s deposit
     /// account.
     DepositStatus { claim_pk: secp256k1::PublicKey },
+    /// Fetch an on-chain balance proof for the deposit account at
+    /// seed-derivation `index` and submit it, crediting AND minting the
+    /// newly-proven balance as USDT e-cash in one transaction
+    /// (deposit-by-proof). No claim step or deposit fee: the full proven delta
+    /// is minted. The client fetches `eth_getProof`/`eth_getBlockByNumber` from
+    /// `--evm-rpc-url` (or the client-configured/default endpoint), targeting
+    /// the federation's newest anchored confirmation-deep block.
+    SubmitDepositProof {
+        #[arg(long)]
+        index: u64,
+        /// Ethereum JSON-RPC endpoint to fetch the proof from (overriding any
+        /// client-configured or built-in default endpoint for this call only).
+        #[arg(long)]
+        evm_rpc_url: Option<String>,
+    },
+    /// Persist (or, with no URL, clear) the client's Ethereum JSON-RPC
+    /// endpoint used by `submit-deposit-proof` when no per-call
+    /// `--evm-rpc-url` is given.
+    SetEvmRpcUrl {
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// Submit a claim transaction for `claim_pk`'s currently claimable
     /// balance (requires a nonzero `claimable` from `deposit-status`, and
     /// that `claim_pk` was previously produced by `deposit-address` on this
@@ -186,6 +208,21 @@ pub(crate) async fn handle_cli_command(
             }))
         }
         Opts::DepositStatus { claim_pk } => json(usdt.deposit_status(claim_pk).await?),
+        Opts::SubmitDepositProof { index, evm_rpc_url } => {
+            let claim_keypair = usdt.claim_keypair_for_index(index);
+            let account = usdt.deposit_address(&claim_keypair.public_key());
+            let operation_id = usdt.submit_deposit_proof(index, evm_rpc_url).await?;
+            json(serde_json::json!({
+                "index": index,
+                "claim_pk": claim_keypair.public_key(),
+                "account": account.to_string(),
+                "operation_id": operation_id.fmt_full().to_string(),
+            }))
+        }
+        Opts::SetEvmRpcUrl { url } => {
+            usdt.set_evm_rpc_url(url.clone()).await;
+            json(serde_json::json!({ "evm_rpc_url": url }))
+        }
         Opts::Claim {
             claim_pk,
             max_deposit_fee,
@@ -280,6 +317,50 @@ mod tests {
         assert!(matches!(
             Opts::try_parse_from(["usdt", "deposit-status", TEST_PUBKEY]).expect("parses"),
             Opts::DepositStatus { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_submit_deposit_proof() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "submit-deposit-proof", "--index", "3"]).expect("parses"),
+            Opts::SubmitDepositProof {
+                index: 3,
+                evm_rpc_url: None,
+            }
+        ));
+        assert!(matches!(
+            Opts::try_parse_from([
+                "usdt",
+                "submit-deposit-proof",
+                "--index",
+                "3",
+                "--evm-rpc-url",
+                "https://example.invalid/rpc",
+            ])
+            .expect("parses"),
+            Opts::SubmitDepositProof {
+                index: 3,
+                evm_rpc_url: Some(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_set_evm_rpc_url() {
+        assert!(matches!(
+            Opts::try_parse_from(["usdt", "set-evm-rpc-url"]).expect("parses"),
+            Opts::SetEvmRpcUrl { url: None }
+        ));
+        assert!(matches!(
+            Opts::try_parse_from([
+                "usdt",
+                "set-evm-rpc-url",
+                "--url",
+                "https://example.invalid/rpc"
+            ])
+            .expect("parses"),
+            Opts::SetEvmRpcUrl { url: Some(_) }
         ));
     }
 

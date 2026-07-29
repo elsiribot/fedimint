@@ -23,6 +23,13 @@ pub enum DbKeyPrefix {
     /// [`crate::UsdtClientModule::withdraw`] will use for a fresh withdrawal
     /// refund key (security finding 09), mirroring [`Self::NextDepositIndex`].
     NextRefundIndex = 0x04,
+    /// Singleton: an optional client-configured Ethereum JSON-RPC URL the
+    /// deposit-by-proof flow
+    /// ([`crate::UsdtClientModule::submit_deposit_proof`])
+    /// fetches `eth_getProof`/`eth_getBlockByNumber` from, overriding the
+    /// built-in [`crate::evm::DEFAULT_EVM_RPC_URLS`] default when a per-call
+    /// `evm_rpc_url` argument is not supplied.
+    EvmRpcUrl = 0x05,
 }
 
 /// Maps a derived deposit account (see
@@ -110,3 +117,22 @@ impl_db_lookup!(
     key = NextRefundIndexKey,
     query_prefix = NextRefundIndexPrefixAll
 );
+
+/// Singleton key holding an optional client-configured Ethereum JSON-RPC URL
+/// for the deposit-by-proof flow (see
+/// [`crate::UsdtClientModule::submit_deposit_proof`]). Absent by default (the
+/// flow falls back to [`crate::evm::DEFAULT_EVM_RPC_URLS`]); set via
+/// [`crate::UsdtClientModule::set_evm_rpc_url`].
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct EvmRpcUrlKey;
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct EvmRpcUrlPrefixAll;
+
+impl_db_record!(
+    key = EvmRpcUrlKey,
+    value = String,
+    db_prefix = DbKeyPrefix::EvmRpcUrl,
+);
+
+impl_db_lookup!(key = EvmRpcUrlKey, query_prefix = EvmRpcUrlPrefixAll);

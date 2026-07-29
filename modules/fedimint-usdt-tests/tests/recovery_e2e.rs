@@ -72,7 +72,7 @@ async fn join_with_root_secret(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
+#[ignore = "re-enable in Task 11 (anvil e2e drives the client eth_getProof submit flow)"]
 async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> {
     let mock = Arc::new(MockEvmRpc::new());
     // The usdt module's default `UsdtGenParams::usdt_contract` placeholder.
@@ -147,9 +147,10 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     let net_deposit_amount = UsdtAmount(2_560_000);
     let deposit_amount = UsdtAmount(net_deposit_amount.0 + deposit_fee.0);
     mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
-    // TODO(Task 9): crediting is now proof-driven -- submit a
-    // `UsdtInput::DepositProofV0` here instead of the removed `check_deposit`
-    // guardian-poll trigger (this test is `#[ignore]`d until that flow lands).
+    // TODO(Task 11): crediting is now proof-driven -- drive the client's
+    // `submit_deposit_proof` (real `eth_getProof` against anvil) here instead of
+    // the removed `check_deposit` guardian-poll trigger (this anvil e2e test is
+    // `#[ignore]`d until Task 11 wires that up).
 
     let credited_deadline = Instant::now() + Duration::from_secs(120);
     loop {

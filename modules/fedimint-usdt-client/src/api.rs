@@ -6,14 +6,15 @@ use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::{OutPoint, PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
     DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
-    POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
-    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    LATEST_ANCHORED_BLOCK_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT,
+    USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
+    WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
-    DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositStatusRequest, DepositStatusResponse,
-    PoolStateResponse, RefundStatusRequest, RefundStatusResponse, StatusResponse, UsdtAmount,
-    UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
-    WithdrawalStatusRequest, WithdrawalStatusResponse,
+    AnchoredBlockResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositStatusRequest,
+    DepositStatusResponse, PoolStateResponse, RefundStatusRequest, RefundStatusResponse,
+    StatusResponse, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
+    WithdrawFeeQuoteResponse, WithdrawalStatusRequest, WithdrawalStatusResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -85,6 +86,15 @@ pub trait UsdtFederationApi {
     /// threshold-aggregated `BootstrapObservation` votes in consensus DB, so
     /// any guardian answers identically.
     async fn status(&self) -> FederationResult<StatusResponse>;
+
+    /// Reports the newest confirmation-depth block height currently anchored
+    /// in the federation's consensus block-hash ring, plus the ring's window
+    /// length (deposit-by-proof, Task 7). A client picks an in-window,
+    /// already-confirmed block to target its `eth_getProof` at (see
+    /// [`crate::UsdtClientModule::submit_deposit_proof`]).
+    /// Threshold-agreement (`request_current_consensus`): read directly from
+    /// consensus DB, so any guardian answers identically.
+    async fn latest_anchored_block(&self) -> FederationResult<AnchoredBlockResponse>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -176,6 +186,14 @@ where
     async fn status(&self) -> FederationResult<StatusResponse> {
         self.request_current_consensus(
             USDT_STATUS_ENDPOINT.to_string(),
+            ApiRequestErased::default(),
+        )
+        .await
+    }
+
+    async fn latest_anchored_block(&self) -> FederationResult<AnchoredBlockResponse> {
+        self.request_current_consensus(
+            LATEST_ANCHORED_BLOCK_ENDPOINT.to_string(),
             ApiRequestErased::default(),
         )
         .await

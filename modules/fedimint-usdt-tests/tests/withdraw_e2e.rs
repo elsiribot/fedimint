@@ -129,7 +129,7 @@ async fn mine_empty_blocks(anvil: &common::AnvilHandle, count: u32) -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
+#[ignore = "re-enable in Task 11 (anvil e2e drives the client eth_getProof submit flow)"]
 async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoint()
 -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {

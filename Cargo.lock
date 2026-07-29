@@ -6102,6 +6102,9 @@ dependencies = [
 name = "fedimint-usdt-client"
 version = "0.12.0-alpha"
 dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
  "anyhow",
  "async-trait",
  "clap",
@@ -6113,6 +6116,7 @@ dependencies = [
  "fedimint-logging",
  "fedimint-usdt-common",
  "futures",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "strum 0.27.1",
@@ -6175,6 +6179,10 @@ name = "fedimint-usdt-tests"
 version = "0.12.0-alpha"
 dependencies = [
  "alloy",
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
  "anyhow",
  "async-trait",
  "clap",

@@ -12,8 +12,9 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use api::UsdtFederationApi;
 use db::{
-    ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix, NextDepositIndexKey, NextDepositIndexPrefixAll,
-    NextRefundIndexKey, NextRefundIndexPrefixAll, RefundKeyKey, RefundKeyPrefixAll,
+    ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix, EvmRpcUrlKey, EvmRpcUrlPrefixAll,
+    NextDepositIndexKey, NextDepositIndexPrefixAll, NextRefundIndexKey, NextRefundIndexPrefixAll,
+    RefundKeyKey, RefundKeyPrefixAll,
 };
 use fedimint_api_client::api::DynModuleApi;
 use fedimint_client_module::db::ClientModuleMigrationFn;
@@ -42,7 +43,7 @@ use fedimint_derive_secret::{ChildId, DerivableSecret};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
-    BootstrapState, DepositFeeQuoteResponse, DepositStatusResponse, EvmAddress, KIND,
+    BootstrapState, DepositFeeQuoteResponse, DepositProof, DepositStatusResponse, EvmAddress, KIND,
     PoolStateResponse, RefundStatusResponse, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
     UsdtInput, UsdtInputV0, UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse,
     WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse, usdt_amount,
@@ -56,6 +57,7 @@ pub mod api;
 #[cfg(feature = "cli")]
 mod cli;
 pub mod db;
+pub mod evm;
 pub mod states;
 
 /// Cap on the exponential backoff [`UsdtClientModule::check_and_claim`] waits
@@ -750,6 +752,247 @@ impl UsdtClientModule {
         Ok(self.module_api.status().await?)
     }
 
+    /// Persists a client-configured Ethereum JSON-RPC URL that
+    /// [`Self::submit_deposit_proof`] uses (unless a per-call `evm_rpc_url`
+    /// argument overrides it) instead of the built-in
+    /// [`evm::DEFAULT_EVM_RPC_URLS`] default. Pass `None` to clear it.
+    pub async fn set_evm_rpc_url(&self, url: Option<String>) {
+        let mut dbtx = self.db.begin_transaction().await;
+        match url {
+            Some(url) => {
+                dbtx.insert_entry(&EvmRpcUrlKey, &url).await;
+            }
+            None => {
+                dbtx.remove_entry(&EvmRpcUrlKey).await;
+            }
+        }
+        dbtx.commit_tx().await;
+    }
+
+    /// Resolves the EVM RPC endpoint list [`Self::submit_deposit_proof`] should
+    /// use, in precedence order: an explicit per-call `evm_rpc_url`, then a
+    /// client-DB [`EvmRpcUrlKey`] override (see [`Self::set_evm_rpc_url`]),
+    /// then the built-in [`evm::DEFAULT_EVM_RPC_URLS`].
+    async fn resolve_evm_rpc_urls(&self, evm_rpc_url: Option<String>) -> Vec<String> {
+        if let Some(url) = evm_rpc_url {
+            return vec![url];
+        }
+        if let Some(url) = self
+            .db
+            .begin_transaction_nc()
+            .await
+            .get_value(&EvmRpcUrlKey)
+            .await
+        {
+            return vec![url];
+        }
+        evm::DEFAULT_EVM_RPC_URLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    /// Reports the newest confirmation-depth block height currently anchored
+    /// in the federation's consensus block-hash ring, plus the retained window
+    /// length (deposit-by-proof, Task 7; thin wrapper around
+    /// [`UsdtFederationApi::latest_anchored_block`]).
+    pub async fn latest_anchored_block(
+        &self,
+    ) -> anyhow::Result<fedimint_usdt_common::AnchoredBlockResponse> {
+        Ok(self.module_api.latest_anchored_block().await?)
+    }
+
+    /// Credits (and, atomically in the same transaction, mints) the deposit at
+    /// seed-derivation `index` by fetching an on-chain balance proof and
+    /// submitting it as a [`UsdtInput::DepositProofV0`] (deposit-by-proof,
+    /// Task 9). Returns the submitted transaction's [`OperationId`].
+    ///
+    /// Flow:
+    /// 1. Derive the `index`'s claim key + deposit `account`
+    ///    ([`Self::claim_keypair_for_index`]/[`Self::deposit_address`]) and
+    ///    persist the claim key ([`ClaimKeyKey`]) so the deposit is
+    ///    recoverable/claimable exactly as [`Self::allocate_deposit`] leaves
+    ///    it.
+    /// 2. Ask the federation for its newest anchored, confirmation-deep block
+    ///    ([`Self::latest_anchored_block`]) and target the proof at it (the
+    ///    ring only ever holds already-confirmed heights, so `latest` is a safe
+    ///    target).
+    /// 3. Fetch `eth_getProof(usdt_contract, [balances_storage_key(account)],
+    ///    B)` and `eth_getBlockByNumber(B)` over the client's OWN WASM-safe
+    ///    HTTP (see [`evm::EthJsonRpc`]), reconstruct + RLP-encode the header,
+    ///    and assert `keccak256(header_rlp) == B.hash` locally before
+    ///    submitting.
+    /// 4. Submit a transaction pairing the `DepositProofV0` input (funding the
+    ///    newly-proven delta in [`USDT_UNIT`]) with the primary
+    ///    (USDT-denominated `mintv2`) module's mint output -- deposit + claim
+    ///    atomic, no fee (see [`UsdtInput::DepositProofV0`]).
+    ///
+    /// `evm_rpc_url` overrides the endpoint for this call only; see
+    /// [`Self::resolve_evm_rpc_urls`] for the precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` if the ring has anchored no block yet, the RPC calls
+    /// fail, the header reconstruction does not hash to the block's own hash,
+    /// or the proof proves nothing new over what is already credited.
+    pub async fn submit_deposit_proof(
+        &self,
+        index: u64,
+        evm_rpc_url: Option<String>,
+    ) -> anyhow::Result<OperationId> {
+        let claim_keypair = self.claim_keypair_for_index(index);
+        let account = self.deposit_address(&claim_keypair.public_key());
+
+        let anchored = self.module_api.latest_anchored_block().await?;
+        if anchored.latest == 0 {
+            bail!("federation has not anchored any confirmation-deep block yet; try again shortly");
+        }
+        let block = anchored.latest;
+
+        let urls = self.resolve_evm_rpc_urls(evm_rpc_url).await;
+        let rpc = evm::EthJsonRpc::new(urls)?;
+        let (proof, proven) = rpc
+            .fetch_deposit_proof(self.cfg.usdt_contract, account, block)
+            .await?;
+
+        self.submit_prebuilt_deposit_proof(&claim_keypair, proof, proven)
+            .await
+    }
+
+    /// Submits an already-built [`DepositProof`] of `claim_keypair`'s derived
+    /// deposit account as a [`UsdtInput::DepositProofV0`], crediting AND
+    /// minting the newly-proven delta as USDT e-cash in one transaction (no
+    /// fee).
+    ///
+    /// This is the transport-agnostic core of [`Self::submit_deposit_proof`]:
+    /// the latter obtains `(proof, proven)` via the client's own WASM-safe
+    /// `eth_getProof` fetch, but an out-of-band indexer (or a hermetic test)
+    /// that already holds a proof can submit it directly here. `proven` is the
+    /// balance the proof attests (used only to compute the credit delta over
+    /// the federation's current `credited`; the authoritative balance is what
+    /// the guardians independently re-derive from the trie).
+    ///
+    /// Persists `claim_keypair` under [`ClaimKeyKey`] (idempotent) so the
+    /// deposit is claimable/recoverable exactly as [`Self::allocate_deposit`]
+    /// leaves it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` if the proof proves nothing new over what is already
+    /// credited, or the submission is rejected.
+    pub async fn submit_prebuilt_deposit_proof(
+        &self,
+        claim_keypair: &Keypair,
+        proof: DepositProof,
+        proven: UsdtAmount,
+    ) -> anyhow::Result<OperationId> {
+        let claim_pk = claim_keypair.public_key();
+        let account = self.deposit_address(&claim_pk);
+
+        {
+            let mut dbtx = self.db.begin_transaction().await;
+            dbtx.insert_entry(&ClaimKeyKey(account), claim_keypair)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Only the delta over the account's existing high-water `credited` is
+        // new, mintable value -- mirror the server's `process_deposit_proof`
+        // high-water logic so the `ClientInput.amounts` we declare matches the
+        // `InputMeta.amount` the server will return (or the transaction would
+        // not balance).
+        let status = self.module_api.deposit_status(claim_pk).await?;
+        let delta = proven.0.saturating_sub(status.credited.0);
+        if delta == 0 {
+            bail!(
+                "deposit proof proves {proven} but {} is already credited for {account}; nothing \
+                 new to credit",
+                status.credited,
+            );
+        }
+
+        self.submit_deposit_proof_input(claim_keypair, account, proof, UsdtAmount(delta))
+            .await
+    }
+
+    /// Builds the [`UsdtInput::DepositProofV0`] client input funding `delta`
+    /// (in [`USDT_UNIT`]) with `claim_keypair`, submits it paired with the
+    /// primary (USDT-denominated `mintv2`) module's mint output, and awaits the
+    /// e-cash issuance -- the deposit-by-proof analogue of
+    /// [`Self::submit_claim`] (implicit-funding pattern), but crediting AND
+    /// minting atomically with no fee. Factored out of
+    /// [`Self::submit_deposit_proof`] so a hermetic test can drive it with
+    /// a pre-built [`DepositProof`] + delta without a live EVM RPC.
+    async fn submit_deposit_proof_input(
+        &self,
+        claim_keypair: &Keypair,
+        account: EvmAddress,
+        proof: DepositProof,
+        delta: UsdtAmount,
+    ) -> anyhow::Result<OperationId> {
+        let input = Self::deposit_proof_input(claim_keypair, proof, delta);
+
+        let operation_id = OperationId::new_random();
+        let tx = TransactionBuilder::new().with_inputs(
+            self.client_ctx
+                .make_client_inputs(ClientInputBundle::new_no_sm(vec![input])),
+        );
+
+        let range = self
+            .client_ctx
+            .finalize_and_submit_transaction(
+                operation_id,
+                KIND.as_str(),
+                // No fee on the deposit-by-proof path (see
+                // `UsdtInput::DepositProofV0`); the full delta is minted.
+                move |_range| UsdtOperationMeta::Claim {
+                    account,
+                    amount: delta,
+                    fee: UsdtAmount(0),
+                },
+                tx,
+            )
+            .await?;
+
+        // Await the USDT-denominated `mintv2` primary module's e-cash issuance,
+        // mirroring `submit_claim`: the deposit's e-cash is minted 1:1 with the
+        // input's `delta` funding, and issuance completes strictly after the
+        // transaction is submitted.
+        self.client_ctx
+            .await_primary_module_outputs_for_unit(
+                operation_id,
+                range.into_iter().collect(),
+                USDT_UNIT,
+            )
+            .await?;
+
+        Ok(operation_id)
+    }
+
+    /// Builds the [`UsdtInput::DepositProofV0`] `ClientInput` claiming a
+    /// newly-proven `delta` for `claim_keypair`'s derived deposit account.
+    ///
+    /// Unlike [`Self::claim_input`], no fee: the server's
+    /// `process_deposit_proof` returns `InputMeta { amounts: delta, fees:
+    /// ZERO, pub_key: claim_pk }`, so `ClientInput.amounts` is the full `delta`
+    /// (which the USDT-`mintv2` primary module mints) and the transaction
+    /// balances in [`USDT_UNIT`]. A pure, synchronous helper (no network/DB
+    /// access) so the input construction is unit-testable.
+    fn deposit_proof_input(
+        claim_keypair: &Keypair,
+        proof: DepositProof,
+        delta: UsdtAmount,
+    ) -> ClientInput<UsdtInput> {
+        ClientInput {
+            input: UsdtInput::DepositProofV0 {
+                claim_pk: claim_keypair.public_key(),
+                proof,
+            },
+            keys: vec![*claim_keypair],
+            amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(delta)),
+        }
+    }
+
     /// Looks up the claim keypair persisted by [`Self::allocate_deposit`] for
     /// `claim_pk`'s derived deposit account.
     async fn load_claim_keypair(
@@ -1382,6 +1625,16 @@ impl ModuleInit for UsdtClientInit {
                         "Usdt Next Refund Index"
                     );
                 }
+                DbKeyPrefix::EvmRpcUrl => {
+                    push_db_pair_items!(
+                        dbtx,
+                        EvmRpcUrlPrefixAll,
+                        EvmRpcUrlKey,
+                        String,
+                        items,
+                        "Usdt Evm Rpc Url"
+                    );
+                }
             }
         }
 
@@ -1424,11 +1677,11 @@ mod tests {
     use fedimint_derive_secret::DerivableSecret;
 
     use super::{
-        Amount, Amounts, Database, DepositFeeQuoteResponse, DepositStatusResponse, EvmAddress,
-        FEE_QUOTE_UNAVAILABLE_MESSAGE, IDatabaseTransactionOpsCoreTyped, Keypair, OutPoint, PeerId,
-        PoolStateResponse, RefundStatusResponse, SECP256K1, StatusResponse, USDT_UNIT, UsdtAmount,
-        UsdtClientModule, UsdtFederationApi, UsdtInput, UserOpStatusResponse,
-        WithdrawFeeQuoteResponse, WithdrawalStatusResponse, check_fee_cap,
+        Amount, Amounts, Database, DepositFeeQuoteResponse, DepositProof, DepositStatusResponse,
+        EvmAddress, FEE_QUOTE_UNAVAILABLE_MESSAGE, IDatabaseTransactionOpsCoreTyped, Keypair,
+        OutPoint, PeerId, PoolStateResponse, RefundStatusResponse, SECP256K1, StatusResponse,
+        USDT_UNIT, UsdtAmount, UsdtClientModule, UsdtFederationApi, UsdtInput,
+        UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatusResponse, check_fee_cap,
         ensure_fee_quote_available, secp256k1,
     };
     use crate::db::{ClaimKeyKey, NextDepositIndexKey};
@@ -1518,6 +1771,53 @@ mod tests {
         // fee > amount.
         UsdtClientModule::claim_input(&keypair, account, UsdtAmount(500), UsdtAmount(600))
             .expect_err("fee exceeding amount must be rejected");
+    }
+
+    /// [`UsdtClientModule::deposit_proof_input`] must build a `DepositProofV0`
+    /// input signed by the claim key, funding the FULL newly-proven `delta`
+    /// (no fee, unlike the `V0` claim path) as its `ClientInput.amounts`, so
+    /// the transaction balances against the server's `process_deposit_proof`
+    /// declaration (`amounts: delta, fees: ZERO, pub_key: claim_pk`) and the
+    /// USDT-`mintv2` primary module mints exactly `delta`.
+    #[test]
+    fn deposit_proof_input_binds_claim_key_and_full_delta() {
+        let keypair = test_keypair();
+        let delta = UsdtAmount(500_000_000);
+        let proof = DepositProof {
+            block_number: 100,
+            header_rlp: vec![0x01, 0x02, 0x03],
+            account_proof: vec![vec![0xaa]],
+            storage_proof: vec![vec![0xbb]],
+        };
+
+        let input = UsdtClientModule::deposit_proof_input(&keypair, proof.clone(), delta);
+
+        match input.input {
+            UsdtInput::DepositProofV0 {
+                claim_pk,
+                proof: input_proof,
+            } => {
+                assert_eq!(
+                    claim_pk,
+                    keypair.public_key(),
+                    "the input must carry the claim key the server derives the account from"
+                );
+                assert_eq!(input_proof, proof, "the proof must be carried verbatim");
+            }
+            UsdtInput::V0(_) | UsdtInput::RefundV0 { .. } | UsdtInput::Default { .. } => {
+                panic!("deposit_proof_input must build a DepositProofV0 input")
+            }
+        }
+        assert_eq!(
+            input.keys,
+            vec![keypair],
+            "the input must be signed by the claim key"
+        );
+        assert_eq!(
+            input.amounts,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(delta.0)),
+            "ClientInput.amounts must fund the FULL delta (deposit-by-proof charges no fee)"
+        );
     }
 
     /// The deposit claim-key derivation must be deterministic from the seed:
@@ -1800,6 +2100,12 @@ mod tests {
 
         async fn status(&self) -> FederationResult<StatusResponse> {
             unimplemented!("recover_deposits_scan never calls status")
+        }
+
+        async fn latest_anchored_block(
+            &self,
+        ) -> FederationResult<fedimint_usdt_common::AnchoredBlockResponse> {
+            unimplemented!("recover_deposits_scan never calls latest_anchored_block")
         }
     }
 

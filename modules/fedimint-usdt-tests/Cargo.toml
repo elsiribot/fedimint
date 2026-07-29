@@ -24,6 +24,13 @@ path = "tests/tests.rs"
 
 [dependencies]
 alloy = { workspace = true }
+# Leaf crates for the hermetic synthetic-proof builder (`tests/common/proof.rs`),
+# mirroring `fedimint-usdt-server`'s deterministic MPT verifier deps. Test-only
+# (this crate is never WASM-shipped).
+alloy-consensus = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+alloy-trie = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
