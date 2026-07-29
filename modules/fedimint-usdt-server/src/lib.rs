@@ -24,9 +24,8 @@ use fedimint_core::envs::{
     FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV, FM_USDT_CHAIN_ID_ENV, FM_USDT_CONFIRMATION_DEPTH_ENV,
     FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV,
     FM_USDT_EVM_RPC_API_KEY_ENV, FM_USDT_EVM_RPC_API_KEY_FILE_ENV, FM_USDT_EVM_RPC_URL_ENV,
-    FM_USDT_POLL_INTERVAL_SECS_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
-    FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV, env_secret_or_file, is_env_var_set_opt,
-    is_running_in_test_env,
+    FM_USDT_POLL_INTERVAL_SECS_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, env_secret_or_file,
+    is_env_var_set_opt, is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -82,13 +81,12 @@ use crate::db::{
     MpcRoundChunkSessionRoundPeerPrefix, MpcRoundChunkSessionRoundPrefix, PendingCheck,
     PendingCheckKey, PendingCheckPrefix, PendingUserOp, PendingUserOpKey, PendingUserOpPrefix,
     PoolState, PoolStateKey, PoolStatePrefix, Refund, RefundKey, RefundPrefix, SessionState,
-    SigningPurpose, SigningSession,
-    SigningSessionKey, SigningSessionPrefix, StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey,
-    SubmittedUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
-    UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
-    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalBatchCapKey, WithdrawalBatchCapPrefix,
-    WithdrawalIncurredFeeKey, WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey,
-    WithdrawalStatePrefix,
+    SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix, StoredFeeVote,
+    SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix, UnclaimedWithdrawalKey,
+    UnclaimedWithdrawalPrefix, UsdtWithdrawalV0, UserOpConfirmedObservation,
+    UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix, UserOpConfirmedVotePrefix, UserOpPurpose,
+    WithdrawalBatchCapKey, WithdrawalBatchCapPrefix, WithdrawalIncurredFeeKey,
+    WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -12691,11 +12689,15 @@ mod tests {
     }
 
     /// Shared setup for the sweep-aware credit-rule tests: drives a first
-    /// deposit of 100 (observed at block 10) through the consensus vote path
-    /// (which auto-enqueues its sweep), then confirms that sweep at
-    /// `sweep_block` -- leaving `credited == swept == 100`, `nonce == 1`,
-    /// `LastSweepBlockKey(account) == sweep_block`, and no in-flight op.
-    /// Returns the swept account.
+    /// deposit of 100 USDT (100_000_000 units, observed at block 10) through
+    /// the consensus vote path (which auto-enqueues its sweep), then confirms
+    /// that sweep at `sweep_block` -- leaving `credited == swept ==
+    /// 100_000_000`, `nonce == 1`, `LastSweepBlockKey(account) ==
+    /// sweep_block`, and no in-flight op. Returns the swept account.
+    ///
+    /// Amounts are scaled to clear the finding-02 dust gate: with
+    /// `sample_fee_vote`'s median a deploy+sweep prices at 86_400_000 units,
+    /// so every credited remainder these tests expect to sweep is above that.
     async fn credit_100_and_confirm_sweep(
         module: &Usdt,
         sweep_block: u64,
@@ -12710,8 +12712,15 @@ mod tests {
             &claim_pk,
         );
 
-        // First deposit: 100 observed at block 10 -> credited 100, sweep of
-        // the full 100 auto-enqueued at nonce 0.
+        // Prerequisites the security wave added: a consensus block count deep
+        // enough that observations at blocks 10..=25 pass the finding-12
+        // freshness gate, and a fee median so the auto-triggered sweep can be
+        // priced (finding 02) instead of being deferred.
+        seed_block_count_votes(db, 4, 30 + module.cfg.consensus.confirmation_depth).await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        // First deposit: 100_000_000 observed at block 10 -> credited
+        // 100_000_000, sweep of the full amount auto-enqueued at nonce 0.
         let op_hash = {
             let mut dbtx = db.begin_transaction().await;
             vote_deposit(
@@ -12719,8 +12728,9 @@ mod tests {
                 &mut dbtx.to_ref_nc(),
                 &DepositObservation {
                     account,
-                    balance: UsdtAmount(100),
+                    balance: UsdtAmount(100_000_000),
                     block: 10,
+                    block_hash: [0u8; 32],
                     claim_pk,
                 },
             )
@@ -12730,17 +12740,17 @@ mod tests {
                 .get_value(&DepositRecordKey(account))
                 .await
                 .expect("record created by the threshold-reaching vote");
-            assert_eq!(record.credited, UsdtAmount(100));
+            assert_eq!(record.credited, UsdtAmount(100_000_000));
             let (hash, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
             assert_eq!(
                 crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
-                UsdtAmount(100)
+                UsdtAmount(100_000_000)
             );
             dbtx.commit_tx().await;
             hash
         };
 
-        // Confirm the sweep at `sweep_block` (swept = 100).
+        // Confirm the sweep at `sweep_block` (swept = 100_000_000).
         promote_pending_to_submitted(db, op_hash).await;
         {
             let mut dbtx = db.begin_transaction().await;
@@ -12751,7 +12761,9 @@ mod tests {
                     &UserOpConfirmedObservation {
                         success: true,
                         block: sweep_block,
-                        swept: UsdtAmount(100),
+                        swept: UsdtAmount(100_000_000),
+                        actual_gas_cost_wei: UsdtAmount(0),
+                        block_hash: [0u8; 32],
                     },
                 )
                 .await;
@@ -12760,7 +12772,7 @@ mod tests {
                 .get_value(&DepositRecordKey(account))
                 .await
                 .expect("record present");
-            assert_eq!(record.swept, UsdtAmount(100));
+            assert_eq!(record.swept, UsdtAmount(100_000_000));
             assert_eq!(
                 dbtx.to_ref_nc()
                     .get_value(&LastSweepBlockKey(account))
@@ -12783,13 +12795,13 @@ mod tests {
     /// **Sweep-aware credit rule (deposits after a completed sweep).** A NEW
     /// deposit paid to an address whose balance was already fully swept back
     /// to `0` must credit FULLY -- under the pre-fix raw-balance rule its
-    /// post-sweep balance (50) never exceeded the historic `credited` (100),
-    /// so it was never credited at all and the funds were effectively lost
-    /// to the depositor. Drives the whole re-arm loop end to end:
-    /// deposit 100 -> credit -> sweep confirms at block 20 (swept 100) ->
-    /// second deposit of 50 observed at block 25 (> 20) -> `credited`
-    /// becomes `swept + balance = 150`, `claimable` reflects it, and
-    /// `maybe_trigger_sweep` (auto-run by `credit_deposit`) sweeps the 50
+    /// post-sweep balance (200M) only credited the delta above the historic
+    /// `credited` (100M), so part of the funds were effectively lost to the
+    /// depositor. Drives the whole re-arm loop end to end:
+    /// deposit 100M -> credit -> sweep confirms at block 20 (swept 100M) ->
+    /// second deposit of 200M observed at block 25 (> 20) -> `credited`
+    /// becomes `swept + balance = 300M`, `claimable` reflects it, and
+    /// `maybe_trigger_sweep` (auto-run by `credit_deposit`) sweeps the 200M
     /// remainder at the advanced nonce.
     #[tokio::test]
     async fn post_sweep_deposit_credits_fully_and_re_arms_the_sweep() {
@@ -12798,7 +12810,7 @@ mod tests {
         let claim_pk = test_pubkey(0xe1);
         let account = credit_100_and_confirm_sweep(&module, 20, 0xe1).await;
 
-        // Second deposit: 50 observed at block 25 > sweep block 20, so the
+        // Second deposit: 200M observed at block 25 > sweep block 20, so the
         // observation provably saw the post-sweep balance.
         let mut dbtx = db.begin_transaction().await;
         vote_deposit(
@@ -12806,8 +12818,9 @@ mod tests {
             &mut dbtx.to_ref_nc(),
             &DepositObservation {
                 account,
-                balance: UsdtAmount(50),
+                balance: UsdtAmount(200_000_000),
                 block: 25,
+                block_hash: [0u8; 32],
                 claim_pk,
             },
         )
@@ -12820,22 +12833,22 @@ mod tests {
             .expect("record present");
         assert_eq!(
             record.credited,
-            UsdtAmount(150),
-            "post-sweep deposit must credit fully: swept (100) + balance (50)"
+            UsdtAmount(300_000_000),
+            "post-sweep deposit must credit fully: swept (100M) + balance (200M)"
         );
 
         let status = module
             .handle_deposit_status(&mut dbtx.to_ref_nc(), claim_pk)
             .await;
-        assert_eq!(status.credited, UsdtAmount(150));
-        assert_eq!(status.claimable, UsdtAmount(150));
+        assert_eq!(status.credited, UsdtAmount(300_000_000));
+        assert_eq!(status.claimable, UsdtAmount(300_000_000));
 
-        // The credit auto-re-armed the sweep: the 50 remainder is enqueued
+        // The credit auto-re-armed the sweep: the 200M remainder is enqueued
         // at the advanced nonce, without redeploying.
         let (_, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
         assert_eq!(
             crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
-            UsdtAmount(50),
+            UsdtAmount(200_000_000),
             "the re-armed sweep moves exactly the new deposit"
         );
         assert_eq!(op.nonce, alloy::primitives::U256::from(1u64));
@@ -12847,10 +12860,10 @@ mod tests {
     }
 
     /// **Sweep-aware credit rule (straddle safety).** An observation taken
-    /// BEFORE a sweep executed (its pre-sweep balance of 100 at block 15)
+    /// BEFORE a sweep executed (its pre-sweep balance of 100M at block 15)
     /// but processed AFTER the sweep's confirm (at block 20) must NOT
     /// double-credit: `obs.block <= last_sweep_block` keeps the conservative
-    /// raw-balance rule, so `credited` stays 100 and nothing is re-swept.
+    /// raw-balance rule, so `credited` stays 100M and nothing is re-swept.
     #[tokio::test]
     async fn observation_straddling_a_sweep_does_not_double_credit() {
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
@@ -12858,7 +12871,7 @@ mod tests {
         let claim_pk = test_pubkey(0xe2);
         let account = credit_100_and_confirm_sweep(&module, 20, 0xe2).await;
 
-        // A straggler observation of the PRE-sweep balance (100 at block
+        // A straggler observation of the PRE-sweep balance (100M at block
         // 15 <= sweep block 20) reaches threshold only now.
         let mut dbtx = db.begin_transaction().await;
         vote_deposit(
@@ -12866,8 +12879,9 @@ mod tests {
             &mut dbtx.to_ref_nc(),
             &DepositObservation {
                 account,
-                balance: UsdtAmount(100),
+                balance: UsdtAmount(100_000_000),
                 block: 15,
+                block_hash: [0u8; 32],
                 claim_pk,
             },
         )
@@ -12880,7 +12894,7 @@ mod tests {
             .expect("record present");
         assert_eq!(
             record.credited,
-            UsdtAmount(100),
+            UsdtAmount(100_000_000),
             "a pre-sweep observation processed post-confirm must not credit the swept funds twice"
         );
         assert!(
@@ -12896,7 +12910,7 @@ mod tests {
     /// deposit LARGER than the historic `credited` high-water mark must
     /// credit fully as `swept + balance`, not merely the raw-balance delta
     /// above the historic high (the pre-fix rule would have credited only
-    /// `120 - 100 = 20` of the new 120).
+    /// `300M - 100M = 200M` of the new 300M).
     #[tokio::test]
     async fn post_sweep_deposit_larger_than_historic_credited_credits_fully() {
         let module = test_module_with_block_count(4, 0).await; // threshold = 3
@@ -12904,7 +12918,7 @@ mod tests {
         let claim_pk = test_pubkey(0xe3);
         let account = credit_100_and_confirm_sweep(&module, 20, 0xe3).await;
 
-        // Second deposit: 120 (> the historic credited of 100) observed at
+        // Second deposit: 300M (> the historic credited of 100M) observed at
         // block 25 > sweep block 20.
         let mut dbtx = db.begin_transaction().await;
         vote_deposit(
@@ -12912,8 +12926,9 @@ mod tests {
             &mut dbtx.to_ref_nc(),
             &DepositObservation {
                 account,
-                balance: UsdtAmount(120),
+                balance: UsdtAmount(300_000_000),
                 block: 25,
+                block_hash: [0u8; 32],
                 claim_pk,
             },
         )
@@ -12926,8 +12941,8 @@ mod tests {
             .expect("record present");
         assert_eq!(
             record.credited,
-            UsdtAmount(220),
-            "the full 120 must credit on top of the 100 already swept, not just the 20 delta"
+            UsdtAmount(400_000_000),
+            "the full 300M must credit on top of the 100M already swept, not just the 200M delta"
         );
         dbtx.commit_tx().await;
     }
