@@ -150,7 +150,7 @@ async fn mine_empty_blocks(anvil: &common::AnvilHandle, count: u32) -> anyhow::R
 /// `SimpleAccount.execute(transfer(pool, amount))` runs and moves real tokens
 /// despite the token pushing no return data.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
+#[ignore = "re-enable in Task 11 (anvil e2e drives the client eth_getProof submit flow)"]
 async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {
         eprintln!(
@@ -263,9 +263,10 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
     .context("failed to fund the counterfactual deposit account with non-standard USDT")?;
     mine_empty_blocks(&anvil, 5).await?;
 
-    // TODO(Task 9): crediting is now proof-driven -- submit a
-    // `UsdtInput::DepositProofV0` here instead of the removed `check_deposit`
-    // guardian-poll trigger (this test is `#[ignore]`d until that flow lands).
+    // TODO(Task 11): crediting is now proof-driven -- drive the client's
+    // `submit_deposit_proof` (real `eth_getProof` against anvil) here instead of
+    // the removed `check_deposit` guardian-poll trigger (this anvil e2e test is
+    // `#[ignore]`d until Task 11 wires that up).
     let credited_deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let status = usdt.deposit_status(claim_keypair.public_key()).await?;
@@ -364,7 +365,7 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
 /// USDT's void return: the pool `SimpleAccount` is deployed by the batch's
 /// `initCode` and pays a fresh EOA in real (non-standard) tokens.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
+#[ignore = "re-enable in Task 11 (anvil e2e drives the client eth_getProof submit flow)"]
 async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {
         eprintln!(

@@ -20,6 +20,16 @@ name = "fedimint_usdt_client"
 path = "src/lib.rs"
 
 [dependencies]
+# Pure, WASM-safe alloy leaf crates for the deposit-by-proof submit flow:
+# reconstruct the block `Header` from an `eth_getBlockByNumber` JSON response
+# and RLP-encode it (asserting `keccak256 == blockHash` locally before
+# submitting). Deliberately does NOT pull in `alloy-trie` (proof verification is
+# server-side only) nor `alloy-provider`/reqwest+tokio (not WASM-safe) -- the
+# JSON-RPC transport is the same `reqwest` path `fedimint-client-module` already
+# ships to WASM.
+alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true, optional = true }
@@ -31,6 +41,11 @@ fedimint-derive-secret = { workspace = true }
 fedimint-logging = { workspace = true }
 fedimint-usdt-common = { workspace = true }
 futures = { workspace = true }
+# WASM-safe HTTP: on wasm32 `reqwest` compiles against the browser Fetch API
+# (the same wasm-safe path `fedimint-client-module` uses for meta-override
+# fetches), never tokio/native TLS. Used only for the deposit-by-proof
+# JSON-RPC calls (`eth_getProof`/`eth_getBlockByNumber`).
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 strum = { workspace = true }

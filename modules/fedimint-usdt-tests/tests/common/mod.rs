@@ -13,6 +13,7 @@
 
 pub mod anvil;
 pub mod mock;
+pub mod proof;
 pub mod ready;
 
 pub use anvil::{
@@ -22,4 +23,5 @@ pub use anvil::{
     transfer_erc20_from_account_1, transfer_nonstandard_from_account_1,
 };
 pub use mock::MockEvmRpc;
+pub use proof::{credit_deposit_via_proof, synthetic_deposit_proof};
 pub use ready::{await_usdt_ready, mock_ready_stack};
