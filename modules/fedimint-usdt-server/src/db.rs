@@ -29,9 +29,6 @@ pub enum DbKeyPrefix {
     /// Per-peer votes on the observed balance of a deposit account at a
     /// given block.
     DepositObservationVote = 0x04,
-    /// Guardian-local (non-consensus) bookkeeping for deposit accounts this
-    /// guardian is actively polling.
-    PendingCheck = 0x05,
     /// Consensus-agreed state of a threshold-ECDSA signing session (Phase
     /// 6a).
     SigningSession = 0x06,
@@ -234,27 +231,6 @@ impl_db_lookup!(
     query_prefix = DepositObservationVotePrefix,
     query_prefix = DepositObservationVoteAccountPrefix,
 );
-
-/// Guardian-local (non-consensus) record of a deposit account this guardian
-/// is actively polling its configured EVM node for.
-#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Serialize)]
-pub struct PendingCheck {
-    pub claim_pk: PublicKey,
-    pub requested_at_block: u64,
-}
-
-#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
-pub struct PendingCheckKey(pub EvmAddress);
-
-#[derive(Clone, Debug, Encodable, Decodable)]
-pub struct PendingCheckPrefix;
-
-impl_db_record!(
-    key = PendingCheckKey,
-    value = PendingCheck,
-    db_prefix = DbKeyPrefix::PendingCheck,
-);
-impl_db_lookup!(key = PendingCheckKey, query_prefix = PendingCheckPrefix);
 
 /// What a signing session's digest is being signed for. Deterministically
 /// created alongside a [`PendingUserOp`] (see `Usdt::maybe_trigger_sweep`) to
@@ -946,18 +922,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_count_vote_and_pending_check_round_trip() {
+    async fn block_count_vote_round_trips() {
         let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
-        let account = EvmAddress([0x77; 20]);
-        let pending = PendingCheck {
-            claim_pk: test_pubkey(),
-            requested_at_block: 55,
-        };
 
         let mut dbtx = db.begin_transaction().await;
         dbtx.insert_new_entry(&BlockCountVoteKey(PeerId::from(2)), &42u64)
-            .await;
-        dbtx.insert_new_entry(&PendingCheckKey(account), &pending)
             .await;
         dbtx.commit_tx().await;
 
@@ -965,10 +934,6 @@ mod tests {
         assert_eq!(
             dbtx.get_value(&BlockCountVoteKey(PeerId::from(2))).await,
             Some(42u64)
-        );
-        assert_eq!(
-            dbtx.get_value(&PendingCheckKey(account)).await,
-            Some(pending)
         );
     }
 
