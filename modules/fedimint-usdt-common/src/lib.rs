@@ -845,7 +845,7 @@ pub struct MpcRoundItem {
 /// an RPC at proof-verification time. Created by the client or off-chain
 /// indexer via `eth_getProof` at a canonical block; verified deterministically
 /// by the server/guardians (no RPC dependency).
-#[derive(Clone, Debug, PartialEq, Eq, Encodable, Decodable)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct DepositProof {
     /// Block number at which the balance was observed.
     pub block_number: u64,
@@ -1595,6 +1595,29 @@ pub enum UsdtInput {
     /// client-controlled `refund_pubkey`, so ONLY the original withdrawer can
     /// claim the refund -- never by `out_point` alone.
     RefundV0 { out_point: OutPoint },
+    /// Credit (and, in the same transaction, mint) a deposit directly from a
+    /// deterministically-verified on-chain USDT balance proof
+    /// (deposit-by-proof). Replaces the guardian-polling observation path: the
+    /// depositor funds the CREATE2 deposit account derived from `claim_pk`
+    /// ([`derive_deposit_account`]), then submits this input carrying that
+    /// `claim_pk` plus a [`DepositProof`] of the account's balance at a
+    /// canonical block.
+    ///
+    /// The server derives `account = derive_deposit_account(claim_pk)` (the
+    /// SAME binding [`DepositObservation`]-driven crediting enforces) and
+    /// verifies `proof` proves THAT account's balance against the federation's
+    /// consensus block-hash ring anchor for `proof.block_number`. Because the
+    /// account is derived from `claim_pk`, a proof of some unrelated on-chain
+    /// account (e.g. an exchange's) verifies against a different storage key
+    /// and yields a zero delta -- an attacker cannot credit funds they cannot
+    /// also derive a `claim_pk` for. Only the newly-proven delta over the
+    /// account's existing high-water `credited` is minted, and core verifies
+    /// the fedimint transaction is signed by `InputMeta.pub_key` = `claim_pk`,
+    /// so only the depositor can spend it.
+    DepositProofV0 {
+        claim_pk: secp256k1::PublicKey,
+        proof: DepositProof,
+    },
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -1697,6 +1720,21 @@ pub enum UsdtInputError {
     FeeQuoteOverflow,
     #[error("No refund record exists for this out_point (never failed, or already claimed)")]
     UnknownRefund,
+    #[error(
+        "deposit proof's block {block} is not anchored in the federation's block-hash ring (not \
+         yet confirmed, or aged out of the retained window)"
+    )]
+    DepositProofNotAnchored { block: u64 },
+    #[error("deposit proof verification failed: {reason}")]
+    DepositProofInvalid { reason: String },
+    #[error(
+        "deposit proof proves {proven} but {credited} is already credited for this account \
+         (nothing new to credit)"
+    )]
+    DepositProofStale {
+        proven: UsdtAmount,
+        credited: UsdtAmount,
+    },
 }
 
 /// Errors that might be returned by the server
