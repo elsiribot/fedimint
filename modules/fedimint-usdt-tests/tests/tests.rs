@@ -2251,6 +2251,24 @@ mod fedimint_migration_tests {
                         );
                         info!("Validated WithdrawalBatchCap (new prefix, empty)");
                     }
+                    DbKeyPrefix::LastSweepBlock => {
+                        // LOCAL fedi extension (sweep-aware credit rule): a
+                        // brand-new prefix holding only new `u64` data -- the
+                        // v0 snapshot fixture predates it and no migration
+                        // writes to it, so it must read back cleanly as EMPTY
+                        // (never populated pre-migration).
+                        let blocks = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::LastSweepBlockPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(
+                            blocks.is_empty(),
+                            "LastSweepBlock is a brand-new prefix; the pre-migration v0 \
+                             snapshot must not contain any rows for it"
+                        );
+                        info!("Validated LastSweepBlock (new prefix, empty)");
+                    }
                 }
             }
 
