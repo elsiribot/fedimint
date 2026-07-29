@@ -17,6 +17,10 @@ path = "src/lib.rs"
 
 [dependencies]
 alloy = { workspace = true }
+alloy-consensus = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rlp = { workspace = true }
+alloy-trie = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 cggmp21 = { workspace = true, features = ["spof"] }
@@ -37,6 +41,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 bls12_381 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [lints]
