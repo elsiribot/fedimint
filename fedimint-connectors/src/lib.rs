@@ -289,11 +289,11 @@ impl ConnectorRegistry {
             http_enable: true,
 
             connection_overrides: API_REPLACEMENT_LIST
-                .into_iter()
+                .iter()
                 .map(|(a, b)| {
                     (
-                        SafeUrl::parse(*a).expect("hardcoded replacement url is valid"),
-                        SafeUrl::parse(*b).expect("hardcoded replacement url is valid"),
+                        SafeUrl::parse(a).expect("hardcoded replacement url is valid"),
+                        SafeUrl::parse(b).expect("hardcoded replacement url is valid"),
                     )
                 })
                 .collect(),
@@ -313,11 +313,11 @@ impl ConnectorRegistry {
             http_enable: false,
 
             connection_overrides: API_REPLACEMENT_LIST
-                .into_iter()
+                .iter()
                 .map(|(a, b)| {
                     (
-                        SafeUrl::parse(*a).expect("hardcoded replacement url is valid"),
-                        SafeUrl::parse(*b).expect("hardcoded replacement url is valid"),
+                        SafeUrl::parse(a).expect("hardcoded replacement url is valid"),
+                        SafeUrl::parse(b).expect("hardcoded replacement url is valid"),
                     )
                 })
                 .collect(),
