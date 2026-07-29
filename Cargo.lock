@@ -6045,6 +6045,10 @@ name = "fedimint-usdt-server"
 version = "0.11.0-rc.1"
 dependencies = [
  "alloy",
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
  "anyhow",
  "async-trait",
  "bls12_381",
@@ -6055,9 +6059,11 @@ dependencies = [
  "fedimint-threshold-ecdsa",
  "fedimint-usdt-common",
  "futures",
+ "hex",
  "rand 0.8.5",
  "secp256k1 0.29.1",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "strum 0.27.1",
  "strum_macros 0.27.1",
