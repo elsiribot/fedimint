@@ -48,22 +48,24 @@ pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
     DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
-    POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
-    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    LATEST_ANCHORED_BLOCK_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT,
+    USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
+    WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
-    BLOCK_HASH_RING_LEN, BlockHashObservation, BootstrapObservation, BootstrapState,
-    DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation, DepositStatusRequest,
-    DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES, MODULE_CONSENSUS_VERSION,
-    MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse, RefundInfo, RefundStatusRequest,
-    RefundStatusResponse, SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
-    UsdtConsensusItem, UsdtGenParams, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput,
-    UsdtOutputError, UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
-    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
-    WithdrawalStatusResponse, deposit_fee_quote, deposit_salt, derive_deposit_account,
-    derive_pool_account, evm_address, fee_vote_in_sane_range, pool_salt, signing_session_id,
-    usdt_amount, validate_usdt_params, wei_gas_cost_to_usdt, withdrawal_fee_quote,
+    AnchoredBlockResponse, BLOCK_HASH_RING_LEN, BlockHashObservation, BootstrapObservation,
+    BootstrapState, DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation,
+    DepositStatusRequest, DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES,
+    MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse, RefundInfo,
+    RefundStatusRequest, RefundStatusResponse, SigningSessionId, StatusResponse, USDT_UNIT,
+    UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtGenParams, UsdtInput, UsdtInputError,
+    UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome, UserOpStatus,
+    UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
+    WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse, deposit_fee_quote,
+    deposit_salt, derive_deposit_account, derive_pool_account, evm_address, fee_vote_in_sane_range,
+    pool_salt, signing_session_id, usdt_amount, validate_usdt_params, wei_gas_cost_to_usdt,
+    withdrawal_fee_quote,
 };
 use futures::{FutureExt as _, StreamExt as _};
 use rand::rngs::OsRng;
@@ -2461,6 +2463,22 @@ impl ServerModule for Usdt {
                     let mut dbtx = db.begin_transaction_nc().await;
 
                     Ok(module.handle_status(&mut dbtx.to_ref_nc()).await)
+                }
+            },
+            api_endpoint! {
+                LATEST_ANCHORED_BLOCK_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |_module: &Usdt, context, _params: ()| -> AnchoredBlockResponse {
+                    // Read-only: the newest ringed height + window length are
+                    // derived entirely from the consensus-agreed
+                    // `BlockHashRingKey` ring (written once a threshold of
+                    // guardians agree on a `UsdtConsensusItem::BlockHash`),
+                    // so any guardian answers identically, mirroring
+                    // `pool_state`/`usdt_status`.
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+
+                    Ok(handle_latest_anchored_block(&mut dbtx.to_ref_nc()).await)
                 }
             },
         ]
@@ -6353,10 +6371,6 @@ async fn ring_hash_at(dbtx: &mut DatabaseTransaction<'_>, height: u64) -> Option
 
 /// The highest height currently present in the ring, or `None` before the
 /// first [`write_block_hash_ring`] call.
-///
-/// Not yet called from production code -- see [`write_block_hash_ring`]'s
-/// doc comment.
-#[allow(dead_code)]
 async fn ring_latest_height(dbtx: &mut DatabaseTransaction<'_>) -> Option<u64> {
     dbtx.find_by_prefix(&BlockHashRingPrefix)
         .await
@@ -6365,6 +6379,18 @@ async fn ring_latest_height(dbtx: &mut DatabaseTransaction<'_>) -> Option<u64> {
         .await
         .into_iter()
         .max()
+}
+
+/// Assembles the `latest_anchored_block` endpoint's [`AnchoredBlockResponse`]
+/// from the consensus-agreed block-hash ring: `latest` is
+/// [`ring_latest_height`] (`0` if the ring is empty), `window` is always
+/// [`BLOCK_HASH_RING_LEN`]. A free function (no module state needed) so it
+/// can be exercised directly in tests without constructing a full [`Usdt`].
+async fn handle_latest_anchored_block(dbtx: &mut DatabaseTransaction<'_>) -> AnchoredBlockResponse {
+    AnchoredBlockResponse {
+        latest: ring_latest_height(dbtx).await.unwrap_or(0),
+        window: BLOCK_HASH_RING_LEN,
+    }
 }
 
 #[cfg(test)]
@@ -8527,6 +8553,36 @@ mod tests {
             ring_latest_height(&mut dbtx.to_ref_nc()).await,
             Some(newest)
         );
+    }
+
+    #[tokio::test]
+    async fn latest_anchored_block_endpoint_reports_newest_ringed_height() {
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+
+        // Before anything has ever been written to the ring, the endpoint
+        // must report `latest: 0` (not panic/error) while still reporting
+        // the real window length, so a client can distinguish "ring empty"
+        // from "some height is anchored".
+        let mut dbtx = db.begin_transaction_nc().await;
+        let empty = handle_latest_anchored_block(&mut dbtx.to_ref_nc()).await;
+        drop(dbtx);
+        assert_eq!(empty.latest, 0);
+        assert_eq!(empty.window, BLOCK_HASH_RING_LEN);
+
+        // Seed the ring at a couple of heights; the endpoint must report the
+        // newest one, mirroring `ring_latest_height` directly.
+        let mut dbtx = db.begin_transaction().await;
+        write_block_hash_ring(&mut dbtx.to_ref_nc(), 42, [0x42; 32]).await;
+        write_block_hash_ring(&mut dbtx.to_ref_nc(), 57, [0x57; 32]).await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let response = handle_latest_anchored_block(&mut dbtx.to_ref_nc()).await;
+        assert_eq!(response.latest, 57);
+        assert_eq!(response.window, BLOCK_HASH_RING_LEN);
     }
 
     // --- Phase 9, Drill A: deposit reorg safety -----------------------------

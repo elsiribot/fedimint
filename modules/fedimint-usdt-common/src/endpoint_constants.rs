@@ -57,3 +57,13 @@ pub const REFUND_STATUS_ENDPOINT: &str = "refund_status";
 /// [`POOL_STATE_ENDPOINT`]/[`DEPOSIT_STATUS_ENDPOINT`]). The client gates
 /// deposit-address handout on this reporting `Ready`.
 pub const USDT_STATUS_ENDPOINT: &str = "usdt_status";
+
+/// Reports the newest height currently anchored in the consensus-agreed
+/// canonical block-hash ring (`BlockHashRingKey`, written by
+/// `write_block_hash_ring`), plus the ring's retained window length
+/// (`BLOCK_HASH_RING_LEN`). A deposit-by-proof client uses this to pick a
+/// block to target its inclusion proof against: a proof for a height with no
+/// ring entry (too new, or already pruned out of the window) is rejected as
+/// not-yet-anchored. Read from consensus DB, so any guardian answers
+/// identically, mirroring [`USDT_STATUS_ENDPOINT`]/[`POOL_STATE_ENDPOINT`].
+pub const LATEST_ANCHORED_BLOCK_ENDPOINT: &str = "latest_anchored_block";
