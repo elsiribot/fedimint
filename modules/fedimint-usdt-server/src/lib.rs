@@ -1021,6 +1021,20 @@ impl ServerModuleInit for UsdtInit {
     /// `refund_pubkey` (its `UnclaimedWithdrawal` rows are REWRITTEN in place,
     /// like [`migrate_db_v2`], appending a placeholder key). See
     /// [`migrate_db_v3`].
+    ///
+    /// `DatabaseVersion(4)` (deposit-by-proof feature,
+    /// `MODULE_CONSENSUS_VERSION` 0.9): the guardian-poll `PendingCheck`
+    /// table (prefix `0x05`) was removed when deposit crediting became
+    /// proof-driven, leaving `0x05` a permanent gap in [`DbKeyPrefix`]. See
+    /// [`migrate_db_v4`] for why this DROPS any residual rows under that
+    /// prefix. The two new keyspaces this version
+    /// added -- [`BlockHashRing`](DbKeyPrefix::BlockHashRing) (`0x13`) and
+    /// [`BlockHashVote`](DbKeyPrefix::BlockHashVote) (`0x14`) -- need no
+    /// migration entry: they are brand-new prefixes holding only new data that
+    /// starts empty and fills at runtime (mirroring `WithdrawalBatchCap`), so
+    /// they require only a `MODULE_CONSENSUS_VERSION` bump and `dump_database`
+    /// coverage. Existing [`DepositRecord`](crate::db::DepositRecord)s are left
+    /// untouched (their `credited` high-water marks carry forward).
     fn get_database_migrations(
         &self,
     ) -> BTreeMap<DatabaseVersion, ServerModuleDbMigrationFn<Usdt>> {
@@ -1041,6 +1055,10 @@ impl ServerModuleInit for UsdtInit {
         migrations.insert(
             DatabaseVersion(3),
             Box::new(|ctx| migrate_db_v3(ctx).boxed()),
+        );
+        migrations.insert(
+            DatabaseVersion(4),
+            Box::new(|ctx| migrate_db_v4(ctx).boxed()),
         );
         migrations
     }
@@ -1204,6 +1222,50 @@ async fn migrate_db_v3(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> a
             .await
             .expect("DB error");
     }
+    Ok(())
+}
+
+/// The DB prefix (`0x05`) of the removed guardian-poll `PendingCheck` table.
+///
+/// This table tracked deposit accounts awaiting a guardian-poll balance
+/// observation. The whole guardian-poll deposit path -- the deposit-check
+/// endpoint, the per-guardian poll/GC tasks, and the scanner that produced
+/// the observations -- was removed when deposit crediting became proof-driven
+/// (see [`UsdtInput::DepositProofV0`](fedimint_usdt_common::UsdtInput)), so
+/// `0x05` is now a permanent GAP in [`DbKeyPrefix`]: no live variant maps to
+/// it, and no code reads or writes it. Named here (rather than reintroducing a
+/// dead `DbKeyPrefix` variant) purely so [`migrate_db_v4`] can drop any
+/// residual rows an upgrading federation still carries.
+const REMOVED_PENDING_CHECK_PREFIX: u8 = 0x05;
+
+/// Migrates out the removed guardian-poll `PendingCheck` table
+/// (`MODULE_CONSENSUS_VERSION` 0.9, deposit-by-proof feature).
+///
+/// Deposit crediting became proof-driven
+/// ([`UsdtInput::DepositProofV0`](fedimint_usdt_common::UsdtInput)), and the
+/// guardian-poll path that populated `PendingCheck`
+/// ([`REMOVED_PENDING_CHECK_PREFIX`], `0x05`) was deleted. A federation that
+/// upgrades across this boundary may still carry residual `PendingCheck` rows
+/// written by the old code; this DROPS them so the gap prefix reads back
+/// empty.
+///
+/// Dropping (rather than reinterpreting) is unconditionally correct here:
+/// `PendingCheck` was pure guardian-local scheduling bookkeeping -- which
+/// accounts to poll next -- never an economically load-bearing balance. The
+/// authoritative credited/claimed high-water marks live in
+/// [`DepositRecord`](crate::db::DepositRecord), which this migration leaves
+/// untouched, and future crediting no longer consults `PendingCheck` at all
+/// (a deposit is credited by a client-submitted `DepositProofV0` verified
+/// against the [`BlockHashRing`](crate::db::DbKeyPrefix::BlockHashRing)
+/// anchor). So the rows carry no information any live code path can use;
+/// leaving them would only waste space and muddy `dump_database`. The two new
+/// deposit-by-proof keyspaces (`BlockHashRing`/`BlockHashVote`) need no action
+/// -- they are brand-new prefixes that start empty and fill at runtime.
+async fn migrate_db_v4(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> anyhow::Result<()> {
+    ctx.dbtx()
+        .raw_remove_by_prefix(&[REMOVED_PENDING_CHECK_PREFIX])
+        .await
+        .expect("DB error");
     Ok(())
 }
 

@@ -1763,7 +1763,7 @@ async fn client_claims_refund_on_terminal_failure() -> anyhow::Result<()> {
 /// module's doc comments for the general pattern).
 #[cfg(test)]
 mod fedimint_migration_tests {
-    use anyhow::ensure;
+    use anyhow::{Context as _, ensure};
     use fedimint_core::db::{
         Database, IDatabaseTransactionOpsCore, IDatabaseTransactionOpsCoreTyped,
     };
@@ -2018,6 +2018,100 @@ mod fedimint_migration_tests {
             })
         })
         .await
+    }
+
+    /// Deposit-by-proof feature (`MODULE_CONSENSUS_VERSION` 0.9):
+    /// `migrate_db_v4` must DROP any residual rows of the removed
+    /// guardian-poll `PendingCheck` table (prefix `0x05`, now a gap in
+    /// `DbKeyPrefix`) while leaving every other keyspace -- notably the
+    /// authoritative `DepositRecord`s -- intact.
+    ///
+    /// The frozen `usdt-server-v0` snapshot predates deposit-by-proof and its
+    /// (frozen) `create_server_db_with_v0_data` writer never wrote a
+    /// `PendingCheck` row, so the snapshot reader test alone cannot exercise
+    /// the drop. This builds a fresh module-namespaced DB carrying a raw
+    /// `0x05` row (the exact on-disk shape the deleted code produced) plus
+    /// a `DepositRecord`, runs the module's FULL migration chain (v0..=v4)
+    /// through the real `apply_migrations` path, and asserts the
+    /// `PendingCheck` row is gone and the `DepositRecord` survives
+    /// untouched. Uses a `MemDatabase` (not the committed RocksDB snapshot
+    /// fixture) so it neither depends on nor dirties the frozen snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrate_v4_drops_residual_pending_check_rows() -> anyhow::Result<()> {
+        use std::sync::Arc;
+
+        use fedimint_core::db::apply_migrations;
+        use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::module::registry::ModuleDecoderRegistry;
+        use fedimint_server::consensus::db::ServerDbMigrationContext;
+        use fedimint_testing::db::TEST_MODULE_INSTANCE_ID;
+
+        let _ = TracingSetup::default().init();
+
+        let module = DynServerModuleInit::from(UsdtInit::default());
+        let decoders = ModuleDecoderRegistry::from_iter([(
+            TEST_MODULE_INSTANCE_ID,
+            module.module_kind(),
+            module.decoder(),
+        )]);
+        let db = Database::new(MemDatabase::new(), decoders);
+        let module_db = db.with_prefix_module_id(TEST_MODULE_INSTANCE_ID).0;
+
+        let account = EvmAddress([0x31; 20]);
+        let record = DepositRecord {
+            claim_pk: test_pubkey(),
+            credited: UsdtAmount(1_000_000),
+            claimed: UsdtAmount(250_000),
+            last_observed_block: 7,
+            swept: UsdtAmount(0),
+            nonce: 0,
+        };
+
+        // A residual `PendingCheck` row in the removed table's on-disk shape:
+        // prefix `0x05` followed by arbitrary key/value bytes. The deleted
+        // guardian-poll code is the only thing that ever wrote this prefix, and no
+        // current type decodes it, so writing raw bytes is the only faithful way
+        // to reproduce what an upgrading federation still carries.
+        let residual_pending_check_key = [0x05u8, 0xaa, 0xbb, 0xcc];
+        {
+            let mut dbtx = module_db.begin_transaction().await;
+            dbtx.raw_insert_bytes(&residual_pending_check_key, b"residual pending check")
+                .await
+                .expect("DB error");
+            dbtx.insert_new_entry(&DepositRecordKey(account), &record)
+                .await;
+            dbtx.commit_tx().await;
+        }
+
+        apply_migrations(
+            &db,
+            Arc::new(ServerDbMigrationContext) as Arc<_>,
+            module.module_kind().to_string(),
+            module.get_database_migrations(),
+            Some(TEST_MODULE_INSTANCE_ID),
+            None,
+        )
+        .await
+        .context("applying usdt migrations to the mem db")?;
+
+        let mut dbtx = module_db.begin_transaction_nc().await;
+        let residual: Vec<_> = dbtx
+            .raw_find_by_prefix(&[0x05])
+            .await
+            .expect("DB error")
+            .collect()
+            .await;
+        ensure!(
+            residual.is_empty(),
+            "migrate_db_v4 must drop every residual PendingCheck (0x05) row"
+        );
+        let survived = dbtx.get_value(&DepositRecordKey(account)).await;
+        ensure!(
+            survived.as_ref() == Some(&record),
+            "migrate_db_v4 must leave DepositRecords untouched"
+        );
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
