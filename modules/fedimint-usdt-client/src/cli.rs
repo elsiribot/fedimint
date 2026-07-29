@@ -12,13 +12,8 @@ use crate::{UsdtClientModule, check_fee_cap};
 enum Opts {
     /// Allocate a fresh claim key, persist it, and print the deposit address
     /// derived from it (`account`) together with the claim public key
-    /// (`claim_pk`) needed by `check-deposit`/`deposit-status`/`claim`.
+    /// (`claim_pk`) needed by `deposit-status`/`claim`.
     DepositAddress,
-    /// Ask the federation to start watching `claim_pk`'s deposit address for
-    /// incoming USDT transfers. If the federation is not yet ready (`ready:
-    /// false` in the response), no guardian starts watching -- retry once
-    /// bootstrap completes.
-    CheckDeposit { claim_pk: secp256k1::PublicKey },
     /// Report the credited/claimed/claimable state of `claim_pk`'s deposit
     /// account.
     DepositStatus { claim_pk: secp256k1::PublicKey },
@@ -99,12 +94,11 @@ enum Opts {
     /// unused indices.
     ///
     /// By default (security finding 08), every scanned index reporting
-    /// `credited == 0` -- a deposit that was funded on-chain but never
-    /// `check-deposit`'d, or checked but not yet credited -- ALSO has its
-    /// claim key persisted and a federation check enqueued, so it is no
-    /// longer practically stranded; see the `checked` field of the printed
-    /// summary. Pass `--check-uncredited=false` to restore the old
-    /// credited-only behavior.
+    /// `credited == 0` -- a deposit that was funded on-chain but not yet
+    /// credited (via a `deposit-proof` submission) -- ALSO has its claim key
+    /// persisted, so it is no longer practically stranded; see the `checked`
+    /// field of the printed summary. Pass `--check-uncredited=false` to
+    /// restore the old credited-only behavior.
     Recover {
         #[arg(long, default_value = "20")]
         gap_limit: u64,
@@ -115,8 +109,8 @@ enum Opts {
     /// persisting anything or advancing the next-deposit-index counter
     /// (security finding 08). Lets a seed-only user (after client-DB loss)
     /// recompute the `claim_pk` needed for a manual
-    /// `check-deposit`/`deposit-status`/`claim`, e.g. for an index a
-    /// `recover` scan reported under `checked`.
+    /// `deposit-status`/`claim`, e.g. for an index a `recover` scan reported
+    /// under `checked`.
     DeriveDeposit {
         #[arg(long)]
         index: u64,
@@ -190,23 +184,6 @@ pub(crate) async fn handle_cli_command(
                 "claim_pk": claim_keypair.public_key(),
                 "account": account.to_string(),
             }))
-        }
-        Opts::CheckDeposit { claim_pk } => {
-            let response = usdt.check_deposit(claim_pk).await?;
-            if response.ready {
-                json(response)
-            } else {
-                // Security finding 13, r2 facet: the federation was not
-                // ready, so no guardian enqueued a `PendingCheck` -- make
-                // that explicit rather than implying the deposit is being
-                // watched.
-                json(serde_json::json!({
-                    "account": response.account.to_string(),
-                    "ready": false,
-                    "message": "federation infrastructure not ready yet; try again after \
-                                bootstrap completes",
-                }))
-            }
         }
         Opts::DepositStatus { claim_pk } => json(usdt.deposit_status(claim_pk).await?),
         Opts::Claim {
@@ -295,14 +272,6 @@ mod tests {
         assert!(matches!(
             Opts::try_parse_from(["usdt", "deposit-address"]).expect("parses"),
             Opts::DepositAddress
-        ));
-    }
-
-    #[test]
-    fn parses_check_deposit() {
-        assert!(matches!(
-            Opts::try_parse_from(["usdt", "check-deposit", TEST_PUBKEY]).expect("parses"),
-            Opts::CheckDeposit { .. }
         ));
     }
 

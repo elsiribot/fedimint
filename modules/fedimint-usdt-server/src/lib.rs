@@ -47,20 +47,19 @@ use fedimint_threshold_ecdsa::{convert_signature, group_public_key};
 pub use fedimint_usdt_common as common;
 use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::endpoint_constants::{
-    CHECK_DEPOSIT_ENDPOINT, DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT,
-    GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT,
-    USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
+    POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
+    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
     BLOCK_HASH_RING_LEN, BlockHashObservation, BootstrapObservation, BootstrapState,
-    CheckDepositRequest, CheckDepositResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse,
-    DepositObservation, DepositStatusRequest, DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS,
-    MAX_MPC_ROUND_BYTES, MAX_PENDING_CHECKS, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE,
-    MpcRoundItem, PoolStateResponse, RefundInfo, RefundStatusRequest, RefundStatusResponse,
-    SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
-    UsdtGenParams, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
-    UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
+    DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation, DepositStatusRequest,
+    DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES, MODULE_CONSENSUS_VERSION,
+    MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse, RefundInfo, RefundStatusRequest,
+    RefundStatusResponse, SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
+    UsdtConsensusItem, UsdtGenParams, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput,
+    UsdtOutputError, UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
     WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
     WithdrawalStatusResponse, deposit_fee_quote, deposit_salt, derive_deposit_account,
     derive_pool_account, evm_address, fee_vote_in_sane_range, pool_salt, signing_session_id,
@@ -79,8 +78,8 @@ use crate::db::{
     DepositRecord, DepositRecordKey, DepositRecordPrefix, FeeVoteKey, FeeVotePrefix,
     HasEverBeenReadyKey, HasEverBeenReadyPrefix, LastSweepBlockKey, LastSweepBlockPrefix,
     MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix, MpcRoundChunkSessionPrefix,
-    MpcRoundChunkSessionRoundPeerPrefix, MpcRoundChunkSessionRoundPrefix, PendingCheck,
-    PendingCheckKey, PendingCheckPrefix, PendingUserOp, PendingUserOpKey, PendingUserOpPrefix,
+    MpcRoundChunkSessionRoundPeerPrefix, MpcRoundChunkSessionRoundPrefix, PendingUserOp,
+    PendingUserOpKey, PendingUserOpPrefix,
     PoolState, PoolStateKey, PoolStatePrefix, Refund, RefundKey, RefundPrefix, SessionState,
     SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix, StoredFeeVote,
     SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix, UnclaimedWithdrawalKey,
@@ -211,16 +210,6 @@ impl ModuleInit for UsdtInit {
                         DepositObservation,
                         items,
                         "Deposit Observation Votes"
-                    );
-                }
-                DbKeyPrefix::PendingCheck => {
-                    push_db_pair_items!(
-                        dbtx,
-                        PendingCheckPrefix,
-                        crate::db::PendingCheckKey,
-                        PendingCheck,
-                        items,
-                        "Pending Checks"
                     );
                 }
                 DbKeyPrefix::SigningSession => {
@@ -1243,10 +1232,6 @@ pub struct Usdt {
     /// so no production method reads it directly.
     #[allow(dead_code)]
     task_group: TaskGroup,
-    /// Deposit observations gathered by the background deposit-checker task
-    /// (spawned in [`Usdt::new`]; see [`scan_pending_deposits`]), drained
-    /// into `UsdtConsensusItem::Deposit` proposals in `consensus_proposal`.
-    deposit_proposals: Arc<Mutex<Vec<DepositObservation>>>,
     /// This guardian's in-memory table of currently-running off-thread
     /// threshold-ECDSA signing sessions (see [`crate::signing`]), spawned by
     /// [`Usdt::start_session`] and pumped round-by-round from
@@ -1268,15 +1253,14 @@ pub struct Usdt {
     /// [`Usdt::advance_local_signer`] alongside (not instead of) its
     /// `completed_signatures` write, drained into
     /// `UsdtConsensusItem::MpcSignature` proposals in `consensus_proposal`.
-    /// Mirrors `deposit_proposals`'s drain pattern.
+    /// Mirrors `user_op_confirmed_proposals`'s drain pattern.
     #[allow(clippy::type_complexity)]
     pending_signature_proposals: Arc<Mutex<Vec<(SigningSessionId, Vec<u8>)>>>,
     /// `UserOp` on-chain outcomes gathered by the background
     /// `usdt-user-op-submitter` task (spawned in [`Usdt::new`]; see
     /// [`Usdt::spawn_user_op_submitter`]), drained into
     /// `UsdtConsensusItem::UserOpConfirmed` proposals in
-    /// `consensus_proposal`. Mirrors `deposit_proposals`'s drain pattern
-    /// exactly (Phase 7, Task 5).
+    /// `consensus_proposal` (Phase 7, Task 5).
     user_op_confirmed_proposals: Arc<Mutex<Vec<UserOpConfirmedProposal>>>,
     /// This guardian's most recently polled [`FeeVote`] (current EVM fee
     /// market / USDT-per-ETH exchange rate), refreshed in the background by
@@ -1296,9 +1280,10 @@ pub struct Usdt {
     /// task (Part C; spawned in [`Usdt::new`], see
     /// [`Usdt::spawn_bootstrap_observer`]), drained into
     /// `UsdtConsensusItem::BootstrapObservation` proposals in
-    /// `consensus_proposal`. Mirrors `deposit_proposals`'s drain pattern;
-    /// each observation is this guardian's own guardian-LOCAL read of the
-    /// on-chain readiness conditions, never itself a consensus decision.
+    /// `consensus_proposal`. Mirrors `user_op_confirmed_proposals`'s drain
+    /// pattern; each observation is this guardian's own guardian-LOCAL read of
+    /// the on-chain readiness conditions, never itself a consensus
+    /// decision.
     bootstrap_proposals: Arc<Mutex<Vec<BootstrapObservation>>>,
     /// This guardian's most recent confirmation-depth block-hash observation
     /// (deposit-by-proof anchor), refreshed in the background by the READ-ONLY
@@ -1347,23 +1332,10 @@ struct BootstrapCounts {
     rpc_healthy: usize,
 }
 
-/// Grouped handles/config for [`Usdt::spawn_deposit_checker`], bundling its
-/// many related parameters into one utility struct (per this workspace's
+/// Grouped handles for [`Usdt::spawn_user_op_submitter`], bundling its many
+/// related parameters into one utility struct (per this workspace's
 /// convention for functions that would otherwise take too many individual
 /// parameters) instead of listing them all out.
-struct DepositCheckerHandles {
-    db: Database,
-    evm_rpc: DynServerEvmRpc,
-    block_count: Arc<AtomicU64>,
-    deposit_proposals: Arc<Mutex<Vec<DepositObservation>>>,
-    usdt_contract: fedimint_usdt_common::EvmAddress,
-    confirmation_depth: u64,
-    check_ttl_blocks: u64,
-    num_peers: NumPeers,
-}
-
-/// Grouped handles for [`Usdt::spawn_user_op_submitter`], mirroring
-/// [`DepositCheckerHandles`]'s convention.
 struct UserOpSubmitterHandles {
     db: Database,
     evm_rpc: DynServerEvmRpc,
@@ -1491,20 +1463,6 @@ impl ServerModule for Usdt {
             let current_vote = dbtx.get_value(&BootstrapVoteKey(self.our_peer_id)).await;
             if current_vote != Some(obs) {
                 items.push(UsdtConsensusItem::BootstrapObservation(obs));
-            }
-        }
-
-        // Drain observations gathered by the background deposit-checker task
-        // (see `scan_pending_deposits`), proposing only those that differ
-        // from what this peer has already voted for the account (avoiding
-        // redundant proposals that `process_consensus_item` would reject).
-        let pending = std::mem::take(&mut *self.deposit_proposals.lock().expect("not poisoned"));
-        for obs in pending {
-            let current_vote = dbtx
-                .get_value(&DepositObservationVoteKey(obs.account, self.our_peer_id))
-                .await;
-            if current_vote != Some(obs.clone()) {
-                items.push(UsdtConsensusItem::Deposit(obs));
             }
         }
 
@@ -2356,23 +2314,6 @@ impl ServerModule for Usdt {
                 }
             },
             api_endpoint! {
-                CHECK_DEPOSIT_ENDPOINT,
-                ApiVersion::new(0, 0),
-                async |module: &Usdt, context, req: CheckDepositRequest| -> CheckDepositResponse {
-                    // Writes a `PendingCheck`, so this needs a committable
-                    // transaction (mirroring lnv2's `add_gateway`), unlike
-                    // the read-only `deposit_status` endpoint below.
-                    let db = context.db();
-                    let mut dbtx = db.begin_transaction().await;
-                    let response = module
-                        .handle_check_deposit(&mut dbtx.to_ref_nc(), req.claim_pk)
-                        .await;
-                    dbtx.commit_tx().await;
-
-                    Ok(response)
-                }
-            },
-            api_endpoint! {
                 DEPOSIT_STATUS_ENDPOINT,
                 ApiVersion::new(0, 0),
                 async |module: &Usdt, context, req: DepositStatusRequest| -> DepositStatusResponse {
@@ -2604,8 +2545,9 @@ pub fn sample_claim_pk() -> secp256k1::PublicKey {
 
 impl Usdt {
     /// Create new module instance, spawning the background block-count
-    /// poller task (see [`Usdt::spawn_block_count_poller`]) and the
-    /// deposit-checker task (see [`Usdt::spawn_deposit_checker`]).
+    /// poller task (see [`Usdt::spawn_block_count_poller`]) and the other
+    /// guardian-local observer/submitter tasks (see e.g.
+    /// [`Usdt::spawn_user_op_submitter`]).
     pub fn new(
         cfg: UsdtConfig,
         evm_rpc: DynServerEvmRpc,
@@ -2616,21 +2558,6 @@ impl Usdt {
     ) -> Usdt {
         let block_count = Arc::new(AtomicU64::new(0));
         Self::spawn_block_count_poller(&task_group, evm_rpc.clone(), block_count.clone());
-
-        let deposit_proposals = Arc::new(Mutex::new(Vec::new()));
-        Self::spawn_deposit_checker(
-            &task_group,
-            DepositCheckerHandles {
-                db: db.clone(),
-                evm_rpc: evm_rpc.clone(),
-                block_count: block_count.clone(),
-                deposit_proposals: deposit_proposals.clone(),
-                usdt_contract: cfg.consensus.usdt_contract,
-                confirmation_depth: cfg.consensus.confirmation_depth,
-                check_ttl_blocks: cfg.consensus.check_ttl_blocks,
-                num_peers,
-            },
-        );
 
         let user_op_confirmed_proposals = Arc::new(Mutex::new(Vec::new()));
         Self::spawn_user_op_submitter(
@@ -2682,7 +2609,6 @@ impl Usdt {
             num_peers,
             block_count,
             task_group,
-            deposit_proposals,
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
@@ -2712,7 +2638,6 @@ impl Usdt {
             num_peers,
             block_count: Arc::new(AtomicU64::new(0)),
             task_group: TaskGroup::new(),
-            deposit_proposals: Arc::new(Mutex::new(Vec::new())),
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
@@ -3103,84 +3028,6 @@ impl Usdt {
         Ok(())
     }
 
-    /// Spawns a background task that periodically scans this guardian's
-    /// [`PendingCheck`]s (see [`scan_pending_deposits`]) and extends
-    /// `deposit_proposals` with any newly observed deposits, for
-    /// `consensus_proposal` to drain into `UsdtConsensusItem::Deposit`
-    /// proposals.
-    ///
-    /// The scan itself only *reads* the module DB (via
-    /// `db.begin_transaction_nc()`), mirroring
-    /// [`Usdt::spawn_block_count_poller`]: no consensus-relevant write may
-    /// happen outside the consensus flow. `PendingCheck` inserts still only
-    /// ever happen in the check-deposit API handler; `PendingCheck` removal
-    /// on a credited deposit still only happens in [`Usdt::credit_deposit`]
-    /// (via `process_consensus_item`).
-    ///
-    /// After the read-only scan, this task additionally opens a SEPARATE,
-    /// committable local transaction and runs [`gc_expired_pending_checks`]
-    /// on it (security finding 13). This is safe despite the "no writes
-    /// outside consensus" rule above because `PendingCheck` is guardian-local,
-    /// non-consensus state -- see that function's doc comment for the full
-    /// argument -- so this is the one guardian-local write this task
-    /// performs, deliberately kept out of the read-only scan itself.
-    fn spawn_deposit_checker(task_group: &TaskGroup, handles: DepositCheckerHandles) {
-        let DepositCheckerHandles {
-            db,
-            evm_rpc,
-            block_count,
-            deposit_proposals,
-            usdt_contract,
-            confirmation_depth,
-            check_ttl_blocks,
-            num_peers,
-        } = handles;
-
-        task_group.spawn_cancellable("usdt-deposit-checker", async move {
-            loop {
-                let mut dbtx = db.begin_transaction_nc().await;
-                let observations = scan_pending_deposits(
-                    &mut dbtx.to_ref_nc(),
-                    &evm_rpc,
-                    block_count.load(Ordering::Relaxed),
-                    usdt_contract,
-                    confirmation_depth,
-                    check_ttl_blocks,
-                    num_peers,
-                )
-                .await;
-                drop(dbtx);
-
-                deposit_proposals
-                    .lock()
-                    .expect("not poisoned")
-                    .extend(observations);
-
-                // GC (security finding 13): a separate, committable local
-                // transaction -- deliberately not part of the read-only scan
-                // above. See `gc_expired_pending_checks`'s doc comment for why
-                // this guardian-local write needs no consensus agreement.
-                let mut gc_dbtx = db.begin_transaction().await;
-                let removed = gc_expired_pending_checks(
-                    &mut gc_dbtx.to_ref_nc(),
-                    check_ttl_blocks,
-                    num_peers,
-                )
-                .await;
-                gc_dbtx.commit_tx().await;
-                if removed > 0 {
-                    debug!(
-                        target: "usdt",
-                        removed,
-                        "garbage-collected expired PendingChecks"
-                    );
-                }
-
-                fedimint_core::runtime::sleep(Duration::from_secs(poll_interval_secs())).await;
-            }
-        });
-    }
-
     /// Spawns the deposit-by-proof block-hash observer: a background task that
     /// periodically reads the canonical hash of the confirmation-depth block
     /// (`consensus_block_count - confirmation_depth`) via
@@ -3188,9 +3035,11 @@ impl Usdt {
     /// `consensus_proposal` to drain into a `UsdtConsensusItem::BlockHash`
     /// proposal.
     ///
-    /// A PURE READER, mirroring [`Usdt::spawn_deposit_checker`]'s read-only
-    /// discipline (COMMIT-SAFETY constraint -- the sec-13 lesson): it opens
-    /// only a NON-committable `db.begin_transaction_nc()` to read
+    /// A PURE READER, mirroring [`Usdt::spawn_block_count_poller`]'s
+    /// read-only discipline (COMMIT-SAFETY constraint -- the sec-13 lesson,
+    /// see this module's removed `spawn_deposit_checker` for the background
+    /// on why guardian-local tasks must never commit consensus DB state): it
+    /// opens only a NON-committable `db.begin_transaction_nc()` to read
     /// `consensus_block_count`, makes one read-only RPC call, and writes
     /// NOTHING to the consensus DB. The observed hash becomes a ring entry
     /// solely in the ordered `process_consensus_item` path, and only once
@@ -3225,8 +3074,7 @@ impl Usdt {
 
                 // Abstain until consensus has observed the chain (`ccount != 0`)
                 // and this guardian's own node has imported the
-                // confirmation-depth block (`at <= cached_head`); mirrors
-                // `scan_pending_deposits`'s own gate.
+                // confirmation-depth block (`at <= cached_head`).
                 if ccount != 0 && at <= cached_head {
                     match rpc_deadline(evm_rpc.get_block_hash(at)).await {
                         Ok(block_hash) => {
@@ -3259,7 +3107,7 @@ impl Usdt {
     /// `consensus_proposal` to drain into `UsdtConsensusItem::UserOpConfirmed`
     /// proposals (Phase 7, Task 5).
     ///
-    /// Mirrors [`Usdt::spawn_deposit_checker`]'s discipline EXACTLY: reads
+    /// Mirrors [`Usdt::spawn_block_count_poller`]'s read-only discipline: reads
     /// the module DB via `db.begin_transaction_nc()` (non-committable) and
     /// NEVER commits a write to it -- submission is idempotent (the
     /// `EntryPoint` dedups by `(sender, nonce)`, so a redundant or
@@ -3472,10 +3320,10 @@ impl Usdt {
     /// `Wallet::consensus_block_count` (but `u64`-valued since EVM block
     /// numbers do not fit the wallet's `u32` bitcoin block heights).
     ///
-    /// Delegates to the free [`consensus_block_count`] function so
-    /// [`scan_pending_deposits`] (which has no `Usdt` to call this method
-    /// on — it must run from a `'static` spawned task) can compute the same
-    /// value without duplicating the median logic.
+    /// Delegates to the free [`consensus_block_count`] function so any
+    /// `'static`-spawned background task (which has no `Usdt` to call this
+    /// method on) can compute the same value without duplicating the median
+    /// logic.
     pub async fn consensus_block_count(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
         consensus_block_count(dbtx, self.num_peers).await
     }
@@ -3763,55 +3611,51 @@ impl Usdt {
 
     /// Credits a deposit observation that has reached threshold agreement:
     /// creates the account's [`DepositRecord`] (using `obs.claim_pk`) if it
-    /// does not exist yet, advances `credited` monotonically forward (see
-    /// "Credit rule" below), updates `last_observed_block`, and clears the
-    /// round's votes and the account's `PendingCheck`.
+    /// does not exist yet, advances `credited` monotonically forward to
+    /// `obs.balance` (balance is monotonic between sweeps since only the
+    /// federation moves funds out), updates `last_observed_block`, and
+    /// clears the round's votes.
     ///
-    /// # Credit rule (sweep-aware, monotone)
+    /// # No longer reachable via honest `consensus_proposal` (proof-driven
+    /// crediting, sec-13)
     ///
-    /// Which floor `credited` is advanced to depends on where `obs.block`
-    /// falls relative to the account's consensus-agreed last sweep block
-    /// ([`LastSweepBlockKey`], written by [`Usdt::apply_user_op_confirmed`]
-    /// from the threshold-agreed [`UserOpConfirmedObservation::block`]):
+    /// The guardian-local polling task that used to scan per-account
+    /// guardian-poll records and propose `UsdtConsensusItem::Deposit` items
+    /// for this to process has been removed entirely: it committed consensus DB
+    /// state from an uncoordinated background task racing the ordered
+    /// `process_consensus_item` path (and, separately, the other guardian
+    /// pollers), which is exactly the `WriteConflict` crash security finding 13
+    /// fixed. Deposits are now credited by the client submitting a verified
+    /// [`fedimint_usdt_common::DepositProof`] as a
+    /// [`fedimint_usdt_common::UsdtInput::DepositProofV0`] (see
+    /// `Self::process_deposit_proof`), which performs the equivalent
+    /// high-water/sweep bookkeeping inline inside the ordered transaction-
+    /// processing path -- never from a spawned task.
     ///
-    /// - `obs.block > last_sweep_block`: the observation provably saw the
-    ///   POST-sweep balance (every confirmed sweep already left the account by
-    ///   `obs.block`), so the account's true all-time deposit total is
-    ///   `record.swept + obs.balance` and `credited` advances to `max(credited,
-    ///   swept + balance)`. This is what lets a brand-new deposit to an
-    ///   already-swept address credit FULLY (previously a documented
-    ///   limitation: the raw balance of such a deposit never exceeded the
-    ///   historic `credited`, so it was never -- or only partially --
-    ///   credited).
-    /// - `obs.block <= last_sweep_block` (or no sweep has ever confirmed): the
-    ///   conservative raw-balance rule, `max(credited, balance)`. An
-    ///   observation taken before a sweep but processed after its confirm lands
-    ///   here, so the funds that sweep moved are never counted twice.
-    ///
-    /// No double credit either way: `swept` only covers sweeps confirmed at
-    /// blocks `<= last_sweep_block`, whose funds are absent from any balance
-    /// observed at `obs.block > last_sweep_block` -- so `swept + balance`
-    /// never exceeds the true deposit total. A sweep that has executed
-    /// on-chain but not yet reached its `UserOpConfirmed` threshold merely
-    /// leaves `swept`/`last_sweep_block` un-advanced, which can only
-    /// UNDER-credit temporarily (both rules are monotone `max`es), and the
-    /// next observation after the confirm catches up.
+    /// `UsdtConsensusItem::Deposit`/[`DepositObservation`] and this method are
+    /// kept (rather than deleted) purely for consensus wire-format stability:
+    /// this crate's `#[derive(Encodable, Decodable)]` assigns enum variant
+    /// tags positionally (0-indexed among non-`#[encodable_default]`
+    /// variants) when no variant carries an explicit
+    /// `#[encodable(index = N)]`, as none do here -- deleting a variant from
+    /// the middle of [`fedimint_usdt_common::UsdtConsensusItem`] would
+    /// silently shift every later-declared variant's wire tag, corrupting
+    /// decode of existing consensus history for `MpcRound`, `MpcSignature`,
+    /// `RotateSigning`, `UserOpConfirmed`, `FeeVote`,
+    /// `BootstrapObservation`, `ReplaceUserOp`, and `BlockHash` unless every
+    /// one of them were re-pinned with an explicit index (a
+    /// `MODULE_CONSENSUS_VERSION`-bump-scale change, out of scope here). No
+    /// honest guardian proposes a `Deposit` item any more; this arm now only
+    /// matters if a byzantine guardian replays one, in which case it must
+    /// still behave exactly as before (self-authenticating, threshold-gated,
+    /// deterministic) rather than silently misbehave.
     ///
     /// # Determinism (consensus-critical)
     ///
     /// `process_consensus_item` must be a pure function of `(ordered
     /// consensus items, prior consensus DB state)` — byte-identical on every
     /// honest guardian. The claim key therefore MUST come from `obs` itself,
-    /// never from this guardian's local [`PendingCheck`] (or an existing
-    /// [`DepositRecord`]): `PendingCheck` is guardian-local, non-consensus
-    /// state written only by the `check_deposit` API handler, which a
-    /// client's request reaches via a *threshold* of guardians, not all of
-    /// them. A guardian that never received the `check_deposit` call would
-    /// have no `PendingCheck` for this account, yet must still process the
-    /// same ordered `Deposit` item identically to every other guardian.
-    /// Reading local state here previously caused exactly that: guardians
-    /// with the `PendingCheck` credited the deposit while a guardian without
-    /// it hit a `bail!` and diverged permanently.
+    /// never from an existing [`DepositRecord`].
     ///
     /// `ensure!` below is a self-authentication check, not a local-state
     /// read: it is a pure function of `obs` and this module's consensus
@@ -3874,13 +3718,9 @@ impl Usdt {
         record.last_observed_block = obs.block;
         dbtx.insert_entry(&DepositRecordKey(obs.account), &record)
             .await;
-        // Clear the round's votes. The `PendingCheck` removal below is local
-        // cleanup only (a guardian lacking one just no-ops the remove) — it
-        // is not read to obtain `claim_pk` above, so its absence cannot
-        // cause divergence.
+        // Clear the round's votes.
         dbtx.remove_by_prefix(&DepositObservationVoteAccountPrefix(obs.account))
             .await;
-        dbtx.remove_entry(&PendingCheckKey(obs.account)).await;
 
         // Deterministic trigger (Phase 7, Task 5): every guardian, right
         // here, enqueues the deploy-and-sweep `UserOp` for this account and
@@ -5062,91 +4902,6 @@ impl Usdt {
             "withdrawal terminally FAILED; reissued e-cash refund created (claimable once by the \
              original withdrawer)"
         );
-    }
-
-    /// Derives `claim_pk`'s deposit account and enqueues a guardian-local
-    /// [`PendingCheck`] for it, so this guardian's deposit-checker task (see
-    /// [`scan_pending_deposits`]) starts watching that address. Idempotent:
-    /// if a `PendingCheck` already exists for the account, it is left
-    /// untouched.
-    ///
-    /// The response only ever carries `account` (deterministic from
-    /// `claim_pk`) and `ready` (deterministic from consensus DB via
-    /// [`Usdt::bootstrap_state`]), never whether this call is what enqueued
-    /// the `PendingCheck` or whether a cap suppressed the insert: that is
-    /// guardian-local state and would let honest guardians return different
-    /// responses to the same request, breaking the threshold-identical
-    /// response requirement of `request_current_consensus`.
-    ///
-    /// # Readiness gate (security finding 13, r2 facet)
-    ///
-    /// If the federation is not yet [`BootstrapState::Ready`], no
-    /// `PendingCheck` is stored at all: funding a deposit account before the
-    /// federation's infra (EntryPoint/factory/impl) is confirmed ready would
-    /// let a caller strand funds in an account the federation cannot yet
-    /// sweep. `bootstrap_state` is a pure function of consensus DB, so this
-    /// gate is identical on every guardian at the same consensus position.
-    ///
-    /// # Cap (security finding 13)
-    ///
-    /// Before inserting a NEW `PendingCheck`, this counts the existing
-    /// `PendingCheck` table and, at [`MAX_PENDING_CHECKS`], skips the insert
-    /// (logging a warning) rather than growing the table further --
-    /// `check_deposit` is unauthenticated and each distinct `claim_pk` derives
-    /// a distinct account, so without a cap this table could grow without
-    /// bound. The cap is enforced purely guardian-locally and, per the
-    /// determinism note above, never changes the response shape.
-    async fn handle_check_deposit(
-        &self,
-        dbtx: &mut DatabaseTransaction<'_>,
-        claim_pk: secp256k1::PublicKey,
-    ) -> CheckDepositResponse {
-        let account = derive_deposit_account(
-            &self.cfg.consensus.group_public_key,
-            self.cfg.consensus.account_factory,
-            self.cfg.consensus.simple_account_impl,
-            &claim_pk,
-        );
-
-        let ready = self.bootstrap_state(dbtx).await == BootstrapState::Ready;
-        if !ready {
-            return CheckDepositResponse {
-                account,
-                ready: false,
-            };
-        }
-
-        if dbtx.get_value(&PendingCheckKey(account)).await.is_some() {
-            return CheckDepositResponse { account, ready };
-        }
-
-        let pending_count: u64 = dbtx
-            .find_by_prefix(&PendingCheckPrefix)
-            .await
-            .count()
-            .await
-            .try_into()
-            .unwrap_or(u64::MAX);
-        if pending_count >= MAX_PENDING_CHECKS {
-            warn!(
-                target: "usdt",
-                count = pending_count,
-                "PendingCheck cap reached; not storing new check"
-            );
-            return CheckDepositResponse { account, ready };
-        }
-
-        let requested_at_block = self.consensus_block_count(dbtx).await;
-        dbtx.insert_entry(
-            &PendingCheckKey(account),
-            &PendingCheck {
-                claim_pk,
-                requested_at_block,
-            },
-        )
-        .await;
-
-        CheckDepositResponse { account, ready }
     }
 
     /// Reports `claim_pk`'s deposit account state: `claimable` is
@@ -6486,8 +6241,8 @@ const BATCH_MAX_ITEMS: usize = 20;
 
 /// Free-function core of [`Usdt::consensus_block_count`], taking `num_peers`
 /// by value instead of borrowing it from `&self`, so it can be called both
-/// from that method and from [`scan_pending_deposits`] (which, running from a
-/// `'static` spawned task, cannot hold a `&Usdt` reference).
+/// from that method and from any `'static`-spawned background task (which
+/// cannot hold a `&Usdt` reference).
 async fn consensus_block_count(dbtx: &mut DatabaseTransaction<'_>, num_peers: NumPeers) -> u64 {
     let peer_count = num_peers.total();
 
@@ -6546,162 +6301,6 @@ async fn fee_vote_median(
         max_fee_per_gas_wei: max_fee_per_gas_wei[max_fee_per_gas_wei.len() / 2],
         usdt_per_eth_e6: usdt_per_eth_e6[usdt_per_eth_e6.len() / 2],
     })
-}
-
-/// Scans every guardian-local [`PendingCheck`] and returns the
-/// [`DepositObservation`]s this guardian is ready to propose for, without
-/// making any writes to `dbtx`.
-///
-/// This is a **pure reader**: fedimint server-module background tasks read
-/// the module DB via `db.begin_transaction_nc()` (non-committable) and must
-/// not commit writes to the module DB outside the consensus flow (mirroring
-/// e.g. the wallet module's read-only `run_broadcast_pending_tx`). All
-/// `PendingCheck` writes therefore live in the check-deposit API handler and
-/// in [`Usdt::credit_deposit`] (via `process_consensus_item`), never here.
-///
-/// The read block (`consensus_block_count(..) - confirmation_depth`) is
-/// derived from federation-wide consensus state, not this guardian's local
-/// EVM head, so that every honest guardian computes an identical observation
-/// for the same deposit and can reach agreement on it.
-///
-/// TTL-expired `PendingCheck`s are skipped (not deleted): deleting them here
-/// would violate the pure-reader constraint above. Garbage collection of
-/// expired checks instead happens in a separate, committable local
-/// transaction opened by the deposit-checker task right after it calls this
-/// function (see [`Usdt::spawn_deposit_checker`] and
-/// [`gc_expired_pending_checks`]; security finding 13).
-async fn scan_pending_deposits(
-    dbtx: &mut DatabaseTransaction<'_>,
-    evm_rpc: &DynServerEvmRpc,
-    cached_head: u64,
-    usdt_contract: fedimint_usdt_common::EvmAddress,
-    confirmation_depth: u64,
-    check_ttl_blocks: u64,
-    num_peers: NumPeers,
-) -> Vec<DepositObservation> {
-    let ccount = consensus_block_count(dbtx, num_peers).await;
-    let at = ccount.saturating_sub(confirmation_depth);
-
-    let pending: Vec<(PendingCheckKey, PendingCheck)> = dbtx
-        .find_by_prefix(&PendingCheckPrefix)
-        .await
-        .collect()
-        .await;
-
-    // Security finding 12: the canonical hash of the read block `at`, fetched
-    // ONCE per scan (it is the same for every account) and bound into every
-    // observation so votes from different forks at the same height cannot
-    // aggregate. `None` when this guardian's node hasn't confirmed `at` yet
-    // (`at > cached_head`) or the hash read failed -- either way, no
-    // observation can be proposed this tick (retried next tick).
-    let block_hash = if at > cached_head {
-        None
-    } else {
-        match rpc_deadline(evm_rpc.get_block_hash(at)).await {
-            Ok(hash) => Some(hash),
-            Err(err) => {
-                debug!(
-                    target: "usdt",
-                    err = %err.fmt_compact_anyhow(),
-                    at_block = at,
-                    "deposit block-hash read failed, retrying next tick"
-                );
-                None
-            }
-        }
-    };
-
-    let mut observations = Vec::new();
-    for (PendingCheckKey(account), check) in pending {
-        // Skipped (not deleted) here -- see this function's doc comment for
-        // why, and `gc_expired_pending_checks` for where the deletion
-        // actually happens.
-        if check.requested_at_block + check_ttl_blocks < ccount {
-            continue;
-        }
-
-        let Some(block_hash) = block_hash else {
-            // This guardian's own EVM node hasn't confirmed `at` yet (or its
-            // hash read failed); retry next tick. Subsumes the old
-            // `at > cached_head` skip.
-            continue;
-        };
-
-        let balance =
-            match rpc_deadline(evm_rpc.get_erc20_balance(usdt_contract, account, at)).await {
-                Ok(balance) => balance,
-                Err(err) => {
-                    debug!(
-                        target: "usdt",
-                        err = %err.fmt_compact_anyhow(),
-                        ?account,
-                        at_block = at,
-                        "deposit balance check failed, retrying next tick"
-                    );
-                    continue;
-                }
-            };
-
-        let credited = dbtx
-            .get_value(&DepositRecordKey(account))
-            .await
-            .map_or(UsdtAmount(0), |record| record.credited);
-
-        if balance.0 > credited.0 {
-            observations.push(DepositObservation {
-                account,
-                balance,
-                block: at,
-                block_hash,
-                claim_pk: check.claim_pk,
-            });
-        }
-    }
-
-    observations
-}
-
-/// Deletes every guardian-local [`PendingCheck`] whose TTL has elapsed
-/// (security finding 13), using the exact same expiry predicate
-/// [`scan_pending_deposits`] uses to *skip* (but not delete) expired checks,
-/// so the two stay consistent.
-///
-/// Guardian-local, non-consensus cleanup: `PendingCheck` is guardian-local
-/// state -- see [`Usdt::credit_deposit`]'s own local `remove_entry` for the
-/// same key, whose doc comment notes a guardian lacking a `PendingCheck`
-/// simply no-ops the removal and is not read to derive anything
-/// consensus-relevant. Deleting expired entries here therefore needs no
-/// federation agreement and cannot cause divergence: an honest guardian that
-/// GC'd (or never had) a `PendingCheck` for an account still correctly
-/// applies a threshold-agreed deposit credit for it.
-///
-/// Takes a **committable** `dbtx`, unlike [`scan_pending_deposits`]'s
-/// read-only one -- callers must commit a dedicated transaction for this
-/// call, kept separate from the read-only scan (see
-/// [`Usdt::spawn_deposit_checker`]). Returns the number of entries removed,
-/// for logging/tests.
-async fn gc_expired_pending_checks(
-    dbtx: &mut DatabaseTransaction<'_>,
-    check_ttl_blocks: u64,
-    num_peers: NumPeers,
-) -> usize {
-    let ccount = consensus_block_count(dbtx, num_peers).await;
-
-    let pending: Vec<(PendingCheckKey, PendingCheck)> = dbtx
-        .find_by_prefix(&PendingCheckPrefix)
-        .await
-        .collect()
-        .await;
-
-    let mut removed = 0usize;
-    for (key, check) in pending {
-        if check.requested_at_block + check_ttl_blocks < ccount {
-            dbtx.remove_entry(&key).await;
-            removed += 1;
-        }
-    }
-
-    removed
 }
 
 /// Inserts `(height, hash)` into the [`BlockHashRingKey`] ring -- the
@@ -6880,24 +6479,13 @@ mod tests {
 
     /// A mostly-no-op [`IServerEvmRpc`] sufficient for constructing a
     /// [`Usdt`] module in tests that exercise consensus logic (block-count
-    /// median/redundancy) rather than EVM-RPC-driven behavior, plus minimal
-    /// scripting of `get_erc20_balance` (via `set_erc20_balance_at`) for the
-    /// deposit-checker tests. This is deliberately separate from
+    /// median/redundancy, user-op submission/confirmation) rather than
+    /// EVM-RPC-driven balance polling. This is deliberately separate from
     /// `fedimint-usdt-tests`' fuller scriptable `MockEvmRpc`:
     /// `fedimint-usdt-server` cannot depend on `fedimint-usdt-tests` (which
     /// itself depends on this crate) without a dependency cycle.
     #[derive(Debug, Default)]
     struct MockEvmRpc {
-        #[allow(clippy::type_complexity)]
-        balances: Mutex<
-            std::collections::HashMap<
-                (
-                    fedimint_usdt_common::EvmAddress,
-                    fedimint_usdt_common::EvmAddress,
-                ),
-                BTreeMap<u64, fedimint_usdt_common::UsdtAmount>,
-            >,
-        >,
         /// Every `SignedUserOp` batch passed to `submit_user_ops`, in call
         /// order (Phase 7 Task 4), so tests can assert on what consensus
         /// logic attempted to submit.
@@ -6973,25 +6561,6 @@ mod tests {
     }
 
     impl MockEvmRpc {
-        /// Scripts `get_erc20_balance(token, holder, at_block)` to return
-        /// `balance` for any `at_block >= block` (until a later, higher
-        /// scripted block for the same `(token, holder)` supersedes it),
-        /// mirroring `fedimint-usdt-tests`' `MockEvmRpc::set_erc20_balance_at`.
-        fn set_erc20_balance_at(
-            &self,
-            token: fedimint_usdt_common::EvmAddress,
-            holder: fedimint_usdt_common::EvmAddress,
-            block: u64,
-            balance: fedimint_usdt_common::UsdtAmount,
-        ) {
-            self.balances
-                .lock()
-                .expect("not poisoned")
-                .entry((token, holder))
-                .or_default()
-                .insert(block, balance);
-        }
-
         /// Scripts the [`fedimint_usdt_common::user_op::UserOpReceipt`]
         /// `get_user_op_receipt(user_op_hash)` returns.
         fn set_user_op_receipt(
@@ -7127,17 +6696,14 @@ mod tests {
 
         async fn get_erc20_balance(
             &self,
-            token: fedimint_usdt_common::EvmAddress,
-            holder: fedimint_usdt_common::EvmAddress,
-            at_block: u64,
+            _token: fedimint_usdt_common::EvmAddress,
+            _holder: fedimint_usdt_common::EvmAddress,
+            _at_block: u64,
         ) -> anyhow::Result<fedimint_usdt_common::UsdtAmount> {
-            Ok(self
-                .balances
-                .lock()
-                .expect("not poisoned")
-                .get(&(token, holder))
-                .and_then(|by_block| by_block.range(..=at_block).next_back())
-                .map_or(fedimint_usdt_common::UsdtAmount(0), |(_, balance)| *balance))
+            // No balance polling in these consensus-logic tests (the deposit
+            // scanner that read this was removed with the guardian-poll path);
+            // deposit crediting is now proof-driven via `process_deposit_proof`.
+            Ok(fedimint_usdt_common::UsdtAmount(0))
         }
 
         async fn get_erc20_basis_points_rate(
@@ -8067,24 +7633,6 @@ mod tests {
             &claim_pk,
         );
 
-        // A PendingCheck is not required for crediting (that is the whole
-        // point of this fix — see `credit_deposit`'s doc comment), but a
-        // real guardian that itself handled the `check_deposit` call would
-        // have one, and this test also exercises that it gets cleared on
-        // credit.
-        {
-            let mut dbtx = db.begin_transaction().await;
-            dbtx.insert_entry(
-                &PendingCheckKey(account),
-                &PendingCheck {
-                    claim_pk,
-                    requested_at_block: 0,
-                },
-            )
-            .await;
-            dbtx.commit_tx().await;
-        }
-
         let obs = DepositObservation {
             account,
             balance: UsdtAmount(2_000_000),
@@ -8131,8 +7679,7 @@ mod tests {
                 .is_none()
         );
 
-        // Third identical 2M vote reaches threshold → credited, votes + pending
-        // cleared.
+        // Third identical 2M vote reaches threshold → credited, votes cleared.
         module
             .process_consensus_item(
                 &mut dbtx.to_ref_nc(),
@@ -8148,12 +7695,6 @@ mod tests {
             .unwrap();
         assert_eq!(record.credited, UsdtAmount(2_000_000));
         assert_eq!(record.claimed, UsdtAmount(0));
-        assert!(
-            dbtx.to_ref_nc()
-                .get_value(&PendingCheckKey(account))
-                .await
-                .is_none()
-        );
         assert_eq!(
             dbtx.to_ref_nc()
                 .find_by_prefix(&DepositObservationVoteAccountPrefix(account))
@@ -8178,19 +7719,6 @@ mod tests {
             module.cfg.consensus.simple_account_impl,
             &claim_pk,
         );
-
-        {
-            let mut dbtx = db.begin_transaction().await;
-            dbtx.insert_entry(
-                &PendingCheckKey(account),
-                &PendingCheck {
-                    claim_pk,
-                    requested_at_block: 0,
-                },
-            )
-            .await;
-            dbtx.commit_tx().await;
-        }
 
         let obs = DepositObservation {
             account,
@@ -8273,79 +7801,6 @@ mod tests {
         );
     }
 
-    /// Regression test for the consensus-safety fix: a guardian that never
-    /// saw the `check_deposit` API call (so has NO local [`PendingCheck`]
-    /// for this account — e.g. a momentarily-slow guardian that a client's
-    /// `check_deposit` did not happen to reach, since
-    /// `request_current_consensus` only hits a threshold of peers, not all
-    /// of them) must still credit the deposit identically to every other
-    /// guardian once threshold-identical `Deposit` votes are ordered,
-    /// because `claim_pk` now comes from the observation itself rather than
-    /// from local state.
-    ///
-    /// Before the fix, `credit_deposit` recovered the claim key by reading
-    /// `PendingCheckKey(obs.account)` and `bail!`ed with "no pending check or
-    /// record" when it was absent — so this exact scenario (no `PendingCheck`
-    /// ever inserted) would return `Err` while guardians that did have the
-    /// `PendingCheck` returned `Ok` for the same ordered consensus item: a
-    /// permanent consensus DB divergence.
-    #[tokio::test]
-    async fn credit_deposit_succeeds_without_any_local_pending_check() {
-        let module = test_module_with_block_count(4, 0).await; // threshold = 3
-        let db = module.db_for_test();
-        // Freshness gate (finding 12): keep the block-50 observation in-window.
-        seed_block_count_votes(db, 4, 50 + module.cfg.consensus.confirmation_depth).await;
-        let claim_pk = test_pubkey(0x42);
-        let account = derive_deposit_account(
-            &module.cfg.consensus.group_public_key,
-            module.cfg.consensus.account_factory,
-            module.cfg.consensus.simple_account_impl,
-            &claim_pk,
-        );
-
-        // Deliberately do NOT insert a `PendingCheck` for `account` —
-        // simulating the guardian that `check_deposit` never reached.
-        assert!(
-            db.begin_transaction_nc()
-                .await
-                .get_value(&PendingCheckKey(account))
-                .await
-                .is_none(),
-            "test setup: this guardian must have no PendingCheck for the account"
-        );
-
-        let obs = DepositObservation {
-            account,
-            balance: UsdtAmount(2_000_000),
-            block: 50,
-            block_hash: [0u8; 32],
-            claim_pk,
-        };
-        let mut dbtx = db.begin_transaction().await;
-
-        // Three (threshold) identical votes, exactly as the ordered
-        // consensus items would arrive on any guardian, PendingCheck or not.
-        for p in [0u16, 1, 2] {
-            module
-                .process_consensus_item(
-                    &mut dbtx.to_ref_nc(),
-                    UsdtConsensusItem::Deposit(obs.clone()),
-                    PeerId::from(p),
-                )
-                .await
-                .expect("crediting must not depend on a local PendingCheck");
-        }
-
-        let record = dbtx
-            .to_ref_nc()
-            .get_value(&DepositRecordKey(account))
-            .await
-            .expect("DepositRecord must be created purely from the observation");
-        assert_eq!(record.credited, UsdtAmount(2_000_000));
-        assert_eq!(record.claimed, UsdtAmount(0));
-        assert_eq!(record.claim_pk, claim_pk);
-    }
-
     /// A `Deposit` observation whose `claim_pk` does not actually derive its
     /// `account` must be rejected by the self-authentication check in
     /// `credit_deposit`, deterministically (a pure function of `obs` and the
@@ -8421,8 +7876,7 @@ mod tests {
 
     /// Sets up a fresh in-memory DB with `BlockCountVote`s from a majority of
     /// `num_peers` peers so that the free `consensus_block_count(dbtx,
-    /// num_peers)` (and therefore `scan_pending_deposits`) computes exactly
-    /// `ccount`.
+    /// num_peers)` computes exactly `ccount`.
     async fn seed_block_count_votes(db: &Database, num_peers: u16, ccount: u64) {
         let mut dbtx = db.begin_transaction().await;
         // A majority (more than half) voting `ccount`, with the rest left
@@ -9020,196 +8474,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_pending_deposits_finds_confirmed_balance_above_credited() {
-        let num_peers = 4u16;
-        let confirmation_depth = 6u64;
-        let check_ttl_blocks = 500u64;
-        let ccount = 100u64;
-        let usdt_contract = EvmAddress([0x11; 20]);
-        let account = EvmAddress([0x22; 20]);
-        let claim_pk = test_pubkey(0xcc);
-
-        let db = fedimint_core::db::Database::new(
-            fedimint_core::db::mem_impl::MemDatabase::new(),
-            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
-        );
-        seed_block_count_votes(&db, num_peers, ccount).await;
-        {
-            let mut dbtx = db.begin_transaction().await;
-            dbtx.insert_entry(
-                &PendingCheckKey(account),
-                &PendingCheck {
-                    claim_pk,
-                    requested_at_block: 0,
-                },
-            )
-            .await;
-            dbtx.commit_tx().await;
-        }
-
-        let at = ccount - confirmation_depth;
-        let evm_rpc = MockEvmRpc::default();
-        evm_rpc.set_erc20_balance_at(usdt_contract, account, at, UsdtAmount(3_000_000));
-        let evm_rpc: DynServerEvmRpc = std::sync::Arc::new(evm_rpc);
-
-        let mut dbtx = db.begin_transaction_nc().await;
-        let observations = scan_pending_deposits(
-            &mut dbtx.to_ref_nc(),
-            &evm_rpc,
-            ccount, // cached head is at least as fresh as `at`
-            usdt_contract,
-            confirmation_depth,
-            check_ttl_blocks,
-            (0..num_peers)
-                .map(PeerId::from)
-                .collect::<Vec<_>>()
-                .to_num_peers(),
-        )
-        .await;
-
-        assert_eq!(
-            observations,
-            vec![DepositObservation {
-                account,
-                balance: UsdtAmount(3_000_000),
-                block: at,
-                block_hash: mock_block_hash(at),
-                claim_pk,
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn scan_pending_deposits_skips_expired_pending_check_without_deleting() {
-        let num_peers = 4u16;
-        let confirmation_depth = 6u64;
-        let check_ttl_blocks = 10u64;
-        let ccount = 1_000u64; // far past requested_at_block(0) + ttl(10)
-        let usdt_contract = EvmAddress([0x33; 20]);
-        let account = EvmAddress([0x44; 20]);
-        let claim_pk = test_pubkey(0xdd);
-
-        let db = fedimint_core::db::Database::new(
-            fedimint_core::db::mem_impl::MemDatabase::new(),
-            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
-        );
-        seed_block_count_votes(&db, num_peers, ccount).await;
-        {
-            let mut dbtx = db.begin_transaction().await;
-            dbtx.insert_entry(
-                &PendingCheckKey(account),
-                &PendingCheck {
-                    claim_pk,
-                    requested_at_block: 0,
-                },
-            )
-            .await;
-            dbtx.commit_tx().await;
-        }
-
-        let evm_rpc: DynServerEvmRpc = std::sync::Arc::new(MockEvmRpc::default());
-
-        let mut dbtx = db.begin_transaction_nc().await;
-        let observations = scan_pending_deposits(
-            &mut dbtx.to_ref_nc(),
-            &evm_rpc,
-            ccount,
-            usdt_contract,
-            confirmation_depth,
-            check_ttl_blocks,
-            (0..num_peers)
-                .map(PeerId::from)
-                .collect::<Vec<_>>()
-                .to_num_peers(),
-        )
-        .await;
-
-        assert!(
-            observations.is_empty(),
-            "expired pending check must not be proposed"
-        );
-
-        // The expired PendingCheck must NOT have been deleted by the scan
-        // itself: removal of stale expired entries happens in the SEPARATE
-        // `gc_expired_pending_checks` (see `scan_pending_deposits`'s doc
-        // comment, and `expired_pending_checks_are_deleted` below for that
-        // function's own coverage).
-        let mut dbtx = db.begin_transaction_nc().await;
-        assert!(
-            dbtx.get_value(&PendingCheckKey(account)).await.is_some(),
-            "the read-only scan must not delete the PendingCheck"
-        );
-    }
-
-    /// Security finding 13: `gc_expired_pending_checks` deletes exactly the
-    /// `PendingCheck`s whose TTL has elapsed (the same predicate
-    /// `scan_pending_deposits` uses to skip them), leaving non-expired ones
-    /// untouched.
-    #[tokio::test]
-    async fn expired_pending_checks_are_deleted() {
-        let num_peers = 4u16;
-        let check_ttl_blocks = 10u64;
-        let ccount = 1_000u64;
-        let expired_account = EvmAddress([0x55; 20]);
-        let live_account = EvmAddress([0x66; 20]);
-        let claim_pk = test_pubkey(0xee);
-
-        let db = fedimint_core::db::Database::new(
-            fedimint_core::db::mem_impl::MemDatabase::new(),
-            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
-        );
-        seed_block_count_votes(&db, num_peers, ccount).await;
-        {
-            let mut dbtx = db.begin_transaction().await;
-            // Expired: requested_at_block(0) + ttl(10) = 10 < ccount(1000).
-            dbtx.insert_entry(
-                &PendingCheckKey(expired_account),
-                &PendingCheck {
-                    claim_pk,
-                    requested_at_block: 0,
-                },
-            )
-            .await;
-            // Not expired: requested_at_block(995) + ttl(10) = 1005 >= ccount(1000).
-            dbtx.insert_entry(
-                &PendingCheckKey(live_account),
-                &PendingCheck {
-                    claim_pk,
-                    requested_at_block: 995,
-                },
-            )
-            .await;
-            dbtx.commit_tx().await;
-        }
-
-        let num_peers = (0..num_peers)
-            .map(PeerId::from)
-            .collect::<Vec<_>>()
-            .to_num_peers();
-
-        let mut dbtx = db.begin_transaction().await;
-        let removed =
-            gc_expired_pending_checks(&mut dbtx.to_ref_nc(), check_ttl_blocks, num_peers).await;
-        dbtx.commit_tx().await;
-
-        assert_eq!(removed, 1);
-
-        let mut dbtx = db.begin_transaction_nc().await;
-        assert!(
-            dbtx.get_value(&PendingCheckKey(expired_account))
-                .await
-                .is_none(),
-            "the expired PendingCheck must be removed"
-        );
-        assert!(
-            dbtx.get_value(&PendingCheckKey(live_account))
-                .await
-                .is_some(),
-            "the non-expired PendingCheck must survive"
-        );
-    }
-
-    #[tokio::test]
     async fn block_hash_ring_write_read_and_prune() {
         let db = fedimint_core::db::Database::new(
             fedimint_core::db::mem_impl::MemDatabase::new(),
@@ -9268,35 +8532,28 @@ mod tests {
     // --- Phase 9, Drill A: deposit reorg safety -----------------------------
     //
     // Hardening-acceptance-audit plan (`docs/superpowers/plans/
-    // 2026-07-21-hardening-acceptance-audit.md`), Task 1. These three tests
-    // prove, against the hermetic (block-aware) `MockEvmRpc` above, that a
-    // reorg shallower than `confirmation_depth` cannot cause a
-    // spurious/rolled-back credit, and document the guarantee's boundary.
+    // 2026-07-21-hardening-acceptance-audit.md`), Task 1.
     //
-    // The formal guarantee: once a deposit has been credited, the block it
-    // was credited from was already `confirmation_depth` deep at the time of
-    // crediting (that's what makes `scan_pending_deposits` propose it in the
-    // first place -- see that function's own doc comment). A SUBSEQUENT
-    // reorg of depth `d < confirmation_depth` can only rewrite blocks within
-    // `d` of the (same-or-taller) new head, and can therefore never reach a
-    // block that was already `confirmation_depth`-deep: `d <
-    // confirmation_depth` implies the credited block lies outside the
-    // reorg's reach. So a shallow reorg cannot un-happen an already-credited
-    // deposit by construction -- there is nothing for consensus logic to
-    // defend against there. What consensus logic DOES defend (and what
-    // `drill_a_deposit_within_confirmation_depth_is_not_credited` and
-    // `drill_a_deposit_reorged_out_before_confirmation_depth_is_never_credited`
-    // below prove) is the OTHER half: a deposit that has NOT yet reached
-    // `confirmation_depth` must never be credited off an unconfirmed read,
-    // precisely because a shallow reorg CAN still rewrite it.
+    // The confirmation-depth gating that used to prevent an unconfirmed /
+    // shallow-reorg deposit from ever being credited off a guardian-local
+    // poll no longer lives on a deposit path at all: crediting is now
+    // proof-driven (a client submits a
+    // [`fedimint_usdt_common::DepositProof`] verified against the federation's
+    // block-hash ring anchor), and the block-hash observer only ever anchors a
+    // block once it is `confirmation_depth` deep AND threshold-many guardians
+    // agree its canonical hash. A proof therefore cannot verify against an
+    // unconfirmed or sub-`confirmation_depth`-reorged block -- there is no
+    // anchor for it -- so the two former scanner-level drill tests
+    // (`..._within_confirmation_depth_is_not_credited` and
+    // `..._reorged_out_before_confirmation_depth_is_never_credited`) were
+    // removed alongside the polling machinery they exercised; that gating is
+    // now covered structurally by the block-hash-ring anchor + proof tests.
     //
-    // What this does NOT prove (a documented boundary, not a gap): a reorg
-    // DEEPER than `confirmation_depth` -- i.e. one that manages to
-    // reorganize a block that was already credited against -- is out of
-    // scope by construction. `credit_deposit`'s `credited` write is
-    // monotonic-forward-only (see its "Credit rule (sweep-aware, monotone)"
-    // doc comment: both floors only ever advance `credited` via a `max`)
-    // and there is no consensus arm that un-credits it.
+    // What remains worth proving here is the deep-reorg boundary: once a
+    // deposit HAS been credited, `credited` is monotonic-forward-only (see
+    // [`Usdt::credit_deposit`]'s own doc comment: "Only credit forward;
+    // balance is monotonic between sweeps") and there is no consensus arm that
+    // un-credits it.
     // `drill_a_credited_deposit_is_monotonic_and_never_moves_backward` below
     // proves that monotonicity directly. Whether to build a credit-reversal
     // path for the deep-reorg case (which also has to interact with
@@ -9306,144 +8563,6 @@ mod tests {
     // rely on an operator choosing `confirmation_depth` conservatively
     // enough, for the target chain, that a reorg past it is not practically
     // achievable.
-
-    #[tokio::test]
-    async fn drill_a_deposit_within_confirmation_depth_is_not_credited() {
-        // The "intended-safe case": a deposit that has NOT yet accumulated
-        // `confirmation_depth` confirmations must never be proposed as an
-        // observation (and therefore never credited), even though the funds
-        // already exist on-chain at the current, unconfirmed head.
-        let num_peers = 4u16;
-        let confirmation_depth = 6u64;
-        let check_ttl_blocks = 500u64;
-        let usdt_contract = EvmAddress([0x71; 20]);
-        let account = EvmAddress([0x72; 20]);
-        let claim_pk = test_pubkey(0x71);
-
-        let deposit_block = 50u64;
-        // Head is only `confirmation_depth - 1` past the deposit block: NOT
-        // yet confirmed (`at = ccount - confirmation_depth` lands strictly
-        // before `deposit_block`, where the pre-deposit balance is 0).
-        let ccount = deposit_block + confirmation_depth - 1;
-
-        let db = fedimint_core::db::Database::new(
-            fedimint_core::db::mem_impl::MemDatabase::new(),
-            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
-        );
-        seed_block_count_votes(&db, num_peers, ccount).await;
-        {
-            let mut dbtx = db.begin_transaction().await;
-            dbtx.insert_entry(
-                &PendingCheckKey(account),
-                &PendingCheck {
-                    claim_pk,
-                    requested_at_block: 0,
-                },
-            )
-            .await;
-            dbtx.commit_tx().await;
-        }
-
-        let evm_rpc = MockEvmRpc::default();
-        evm_rpc.set_erc20_balance_at(usdt_contract, account, deposit_block, UsdtAmount(2_000_000));
-        let evm_rpc: DynServerEvmRpc = std::sync::Arc::new(evm_rpc);
-
-        let mut dbtx = db.begin_transaction_nc().await;
-        let observations = scan_pending_deposits(
-            &mut dbtx.to_ref_nc(),
-            &evm_rpc,
-            ccount,
-            usdt_contract,
-            confirmation_depth,
-            check_ttl_blocks,
-            (0..num_peers)
-                .map(PeerId::from)
-                .collect::<Vec<_>>()
-                .to_num_peers(),
-        )
-        .await;
-
-        assert!(
-            observations.is_empty(),
-            "a deposit that has not yet reached confirmation_depth confirmations must never \
-             be proposed for crediting"
-        );
-    }
-
-    #[tokio::test]
-    async fn drill_a_deposit_reorged_out_before_confirmation_depth_is_never_credited() {
-        // A reorg that removes a deposit BEFORE it accumulates
-        // `confirmation_depth` confirmations is fully invisible to the
-        // deposit-checker: the checker only ever reads a block once it is
-        // `confirmation_depth` deep, and by the time it reads, it sees
-        // whatever the (now-canonical, post-reorg) chain actually has at
-        // that block. No special reorg-handling logic is needed for this
-        // case -- it falls straight out of confirmation-depth gating.
-        //
-        // This mock keys scripted balances by block number (see
-        // `MockEvmRpc::set_erc20_balance_at`'s doc comment), mirroring how a
-        // reorged chain has exactly one canonical value per block: a reorg
-        // is modeled here by re-scripting the SAME block key to its
-        // post-reorg value.
-        let num_peers = 4u16;
-        let confirmation_depth = 6u64;
-        let check_ttl_blocks = 500u64;
-        let usdt_contract = EvmAddress([0x73; 20]);
-        let account = EvmAddress([0x74; 20]);
-        let claim_pk = test_pubkey(0x73);
-
-        let deposit_block = 50u64;
-
-        let db = fedimint_core::db::Database::new(
-            fedimint_core::db::mem_impl::MemDatabase::new(),
-            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
-        );
-        {
-            let mut dbtx = db.begin_transaction().await;
-            dbtx.insert_entry(
-                &PendingCheckKey(account),
-                &PendingCheck {
-                    claim_pk,
-                    requested_at_block: 0,
-                },
-            )
-            .await;
-            dbtx.commit_tx().await;
-        }
-
-        let evm_rpc = MockEvmRpc::default();
-        // The deposit lands at block 50 with a 2,000,000 balance...
-        evm_rpc.set_erc20_balance_at(usdt_contract, account, deposit_block, UsdtAmount(2_000_000));
-        // ...but is reorged out before it ever reaches confirmation depth:
-        // the canonical balance AT BLOCK 50 is rewritten back to 0.
-        evm_rpc.set_erc20_balance_at(usdt_contract, account, deposit_block, UsdtAmount(0));
-        let evm_rpc: DynServerEvmRpc = std::sync::Arc::new(evm_rpc);
-
-        // The chain head later advances well past confirmation_depth...
-        let ccount = deposit_block + confirmation_depth + 100;
-        seed_block_count_votes(&db, num_peers, ccount).await;
-
-        let mut dbtx = db.begin_transaction_nc().await;
-        let observations = scan_pending_deposits(
-            &mut dbtx.to_ref_nc(),
-            &evm_rpc,
-            ccount,
-            usdt_contract,
-            confirmation_depth,
-            check_ttl_blocks,
-            (0..num_peers)
-                .map(PeerId::from)
-                .collect::<Vec<_>>()
-                .to_num_peers(),
-        )
-        .await;
-
-        assert!(
-            observations.is_empty(),
-            "a deposit reorged out before it reached confirmation_depth confirmations must \
-             never be credited"
-        );
-    }
 
     #[tokio::test]
     async fn drill_a_credited_deposit_is_monotonic_and_never_moves_backward() {
@@ -10958,199 +10077,6 @@ mod tests {
             module.output_status(&mut dbtx.to_ref_nc(), out_point).await,
             Some(UsdtOutputOutcome),
             "an outcome exists once the withdrawal is queued"
-        );
-    }
-
-    #[tokio::test]
-    async fn check_deposit_enqueues_pending_check_and_is_idempotent() {
-        let module = test_module_with_block_count(4, 0).await; // threshold = 3
-        let db = module.db_for_test();
-        let claim_pk = test_pubkey(0x01);
-        let expected_account = fedimint_usdt_common::derive_deposit_account(
-            &module.cfg.consensus.group_public_key,
-            module.cfg.consensus.account_factory,
-            module.cfg.consensus.simple_account_impl,
-            &claim_pk,
-        );
-
-        // Reach BootstrapState::Ready first (security finding 13's readiness
-        // gate): otherwise handle_check_deposit refuses to enqueue anything.
-        let mut dbtx = db.begin_transaction().await;
-        for p in [0u16, 1, 2] {
-            vote_bootstrap(&module, &mut dbtx.to_ref_nc(), p, ready_observation()).await;
-        }
-        dbtx.commit_tx().await;
-
-        // First call: derives the account and enqueues a PendingCheck.
-        let mut dbtx = db.begin_transaction().await;
-        let response = module
-            .handle_check_deposit(&mut dbtx.to_ref_nc(), claim_pk)
-            .await;
-        dbtx.commit_tx().await;
-
-        assert_eq!(response.account, expected_account);
-        assert!(response.ready, "federation was voted to Ready above");
-
-        let pending = db
-            .begin_transaction_nc()
-            .await
-            .get_value(&PendingCheckKey(expected_account))
-            .await
-            .expect("PendingCheck must have been inserted");
-        assert_eq!(pending.claim_pk, claim_pk);
-        assert_eq!(pending.requested_at_block, 0);
-
-        // Advance the consensus block count so a bug that re-derives
-        // requested_at_block on every call (instead of leaving an existing
-        // PendingCheck untouched) would be caught below.
-        let mut dbtx = db.begin_transaction().await;
-        for p in [0u16, 1, 2] {
-            module
-                .process_consensus_item(
-                    &mut dbtx.to_ref_nc(),
-                    UsdtConsensusItem::BlockCount(100),
-                    PeerId::from(p),
-                )
-                .await
-                .expect("valid consensus item");
-        }
-        dbtx.commit_tx().await;
-        let mut dbtx = db.begin_transaction().await;
-        assert_eq!(
-            module.consensus_block_count(&mut dbtx.to_ref_nc()).await,
-            100
-        );
-        dbtx.commit_tx().await;
-
-        // Second call for the same claim_pk: idempotent, must not overwrite the
-        // existing PendingCheck (in particular, requested_at_block must stay 0,
-        // not be bumped to the now-advanced block count of 100).
-        let mut dbtx = db.begin_transaction().await;
-        let response2 = module
-            .handle_check_deposit(&mut dbtx.to_ref_nc(), claim_pk)
-            .await;
-        dbtx.commit_tx().await;
-
-        assert_eq!(response2.account, expected_account);
-        assert!(response2.ready);
-
-        let pending_after_second_call = db
-            .begin_transaction_nc()
-            .await
-            .get_value(&PendingCheckKey(expected_account))
-            .await
-            .expect("PendingCheck must still be present");
-        assert_eq!(pending_after_second_call, pending);
-    }
-
-    /// Security finding 13 (r2 facet): before the federation reaches
-    /// `BootstrapState::Ready`, `handle_check_deposit` must refuse to enqueue
-    /// a `PendingCheck` -- funding an account before the federation can sweep
-    /// it would strand funds -- and must report `ready: false` so the caller
-    /// knows nothing was enqueued.
-    #[tokio::test]
-    async fn check_deposit_rejected_before_ready() {
-        let module = test_module_with_block_count(4, 0).await; // no bootstrap votes cast
-        let db = module.db_for_test();
-        let claim_pk = test_pubkey(0x10);
-        let expected_account = fedimint_usdt_common::derive_deposit_account(
-            &module.cfg.consensus.group_public_key,
-            module.cfg.consensus.account_factory,
-            module.cfg.consensus.simple_account_impl,
-            &claim_pk,
-        );
-
-        let mut dbtx = db.begin_transaction().await;
-        let response = module
-            .handle_check_deposit(&mut dbtx.to_ref_nc(), claim_pk)
-            .await;
-        dbtx.commit_tx().await;
-
-        assert_eq!(
-            response.account, expected_account,
-            "account is a pure function of claim_pk + config, unaffected by readiness"
-        );
-        assert!(!response.ready);
-
-        let mut dbtx = db.begin_transaction_nc().await;
-        assert!(
-            dbtx.get_value(&PendingCheckKey(expected_account))
-                .await
-                .is_none(),
-            "no PendingCheck may be stored before the federation is Ready"
-        );
-    }
-
-    /// Security finding 13: once `PendingCheckPrefix` holds
-    /// `MAX_PENDING_CHECKS` entries, `handle_check_deposit` must not insert
-    /// another one for a brand-new distinct account -- but must still return
-    /// a normal, well-formed (deterministic) response rather than encoding
-    /// the cap into it.
-    #[tokio::test]
-    async fn check_deposit_capped_at_max() {
-        let module = test_module_with_block_count(4, 0).await; // threshold = 3
-        let db = module.db_for_test();
-
-        // Reach BootstrapState::Ready: the cap only matters on the insert
-        // path, which is only reached once ready.
-        let mut dbtx = db.begin_transaction().await;
-        for p in [0u16, 1, 2] {
-            vote_bootstrap(&module, &mut dbtx.to_ref_nc(), p, ready_observation()).await;
-        }
-        dbtx.commit_tx().await;
-
-        // Seed the table up to the cap with distinct accounts.
-        let filler_claim_pk = test_pubkey(0x11);
-        let mut dbtx = db.begin_transaction().await;
-        for i in 0..MAX_PENDING_CHECKS {
-            let mut bytes = [0u8; 20];
-            bytes[12..20].copy_from_slice(&i.to_be_bytes());
-            dbtx.insert_new_entry(
-                &PendingCheckKey(EvmAddress(bytes)),
-                &PendingCheck {
-                    claim_pk: filler_claim_pk,
-                    requested_at_block: 0,
-                },
-            )
-            .await;
-        }
-        dbtx.commit_tx().await;
-
-        let claim_pk = test_pubkey(0x12);
-        let expected_account = fedimint_usdt_common::derive_deposit_account(
-            &module.cfg.consensus.group_public_key,
-            module.cfg.consensus.account_factory,
-            module.cfg.consensus.simple_account_impl,
-            &claim_pk,
-        );
-
-        let mut dbtx = db.begin_transaction().await;
-        let response = module
-            .handle_check_deposit(&mut dbtx.to_ref_nc(), claim_pk)
-            .await;
-        dbtx.commit_tx().await;
-
-        assert_eq!(response.account, expected_account);
-        assert!(response.ready, "cap must not affect the ready computation");
-
-        let mut dbtx = db.begin_transaction_nc().await;
-        assert!(
-            dbtx.get_value(&PendingCheckKey(expected_account))
-                .await
-                .is_none(),
-            "at the cap, a new distinct account's PendingCheck must not be stored"
-        );
-
-        let count: u64 = dbtx
-            .find_by_prefix(&PendingCheckPrefix)
-            .await
-            .count()
-            .await
-            .try_into()
-            .unwrap_or(u64::MAX);
-        assert_eq!(
-            count, MAX_PENDING_CHECKS,
-            "the table must stay exactly at the cap, not grow past it"
         );
     }
 
@@ -16334,14 +15260,6 @@ mod tests {
         )
         .await;
         dbtx.insert_new_entry(
-            &PendingCheckKey(account),
-            &PendingCheck {
-                claim_pk,
-                requested_at_block: 1,
-            },
-        )
-        .await;
-        dbtx.insert_new_entry(
             &SigningSessionKey(session_id),
             &SigningSession {
                 purpose: SigningPurpose::UserOp(op_hash),
@@ -16468,7 +15386,6 @@ mod tests {
             "Fee Votes",
             "Deposit Records",
             "Deposit Observation Votes",
-            "Pending Checks",
             "Signing Sessions",
             "MPC Round Chunks",
             "Pending UserOps",
@@ -16489,7 +15406,7 @@ mod tests {
         assert_eq!(
             dumped.len(),
             expected_labels.len(),
-            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x14 upstream + local 0x20)"
+            "dump_database must produce exactly one entry per DbKeyPrefix variant"
         );
         for label in expected_labels {
             assert!(

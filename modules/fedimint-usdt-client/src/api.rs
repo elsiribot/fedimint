@@ -5,16 +5,15 @@ use fedimint_core::module::ApiRequestErased;
 use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::{OutPoint, PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
-    CHECK_DEPOSIT_ENDPOINT, DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT,
-    GROUP_PUBLIC_KEY_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT,
-    USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
+    DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
+    POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT, USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT,
+    WITHDRAW_FEE_QUOTE_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
-    CheckDepositRequest, CheckDepositResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse,
-    DepositStatusRequest, DepositStatusResponse, PoolStateResponse, RefundStatusRequest,
-    RefundStatusResponse, StatusResponse, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse,
-    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatusRequest,
-    WithdrawalStatusResponse,
+    DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositStatusRequest, DepositStatusResponse,
+    PoolStateResponse, RefundStatusRequest, RefundStatusResponse, StatusResponse, UsdtAmount,
+    UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
+    WithdrawalStatusRequest, WithdrawalStatusResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -23,13 +22,6 @@ pub trait UsdtFederationApi {
     /// key, proving that DKG-produced config has been loaded and is
     /// queryable.
     async fn group_public_key(&self) -> FederationResult<secp256k1::PublicKey>;
-
-    /// Enqueues this guardian's local deposit-checker task to start watching
-    /// `claim_pk`'s deposit address, returning that derived address.
-    async fn check_deposit(
-        &self,
-        claim_pk: secp256k1::PublicKey,
-    ) -> FederationResult<CheckDepositResponse>;
 
     /// Reports the credited/claimed/claimable state of `claim_pk`'s deposit
     /// account.
@@ -104,17 +96,6 @@ where
         self.request_current_consensus(
             GROUP_PUBLIC_KEY_ENDPOINT.to_string(),
             ApiRequestErased::default(),
-        )
-        .await
-    }
-
-    async fn check_deposit(
-        &self,
-        claim_pk: secp256k1::PublicKey,
-    ) -> FederationResult<CheckDepositResponse> {
-        self.request_current_consensus(
-            CHECK_DEPOSIT_ENDPOINT.to_string(),
-            ApiRequestErased::new(CheckDepositRequest { claim_pk }),
         )
         .await
     }
