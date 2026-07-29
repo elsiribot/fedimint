@@ -54,18 +54,18 @@ use fedimint_usdt_common::endpoint_constants::{
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
-    BLOCK_HASH_RING_LEN, BootstrapObservation, BootstrapState, CheckDepositRequest,
-    CheckDepositResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation,
-    DepositStatusRequest, DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES,
-    MAX_PENDING_CHECKS, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem,
-    PoolStateResponse, RefundInfo, RefundStatusRequest, RefundStatusResponse, SigningSessionId,
-    StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtGenParams,
-    UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
-    UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
-    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse,
-    deposit_fee_quote, deposit_salt, derive_deposit_account, derive_pool_account, evm_address,
-    fee_vote_in_sane_range, pool_salt, signing_session_id, usdt_amount, validate_usdt_params,
-    wei_gas_cost_to_usdt, withdrawal_fee_quote,
+    BLOCK_HASH_RING_LEN, BlockHashObservation, BootstrapObservation, BootstrapState,
+    CheckDepositRequest, CheckDepositResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse,
+    DepositObservation, DepositStatusRequest, DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS,
+    MAX_MPC_ROUND_BYTES, MAX_PENDING_CHECKS, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE,
+    MpcRoundItem, PoolStateResponse, RefundInfo, RefundStatusRequest, RefundStatusResponse,
+    SigningSessionId, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem,
+    UsdtGenParams, UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError,
+    UsdtOutputOutcome, UserOpStatus, UserOpStatusRequest, UserOpStatusResponse,
+    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest,
+    WithdrawalStatusResponse, deposit_fee_quote, deposit_salt, derive_deposit_account,
+    derive_pool_account, evm_address, fee_vote_in_sane_range, pool_salt, signing_session_id,
+    usdt_amount, validate_usdt_params, wei_gas_cost_to_usdt, withdrawal_fee_quote,
 };
 use futures::{FutureExt as _, StreamExt as _};
 use rand::rngs::OsRng;
@@ -75,19 +75,20 @@ use tracing::{debug, info, warn};
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 use crate::db::{
     BlockCountVoteKey, BlockCountVotePrefix, BlockHashRingKey, BlockHashRingPrefix,
-    BootstrapVoteKey, BootstrapVotePrefix, DbKeyPrefix, DepositObservationVoteAccountPrefix,
-    DepositObservationVoteKey, DepositObservationVotePrefix, DepositRecord, DepositRecordKey,
-    DepositRecordPrefix, FeeVoteKey, FeeVotePrefix, HasEverBeenReadyKey, HasEverBeenReadyPrefix,
-    MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix, MpcRoundChunkSessionPrefix,
-    MpcRoundChunkSessionRoundPeerPrefix, MpcRoundChunkSessionRoundPrefix, PendingCheck,
-    PendingCheckKey, PendingCheckPrefix, PendingUserOp, PendingUserOpKey, PendingUserOpPrefix,
-    PoolState, PoolStateKey, PoolStatePrefix, Refund, RefundKey, RefundPrefix, SessionState,
-    SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix, StoredFeeVote,
-    SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix, UnclaimedWithdrawalKey,
-    UnclaimedWithdrawalPrefix, UsdtWithdrawalV0, UserOpConfirmedObservation,
-    UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix, UserOpConfirmedVotePrefix, UserOpPurpose,
-    WithdrawalBatchCapKey, WithdrawalBatchCapPrefix, WithdrawalIncurredFeeKey,
-    WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
+    BlockHashVoteKey, BlockHashVotePrefix, BootstrapVoteKey, BootstrapVotePrefix, DbKeyPrefix,
+    DepositObservationVoteAccountPrefix, DepositObservationVoteKey, DepositObservationVotePrefix,
+    DepositRecord, DepositRecordKey, DepositRecordPrefix, FeeVoteKey, FeeVotePrefix,
+    HasEverBeenReadyKey, HasEverBeenReadyPrefix, MpcRoundChunk, MpcRoundChunkKey,
+    MpcRoundChunkPrefix, MpcRoundChunkSessionPrefix, MpcRoundChunkSessionRoundPeerPrefix,
+    MpcRoundChunkSessionRoundPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
+    PendingUserOp, PendingUserOpKey, PendingUserOpPrefix, PoolState, PoolStateKey, PoolStatePrefix,
+    Refund, RefundKey, RefundPrefix, SessionState, SigningPurpose, SigningSession,
+    SigningSessionKey, SigningSessionPrefix, StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey,
+    SubmittedUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
+    UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
+    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalBatchCapKey, WithdrawalBatchCapPrefix,
+    WithdrawalIncurredFeeKey, WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey,
+    WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -361,6 +362,16 @@ impl ModuleInit for UsdtInit {
                         [u8; 32],
                         items,
                         "Block Hash Ring"
+                    );
+                }
+                DbKeyPrefix::BlockHashVote => {
+                    push_db_pair_items!(
+                        dbtx,
+                        BlockHashVotePrefix,
+                        crate::db::BlockHashVoteKey,
+                        BlockHashObservation,
+                        items,
+                        "Block Hash Votes"
                     );
                 }
             }
@@ -1346,6 +1357,16 @@ pub struct Usdt {
     /// each observation is this guardian's own guardian-LOCAL read of the
     /// on-chain readiness conditions, never itself a consensus decision.
     bootstrap_proposals: Arc<Mutex<Vec<BootstrapObservation>>>,
+    /// This guardian's most recent confirmation-depth block-hash observation
+    /// (deposit-by-proof anchor), refreshed in the background by the READ-ONLY
+    /// [`Usdt::spawn_block_hash_observer`] task and drained into a
+    /// `UsdtConsensusItem::BlockHash` proposal in `consensus_proposal`. `None`
+    /// until the observer's first successful read; a single-slot `Option`
+    /// (latest wins) since only the most recent anchor is worth proposing --
+    /// mirrors `fee_estimate`'s cache shape. Never itself a consensus write; it
+    /// becomes a ring entry only once threshold-aggregated in the ordered
+    /// `process` path.
+    block_hash_proposals: Arc<Mutex<Option<BlockHashObservation>>>,
 }
 
 /// One guardian-local observation of a submitted `UserOp`'s on-chain outcome
@@ -1425,6 +1446,27 @@ struct BootstrapObserverHandles {
     account_factory: fedimint_usdt_common::EvmAddress,
     simple_account_impl: fedimint_usdt_common::EvmAddress,
     broadcaster_min_balance_wei: u64,
+}
+
+/// Grouped handles/config for [`Usdt::spawn_block_hash_observer`]
+/// (deposit-by-proof anchor), mirroring [`DepositCheckerHandles`]'s
+/// convention. All uses are read-only: the observer reads
+/// `consensus_block_count` from the guardian-local DB, reads the canonical
+/// hash of the confirmation-depth block via `evm_rpc.get_block_hash`, and
+/// queues it into `block_hash_proposals` -- it NEVER writes the consensus DB
+/// (commit-safety constraint).
+struct BlockHashObserverHandles {
+    db: Database,
+    evm_rpc: DynServerEvmRpc,
+    /// This guardian's most recently polled chain head (see
+    /// [`Usdt::spawn_block_count_poller`]); used only to skip observing a
+    /// confirmation-depth height this guardian's own node has not yet imported.
+    block_count: Arc<AtomicU64>,
+    confirmation_depth: u64,
+    /// Needed to compute `consensus_block_count(dbtx, num_peers)` (the shared
+    /// height reference all honest guardians target) from the local DB.
+    num_peers: NumPeers,
+    block_hash_proposals: Arc<Mutex<Option<BlockHashObservation>>>,
 }
 
 /// Implementation of consensus for the server module
@@ -1520,6 +1562,29 @@ impl ServerModule for Usdt {
                 .await;
             if current_vote != Some(obs.clone()) {
                 items.push(UsdtConsensusItem::Deposit(obs));
+            }
+        }
+
+        // Propose this guardian's most recent confirmation-depth block-hash
+        // observation (deposit-by-proof anchor; gathered by the READ-ONLY
+        // `spawn_block_hash_observer`), mirroring the `FeeVote`/`Bootstrap`
+        // drains: only the LATEST observation matters (the observer overwrites
+        // its single slot each tick), and it is proposed only when it differs
+        // from this peer's already-recorded vote, so an unchanged anchor does
+        // not spam consensus every round (`process_consensus_item`'s redundancy
+        // guard is what actually enforces this). The observation is a
+        // guardian-LOCAL RPC read, never itself a consensus write; it becomes a
+        // ring entry only once threshold-aggregated in the ordered `process`
+        // path.
+        let latest_block_hash = self
+            .block_hash_proposals
+            .lock()
+            .expect("not poisoned")
+            .take();
+        if let Some(obs) = latest_block_hash {
+            let current_vote = dbtx.get_value(&BlockHashVoteKey(self.our_peer_id)).await;
+            if current_vote != Some(obs) {
+                items.push(UsdtConsensusItem::BlockHash(obs));
             }
         }
 
@@ -1949,6 +2014,65 @@ impl ServerModule for Usdt {
                     && dbtx.get_value(&HasEverBeenReadyKey).await.is_none()
                 {
                     dbtx.insert_new_entry(&HasEverBeenReadyKey, &()).await;
+                }
+
+                Ok(())
+            }
+            UsdtConsensusItem::BlockHash(obs) => {
+                // Deposit-by-proof anchor: persist a threshold-agreed
+                // confirmation-depth `(height, block_hash)` into the block-hash
+                // ring. DETERMINISTIC, mirroring the `Deposit` arm's discipline
+                // exactly -- a pure function of the ordered item, prior
+                // consensus DB state, and `cfg.consensus` (no RPC/wall-clock/
+                // `our_peer_id`, so every honest guardian decides identically).
+                //
+                // FRESHNESS gate (mirrors the `Deposit` arm, security finding
+                // 12), reject BEFORE any DB mutation so a rejected observation
+                // is non-state-changing:
+                //   * too NEW: `obs.height` must be at least `confirmation_depth` behind the
+                //     consensus block count, so the ring never anchors a block that is not yet
+                //     confirmation-deep; and
+                //   * too OLD: `obs.height` must be within `confirmation_depth +
+                //     DEPOSIT_VOTE_MAX_AGE_BLOCKS` of the consensus block count, so a stale
+                //     pre-reorg vote can never complete a threshold long after the fact and
+                //     re-anchor an old height.
+                let confirmation_depth = self.cfg.consensus.confirmation_depth;
+                let ccount = self.consensus_block_count(dbtx).await;
+                ensure!(
+                    obs.height <= ccount.saturating_sub(confirmation_depth),
+                    "block-hash observation is not yet confirmation-deep"
+                );
+                ensure!(
+                    ccount.saturating_sub(obs.height)
+                        <= confirmation_depth + DEPOSIT_VOTE_MAX_AGE_BLOCKS,
+                    "block-hash observation is too old (outside the freshness window)"
+                );
+
+                // Store the ORDERED item's origin peer's vote (keyed by the
+                // framework-supplied `peer_id`, NEVER `self.our_peer_id`), with
+                // an equality-based redundancy guard: reject (non-state-changing
+                // `Err`) an EXACT repeat of this peer's current vote so a
+                // re-proposed unchanged observation cannot bloat consensus
+                // history.
+                let key = BlockHashVoteKey(peer_id);
+                if dbtx.insert_entry(&key, &obs).await.as_ref() == Some(&obs) {
+                    bail!("block-hash observation vote is redundant");
+                }
+
+                // Tally FULLY-equal `(height, block_hash)` votes across every
+                // peer (one slot per peer). Two guardians observing the same
+                // height on DIFFERENT forks vote non-equal hashes, so they never
+                // aggregate toward the ring write.
+                let votes: Vec<BlockHashObservation> = dbtx
+                    .find_by_prefix(&BlockHashVotePrefix)
+                    .await
+                    .map(|(_, v)| v)
+                    .collect()
+                    .await;
+                let agreeing = votes.iter().filter(|v| **v == obs).count();
+
+                if agreeing >= self.num_peers.threshold() {
+                    write_block_hash_ring(dbtx, obs.height, obs.block_hash).await;
                 }
 
                 Ok(())
@@ -2591,6 +2715,19 @@ impl Usdt {
             },
         );
 
+        let block_hash_proposals = Arc::new(Mutex::new(None));
+        Self::spawn_block_hash_observer(
+            &task_group,
+            BlockHashObserverHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.clone(),
+                block_count: block_count.clone(),
+                confirmation_depth: cfg.consensus.confirmation_depth,
+                num_peers,
+                block_hash_proposals: block_hash_proposals.clone(),
+            },
+        );
+
         Usdt {
             cfg,
             evm_rpc,
@@ -2606,6 +2743,7 @@ impl Usdt {
             user_op_confirmed_proposals,
             fee_estimate,
             bootstrap_proposals,
+            block_hash_proposals,
         }
     }
 
@@ -2639,6 +2777,10 @@ impl Usdt {
             // readiness by feeding `BootstrapObservation` items through
             // `process_consensus_item` directly.
             bootstrap_proposals: Arc::new(Mutex::new(Vec::new())),
+            // The block-hash observer poller is NOT spawned in tests (mirroring
+            // the other pollers); tests drive the ring by feeding
+            // `BlockHash` items through `process_consensus_item` directly.
+            block_hash_proposals: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3086,6 +3228,77 @@ impl Usdt {
                         removed,
                         "garbage-collected expired PendingChecks"
                     );
+                }
+
+                fedimint_core::runtime::sleep(Duration::from_secs(poll_interval_secs())).await;
+            }
+        });
+    }
+
+    /// Spawns the deposit-by-proof block-hash observer: a background task that
+    /// periodically reads the canonical hash of the confirmation-depth block
+    /// (`consensus_block_count - confirmation_depth`) via
+    /// `evm_rpc.get_block_hash` and queues it into `block_hash_proposals`, for
+    /// `consensus_proposal` to drain into a `UsdtConsensusItem::BlockHash`
+    /// proposal.
+    ///
+    /// A PURE READER, mirroring [`Usdt::spawn_deposit_checker`]'s read-only
+    /// discipline (COMMIT-SAFETY constraint -- the sec-13 lesson): it opens
+    /// only a NON-committable `db.begin_transaction_nc()` to read
+    /// `consensus_block_count`, makes one read-only RPC call, and writes
+    /// NOTHING to the consensus DB. The observed hash becomes a ring entry
+    /// solely in the ordered `process_consensus_item` path, and only once
+    /// threshold-many guardians propose the identical `(height,
+    /// block_hash)` pair (see the `UsdtConsensusItem::BlockHash` arm) --
+    /// never on this task's own say-so.
+    ///
+    /// The height is derived from the CONSENSUS block count (not this
+    /// guardian's raw chain tip), so every honest guardian targets the SAME
+    /// height and their votes can aggregate; `block_count` (this guardian's
+    /// polled tip) is consulted only to SKIP a height its own node has not yet
+    /// imported (`at > cached_head`), retried next tick. An RPC error likewise
+    /// just abstains this tick.
+    fn spawn_block_hash_observer(task_group: &TaskGroup, handles: BlockHashObserverHandles) {
+        let BlockHashObserverHandles {
+            db,
+            evm_rpc,
+            block_count,
+            confirmation_depth,
+            num_peers,
+            block_hash_proposals,
+        } = handles;
+
+        task_group.spawn_cancellable("usdt-block-hash-observer", async move {
+            loop {
+                let mut dbtx = db.begin_transaction_nc().await;
+                let ccount = consensus_block_count(&mut dbtx.to_ref_nc(), num_peers).await;
+                drop(dbtx);
+
+                let at = ccount.saturating_sub(confirmation_depth);
+                let cached_head = block_count.load(Ordering::Relaxed);
+
+                // Abstain until consensus has observed the chain (`ccount != 0`)
+                // and this guardian's own node has imported the
+                // confirmation-depth block (`at <= cached_head`); mirrors
+                // `scan_pending_deposits`'s own gate.
+                if ccount != 0 && at <= cached_head {
+                    match rpc_deadline(evm_rpc.get_block_hash(at)).await {
+                        Ok(block_hash) => {
+                            *block_hash_proposals.lock().expect("not poisoned") =
+                                Some(BlockHashObservation {
+                                    height: at,
+                                    block_hash,
+                                });
+                        }
+                        Err(err) => {
+                            debug!(
+                                target: "usdt",
+                                err = %err.fmt_compact_anyhow(),
+                                at_block = at,
+                                "block-hash observation read failed, retrying next tick"
+                            );
+                        }
+                    }
                 }
 
                 fedimint_core::runtime::sleep(Duration::from_secs(poll_interval_secs())).await;
@@ -6365,11 +6578,10 @@ async fn gc_expired_pending_checks(
 /// ring's current max), so writing an out-of-order LOWER height does not
 /// widen the retained window back out.
 ///
-/// Not yet called from production code: the consensus item that observes
-/// EVM block hashes and drives this write is a later deposit-by-proof task.
-/// `#[allow(dead_code)]` until then (exercised directly by
-/// `block_hash_ring_write_read_and_prune` in the meantime).
-#[allow(dead_code)]
+/// Called from the ordered `process_consensus_item` path
+/// (`UsdtConsensusItem::BlockHash`) once a threshold of guardians agree on a
+/// confirmation-depth `(height, block_hash)` pair -- never from a
+/// guardian-local task (commit-safety constraint).
 async fn write_block_hash_ring(dbtx: &mut DatabaseTransaction<'_>, height: u64, hash: [u8; 32]) {
     dbtx.insert_entry(&BlockHashRingKey(height), &hash).await;
 
@@ -7206,6 +7418,184 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("redundant"));
+    }
+
+    /// Feeds `(height, block_hash)` as peer `peer`'s `BlockHash` observation
+    /// through `process_consensus_item` (the ordered ring-population path),
+    /// returning the result so callers can assert accept vs. reject.
+    async fn vote_block_hash(
+        module: &Usdt,
+        dbtx: &mut DatabaseTransaction<'_>,
+        peer: u16,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> anyhow::Result<()> {
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::BlockHash(BlockHashObservation { height, block_hash }),
+                PeerId::from(peer),
+            )
+            .await
+    }
+
+    /// A threshold-agreed confirmation-depth `(height, block_hash)` observation
+    /// is persisted into the ring in the ordered `process` path, and only once
+    /// the threshold is reached; older heights prune out of the window.
+    #[tokio::test]
+    async fn block_hash_observation_populates_ring_at_threshold_and_prunes() {
+        let num_peers = 4u16; // threshold = 3
+        let module = test_module_with_block_count(num_peers, 0).await;
+        // confirmation_depth defaults to 1 for the test config.
+        let confirmation_depth = module.cfg.consensus.confirmation_depth;
+
+        // Consensus block count = 100, so the confirmation-depth height is 99.
+        seed_block_count_votes(module.db_for_test(), num_peers, 100).await;
+        let height = 100u64.saturating_sub(confirmation_depth); // 99
+        let hash = [0xA1; 32];
+
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        // Two of four peers agree: below the threshold of 3 -> ring still empty.
+        vote_block_hash(&module, &mut dbtx.to_ref_nc(), 0, height, hash)
+            .await
+            .expect("first fresh vote is accepted");
+        vote_block_hash(&module, &mut dbtx.to_ref_nc(), 1, height, hash)
+            .await
+            .expect("second fresh vote is accepted");
+        assert_eq!(ring_hash_at(&mut dbtx.to_ref_nc(), height).await, None);
+
+        // The third identical vote reaches threshold -> the ring is written in
+        // this ordered `process` path.
+        vote_block_hash(&module, &mut dbtx.to_ref_nc(), 2, height, hash)
+            .await
+            .expect("threshold vote is accepted");
+        assert_eq!(
+            ring_hash_at(&mut dbtx.to_ref_nc(), height).await,
+            Some(hash)
+        );
+        assert_eq!(
+            ring_latest_height(&mut dbtx.to_ref_nc()).await,
+            Some(height)
+        );
+        dbtx.commit_tx().await;
+
+        // Advance consensus far enough that a new confirmation-depth anchor
+        // falls `BLOCK_HASH_RING_LEN` beyond the old one, which prunes it.
+        let new_ccount = 400u64;
+        seed_block_count_votes(module.db_for_test(), num_peers, new_ccount).await;
+        let new_height = new_ccount.saturating_sub(confirmation_depth); // 399
+        assert!(new_height >= height + BLOCK_HASH_RING_LEN);
+        let new_hash = [0xB2; 32];
+
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            vote_block_hash(&module, &mut dbtx.to_ref_nc(), p, new_height, new_hash)
+                .await
+                .expect("fresh higher-height vote is accepted");
+        }
+        assert_eq!(
+            ring_hash_at(&mut dbtx.to_ref_nc(), new_height).await,
+            Some(new_hash)
+        );
+        // The old height has fallen out of the retained window.
+        assert_eq!(ring_hash_at(&mut dbtx.to_ref_nc(), height).await, None);
+    }
+
+    /// The freshness gate (mirroring the `Deposit` arm) rejects observations
+    /// that are not yet confirmation-deep or that have aged out, and the
+    /// redundancy guard rejects an exact repeat -- all BEFORE any ring write.
+    #[tokio::test]
+    async fn block_hash_observation_freshness_and_redundancy_guards() {
+        let num_peers = 4u16;
+        let module = test_module_with_block_count(num_peers, 0).await;
+        let confirmation_depth = module.cfg.consensus.confirmation_depth;
+        // `ccount` must exceed `confirmation_depth + DEPOSIT_VOTE_MAX_AGE_BLOCKS`
+        // for any height to be able to fall outside the too-old bound.
+        let ccount = 1_000u64;
+        seed_block_count_votes(module.db_for_test(), num_peers, ccount).await;
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        // Too NEW: a height that is not yet confirmation-deep is rejected.
+        let too_new = ccount.saturating_sub(confirmation_depth) + 1;
+        let err = vote_block_hash(&module, &mut dbtx.to_ref_nc(), 0, too_new, [0x01; 32])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not yet confirmation-deep"));
+
+        // Too OLD: outside `confirmation_depth + DEPOSIT_VOTE_MAX_AGE_BLOCKS`.
+        let too_old = ccount.saturating_sub(confirmation_depth + DEPOSIT_VOTE_MAX_AGE_BLOCKS + 1);
+        let err = vote_block_hash(&module, &mut dbtx.to_ref_nc(), 0, too_old, [0x02; 32])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too old"));
+
+        // A fresh vote is accepted; an EXACT repeat is redundant (rejected).
+        let height = ccount.saturating_sub(confirmation_depth);
+        vote_block_hash(&module, &mut dbtx.to_ref_nc(), 0, height, [0x03; 32])
+            .await
+            .expect("fresh vote accepted");
+        let err = vote_block_hash(&module, &mut dbtx.to_ref_nc(), 0, height, [0x03; 32])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("redundant"));
+    }
+
+    /// Two guardians observing the SAME confirmation-depth height on DIFFERENT
+    /// forks (distinct hashes) never aggregate toward the ring write: the
+    /// full-field tally counts only identical `(height, block_hash)` pairs.
+    #[tokio::test]
+    async fn block_hash_cross_fork_votes_do_not_aggregate() {
+        let num_peers = 4u16; // threshold = 3
+        let module = test_module_with_block_count(num_peers, 0).await;
+        let confirmation_depth = module.cfg.consensus.confirmation_depth;
+        seed_block_count_votes(module.db_for_test(), num_peers, 100).await;
+        let height = 100u64.saturating_sub(confirmation_depth);
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+
+        // Three peers vote the same height but pairwise-distinct hashes: no
+        // single hash reaches the threshold of 3.
+        vote_block_hash(&module, &mut dbtx.to_ref_nc(), 0, height, [0xAA; 32])
+            .await
+            .unwrap();
+        vote_block_hash(&module, &mut dbtx.to_ref_nc(), 1, height, [0xBB; 32])
+            .await
+            .unwrap();
+        vote_block_hash(&module, &mut dbtx.to_ref_nc(), 2, height, [0xCC; 32])
+            .await
+            .unwrap();
+        assert_eq!(ring_hash_at(&mut dbtx.to_ref_nc(), height).await, None);
+    }
+
+    /// The guardian-local observer path (its `consensus_proposal` drain) only
+    /// PROPOSES a `BlockHash` item; it never writes the ring. Only the ordered
+    /// `process_consensus_item` path does (verified by the tests above).
+    #[tokio::test]
+    async fn block_hash_proposal_path_does_not_write_ring() {
+        let num_peers = 4u16;
+        let module = test_module_with_block_count(num_peers, 0).await;
+        let confirmation_depth = module.cfg.consensus.confirmation_depth;
+        seed_block_count_votes(module.db_for_test(), num_peers, 100).await;
+        let height = 100u64.saturating_sub(confirmation_depth);
+        let obs = BlockHashObservation {
+            height,
+            block_hash: [0xD4; 32],
+        };
+
+        // Simulate what the READ-ONLY observer task does: queue its observation
+        // into the single-slot proposal cache (never touching the DB).
+        *module.block_hash_proposals.lock().expect("not poisoned") = Some(obs);
+
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+        let items = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+
+        // The observation surfaces as a proposal...
+        assert!(
+            items.contains(&UsdtConsensusItem::BlockHash(obs)),
+            "consensus_proposal should surface the queued block-hash observation"
+        );
+        // ...but the ring was NOT written by the proposal path.
+        assert_eq!(ring_latest_height(&mut dbtx.to_ref_nc()).await, None);
     }
 
     /// An all-conditions-met [`BootstrapObservation`] (Part C).
@@ -15202,6 +15592,14 @@ mod tests {
             .await;
         dbtx.insert_new_entry(&BlockHashRingKey(1), &[0x61; 32])
             .await;
+        dbtx.insert_new_entry(
+            &BlockHashVoteKey(PeerId::from(0)),
+            &BlockHashObservation {
+                height: 1,
+                block_hash: [0x62; 32],
+            },
+        )
+        .await;
 
         dbtx.commit_tx().await;
 
@@ -15231,11 +15629,12 @@ mod tests {
             "Withdrawal Refunds",
             "Withdrawal Incurred Fees",
             "Block Hash Ring",
+            "Block Hash Votes",
         ];
         assert_eq!(
             dumped.len(),
             expected_labels.len(),
-            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x13)"
+            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x14)"
         );
         for label in expected_labels {
             assert!(
