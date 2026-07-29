@@ -2251,6 +2251,24 @@ mod fedimint_migration_tests {
                         );
                         info!("Validated WithdrawalBatchCap (new prefix, empty)");
                     }
+                    DbKeyPrefix::BlockHashRing => {
+                        // Deposit-by-proof task 3: a brand-new prefix, like
+                        // `Refund`/`WithdrawalIncurredFee`/`WithdrawalBatchCap`
+                        // above -- the pre-migration v0 snapshot predates it and
+                        // no migration writes to it, so it must read back
+                        // cleanly as EMPTY.
+                        let ring = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::BlockHashRingPrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(
+                            ring.is_empty(),
+                            "BlockHashRing is a brand-new prefix; the pre-migration v0 snapshot \
+                             must not contain any rows for it"
+                        );
+                        info!("Validated BlockHashRing (new prefix, empty)");
+                    }
                 }
             }
 

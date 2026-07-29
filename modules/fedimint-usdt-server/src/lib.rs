@@ -54,18 +54,18 @@ use fedimint_usdt_common::endpoint_constants::{
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
-    BootstrapObservation, BootstrapState, CheckDepositRequest, CheckDepositResponse,
-    DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation, DepositStatusRequest,
-    DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES, MAX_PENDING_CHECKS,
-    MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem, PoolStateResponse, RefundInfo,
-    RefundStatusRequest, RefundStatusResponse, SigningSessionId, StatusResponse, USDT_UNIT,
-    UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtGenParams, UsdtInput, UsdtInputError,
-    UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome, UserOpStatus,
-    UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
-    WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse, deposit_fee_quote,
-    deposit_salt, derive_deposit_account, derive_pool_account, evm_address, fee_vote_in_sane_range,
-    pool_salt, signing_session_id, usdt_amount, validate_usdt_params, wei_gas_cost_to_usdt,
-    withdrawal_fee_quote,
+    BLOCK_HASH_RING_LEN, BootstrapObservation, BootstrapState, CheckDepositRequest,
+    CheckDepositResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositObservation,
+    DepositStatusRequest, DepositStatusResponse, FeeVote, MAX_MPC_CHUNKS, MAX_MPC_ROUND_BYTES,
+    MAX_PENDING_CHECKS, MODULE_CONSENSUS_VERSION, MPC_ROUND_CHUNK_SIZE, MpcRoundItem,
+    PoolStateResponse, RefundInfo, RefundStatusRequest, RefundStatusResponse, SigningSessionId,
+    StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtGenParams,
+    UsdtInput, UsdtInputError, UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome,
+    UserOpStatus, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
+    WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse,
+    deposit_fee_quote, deposit_salt, derive_deposit_account, derive_pool_account, evm_address,
+    fee_vote_in_sane_range, pool_salt, signing_session_id, usdt_amount, validate_usdt_params,
+    wei_gas_cost_to_usdt, withdrawal_fee_quote,
 };
 use futures::{FutureExt as _, StreamExt as _};
 use rand::rngs::OsRng;
@@ -74,20 +74,20 @@ use tracing::{debug, info, warn};
 
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 use crate::db::{
-    BlockCountVoteKey, BlockCountVotePrefix, BootstrapVoteKey, BootstrapVotePrefix, DbKeyPrefix,
-    DepositObservationVoteAccountPrefix, DepositObservationVoteKey, DepositObservationVotePrefix,
-    DepositRecord, DepositRecordKey, DepositRecordPrefix, FeeVoteKey, FeeVotePrefix,
-    HasEverBeenReadyKey, HasEverBeenReadyPrefix, MpcRoundChunk, MpcRoundChunkKey,
-    MpcRoundChunkPrefix, MpcRoundChunkSessionPrefix, MpcRoundChunkSessionRoundPeerPrefix,
-    MpcRoundChunkSessionRoundPrefix, PendingCheck, PendingCheckKey, PendingCheckPrefix,
-    PendingUserOp, PendingUserOpKey, PendingUserOpPrefix, PoolState, PoolStateKey, PoolStatePrefix,
-    Refund, RefundKey, RefundPrefix, SessionState, SigningPurpose, SigningSession,
-    SigningSessionKey, SigningSessionPrefix, StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey,
-    SubmittedUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
-    UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
-    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalBatchCapKey, WithdrawalBatchCapPrefix,
-    WithdrawalIncurredFeeKey, WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey,
-    WithdrawalStatePrefix,
+    BlockCountVoteKey, BlockCountVotePrefix, BlockHashRingKey, BlockHashRingPrefix,
+    BootstrapVoteKey, BootstrapVotePrefix, DbKeyPrefix, DepositObservationVoteAccountPrefix,
+    DepositObservationVoteKey, DepositObservationVotePrefix, DepositRecord, DepositRecordKey,
+    DepositRecordPrefix, FeeVoteKey, FeeVotePrefix, HasEverBeenReadyKey, HasEverBeenReadyPrefix,
+    MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix, MpcRoundChunkSessionPrefix,
+    MpcRoundChunkSessionRoundPeerPrefix, MpcRoundChunkSessionRoundPrefix, PendingCheck,
+    PendingCheckKey, PendingCheckPrefix, PendingUserOp, PendingUserOpKey, PendingUserOpPrefix,
+    PoolState, PoolStateKey, PoolStatePrefix, Refund, RefundKey, RefundPrefix, SessionState,
+    SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix, StoredFeeVote,
+    SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix, UnclaimedWithdrawalKey,
+    UnclaimedWithdrawalPrefix, UsdtWithdrawalV0, UserOpConfirmedObservation,
+    UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix, UserOpConfirmedVotePrefix, UserOpPurpose,
+    WithdrawalBatchCapKey, WithdrawalBatchCapPrefix, WithdrawalIncurredFeeKey,
+    WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -351,6 +351,16 @@ impl ModuleInit for UsdtInit {
                         UsdtAmount,
                         items,
                         "Withdrawal Incurred Fees"
+                    );
+                }
+                DbKeyPrefix::BlockHashRing => {
+                    push_db_pair_items!(
+                        dbtx,
+                        BlockHashRingPrefix,
+                        BlockHashRingKey,
+                        [u8; 32],
+                        items,
+                        "Block Hash Ring"
                     );
                 }
             }
@@ -6338,6 +6348,72 @@ async fn gc_expired_pending_checks(
     removed
 }
 
+/// Inserts `(height, hash)` into the [`BlockHashRingKey`] ring -- the
+/// canonical-block-hash anchor a later deposit-by-proof verification task
+/// checks a claimed inclusion proof's block hash against -- then prunes
+/// every entry that has fallen out of the trailing
+/// [`BLOCK_HASH_RING_LEN`]-height window ending at `height`, i.e. every
+/// entry at height `h` with `h + BLOCK_HASH_RING_LEN <= height`.
+///
+/// Uses `insert_entry` (not `insert_new_entry`): a caller re-writing the
+/// same height (e.g. after a local reorg) overwrites the stored hash rather
+/// than panicking. Saturating arithmetic throughout so a `height` near
+/// `u64::MAX` cannot overflow the prune comparison.
+///
+/// Callers are expected to call this with monotonically non-decreasing
+/// `height`s; pruning is always relative to the height just written (not the
+/// ring's current max), so writing an out-of-order LOWER height does not
+/// widen the retained window back out.
+///
+/// Not yet called from production code: the consensus item that observes
+/// EVM block hashes and drives this write is a later deposit-by-proof task.
+/// `#[allow(dead_code)]` until then (exercised directly by
+/// `block_hash_ring_write_read_and_prune` in the meantime).
+#[allow(dead_code)]
+async fn write_block_hash_ring(dbtx: &mut DatabaseTransaction<'_>, height: u64, hash: [u8; 32]) {
+    dbtx.insert_entry(&BlockHashRingKey(height), &hash).await;
+
+    let keys: Vec<BlockHashRingKey> = dbtx
+        .find_by_prefix(&BlockHashRingPrefix)
+        .await
+        .map(|(key, _)| key)
+        .collect()
+        .await;
+
+    for key in keys {
+        if key.0.saturating_add(BLOCK_HASH_RING_LEN) <= height {
+            dbtx.remove_entry(&key).await;
+        }
+    }
+}
+
+/// Reads the ring's canonical block hash at `height`, or `None` if `height`
+/// was never written or has since fallen out of the retained window (see
+/// [`write_block_hash_ring`]).
+///
+/// Not yet called from production code -- see [`write_block_hash_ring`]'s
+/// doc comment.
+#[allow(dead_code)]
+async fn ring_hash_at(dbtx: &mut DatabaseTransaction<'_>, height: u64) -> Option<[u8; 32]> {
+    dbtx.get_value(&BlockHashRingKey(height)).await
+}
+
+/// The highest height currently present in the ring, or `None` before the
+/// first [`write_block_hash_ring`] call.
+///
+/// Not yet called from production code -- see [`write_block_hash_ring`]'s
+/// doc comment.
+#[allow(dead_code)]
+async fn ring_latest_height(dbtx: &mut DatabaseTransaction<'_>) -> Option<u64> {
+    dbtx.find_by_prefix(&BlockHashRingPrefix)
+        .await
+        .map(|(key, _)| key.0)
+        .collect::<Vec<u64>>()
+        .await
+        .into_iter()
+        .max()
+}
+
 #[cfg(test)]
 mod tests {
     use fedimint_core::bitcoin::Network;
@@ -8598,6 +8674,62 @@ mod tests {
                 .await
                 .is_some(),
             "the non-expired PendingCheck must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_hash_ring_write_read_and_prune() {
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+
+        // Write two nearby heights; both must read back and `ring_latest_height`
+        // must report the newer one.
+        let mut dbtx = db.begin_transaction().await;
+        write_block_hash_ring(&mut dbtx.to_ref_nc(), 10, [0x10; 32]).await;
+        write_block_hash_ring(&mut dbtx.to_ref_nc(), 11, [0x11; 32]).await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            ring_hash_at(&mut dbtx.to_ref_nc(), 10).await,
+            Some([0x10; 32])
+        );
+        assert_eq!(
+            ring_hash_at(&mut dbtx.to_ref_nc(), 11).await,
+            Some([0x11; 32])
+        );
+        assert_eq!(ring_latest_height(&mut dbtx.to_ref_nc()).await, Some(11));
+        drop(dbtx);
+
+        // Writing a height far enough ahead (>= oldest + BLOCK_HASH_RING_LEN)
+        // prunes the oldest entry out of the window, but must not disturb an
+        // entry that is still within it.
+        let newest = 10 + BLOCK_HASH_RING_LEN;
+        let mut dbtx = db.begin_transaction().await;
+        write_block_hash_ring(&mut dbtx.to_ref_nc(), newest, [0x99; 32]).await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            ring_hash_at(&mut dbtx.to_ref_nc(), 10).await,
+            None,
+            "height 10 is exactly BLOCK_HASH_RING_LEN behind the new newest height and must \
+             be pruned"
+        );
+        assert_eq!(
+            ring_hash_at(&mut dbtx.to_ref_nc(), 11).await,
+            Some([0x11; 32]),
+            "height 11 is still within the window and must survive the prune"
+        );
+        assert_eq!(
+            ring_hash_at(&mut dbtx.to_ref_nc(), newest).await,
+            Some([0x99; 32])
+        );
+        assert_eq!(
+            ring_latest_height(&mut dbtx.to_ref_nc()).await,
+            Some(newest)
         );
     }
 
@@ -15068,6 +15200,8 @@ mod tests {
         .await;
         dbtx.insert_new_entry(&WithdrawalIncurredFeeKey(out_point), &UsdtAmount(12_345))
             .await;
+        dbtx.insert_new_entry(&BlockHashRingKey(1), &[0x61; 32])
+            .await;
 
         dbtx.commit_tx().await;
 
@@ -15096,11 +15230,12 @@ mod tests {
             "Withdrawal Batch Caps",
             "Withdrawal Refunds",
             "Withdrawal Incurred Fees",
+            "Block Hash Ring",
         ];
         assert_eq!(
             dumped.len(),
             expected_labels.len(),
-            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x12)"
+            "dump_database must produce exactly one entry per DbKeyPrefix variant (0x01..=0x13)"
         );
         for label in expected_labels {
             assert!(

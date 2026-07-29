@@ -100,6 +100,13 @@ pub enum DbKeyPrefix {
     /// settlement path or when the refund is created. See
     /// [`WithdrawalIncurredFeeKey`].
     WithdrawalIncurredFee = 0x12,
+    /// A rolling window of the last
+    /// [`fedimint_usdt_common::BLOCK_HASH_RING_LEN`] consensus-agreed EVM
+    /// block hashes, keyed by height (deposit-by-proof anchor). Written by
+    /// `write_block_hash_ring`, which also prunes every entry older than the
+    /// window; read by `ring_hash_at`/`ring_latest_height`. See
+    /// [`BlockHashRingKey`].
+    BlockHashRing = 0x13,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -804,6 +811,24 @@ impl_db_lookup!(
     query_prefix = WithdrawalIncurredFeePrefix
 );
 
+/// One height's canonical EVM block hash in the rolling
+/// [`fedimint_usdt_common::BLOCK_HASH_RING_LEN`]-entry ring (deposit-by-proof
+/// anchor): the value a later deposit-proof verification task checks a
+/// claimed inclusion proof's block hash against. Written/pruned exclusively
+/// via `write_block_hash_ring`.
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct BlockHashRingKey(pub u64);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct BlockHashRingPrefix;
+
+impl_db_record!(
+    key = BlockHashRingKey,
+    value = [u8; 32],
+    db_prefix = DbKeyPrefix::BlockHashRing,
+);
+impl_db_lookup!(key = BlockHashRingKey, query_prefix = BlockHashRingPrefix);
+
 #[cfg(test)]
 mod tests {
     use fedimint_core::PeerId;
@@ -1380,5 +1405,34 @@ mod tests {
                 Some(state)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn block_hash_ring_key_round_trips() {
+        let db = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(&BlockHashRingKey(10), &[0x10; 32])
+            .await;
+        dbtx.insert_new_entry(&BlockHashRingKey(11), &[0x11; 32])
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&BlockHashRingKey(10)).await,
+            Some([0x10; 32])
+        );
+        assert_eq!(
+            dbtx.get_value(&BlockHashRingKey(11)).await,
+            Some([0x11; 32])
+        );
+        assert_eq!(
+            dbtx.find_by_prefix(&BlockHashRingPrefix)
+                .await
+                .count()
+                .await,
+            2
+        );
     }
 }
