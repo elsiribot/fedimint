@@ -3,7 +3,8 @@ use fedimint_core::secp256k1::PublicKey;
 use fedimint_core::{OutPoint, PeerId, impl_db_lookup, impl_db_record};
 use fedimint_usdt_common::user_op::{SignedUserOp, UnsignedUserOp};
 use fedimint_usdt_common::{
-    BootstrapObservation, DepositObservation, EvmAddress, FeeVote, SigningSessionId, UsdtAmount,
+    BlockHashObservation, BootstrapObservation, DepositObservation, EvmAddress, FeeVote,
+    SigningSessionId, UsdtAmount,
 };
 use serde::Serialize;
 use strum_macros::EnumIter;
@@ -107,6 +108,12 @@ pub enum DbKeyPrefix {
     /// window; read by `ring_hash_at`/`ring_latest_height`. See
     /// [`BlockHashRingKey`].
     BlockHashRing = 0x13,
+    /// Per-peer votes on the canonical hash of a confirmation-depth EVM block
+    /// (deposit-by-proof anchor), mirroring [`Self::BlockCountVote`]'s
+    /// per-peer single-slot shape. Once at least a threshold of peers vote the
+    /// IDENTICAL `(height, block_hash)` pair, `write_block_hash_ring` persists
+    /// it into the [`Self::BlockHashRing`] window (see [`BlockHashVoteKey`]).
+    BlockHashVote = 0x14,
     /// Per-account record of the consensus-agreed EVM block at which the
     /// account's most recent SUCCESSFUL sweep confirmed (see
     /// [`LastSweepBlockKey`]). `Usdt::credit_deposit` compares each deposit
@@ -837,6 +844,25 @@ impl_db_record!(
     db_prefix = DbKeyPrefix::BlockHashRing,
 );
 impl_db_lookup!(key = BlockHashRingKey, query_prefix = BlockHashRingPrefix);
+
+/// One peer's vote on the canonical hash of a confirmation-depth EVM block
+/// (deposit-by-proof anchor), mirroring [`BlockCountVoteKey`]'s per-peer
+/// single-slot shape: each peer holds exactly its latest observation, and the
+/// tally in `fedimint_usdt_server::Usdt::process_consensus_item` counts the
+/// peers whose stored vote FULLY equals the ordered one, writing the agreed
+/// `(height, block_hash)` into the [`BlockHashRingKey`] ring at threshold.
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct BlockHashVoteKey(pub PeerId);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct BlockHashVotePrefix;
+
+impl_db_record!(
+    key = BlockHashVoteKey,
+    value = BlockHashObservation,
+    db_prefix = DbKeyPrefix::BlockHashVote,
+);
+impl_db_lookup!(key = BlockHashVoteKey, query_prefix = BlockHashVotePrefix);
 
 /// The consensus-agreed EVM block (`value = u64`) at which this deposit
 /// account's most recent SUCCESSFUL sweep (`DeployAndSweep` `UserOp`)
