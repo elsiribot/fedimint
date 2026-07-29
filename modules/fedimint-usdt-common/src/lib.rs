@@ -30,8 +30,11 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// debug-only variant -- both consensus-encoded types changed shape, so old
 /// and new binaries can no longer agree on the wire format.
 ///
-/// Bumped to `0.2` (sec-13 hardening): [`CheckDepositResponse`] gained a
-/// `ready` field (the `check_deposit` API response's wire shape changed).
+/// Bumped to `0.2` (sec-13 hardening): the (since-removed) deposit-check API
+/// response gained a `ready` field, changing its wire shape at the time. The
+/// whole guardian-poll deposit path was later removed when deposit crediting
+/// became proof-driven (see [`UsdtInput::DepositProofV0`]); this historical
+/// note is retained only to explain the version number.
 ///
 /// Bumped to `0.3` (sec-misc #4/06-facet): [`WithdrawFeeQuoteResponse`] and
 /// [`DepositFeeQuoteResponse`] gained an `available` field (their wire shape
@@ -808,16 +811,6 @@ const _: () = assert!(
      literal above to match"
 );
 
-/// Hard cap on the number of guardian-local `PendingCheck` records a single
-/// guardian will store at once (security finding 13). `check_deposit` is
-/// unauthenticated and each distinct `claim_pk` derives a distinct account,
-/// so without a cap an attacker could cheaply grow this table without bound.
-/// Once the cap is reached, `Usdt::handle_check_deposit` stops inserting NEW
-/// `PendingCheck`s (logging a warning) but still returns its normal
-/// deterministic [`CheckDepositResponse`] -- the cap is never reflected in
-/// the response itself (see that struct's doc comment for why).
-pub const MAX_PENDING_CHECKS: u64 = 10_000;
-
 /// One chunk of one guardian's message for a single round of a signing
 /// session's cggmp21 state machine. A round's full per-peer payload can
 /// exceed Fedimint's `AlephBFT` unit byte limit, so it is split into
@@ -874,28 +867,35 @@ impl DepositProof {
 
 /// Payload of a `UsdtConsensusItem::Deposit` observation.
 ///
-/// `claim_pk` is carried in the observation itself (rather than being
-/// recovered from a guardian's local `PendingCheck` when the item is
-/// processed) so that crediting a deposit is a pure function of consensus
-/// data: `process_consensus_item` must be byte-identical across every
-/// honest guardian, but `PendingCheck` is guardian-local state that not
-/// every guardian is guaranteed to have (e.g. a `check_deposit` API call
-/// only reaches a threshold of guardians, not all of them). See
-/// `Usdt::credit_deposit`'s doc comment in `fedimint-usdt-server` for the
-/// full argument.
+/// # Legacy (proof-driven crediting superseded this)
+///
+/// This was the payload of the guardian-polling deposit-observation quorum.
+/// That whole path -- the deposit-check endpoint, the guardian-local
+/// poll/GC tasks, and the scanner that produced these observations -- was
+/// removed when deposit crediting became proof-driven
+/// (see [`UsdtInput::DepositProofV0`]). No honest guardian proposes a
+/// `UsdtConsensusItem::Deposit` any more. The variant and this type are kept
+/// (not deleted) purely for consensus wire-format stability: the derived enum
+/// tag of `UsdtConsensusItem` is positional, so removing the `Deposit` variant
+/// would shift every later variant's tag and corrupt decode of existing
+/// consensus history. `fedimint_usdt_server::Usdt::credit_deposit` still
+/// handles a replayed item deterministically (see its doc comment).
+///
+/// `claim_pk` is carried in the observation itself (rather than recovered from
+/// guardian-local state when the item is processed) so that crediting a
+/// deposit is a pure function of consensus data: `process_consensus_item` must
+/// be byte-identical across every honest guardian.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct DepositObservation {
     pub account: EvmAddress,
     pub balance: UsdtAmount,
     pub block: u64,
     /// The canonical hash of [`Self::block`] (security findings 04/12/15):
-    /// the deposit scanner reads it via `IServerEvmRpc::get_block_hash` for
-    /// the exact block it read the balance at, so an observation is bound to
-    /// a specific fork. Because the vote tally counts only FULLY-equal
-    /// observations, two guardians observing the same account/balance/height
-    /// on DIFFERENT forks produce non-equal votes that never aggregate to a
-    /// threshold credit -- closing the "stale pre-reorg vote completes a
-    /// threshold on a non-canonical fork" gap.
+    /// bound the observation to a specific fork so the vote tally counts only
+    /// FULLY-equal observations, so two guardians observing the same
+    /// account/balance/height on DIFFERENT forks produce non-equal votes that
+    /// never aggregate to a threshold credit -- closing the "stale pre-reorg
+    /// vote completes a threshold on a non-canonical fork" gap.
     pub block_hash: [u8; 32],
     pub claim_pk: secp256k1::PublicKey,
 }
@@ -1021,40 +1021,6 @@ pub struct StatusResponse {
     pub funded_guardians: u16,
     pub healthy_guardians: u16,
     pub threshold: u16,
-}
-
-/// Request to enqueue this guardian's local deposit-checker task to start
-/// watching `claim_pk`'s deposit address (see [`derive_deposit_account`]),
-/// and to have the derived address returned to the caller. Idempotent: a
-/// repeated request for the same `claim_pk` does not overwrite an
-/// already-enqueued [check][CheckDepositResponse].
-#[derive(Debug, Clone, Serialize, Deserialize, Encodable, Decodable)]
-pub struct CheckDepositRequest {
-    pub claim_pk: secp256k1::PublicKey,
-}
-
-/// Response to [`CheckDepositRequest`]: the derived deposit account, plus
-/// `ready` -- whether the federation's consensus-agreed `bootstrap_state` is
-/// `Ready` right now (security finding 13's r2 facet). `account` is always
-/// populated (a pure function of `claim_pk` + config), but if `ready` is
-/// `false` the guardian did NOT enqueue a `PendingCheck` for it: funding an
-/// account before the federation can sweep it would strand funds, so callers
-/// must wait for `ready` before depositing.
-///
-/// Deliberately does not report whether this call is what enqueued the
-/// guardian-local check, nor whether a `PendingCheck` cap
-/// ([`MAX_PENDING_CHECKS`]) caused this guardian to skip storing one: that is
-/// guardian-local state (some guardians may already have a `PendingCheck`
-/// enqueued for this account, others may not, and the per-guardian pending
-/// count differs), so including it here would let honest guardians return
-/// different responses to the same request, breaking the threshold-identical
-/// response requirement of `request_current_consensus`. `ready`, by
-/// contrast, is a pure function of consensus DB (`bootstrap_state`), so it is
-/// identical on every guardian at the same consensus position.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
-pub struct CheckDepositResponse {
-    pub account: EvmAddress,
-    pub ready: bool,
 }
 
 /// Request for the current credited/claimed/claimable state of `claim_pk`'s
@@ -1437,8 +1403,13 @@ pub fn validate_usdt_params(p: &UsdtGenParams) -> anyhow::Result<()> {
 pub enum UsdtConsensusItem {
     /// Guardian's view of the EVM chain head (median-voted, wallet-style).
     BlockCount(u64),
-    /// Guardian's observation of a pending deposit account's confirmed
-    /// balance (claim-triggered, D7).
+    /// LEGACY (deposit crediting is now proof-driven; see
+    /// [`UsdtInput::DepositProofV0`]). Formerly a guardian's observation of a
+    /// pending deposit account's confirmed balance, produced by the
+    /// now-removed guardian-poll deposit path. No honest
+    /// guardian proposes this any more; it is retained ONLY so the positional
+    /// wire tags of the later variants do not shift (removing it would corrupt
+    /// decode of existing consensus history). See [`DepositObservation`].
     Deposit(DepositObservation),
     /// One guardian's message for a single round of a signing session's
     /// cggmp21 state machine (Phase 6a).

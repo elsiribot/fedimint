@@ -131,6 +131,7 @@ async fn find_sole_pending_user_op_hash(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
 async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint()
 -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {
@@ -270,8 +271,10 @@ async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint(
             .context("failed to mine an anvil block past the funding transfer")?;
     }
 
-    // 7. check_deposit -> poll until the federation credits it.
-    usdt.check_deposit(claim_keypair.public_key()).await?;
+    // 7. Poll until the federation credits the deposit.
+    // TODO(Task 9): crediting is now proof-driven -- submit a
+    // `UsdtInput::DepositProofV0` here instead of the removed `check_deposit`
+    // guardian-poll trigger (this test is `#[ignore]`d until that flow lands).
     let credited_deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let status = usdt.deposit_status(claim_keypair.public_key()).await?;

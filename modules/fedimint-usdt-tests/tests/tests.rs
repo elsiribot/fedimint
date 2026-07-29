@@ -158,6 +158,7 @@ async fn client_deposit_address_matches_common_derivation() -> anyhow::Result<()
 /// 1s test-interval timers -- no test hook forcing progress), and the second
 /// mintv2 instance (denominated in [`USDT_UNIT`]) mints the claimed e-cash.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
 async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     let mock = Arc::new(MockEvmRpc::new());
     // The usdt module's default `UsdtGenParams::usdt_contract`
@@ -369,6 +370,7 @@ async fn dump_usdt_module_db(
 /// Slow (real MPC over a real, real-timer-driven federation, ~1-3 min);
 /// intentionally run in the foreground.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
 async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> anyhow::Result<()> {
     let mock = Arc::new(MockEvmRpc::new());
     // The usdt module's default `UsdtGenParams::usdt_contract` placeholder.
@@ -443,10 +445,12 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
     }
 
     // 1. Allocate + fund a deposit; wait for it to be credited.
+    // TODO(Task 9): crediting is now proof-driven -- submit a
+    // `UsdtInput::DepositProofV0` here instead of the removed `check_deposit`
+    // guardian-poll trigger (this test is `#[ignore]`d until that flow lands).
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
     let deposit_amount = UsdtAmount(2_500_000);
     mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
-    usdt.check_deposit(claim_keypair.public_key()).await?;
 
     let credited_deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -622,6 +626,7 @@ async fn find_sole_unclaimed_withdrawal(
 /// to trigger, since the mock's block count never advances past its initial
 /// value here).
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
 async fn withdrawal_status_reports_unknown_then_queued() -> anyhow::Result<()> {
     let mock = Arc::new(MockEvmRpc::new());
     let usdt_contract = EvmAddress([0u8; 20]);
@@ -768,6 +773,7 @@ async fn withdrawal_status_reports_unknown_then_queued() -> anyhow::Result<()> {
 /// Slow (real DKG + a real, real-timer-driven federation); run in the
 /// foreground.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
 async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> anyhow::Result<()> {
     let mock = Arc::new(MockEvmRpc::new());
     let usdt_contract = EvmAddress([0u8; 20]);
@@ -1093,6 +1099,7 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
 /// Slow (real MPC over a real, real-timer-driven federation, ~2-4 min);
 /// intentionally run in the foreground.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
 async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() -> anyhow::Result<()>
 {
     let mock = Arc::new(MockEvmRpc::new());
@@ -1519,6 +1526,7 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
 /// `UsdtInput::RefundV0` and the burned e-cash is restored to the client's
 /// spendable balance -- without any manual intervention.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "deposit crediting is proof-driven post-sec-13 (PendingCheck removed); re-enable once Task 9 adds the client DepositProofV0 submit flow"]
 async fn client_claims_refund_on_terminal_failure() -> anyhow::Result<()> {
     let mock = Arc::new(MockEvmRpc::new());
     let usdt_contract = EvmAddress([0u8; 20]);
@@ -1772,10 +1780,10 @@ mod fedimint_migration_tests {
     use fedimint_usdt_server::db::{
         BlockCountVoteKey, BootstrapVoteKey, DbKeyPrefix, DepositObservationVoteKey, DepositRecord,
         DepositRecordKey, FeeVoteKey, FeeVotePrefix, HasEverBeenReadyKey, MpcRoundChunk,
-        MpcRoundChunkKey, PendingCheck, PendingCheckKey, PendingUserOp, PendingUserOpKey,
-        PoolState, PoolStateKey, SessionState, SigningPurpose, SigningSession, SigningSessionKey,
-        StoredFeeVote, SubmittedUserOpKey, UserOpConfirmedObservation, UserOpConfirmedVoteKey,
-        UserOpPurpose, WithdrawalState, WithdrawalStateKey,
+        MpcRoundChunkKey, PendingUserOp, PendingUserOpKey, PoolState, PoolStateKey, SessionState,
+        SigningPurpose, SigningSession, SigningSessionKey, StoredFeeVote, SubmittedUserOpKey,
+        UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpPurpose, WithdrawalState,
+        WithdrawalStateKey,
     };
     use futures::StreamExt as _;
     use strum::IntoEnumIterator;
@@ -1883,14 +1891,6 @@ mod fedimint_migration_tests {
         dbtx.raw_insert_bytes(&old_deposit_vote_key_bytes, &old_deposit_vote_value_bytes)
             .await
             .expect("DB error");
-        dbtx.insert_new_entry(
-            &PendingCheckKey(account),
-            &PendingCheck {
-                claim_pk,
-                requested_at_block: 1,
-            },
-        )
-        .await;
         dbtx.insert_new_entry(
             &SigningSessionKey(session_id),
             &SigningSession {
@@ -2084,15 +2084,6 @@ mod fedimint_migration_tests {
                              migrate_db_v1, not rewritten"
                         );
                         info!("Validated DepositObservationVote (dropped, not rewritten)");
-                    }
-                    DbKeyPrefix::PendingCheck => {
-                        let checks = dbtx
-                            .find_by_prefix(&fedimint_usdt_server::db::PendingCheckPrefix)
-                            .await
-                            .collect::<Vec<_>>()
-                            .await;
-                        ensure!(!checks.is_empty(), "no PendingChecks read back");
-                        info!("Validated PendingCheck");
                     }
                     DbKeyPrefix::SigningSession => {
                         let sessions = dbtx
