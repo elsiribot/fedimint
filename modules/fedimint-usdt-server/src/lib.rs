@@ -9623,6 +9623,7 @@ mod tests {
     /// rejected (delta 0), while a later proof of a HIGHER balance credits
     /// only the additional delta.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn deposit_proof_input_credits_delta_and_sets_high_water() {
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
@@ -9860,6 +9861,106 @@ mod tests {
                 credited: UsdtAmount(0),
             }
         );
+    }
+
+    /// SECURITY (Task 5 review): the whole point of `DepositProofV0` bumping
+    /// `claimed` alongside `credited` is to close off a legacy `UsdtInput::V0`
+    /// claim on the SAME account for the value the proof just minted. Prove
+    /// that end-to-end: credit an account via a proof, then immediately
+    /// attempt a real `V0` claim against it and confirm there is nothing left
+    /// to claim (`available == 0`). If `process_deposit_proof` only bumped
+    /// `credited` (forgetting `claimed += delta`), this V0 claim would
+    /// succeed and re-mint the already-minted 500M -- a double-spend.
+    #[tokio::test]
+    async fn deposit_proof_then_v0_cannot_double_claim() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x75);
+        let account = derived_account(&module, &claim_pk);
+        let usdt_contract = module.cfg.consensus.usdt_contract;
+
+        // Anchor and submit a proof of a 500 USDT (1e-6 units) on-chain balance.
+        let (proof, hash) = synthetic_deposit_proof(usdt_contract, account, 500_000_000, 100);
+        {
+            let mut dbtx = db.begin_transaction().await;
+            write_block_hash_ring(&mut dbtx.to_ref_nc(), 100, hash).await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        let meta = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::DepositProofV0 {
+                    claim_pk,
+                    proof: proof.clone(),
+                },
+                test_in_point(),
+            )
+            .await
+            .expect("anchored proof of a derived account must credit");
+        assert_eq!(
+            meta.amount.amounts,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(500_000_000)),
+            "the proof mints the full delta"
+        );
+        dbtx.commit_tx().await;
+
+        let record = db
+            .begin_transaction_nc()
+            .await
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("credit created the record");
+        assert_eq!(
+            record.credited,
+            UsdtAmount(500_000_000),
+            "credited = proven"
+        );
+        assert_eq!(
+            record.claimed,
+            UsdtAmount(500_000_000),
+            "claimed advanced by the SAME delta the proof minted -- this is the \
+             guard under test"
+        );
+
+        // Now attempt a legacy V0 claim on the SAME account. `available =
+        // credited - claimed` must be 0: the proof already minted this value,
+        // so there is nothing left for a V0 input to re-mint. Even a
+        // 1-unit claim must be rejected as insufficient credit; no fee vote
+        // is seeded because the `InsufficientCredit` check runs before the
+        // fee-quote lookup in `process_input`, so it cannot mask this guard.
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::V0(UsdtInputV0 {
+                    account,
+                    amount: UsdtAmount(1),
+                    fee: UsdtAmount(0),
+                }),
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UsdtInputError::InsufficientCredit {
+                available: UsdtAmount(0),
+                requested: UsdtAmount(1),
+            },
+            "a V0 claim must not be able to re-mint value a DepositProofV0 \
+             already minted for this account"
+        );
+
+        // `claimed` (and `credited`) must be unchanged by the rejected claim.
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record still exists");
+        assert_eq!(record.credited, UsdtAmount(500_000_000));
+        assert_eq!(record.claimed, UsdtAmount(500_000_000));
     }
 
     #[tokio::test]
