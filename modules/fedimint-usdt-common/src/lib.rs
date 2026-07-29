@@ -77,7 +77,22 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// per-withdrawal accumulated incurred gas) -- and the persistent
 /// `UsdtWithdrawalV0` record gained `refund_pubkey`. See `migrate_db_v3` for
 /// how the persistent `UsdtWithdrawalV0` change is handled.
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 8);
+///
+/// Bumped to `0.9` (deposit-by-proof feature): several consensus-serialized
+/// types and DB keyspaces changed shape to make deposit crediting
+/// proof-driven rather than guardian-poll-driven. On the wire,
+/// [`UsdtConsensusItem`] gained a `BlockHash` variant (the canonical
+/// block-hash anchor vote, Task 4) and [`UsdtInput`] gained a
+/// `DepositProofV0` variant (with new [`UsdtInputError`] variants, Task 5).
+/// In the consensus DB, two new prefixes were added -- `BlockHashRing`
+/// (`0x13`, Task 3) and `BlockHashVote` (`0x14`, Task 4) -- and the old
+/// guardian-poll `PendingCheck` table (prefix `0x05`) was removed (Task 6),
+/// leaving `0x05` a permanent gap in `DbKeyPrefix`. The two new prefixes
+/// start empty and fill at runtime (no migration needed for them); any
+/// residual `PendingCheck` rows are dropped by `migrate_db_v4`. Existing
+/// `DepositRecord`s are untouched (their `credited` high-water marks carry
+/// forward). See `migrate_db_v4`.
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 9);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
