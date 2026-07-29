@@ -6130,6 +6130,8 @@ dependencies = [
  "alloy-sol-types",
  "anyhow",
  "fedimint-core",
+ "hex",
+ "hex_lit",
  "secp256k1 0.29.1",
  "serde",
  "sha3 0.10.8",

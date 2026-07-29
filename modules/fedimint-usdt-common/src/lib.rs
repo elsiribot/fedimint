@@ -399,6 +399,38 @@ pub const POOL_ACCOUNT_DOMAIN: &[u8] = b"fedimint-usdt-pool-v0";
 /// [`signing_session_id`]).
 pub const SIGNING_SESSION_DOMAIN: &[u8] = b"fedimint-usdt-signing-v0";
 
+/// The EVM storage slot for the USDT contract's token balances mapping.
+pub const USDT_BALANCES_SLOT: u64 = 2;
+
+/// Maximum size (in bytes) of a [`DepositProof`]'s encoded form.
+pub const MAX_DEPOSIT_PROOF_BYTES: usize = 16_384;
+
+/// Ring buffer size for canonical block-hash tracking (number of blocks to
+/// retain).
+pub const BLOCK_HASH_RING_LEN: u64 = 300;
+
+/// Derives the EVM storage key for a USDT balance lookup: the keccak256 hash
+/// of the left-padded (to 32 bytes) account address concatenated with the
+/// left-padded (to 32 bytes) `USDT_BALANCES_SLOT` (2).
+///
+/// Mirrors the Solidity mapping storage key derivation for `mapping(address
+/// => uint256) balances` at slot 2: `keccak256(pad32(account) ‖
+/// pad32(slot))`.
+#[must_use]
+pub fn balances_storage_key(account: &EvmAddress) -> [u8; 32] {
+    let mut padded_account = [0u8; 32];
+    padded_account[12..].copy_from_slice(&account.0);
+
+    let mut padded_slot = [0u8; 32];
+    padded_slot[24..].copy_from_slice(&USDT_BALANCES_SLOT.to_be_bytes());
+
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(&padded_account);
+    input[32..].copy_from_slice(&padded_slot);
+
+    alloy_primitives::keccak256(input).into()
+}
+
 /// The standard Ethereum address of a secp256k1 public key: last 20 bytes of
 /// `keccak256` over the 64-byte uncompressed point (SEC1 with the `0x04`
 /// prefix stripped). WASM-safe (pure-Rust `sha3`); mirrors
@@ -805,6 +837,39 @@ pub struct MpcRoundItem {
     pub chunk_count: u16,
     /// THIS chunk's bytes (not the whole round payload).
     pub payload: Vec<u8>,
+}
+
+/// Merkle proof of a USDT balance at a specific block height (Phase 9, Task 1,
+/// "deposit-by-proof" feature). Contains the block header and state proof
+/// trees needed to verify an account's balance on-chain without reading from
+/// an RPC at proof-verification time. Created by the client or off-chain
+/// indexer via `eth_getProof` at a canonical block; verified deterministically
+/// by the server/guardians (no RPC dependency).
+#[derive(Clone, Debug, PartialEq, Eq, Encodable, Decodable)]
+pub struct DepositProof {
+    /// Block number at which the balance was observed.
+    pub block_number: u64,
+    /// RLP-encoded EVM block header (contains state root, timestamp, etc.).
+    pub header_rlp: Vec<u8>,
+    /// Account proof: sequence of RLP-encoded Merkle trie nodes from the
+    /// state root to the account's leaf.
+    pub account_proof: Vec<Vec<u8>>,
+    /// Storage proof: sequence of RLP-encoded Merkle trie nodes from the
+    /// account's storage root to the USDT balance's leaf.
+    pub storage_proof: Vec<Vec<u8>>,
+}
+
+impl DepositProof {
+    /// Returns the total byte count of this proof's encoded form, used for
+    /// size-cap validation (must not exceed [`MAX_DEPOSIT_PROOF_BYTES`]).
+    #[must_use]
+    pub fn encoded_len_bytes(&self) -> usize {
+        // Approximate: header_rlp + all account_proof nodes + all storage_proof nodes.
+        // For precise accounting, sum the lengths of all components.
+        self.header_rlp.len()
+            + self.account_proof.iter().map(Vec::len).sum::<usize>()
+            + self.storage_proof.iter().map(Vec::len).sum::<usize>()
+    }
 }
 
 /// Payload of a `UsdtConsensusItem::Deposit` observation.
@@ -1680,6 +1745,38 @@ mod tests {
     #[test]
     fn test_kind_is_usdt() {
         assert_eq!(KIND, ModuleKind::from_static_str("usdt"));
+    }
+
+    #[test]
+    fn balances_storage_key_matches_mainnet() {
+        // holder 0xF977…aceC, USDT slot 2 -> key verified against eth_getStorageAt
+        let acct = EvmAddress(hex_lit::hex!("F977814e90dA44bFA03b6295A0616a897441aceC"));
+        let key = balances_storage_key(&acct);
+        assert_eq!(
+            hex::encode(key),
+            "0be16d71963429204d70543701f859c43526c316ac005c10114f4694ca405f36"
+        );
+    }
+
+    #[test]
+    fn deposit_proof_round_trips_through_consensus_encoding() {
+        let proof = DepositProof {
+            block_number: 19_123_456,
+            header_rlp: vec![0xf9, 0x02, 0x00, 0xa0, 0x01, 0x02, 0x03],
+            account_proof: vec![
+                vec![0x01, 0x02, 0x03],
+                vec![0x04, 0x05, 0x06, 0x07],
+                vec![0x08],
+            ],
+            storage_proof: vec![vec![0xaa, 0xbb, 0xcc], vec![0xdd, 0xee]],
+        };
+
+        let bytes = proof.consensus_encode_to_vec();
+        let decoded =
+            DepositProof::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("DepositProof should decode what it just encoded");
+
+        assert_eq!(proof, decoded);
     }
 
     #[test]

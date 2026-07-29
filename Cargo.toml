@@ -287,6 +287,7 @@ hd-wallet = { version = "0.6.1", default-features = false, features = [
 ] }
 hex = "0.4.3"
 hex-conservative = "1.0.0"
+hex_lit = "0.1.1"
 hkdf = { package = "fedimint-hkdf", path = "./crypto/hkdf", version = "=0.12.0-alpha" }
 honggfuzz = { version = "=0.5.60", default-features = false } # needs to be pinned to the same version `cargo-fuzz` binary uses
 hyper = "1.9"
