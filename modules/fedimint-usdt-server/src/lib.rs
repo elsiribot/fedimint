@@ -2140,6 +2140,9 @@ impl ServerModule for Usdt {
                     pub_key: refund.refund_pubkey,
                 });
             }
+            UsdtInput::DepositProofV0 { claim_pk, proof } => {
+                return self.process_deposit_proof(dbtx, claim_pk, proof).await;
+            }
             UsdtInput::Default { .. } => {
                 return Err(UsdtInputError::UnknownDepositAccount); // unknown/default variant
             }
@@ -3685,6 +3688,134 @@ impl Usdt {
         matches!(session.state, SessionState::InProgress)
             && self.consensus_block_count(dbtx).await
                 > session.last_progress_block.saturating_add(timeout_blocks())
+    }
+
+    /// Credits (and mints, atomically with the transaction's paired mint
+    /// output) a deposit from a verified [`DepositProof`], for the
+    /// [`UsdtInput::DepositProofV0`] arm of [`Self::process_input`].
+    ///
+    /// The `account` whose balance is verified is DERIVED from `claim_pk`
+    /// ([`derive_deposit_account`]) -- the exact same binding
+    /// [`Self::credit_deposit`] enforces for the observation path -- so a
+    /// proof of any account a submitter cannot also derive a `claim_pk` for
+    /// (e.g. an exchange's hot wallet) verifies against a different storage
+    /// key and yields a zero delta. Only the newly-proven delta over the
+    /// account's existing high-water `credited` becomes spendable e-cash, and
+    /// `claimed` is advanced by that same delta so the freshly-minted value
+    /// can never be re-claimed a second time through the [`UsdtInput::V0`]
+    /// path (whose over-claim guard reads `credited - claimed`). The high-water
+    /// `credited` is advanced to the proven balance and the SAME
+    /// [`Self::maybe_trigger_sweep`] bookkeeping the observation path fires is
+    /// fired here, so the on-chain USDT is deploy-and-swept into the pool
+    /// exactly as before.
+    ///
+    /// Unlike [`UsdtInput::V0`], no deposit fee is charged here: the input
+    /// carries no `fee` field and its `delta` is minted in full (paired 1:1
+    /// with the transaction's mint output). The deploy+sweep gas is fronted by
+    /// the broadcaster EOA out of band, as it already is for the
+    /// observation-driven path (see [`derive_deposit_account`]'s note on
+    /// broadcaster funding never being reimbursed on-chain).
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of `(claim_pk, proof, prior consensus DB state,
+    /// config)`: `derive_deposit_account` and `verify_deposit_proof` are pure
+    /// (keccak/RLP/trie-walk only -- no RPC, no wall-clock, no `our_peer_id`,
+    /// no floats), and the only consensus reads are the block-hash ring anchor
+    /// and this account's [`DepositRecord`]. Every guardian computes the
+    /// identical `Ok`/`Err` and the identical `DepositRecordKey` write.
+    async fn process_deposit_proof(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        claim_pk: &secp256k1::PublicKey,
+        proof: &fedimint_usdt_common::DepositProof,
+    ) -> Result<InputMeta, UsdtInputError> {
+        // The account this proof must be for is derived from `claim_pk`; this
+        // IS the claim binding (no separate check needed -- an unrelated
+        // account's proof simply verifies against the wrong storage key).
+        let account = derive_deposit_account(
+            &self.cfg.consensus.group_public_key,
+            self.cfg.consensus.account_factory,
+            self.cfg.consensus.simple_account_impl,
+            claim_pk,
+        );
+
+        // Anchor: `proof.block_number` must have an agreed canonical hash in
+        // the federation's block-hash ring. `None` => not yet confirmed to
+        // consensus, or aged out of the retained window => reject.
+        let expected = ring_hash_at(dbtx, proof.block_number).await.ok_or(
+            UsdtInputError::DepositProofNotAnchored {
+                block: proof.block_number,
+            },
+        )?;
+
+        // Deterministic MPT verification against the anchored hash. Returns
+        // the PROVEN balance (proof-of-absence => 0); the size cap is enforced
+        // inside. The reason string is a pure function of the (deterministic)
+        // proof, so it is identical across guardians.
+        let proven = crate::proof::verify_deposit_proof(
+            proof,
+            expected,
+            &self.cfg.consensus.usdt_contract,
+            &account,
+        )
+        .map_err(|e| UsdtInputError::DepositProofInvalid {
+            reason: e.to_string(),
+        })?;
+
+        let mut record =
+            dbtx.get_value(&DepositRecordKey(account))
+                .await
+                .unwrap_or(DepositRecord {
+                    claim_pk: *claim_pk,
+                    credited: UsdtAmount(0),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                });
+
+        // High-water mark: only the delta over what is already credited is
+        // new, spendable value. A resubmitted/stale proof (proven <= credited)
+        // gives delta 0 and is rejected as a duplicate.
+        let credited = record.credited;
+        let delta = proven.0.saturating_sub(credited.0);
+        if delta == 0 {
+            return Err(UsdtInputError::DepositProofStale { proven, credited });
+        }
+
+        // Advance the monotonic high-water `credited` to the proven balance
+        // AND advance `claimed` by the minted delta (`claimed <= credited`
+        // stays invariant, keeping `audit` conservative and the `V0` over-claim
+        // guard tight against re-minting this same value).
+        record.credited = proven;
+        record.claimed = UsdtAmount(record.claimed.0.saturating_add(delta));
+        record.last_observed_block = proof.block_number;
+        dbtx.insert_entry(&DepositRecordKey(account), &record).await;
+
+        // Same deterministic sweep trigger the observation path fires on
+        // credit: enqueue the deploy-and-sweep `UserOp` for this account.
+        self.maybe_trigger_sweep(dbtx, account).await;
+
+        info!(
+            target: "usdt",
+            account = %account,
+            proven = proven.0,
+            delta,
+            block = proof.block_number,
+            "deposit credited from verified proof; delta minted to depositor"
+        );
+
+        // The delta funds `USDT_UNIT` value into the transaction, which the
+        // client pairs 1:1 with a mint output (deposit + claim atomic). No
+        // fee: `fees` is `ZERO`.
+        Ok(InputMeta {
+            amount: TransactionItemAmounts {
+                amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(UsdtAmount(delta))),
+                fees: Amounts::ZERO,
+            },
+            pub_key: *claim_pk,
+        })
     }
 
     /// Credits a deposit observation that has reached threshold agreement:
@@ -6603,9 +6734,8 @@ async fn write_block_hash_ring(dbtx: &mut DatabaseTransaction<'_>, height: u64, 
 /// was never written or has since fallen out of the retained window (see
 /// [`write_block_hash_ring`]).
 ///
-/// Not yet called from production code -- see [`write_block_hash_ring`]'s
-/// doc comment.
-#[allow(dead_code)]
+/// The deposit-by-proof anchor read by [`Usdt::process_deposit_proof`]: a
+/// proof for a block with no entry here is rejected as not-yet-anchored.
 async fn ring_hash_at(dbtx: &mut DatabaseTransaction<'_>, height: u64) -> Option<[u8; 32]> {
     dbtx.get_value(&BlockHashRingKey(height)).await
 }
@@ -9389,6 +9519,335 @@ mod tests {
         // Freshness tracking (`last_observed_block`) is independent of the
         // monotonic credit amount, and does still advance.
         assert_eq!(record.last_observed_block, 80);
+    }
+
+    /// Builds a synthetic single-leaf Merkle-Patricia deposit proof that the
+    /// real [`crate::proof::verify_deposit_proof`] accepts, wholly offline: a
+    /// state trie holding exactly `usdt_contract`'s account (whose storage
+    /// trie holds exactly `account`'s USDT balance slot), wrapped in a header
+    /// whose keccak is the returned canonical block hash.
+    ///
+    /// A single-key trie is just its one leaf node, so its root is
+    /// `keccak256(rlp(leaf))` and its proof is `[rlp(leaf)]` -- `verify_proof`
+    /// walks that one node to the full key. The committed mainnet fixtures
+    /// (Task 2) prove an EXCHANGE hot wallet, which by design no `claim_pk` can
+    /// derive an account for, so they cannot drive a POSITIVE credit through
+    /// the claim-key-derived-account binding; this hermetic builder lets us
+    /// prove a balance for a genuinely-derived deposit account instead.
+    fn synthetic_deposit_proof(
+        usdt_contract: fedimint_usdt_common::EvmAddress,
+        account: fedimint_usdt_common::EvmAddress,
+        balance: u64,
+        block_number: u64,
+    ) -> (fedimint_usdt_common::DepositProof, [u8; 32]) {
+        use alloy_consensus::Header;
+        use alloy_primitives::{B256, U256, keccak256};
+        use alloy_rlp::Encodable as _;
+        use alloy_trie::nodes::LeafNode;
+        use alloy_trie::{Nibbles, TrieAccount};
+
+        // Storage trie: one leaf at keccak(balances_storage_key(account)),
+        // value = rlp(balance word), root = keccak(rlp(leaf)).
+        let storage_key = Nibbles::unpack(keccak256(fedimint_usdt_common::balances_storage_key(
+            &account,
+        )));
+        let mut storage_value = Vec::new();
+        U256::from(balance).encode(&mut storage_value);
+        let mut storage_leaf_rlp = Vec::new();
+        LeafNode::new(storage_key, storage_value).encode(&mut storage_leaf_rlp);
+        let storage_root = B256::from(keccak256(&storage_leaf_rlp));
+
+        // Account trie: one leaf at keccak(usdt_contract), value =
+        // rlp(TrieAccount { storage_root, .. }), root = state root.
+        let account_key = Nibbles::unpack(keccak256(usdt_contract.0));
+        let mut account_value = Vec::new();
+        TrieAccount {
+            storage_root,
+            ..Default::default()
+        }
+        .encode(&mut account_value);
+        let mut account_leaf_rlp = Vec::new();
+        LeafNode::new(account_key, account_value).encode(&mut account_leaf_rlp);
+        let state_root = B256::from(keccak256(&account_leaf_rlp));
+
+        // Header committing to that state root; its keccak is the block hash
+        // the ring must anchor for the proof to verify.
+        let mut header_rlp = Vec::new();
+        Header {
+            state_root,
+            number: block_number,
+            ..Default::default()
+        }
+        .encode(&mut header_rlp);
+        let block_hash = keccak256(&header_rlp).0;
+
+        (
+            fedimint_usdt_common::DepositProof {
+                block_number,
+                header_rlp,
+                account_proof: vec![account_leaf_rlp],
+                storage_proof: vec![storage_leaf_rlp],
+            },
+            block_hash,
+        )
+    }
+
+    /// Derives `claim_pk`'s deposit account under `module`'s config, exactly
+    /// as `process_deposit_proof` does internally.
+    fn derived_account(module: &Usdt, claim_pk: &secp256k1::PublicKey) -> EvmAddress {
+        derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            claim_pk,
+        )
+    }
+
+    /// Happy path: a proof of a genuinely-derived deposit account's on-chain
+    /// balance, anchored in the ring, credits the newly-proven delta as
+    /// spendable e-cash, advances the monotonic high-water `credited` to the
+    /// proven balance, and advances `claimed` by the same delta (so the minted
+    /// value cannot be re-claimed). A resubmission of the same proof is
+    /// rejected (delta 0), while a later proof of a HIGHER balance credits
+    /// only the additional delta.
+    #[tokio::test]
+    async fn deposit_proof_input_credits_delta_and_sets_high_water() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x71);
+        let account = derived_account(&module, &claim_pk);
+        let usdt_contract = module.cfg.consensus.usdt_contract;
+
+        // First proof: 500 USDT (in 1e-6 units) at block 100.
+        let (proof1, hash1) = synthetic_deposit_proof(usdt_contract, account, 500_000_000, 100);
+        {
+            let mut dbtx = db.begin_transaction().await;
+            write_block_hash_ring(&mut dbtx.to_ref_nc(), 100, hash1).await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        let meta = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::DepositProofV0 {
+                    claim_pk,
+                    proof: proof1.clone(),
+                },
+                test_in_point(),
+            )
+            .await
+            .expect("anchored proof of a derived account must credit");
+        assert_eq!(
+            meta.amount.amounts,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(500_000_000)),
+            "the full newly-proven delta funds USDT_UNIT value (paired 1:1 with a mint output)"
+        );
+        assert_eq!(
+            meta.amount.fees,
+            Amounts::ZERO,
+            "deposit-by-proof charges no fee"
+        );
+        assert_eq!(
+            meta.pub_key, claim_pk,
+            "e-cash is bound to the depositor's claim key"
+        );
+        dbtx.commit_tx().await;
+
+        let record = db
+            .begin_transaction_nc()
+            .await
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("credit created the record");
+        assert_eq!(
+            record.credited,
+            UsdtAmount(500_000_000),
+            "credited = proven"
+        );
+        assert_eq!(
+            record.claimed,
+            UsdtAmount(500_000_000),
+            "claimed advanced by the minted delta"
+        );
+        assert_eq!(record.last_observed_block, 100);
+
+        // Resubmitting the same proof: credited already == proven, delta 0.
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::DepositProofV0 {
+                    claim_pk,
+                    proof: proof1,
+                },
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UsdtInputError::DepositProofStale {
+                proven: UsdtAmount(500_000_000),
+                credited: UsdtAmount(500_000_000),
+            }
+        );
+        dbtx.commit_tx().await;
+
+        // A later proof of a HIGHER balance (the address received more USDT)
+        // credits only the additional delta and advances the high-water.
+        let (proof2, hash2) = synthetic_deposit_proof(usdt_contract, account, 800_000_000, 110);
+        {
+            let mut dbtx = db.begin_transaction().await;
+            write_block_hash_ring(&mut dbtx.to_ref_nc(), 110, hash2).await;
+            dbtx.commit_tx().await;
+        }
+        let mut dbtx = db.begin_transaction().await;
+        let meta = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::DepositProofV0 {
+                    claim_pk,
+                    proof: proof2,
+                },
+                test_in_point(),
+            )
+            .await
+            .expect("higher-balance proof credits the growth");
+        assert_eq!(
+            meta.amount.amounts,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(300_000_000)),
+            "only the 300M delta over the 500M high-water is minted"
+        );
+        dbtx.commit_tx().await;
+
+        let record = db
+            .begin_transaction_nc()
+            .await
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record still exists");
+        assert_eq!(record.credited, UsdtAmount(800_000_000));
+        assert_eq!(record.claimed, UsdtAmount(800_000_000));
+        assert_eq!(record.last_observed_block, 110);
+    }
+
+    /// A proof for a block the federation has not anchored in its block-hash
+    /// ring is rejected outright -- there is no trusted hash to verify against.
+    #[tokio::test]
+    async fn deposit_proof_input_rejects_block_not_in_ring() {
+        let module = test_module_with_block_count(4, 0).await;
+        let claim_pk = test_pubkey(0x72);
+        let account = derived_account(&module, &claim_pk);
+        let (proof, _hash) = synthetic_deposit_proof(
+            module.cfg.consensus.usdt_contract,
+            account,
+            123_000_000,
+            100,
+        );
+        // Ring left empty: block 100 was never anchored.
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::DepositProofV0 { claim_pk, proof },
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, UsdtInputError::DepositProofNotAnchored { block: 100 });
+    }
+
+    /// A tampered proof (header no longer hashes to the anchored block hash)
+    /// fails verification and is rejected, never crediting anything.
+    #[tokio::test]
+    async fn deposit_proof_input_rejects_tampered_proof() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x73);
+        let account = derived_account(&module, &claim_pk);
+        let (mut proof, hash) = synthetic_deposit_proof(
+            module.cfg.consensus.usdt_contract,
+            account,
+            400_000_000,
+            100,
+        );
+        {
+            let mut dbtx = db.begin_transaction().await;
+            // Anchor the ORIGINAL (untampered) block hash.
+            write_block_hash_ring(&mut dbtx.to_ref_nc(), 100, hash).await;
+            dbtx.commit_tx().await;
+        }
+        // Flip a byte deep inside the header: keccak(header_rlp) != anchored hash.
+        let mid = proof.header_rlp.len() / 2;
+        proof.header_rlp[mid] ^= 0xff;
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::DepositProofV0 { claim_pk, proof },
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UsdtInputError::DepositProofInvalid { .. }),
+            "expected DepositProofInvalid, got {err:?}"
+        );
+        // No record was created by the rejected input.
+        assert!(
+            db.begin_transaction_nc()
+                .await
+                .get_value(&DepositRecordKey(account))
+                .await
+                .is_none()
+        );
+    }
+
+    /// SECURITY: a valid proof for an on-chain account the submitter's
+    /// `claim_pk` does NOT derive (e.g. an exchange wallet) credits nothing.
+    /// `process_deposit_proof` verifies against the DERIVED account's storage
+    /// key, so the unrelated account's balance proof reads as proof-of-absence
+    /// (0) -- an attacker cannot mint against funds they cannot also derive a
+    /// claim key for.
+    #[tokio::test]
+    async fn deposit_proof_input_for_unrelated_account_credits_nothing() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0x74);
+        // Build a genuine, verifiable proof -- but for an account that is NOT
+        // derive_deposit_account(claim_pk).
+        let unrelated = EvmAddress([0x99; 20]);
+        assert_ne!(unrelated, derived_account(&module, &claim_pk));
+        let (proof, hash) = synthetic_deposit_proof(
+            module.cfg.consensus.usdt_contract,
+            unrelated,
+            17_764_402_170_699_000,
+            100,
+        );
+        {
+            let mut dbtx = db.begin_transaction().await;
+            write_block_hash_ring(&mut dbtx.to_ref_nc(), 100, hash).await;
+            dbtx.commit_tx().await;
+        }
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::DepositProofV0 { claim_pk, proof },
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        // Verifies against the DERIVED account -> absence -> proven 0 -> delta 0.
+        assert_eq!(
+            err,
+            UsdtInputError::DepositProofStale {
+                proven: UsdtAmount(0),
+                credited: UsdtAmount(0),
+            }
+        );
     }
 
     #[tokio::test]

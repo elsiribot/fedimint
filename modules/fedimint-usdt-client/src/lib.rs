@@ -1498,7 +1498,9 @@ mod tests {
                 assert_eq!(v0.amount, amount);
                 assert_eq!(v0.fee, fee);
             }
-            UsdtInput::RefundV0 { .. } | UsdtInput::Default { .. } => {
+            UsdtInput::RefundV0 { .. }
+            | UsdtInput::DepositProofV0 { .. }
+            | UsdtInput::Default { .. } => {
                 panic!("claim_input must build a V0 input")
             }
         }
