@@ -2269,6 +2269,23 @@ mod fedimint_migration_tests {
                         );
                         info!("Validated BlockHashRing (new prefix, empty)");
                     }
+                    DbKeyPrefix::BlockHashVote => {
+                        // Deposit-by-proof task 4: a brand-new per-peer vote
+                        // prefix, like `BlockHashRing` above -- the pre-migration
+                        // v0 snapshot predates it and no migration writes to it,
+                        // so it must read back cleanly as EMPTY.
+                        let votes = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::BlockHashVotePrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(
+                            votes.is_empty(),
+                            "BlockHashVote is a brand-new prefix; the pre-migration v0 snapshot \
+                             must not contain any rows for it"
+                        );
+                        info!("Validated BlockHashVote (new prefix, empty)");
+                    }
                     DbKeyPrefix::LastSweepBlock => {
                         // LOCAL fedi extension (sweep-aware credit rule): a
                         // brand-new prefix holding only new `u64` data -- the

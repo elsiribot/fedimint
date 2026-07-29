@@ -900,6 +900,26 @@ pub struct DepositObservation {
     pub claim_pk: secp256k1::PublicKey,
 }
 
+/// Payload of a [`UsdtConsensusItem::BlockHash`] (deposit-by-proof anchor):
+/// one guardian's observation of the canonical hash of a confirmation-depth
+/// EVM block `height`, read via `IServerEvmRpc::get_block_hash`. Mirrors
+/// [`DepositObservation`]'s `(block, block_hash)` binding, reduced to just the
+/// height+hash: `fedimint_usdt_server`'s block-hash observer proposes it and
+/// `process_consensus_item` tallies FULLY-equal observations, writing the
+/// agreed `(height, block_hash)` into the block-hash ring only once at least a
+/// threshold of guardians propose the identical pair (so two guardians
+/// observing the same height on DIFFERENT forks produce non-equal votes that
+/// never aggregate). Kept whole in the vote so the tally is a pure function of
+/// consensus data.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
+pub struct BlockHashObservation {
+    /// The confirmation-depth block height whose canonical hash this
+    /// guardian observed (`consensus_block_count - confirmation_depth`).
+    pub height: u64,
+    /// The canonical hash of [`Self::height`].
+    pub block_hash: [u8; 32],
+}
+
 /// Payload of a `UsdtConsensusItem::BootstrapObservation` (Part C): one
 /// guardian's periodic view of whether the module's on-chain infrastructure
 /// is ready to honor the full deposit->claim->sweep->withdraw lifecycle.
@@ -1537,6 +1557,21 @@ pub enum UsdtConsensusItem {
     /// (kept live so a late confirmation of it still settles -- the RBF-nonce
     /// safety point). Byte-identical on every guardian, signer or not.
     ReplaceUserOp { op_hash: [u8; 32] },
+    /// One guardian's observation of the canonical hash of a confirmation-depth
+    /// EVM block (deposit-by-proof anchor), mirroring [`Self::Deposit`]'s
+    /// per-peer observation-vote shape. Proposed by `fedimint_usdt_server`'s
+    /// guardian-local, READ-ONLY block-hash observer task (it only reads the
+    /// hash via `IServerEvmRpc::get_block_hash` and queues it -- never itself a
+    /// consensus write). `process_consensus_item` stores this peer's vote under
+    /// `BlockHashVoteKey(ordered-item's peer)` (with a redundancy guard + a
+    /// freshness gate mirroring the `Deposit` arm) and, once at least a
+    /// threshold of guardians have proposed the IDENTICAL `(height,
+    /// block_hash)` pair, writes it into the consensus block-hash ring
+    /// (`write_block_hash_ring`) -- the anchor a later deposit-by-proof input
+    /// verifies a client's `eth_getProof` state proof against. The ring write
+    /// is therefore never any single guardian's raw observation; it is a pure
+    /// function of the threshold-agreed pair + prior consensus DB.
+    BlockHash(BlockHashObservation),
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -2013,6 +2048,20 @@ mod tests {
         let decoded =
             UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
                 .expect("UsdtConsensusItem::Deposit should decode what it just encoded");
+
+        assert_eq!(item, decoded);
+    }
+
+    #[test]
+    fn test_usdt_consensus_item_block_hash_round_trips_through_consensus_encoding() {
+        let item = UsdtConsensusItem::BlockHash(BlockHashObservation {
+            height: 123,
+            block_hash: [0xEF; 32],
+        });
+        let bytes = item.consensus_encode_to_vec();
+        let decoded =
+            UsdtConsensusItem::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+                .expect("UsdtConsensusItem::BlockHash should decode what it just encoded");
 
         assert_eq!(item, decoded);
     }
