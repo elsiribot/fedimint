@@ -471,7 +471,7 @@ impl IrohConnector {
 fn node_addr_stable_to_next(stable: &iroh::NodeAddr) -> iroh_next::EndpointAddr {
     let next_node_id =
         iroh_next::EndpointId::from_bytes(stable.node_id.as_bytes()).expect("Can't fail");
-    let relay_addrs = stable.relay_url.iter().cloned().map(|u| {
+    let relay_addrs = stable.relay_url.iter().map(|u| {
         iroh_next::TransportAddr::Relay(
             iroh_next::RelayUrl::from_str(&u.to_string()).expect("Can't fail"),
         )

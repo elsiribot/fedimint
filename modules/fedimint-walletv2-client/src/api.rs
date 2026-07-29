@@ -23,6 +23,7 @@ pub trait WalletFederationApi {
 
     async fn pending_tx_chain(&self) -> FederationResult<Vec<TxInfo>>;
 
+    #[allow(dead_code)] // unreferenced on this v0.11 branch; kept for API completeness
     async fn tx_chain(&self) -> FederationResult<Vec<TxInfo>>;
 
     async fn output_info_slice(

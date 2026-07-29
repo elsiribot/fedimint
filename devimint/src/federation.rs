@@ -905,8 +905,7 @@ impl Federation {
             )
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "new balance did not equal prev balance minus withdraw_amount minus fees: {}",
-                    e
+                    "new balance did not equal prev balance minus withdraw_amount minus fees: {e}"
                 )
             })?;
         }

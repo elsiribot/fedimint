@@ -423,7 +423,7 @@ impl Bitcoind {
             api_networking_backoff(),
             || async {
                 if client.get_transaction(txid).await?.is_none() {
-                    bail!("Genesis tx not visible yet = {}", txid);
+                    bail!("Genesis tx not visible yet = {txid}");
                 }
 
                 Ok(())

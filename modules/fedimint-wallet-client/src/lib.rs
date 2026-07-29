@@ -674,7 +674,7 @@ impl ClientModule for WalletClientModule {
                     let req: PegInRequest = serde_json::from_value(request)?;
                     let response = self.peg_in(req)
                         .await
-                        .map_err(|e| anyhow::anyhow!("peg_in failed: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("peg_in failed: {e}"))?;
                     let result = serde_json::to_value(&response)?;
                     yield result;
                 },
@@ -682,7 +682,7 @@ impl ClientModule for WalletClientModule {
                     let req: PegOutRequest = serde_json::from_value(request)?;
                     let response = self.peg_out(req)
                         .await
-                        .map_err(|e| anyhow::anyhow!("peg_out failed: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("peg_out failed: {e}"))?;
                     let result = serde_json::to_value(&response)?;
                     yield result;
                 },
@@ -699,7 +699,7 @@ impl ClientModule for WalletClientModule {
                     }
                 }
                 _ => {
-                    Err(anyhow::format_err!("Unknown method: {}", method))?;
+                    Err(anyhow::format_err!("Unknown method: {method}"))?;
                 }
             }
         })
@@ -1698,7 +1698,7 @@ impl WalletClientModule {
                 let tx_subscriber = self.client_ctx.transaction_updates(operation_id).await;
 
                 if let Err(e) = tx_subscriber.await_tx_accepted(transaction_id).await {
-                    bail!("{}", e);
+                    bail!("{e}");
                 }
 
                 debug!(target: LOG_CLIENT_MODULE_WALLET, out_points=?change, "Ensuring outputs claimed");

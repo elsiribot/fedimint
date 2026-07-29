@@ -93,7 +93,9 @@ pub async fn build_iroh_endpoint(
         SocketAddr::V6(addr_v6) => builder.bind_addr_v6(addr_v6),
     };
 
-    let endpoint = builder.bind().await.expect("Could not bind to port");
+    let endpoint = Box::pin(builder.bind())
+        .await
+        .expect("Could not bind to port");
 
     info!(
         target: LOG_NET_IROH,

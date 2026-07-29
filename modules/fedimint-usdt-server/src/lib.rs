@@ -12689,14 +12689,14 @@ mod tests {
     }
 
     /// Shared setup for the sweep-aware credit-rule tests: drives a first
-    /// deposit of 100 USDT (100_000_000 units, observed at block 10) through
+    /// deposit of 100 USDT (`100_000_000` units, observed at block 10) through
     /// the consensus vote path (which auto-enqueues its sweep), then confirms
     /// that sweep at `sweep_block` -- leaving `credited == swept ==
     /// 100_000_000`, `nonce == 1`, `LastSweepBlockKey(account) ==
     /// sweep_block`, and no in-flight op. Returns the swept account.
     ///
     /// Amounts are scaled to clear the finding-02 dust gate: with
-    /// `sample_fee_vote`'s median a deploy+sweep prices at 86_400_000 units,
+    /// `sample_fee_vote`'s median a deploy+sweep prices at `86_400_000` units,
     /// so every credited remainder these tests expect to sweep is above that.
     async fn credit_100_and_confirm_sweep(
         module: &Usdt,
