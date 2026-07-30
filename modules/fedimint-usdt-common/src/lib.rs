@@ -92,7 +92,19 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// residual `PendingCheck` rows are dropped by `migrate_db_v4`. Existing
 /// `DepositRecord`s are untouched (their `credited` high-water marks carry
 /// forward). See `migrate_db_v4`.
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 9);
+///
+/// Bumped to `0.10` (finding B1): the over-ceiling withdrawal-reprice path in
+/// the server's `process_replace_user_op` no longer refunds-and-purges a
+/// still-live, threshold-signed op. The old behavior reissued the covered
+/// withdrawals' e-cash as a refund AND removed the op even though its
+/// `(sender, nonce)` was still live on-chain with an unconsumed nonce, so a
+/// later confirmation paid the recipient a SECOND time (double pay). The op is
+/// now kept live and merely marked `superseded`, so a later confirmation
+/// settles it exactly-once via `apply_user_op_confirmed`. This is a
+/// deterministic apply-path BEHAVIOR change only: no consensus-serialized type,
+/// wire shape, or DB record layout changed, so there is no
+/// `get_database_migrations` entry/snapshot for this bump.
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 10);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
