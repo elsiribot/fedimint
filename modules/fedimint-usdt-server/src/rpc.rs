@@ -127,6 +127,16 @@ alloy::sol! {
         // with no collision). `depositTo` tops that deposit up (payable).
         function depositTo(address account) external payable;
         function balanceOf(address account) external view returns (uint256);
+        // Finding A (residual recovery): withdraws `amount` of the *calling*
+        // account's `EntryPoint` gas deposit to `withdrawAddress`. Encoded into
+        // a `SimpleAccount.execute(entry_point, 0, withdrawTo(recipient,
+        // amount))` UserOp so a fully-swept, single-use deposit account's
+        // stranded deposit is recovered to the deterministic
+        // `residual_recovery_recipient` (see
+        // `user_op::build_recover_residual_userop`). Not used as a direct
+        // `#[sol(rpc)]` call here -- only its ABI encoding (`withdrawToCall`) is
+        // needed to build the op's inner calldata.
+        function withdrawTo(address payable withdrawAddress, uint256 amount) external;
     }
 
     /// `EntryPoint` v0.7's `UserOperationEvent`
@@ -317,6 +327,19 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
         &self,
         user_op_hash: [u8; 32],
     ) -> anyhow::Result<Option<UserOpReceipt>>;
+
+    /// The `account`'s ETH gas deposit held *inside the configured
+    /// `EntryPoint`*, in wei (finding A), read via `IEntryPoint::balanceOf`
+    /// (the gas-deposit accounting, NOT the ERC-20 `balanceOf`). Used by the
+    /// guardian-local residual-recovery observer to detect a fully-swept,
+    /// single-use deposit account's stranded gas deposit before proposing a
+    /// [`fedimint_usdt_common::UsdtConsensusItem::RecoverResidual`] vote. A
+    /// `u128` comfortably holds any real deposit (total ETH supply ~1e26 wei is
+    /// far below `u128::MAX` ~3.4e38). Read as of "latest" (the deposit only
+    /// grows until withdrawn, and the observer's read is guardian-local and
+    /// never itself a consensus decision -- the federation acts only on the
+    /// threshold-MEDIAN of guardians' votes).
+    async fn get_entrypoint_deposit(&self, account: EvmAddress) -> anyhow::Result<u128>;
 
     /// Wraps `self` into a type-erased, cheaply-cloneable [`DynServerEvmRpc`]
     /// handle.
@@ -1080,6 +1103,24 @@ impl IServerEvmRpc for AlloyEvmRpc {
              treating as unconfirmed"
         );
         Ok(None)
+    }
+
+    async fn get_entrypoint_deposit(&self, account: EvmAddress) -> anyhow::Result<u128> {
+        let entry_point = self.entry_point.context(
+            "AlloyEvmRpc::get_entrypoint_deposit requires an EntryPoint address (see \
+             Self::with_entry_point)",
+        )?;
+        let contract = IEntryPoint::new(Address::from(entry_point.0), &self.provider);
+        // The EntryPoint gas *deposit* (NOT the ERC-20 balance): a distinct
+        // `sol!` interface method from `IERC20::balanceOf`.
+        let deposit: U256 = contract
+            .balanceOf(Address::from(account.0))
+            .call()
+            .await
+            .with_context(|| format!("EntryPoint.balanceOf({account}) deposit read"))?;
+        u128::try_from(deposit).with_context(|| {
+            format!("EntryPoint deposit {deposit} wei for {account} overflows u128")
+        })
     }
 }
 

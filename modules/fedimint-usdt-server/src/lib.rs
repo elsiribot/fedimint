@@ -24,9 +24,9 @@ use fedimint_core::envs::{
     FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV, FM_USDT_CHAIN_ID_ENV, FM_USDT_CONFIRMATION_DEPTH_ENV,
     FM_USDT_CONTRACT_ENV, FM_USDT_ENTRY_POINT_ENV, FM_USDT_ETH_USD_PRICE_FEED_ENV,
     FM_USDT_EVM_RPC_API_KEY_ENV, FM_USDT_EVM_RPC_API_KEY_FILE_ENV, FM_USDT_EVM_RPC_URL_ENV,
-    FM_USDT_POLL_INTERVAL_SECS_ENV, FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV,
-    FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV, env_secret_or_file, is_env_var_set_opt,
-    is_running_in_test_env,
+    FM_USDT_POLL_INTERVAL_SECS_ENV, FM_USDT_RESIDUAL_RECOVERY_RECIPIENT_ENV,
+    FM_USDT_SIMPLE_ACCOUNT_IMPL_ENV, FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH_ENV, env_secret_or_file,
+    is_env_var_set_opt, is_running_in_test_env,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -82,18 +82,21 @@ use crate::db::{
     HasEverBeenReadyKey, HasEverBeenReadyPrefix, MpcRoundChunk, MpcRoundChunkKey,
     MpcRoundChunkPrefix, MpcRoundChunkSessionPrefix, MpcRoundChunkSessionRoundPeerPrefix,
     MpcRoundChunkSessionRoundPrefix, PendingUserOp, PendingUserOpKey, PendingUserOpPrefix,
-    PoolState, PoolStateKey, PoolStatePrefix, Refund, RefundKey, RefundPrefix, SessionState,
-    SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix, StoredFeeVote,
-    SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix, UnclaimedWithdrawalKey,
-    UnclaimedWithdrawalPrefix, UsdtWithdrawalV0, UserOpConfirmedObservation,
-    UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix, UserOpConfirmedVotePrefix, UserOpPurpose,
-    WithdrawalBatchCapKey, WithdrawalBatchCapPrefix, WithdrawalIncurredFeeKey,
-    WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
+    PoolState, PoolStateKey, PoolStatePrefix, RecoverResidualVoteAccountPrefix,
+    RecoverResidualVoteKey, RecoverResidualVotePrefix, Refund, RefundKey, RefundPrefix,
+    SessionState, SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix,
+    StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix,
+    UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
+    UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
+    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalBatchCapKey, WithdrawalBatchCapPrefix,
+    WithdrawalIncurredFeeKey, WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey,
+    WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
 use crate::user_op::{
-    DeployAndSweepParams, GasBounds, WithdrawalBatchParams, assemble_eth_signature,
+    DeployAndSweepParams, GasBounds, RecoverResidualParams, WithdrawalBatchParams,
+    assemble_eth_signature, build_recover_residual_userop,
 };
 
 mod dkg;
@@ -364,6 +367,16 @@ impl ModuleInit for UsdtInit {
                         "Block Hash Votes"
                     );
                 }
+                DbKeyPrefix::RecoverResidualVote => {
+                    push_db_pair_items!(
+                        dbtx,
+                        RecoverResidualVotePrefix,
+                        crate::db::RecoverResidualVoteKey,
+                        u64,
+                        items,
+                        "Recover Residual Votes"
+                    );
+                }
             }
         }
 
@@ -439,6 +452,9 @@ fn usdt_gen_params_from_env() -> anyhow::Result<UsdtGenParams> {
 
     if let Some(feed) = env_override(FM_USDT_ETH_USD_PRICE_FEED_ENV)? {
         params.eth_usd_price_feed = feed;
+    }
+    if let Some(recipient) = env_override(FM_USDT_RESIDUAL_RECOVERY_RECIPIENT_ENV)? {
+        params.residual_recovery_recipient = recipient;
     }
 
     // Numeric config-gen overrides. `chain_id` and `confirmation_depth`
@@ -529,6 +545,26 @@ fn slow_poll_interval_secs() -> u64 {
     }
     poll_interval_secs().saturating_mul(SLOW_POLL_MULTIPLIER)
 }
+
+/// Minimum residual `EntryPoint` gas deposit (in wei) worth recovering from a
+/// fully-swept, single-use deposit account (finding A). Below this, the
+/// recovery op's own gas would consume most/all of what it recovers, so the
+/// observer never proposes and the `process_consensus_item` recovery arm never
+/// enqueues -- the dust simply sits stranded (costing the federation nothing).
+/// `0.002 ETH`: comfortably above one recovery op's own worst-case gas
+/// (`RECOVER_RESIDUAL_GAS_UNITS` ~260k * a few gwei), so a recovery that fires
+/// nets a meaningful residual back to the broadcaster-refill recipient.
+const RESIDUAL_RECOVERY_MIN_WEI: u128 = 2_000_000_000_000_000;
+
+/// Drift cushion (percent) added to a residual-recovery op's own worst-case
+/// gas `need` before it is subtracted from the observed deposit, mirroring
+/// [`crate::rpc`]'s `PREFUND_MARGIN_PERCENT`: the op must leave enough deposit
+/// behind to pay for itself even if the fee market drifts up between building
+/// the op and its on-chain inclusion. Over-leaving merely recovers slightly
+/// less (safe); under-leaving would make the op's own `handleOps` under-fund
+/// and revert (also safe -- no loss -- but wasteful), so a generous margin is
+/// preferred here.
+const RESIDUAL_RECOVERY_NEED_MARGIN_PERCENT: u128 = 20;
 
 /// Pure parse/clamp for [`poll_interval_secs`], split out so it is testable
 /// without depending on `is_running_in_test_env()` (which is always true under
@@ -739,6 +775,10 @@ impl ServerModuleInit for UsdtInit {
             EnvVarDoc {
                 name: FM_USDT_ETH_USD_PRICE_FEED_ENV,
                 description: "Overrides the ERC-4337 USDT module's Chainlink ETH/USD price-feed config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.",
+            },
+            EnvVarDoc {
+                name: FM_USDT_RESIDUAL_RECOVERY_RECIPIENT_ENV,
+                description: "Overrides the USDT module's `residual_recovery_recipient` config-gen param (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader — the deterministic recipient stranded deposit-account EntryPoint gas deposits are withdrawn to. Must be set on non-dev chains.",
             },
             EnvVarDoc {
                 name: FM_USDT_CHAIN_ID_ENV,
@@ -973,6 +1013,7 @@ impl ServerModuleInit for UsdtInit {
                         broadcaster_min_balance_wei: params.broadcaster_min_balance_wei,
                         eth_usd_price_feed: params.eth_usd_price_feed,
                         price_feed_max_staleness_secs: params.price_feed_max_staleness_secs,
+                        residual_recovery_recipient: params.residual_recovery_recipient,
                     },
                 };
 
@@ -1042,6 +1083,7 @@ impl ServerModuleInit for UsdtInit {
             broadcaster_min_balance_wei: config.consensus.broadcaster_min_balance_wei,
             eth_usd_price_feed: config.consensus.eth_usd_price_feed,
             price_feed_max_staleness_secs: config.consensus.price_feed_max_staleness_secs,
+            residual_recovery_recipient: config.consensus.residual_recovery_recipient,
         })
         .context("consensus config failed USDT safety validation")?;
 
@@ -1415,6 +1457,19 @@ pub struct Usdt {
     /// becomes a ring entry only once threshold-aggregated in the ordered
     /// `process` path.
     block_hash_proposals: Arc<Mutex<Option<BlockHashObservation>>>,
+    /// Fully-swept deposit accounts whose stranded on-chain `EntryPoint` gas
+    /// deposit this guardian has observed above [`RESIDUAL_RECOVERY_MIN_WEI`]
+    /// (finding A), gathered by the READ-ONLY
+    /// [`Usdt::spawn_residual_recovery_observer`] task and drained into
+    /// `UsdtConsensusItem::RecoverResidual` proposals in `consensus_proposal`
+    /// (batched -- many accounts per round, each its own item). Each entry is
+    /// `(account, deposit_wei)`; the observation is this guardian's own
+    /// guardian-LOCAL RPC read (`get_entrypoint_deposit`), never itself a
+    /// consensus decision -- the federation acts only on the threshold-MEDIAN
+    /// of guardians' votes. Mirrors `user_op_confirmed_proposals`'s drain
+    /// pattern.
+    #[allow(clippy::type_complexity)]
+    residual_recovery_proposals: Arc<Mutex<Vec<(fedimint_usdt_common::EvmAddress, u64)>>>,
 }
 
 /// One guardian-local observation of a submitted `UserOp`'s on-chain outcome
@@ -1502,6 +1557,26 @@ struct BlockHashObserverHandles {
     /// height reference all honest guardians target) from the local DB.
     num_peers: NumPeers,
     block_hash_proposals: Arc<Mutex<Option<BlockHashObservation>>>,
+}
+
+/// Grouped handles/config for [`Usdt::spawn_residual_recovery_observer`]
+/// (finding A), mirroring [`BlockHashObserverHandles`]'s convention. All uses
+/// are read-only: the observer opens a NON-committing dbtx to scan
+/// `DepositRecord`s (fully-swept accounts) and detect any recovery already
+/// in-flight, reads each swept account's on-chain `EntryPoint` gas deposit via
+/// `evm_rpc.get_entrypoint_deposit`, and queues `(account, deposit_wei)` into
+/// `residual_recovery_proposals` -- it NEVER writes the consensus DB
+/// (commit-safety constraint); the recovery op is enqueued only in the ordered
+/// `process_consensus_item` path once threshold-many guardians agree.
+struct ResidualRecoveryObserverHandles {
+    db: Database,
+    evm_rpc: DynServerEvmRpc,
+    residual_recovery_proposals: Arc<Mutex<Vec<(fedimint_usdt_common::EvmAddress, u64)>>>,
+    /// The deterministic recovery recipient; an all-zero address DISABLES
+    /// residual recovery (the observer proposes nothing), so a
+    /// dev/misconfigured federation never withdraws stranded gas to the
+    /// burn address.
+    residual_recovery_recipient: fedimint_usdt_common::EvmAddress,
 }
 
 /// Implementation of consensus for the server module
@@ -1606,6 +1681,35 @@ impl ServerModule for Usdt {
             let current_vote = dbtx.get_value(&BlockHashVoteKey(self.our_peer_id)).await;
             if current_vote != Some(obs) {
                 items.push(UsdtConsensusItem::BlockHash(obs));
+            }
+        }
+
+        // Propose this guardian's residual-recovery observations (finding A;
+        // gathered by the READ-ONLY `spawn_residual_recovery_observer`), BATCHED
+        // -- one `RecoverResidual` item per fully-swept account whose stranded
+        // `EntryPoint` deposit this guardian observed above the min threshold.
+        // Equality-based dedup per account (the observed deposit can move in
+        // either direction, e.g. as top-ups accrue): only propose when this
+        // peer's stored `(account -> deposit_wei)` vote differs, so an unchanged
+        // observation does not spam consensus every round. Each observation is a
+        // guardian-LOCAL RPC read, never itself a consensus write; the recovery
+        // op is enqueued only once threshold-aggregated in the ordered `process`
+        // path.
+        let residual_observations = std::mem::take(
+            &mut *self
+                .residual_recovery_proposals
+                .lock()
+                .expect("not poisoned"),
+        );
+        for (account, deposit_wei) in residual_observations {
+            let current_vote = dbtx
+                .get_value(&RecoverResidualVoteKey(account, self.our_peer_id))
+                .await;
+            if current_vote != Some(deposit_wei) {
+                items.push(UsdtConsensusItem::RecoverResidual {
+                    account,
+                    deposit_wei,
+                });
             }
         }
 
@@ -2095,6 +2199,32 @@ impl ServerModule for Usdt {
                 if agreeing >= self.num_peers.threshold() {
                     write_block_hash_ring(dbtx, obs.height, obs.block_hash).await;
                 }
+
+                Ok(())
+            }
+            UsdtConsensusItem::RecoverResidual {
+                account,
+                deposit_wei,
+            } => {
+                // Finding A: store the ORDERED item's origin peer's vote on this
+                // swept account's stranded `EntryPoint` deposit (keyed by the
+                // framework-supplied `peer_id`, NEVER `self.our_peer_id`), with
+                // an equality-based redundancy guard so a re-proposed unchanged
+                // observation is non-state-changing and cannot bloat consensus
+                // history (per the framework WARNING above).
+                let key = RecoverResidualVoteKey(account, peer_id);
+                if dbtx.insert_entry(&key, &deposit_wei).await == Some(deposit_wei) {
+                    bail!("residual-recovery observation vote is redundant");
+                }
+
+                // Storing a fresh vote IS a state change, so returning `Ok`
+                // below is correct even when the threshold/median/amount gates
+                // in `maybe_trigger_residual_recovery` decline to enqueue an op
+                // this round (a later vote re-drives it). The op-build is a pure
+                // function of the threshold-MEDIAN deposit, the fee-vote median,
+                // prior consensus DB state, and config -- byte-identical on
+                // every guardian.
+                self.maybe_trigger_residual_recovery(dbtx, account).await;
 
                 Ok(())
             }
@@ -2737,6 +2867,17 @@ impl Usdt {
             },
         );
 
+        let residual_recovery_proposals = Arc::new(Mutex::new(Vec::new()));
+        Self::spawn_residual_recovery_observer(
+            &task_group,
+            ResidualRecoveryObserverHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.clone(),
+                residual_recovery_proposals: residual_recovery_proposals.clone(),
+                residual_recovery_recipient: cfg.consensus.residual_recovery_recipient,
+            },
+        );
+
         Usdt {
             cfg,
             evm_rpc,
@@ -2752,6 +2893,7 @@ impl Usdt {
             fee_estimate,
             bootstrap_proposals,
             block_hash_proposals,
+            residual_recovery_proposals,
         }
     }
 
@@ -2788,6 +2930,10 @@ impl Usdt {
             // the other pollers); tests drive the ring by feeding
             // `BlockHash` items through `process_consensus_item` directly.
             block_hash_proposals: Arc::new(Mutex::new(None)),
+            // The residual-recovery observer is NOT spawned in tests (mirroring
+            // the other pollers); tests drive recovery by feeding
+            // `RecoverResidual` items through `process_consensus_item` directly.
+            residual_recovery_proposals: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -3236,6 +3382,128 @@ impl Usdt {
         });
     }
 
+    /// Spawns the READ-ONLY residual-recovery observer (finding A): each tick,
+    /// it scans the consensus `DepositRecord` set for fully-swept, single-use
+    /// deposit accounts (`credited > 0 && swept == credited`) with no recovery
+    /// already in-flight, reads each such account's on-chain `EntryPoint` gas
+    /// deposit via `evm_rpc.get_entrypoint_deposit`, and queues
+    /// `(account, deposit_wei)` for every deposit above
+    /// [`RESIDUAL_RECOVERY_MIN_WEI`] into `residual_recovery_proposals`, which
+    /// `consensus_proposal` drains into `UsdtConsensusItem::RecoverResidual`
+    /// votes.
+    ///
+    /// Mirrors [`Usdt::spawn_block_hash_observer`]'s read-only discipline: it
+    /// reads the module DB via `db.begin_transaction_nc()` (non-committable)
+    /// and writes NOTHING to consensus. The recovery op is enqueued (and
+    /// its ETH withdrawn to the deterministic
+    /// `residual_recovery_recipient`) solely in the ordered
+    /// `process_consensus_item` path, and only once threshold-many
+    /// guardians agree on the observed deposit -- never on this task's own
+    /// say-so. Runs on the slow cadence ([`slow_poll_interval_secs`]): a
+    /// stranded deposit only grows until recovered, so there is no urgency.
+    ///
+    /// An all-zero `residual_recovery_recipient` DISABLES recovery (the task
+    /// still runs but proposes nothing), so a dev/misconfigured federation
+    /// never withdraws stranded gas to the burn address.
+    fn spawn_residual_recovery_observer(
+        task_group: &TaskGroup,
+        handles: ResidualRecoveryObserverHandles,
+    ) {
+        let ResidualRecoveryObserverHandles {
+            db,
+            evm_rpc,
+            residual_recovery_proposals,
+            residual_recovery_recipient,
+        } = handles;
+
+        task_group.spawn_cancellable("usdt-residual-recovery-observer", async move {
+            loop {
+                // Disabled when no recovery recipient is configured (all-zero):
+                // never observe or propose, so stranded gas is never burned to
+                // the zero address on a dev/misconfigured federation.
+                if residual_recovery_recipient == fedimint_usdt_common::EvmAddress([0u8; 20]) {
+                    fedimint_core::runtime::sleep(Duration::from_secs(slow_poll_interval_secs()))
+                        .await;
+                    continue;
+                }
+
+                let mut dbtx = db.begin_transaction_nc().await;
+                // Fully-swept, single-use deposit accounts: their USDT is fully
+                // pooled, so any remaining on-chain `EntryPoint` deposit is
+                // stranded broadcaster gas.
+                let records: Vec<(fedimint_usdt_common::EvmAddress, DepositRecord)> = dbtx
+                    .find_by_prefix(&DepositRecordPrefix)
+                    .await
+                    .map(|(DepositRecordKey(account), record)| (account, record))
+                    .collect()
+                    .await;
+                // Accounts already mid-recovery (a `RecoverResidual` op Pending
+                // or Submitted); scanned once per tick rather than per account.
+                let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+                    .find_by_prefix(&PendingUserOpPrefix)
+                    .await
+                    .collect()
+                    .await;
+                let submitted: Vec<(SubmittedUserOpKey, SubmittedUserOp)> = dbtx
+                    .find_by_prefix(&SubmittedUserOpPrefix)
+                    .await
+                    .collect()
+                    .await;
+                drop(dbtx);
+
+                let mut in_flight: std::collections::HashSet<fedimint_usdt_common::EvmAddress> =
+                    std::collections::HashSet::new();
+                for (_, p) in &pending {
+                    if let UserOpPurpose::RecoverResidual { account } = p.purpose {
+                        in_flight.insert(account);
+                    }
+                }
+                for (_, s) in &submitted {
+                    if let UserOpPurpose::RecoverResidual { account } = s.purpose {
+                        in_flight.insert(account);
+                    }
+                }
+
+                let mut observations: Vec<(fedimint_usdt_common::EvmAddress, u64)> = Vec::new();
+                for (account, record) in records {
+                    let fully_swept = record.credited.0 > 0 && record.swept.0 == record.credited.0;
+                    if !fully_swept || in_flight.contains(&account) {
+                        continue;
+                    }
+                    match rpc_deadline(evm_rpc.get_entrypoint_deposit(account)).await {
+                        Ok(deposit_wei) if deposit_wei >= RESIDUAL_RECOVERY_MIN_WEI => {
+                            // Clamp the u128 read to the u64 wire type (a
+                            // single-op gas deposit is far below u64::MAX wei);
+                            // an implausibly huge reading saturates rather than
+                            // wrapping, and over-stating only makes the op's
+                            // `withdrawTo` exceed the balance and revert on-chain
+                            // (no loss) -- never a spurious inflation.
+                            let deposit_wei = u64::try_from(deposit_wei).unwrap_or(u64::MAX);
+                            observations.push((account, deposit_wei));
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            debug!(
+                                target: "usdt",
+                                err = %err.fmt_compact_anyhow(),
+                                %account,
+                                "residual-recovery deposit read failed, retrying next tick"
+                            );
+                        }
+                    }
+                }
+
+                // Replace (not append) the queue with this tick's full view, so
+                // it never accumulates stale duplicates; `consensus_proposal`
+                // drains it and its per-peer redundancy guard dedups unchanged
+                // votes round-to-round.
+                *residual_recovery_proposals.lock().expect("not poisoned") = observations;
+
+                fedimint_core::runtime::sleep(Duration::from_secs(slow_poll_interval_secs())).await;
+            }
+        });
+    }
+
     /// Spawns a background task that submits every consensus-agreed
     /// [`SubmittedUserOp`] via `evm_rpc.submit_user_ops` and polls
     /// `evm_rpc.get_user_op_receipt` for its confirmation, gathering
@@ -3385,6 +3653,16 @@ impl Usdt {
                                                 crate::user_op::decode_batch_transfer_total(
                                                     &record.signed.unsigned,
                                                 )
+                                            }
+                                            // Finding A: a residual-recovery op
+                                            // moves broadcaster ETH gas (via
+                                            // `EntryPoint.withdrawTo`), never
+                                            // pool USDT, so its `swept` USDT is
+                                            // always zero (the confirm arm
+                                            // touches only the deposit account's
+                                            // nonce, not `PoolState`).
+                                            UserOpPurpose::RecoverResidual { .. } => {
+                                                Ok(UsdtAmount(0))
                                             }
                                         };
                                         match decoded {
@@ -4163,6 +4441,187 @@ impl Usdt {
         })
     }
 
+    /// `true` if a `RecoverResidual`-purpose `UserOp` for exactly this
+    /// `account` is currently `Pending` or `Submitted` -- i.e. a residual
+    /// recovery of this deposit account is already in flight and
+    /// [`Usdt::maybe_trigger_residual_recovery`] must not start a second one at
+    /// the same on-chain nonce (which would collide, AA25). Mirrors
+    /// [`Usdt::deploy_and_sweep_in_flight`] exactly, filtered to a SINGLE
+    /// `account`. A pure function of consensus-DB state and `account`, so
+    /// identical on every guardian.
+    async fn residual_recovery_in_flight(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        account: fedimint_usdt_common::EvmAddress,
+    ) -> bool {
+        let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        if pending.iter().any(|(_, p)| {
+            matches!(p.purpose, UserOpPurpose::RecoverResidual { account: a } if a == account)
+        }) {
+            return true;
+        }
+
+        let submitted: Vec<(SubmittedUserOpKey, SubmittedUserOp)> = dbtx
+            .find_by_prefix(&SubmittedUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        submitted.iter().any(|(_, s)| {
+            matches!(s.purpose, UserOpPurpose::RecoverResidual { account: a } if a == account)
+        })
+    }
+
+    /// Finding A: once at least a threshold of guardians have voted on
+    /// `account`'s stranded on-chain `EntryPoint` gas deposit, builds and
+    /// enqueues a threshold-signed `EntryPoint.withdrawTo(recipient, amount)`
+    /// recovery op (and starts its MPC signing session), sending the residual
+    /// -- net of the op's own worst-case gas -- to the deterministic
+    /// `residual_recovery_recipient` consensus config address. Called from the
+    /// `RecoverResidual` consensus-item arm, mirroring where
+    /// [`Usdt::maybe_trigger_sweep`] sits in the deposit path.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of `(account, prior consensus DB state, config)`: the
+    /// recovered `amount` is derived from the threshold-MEDIAN of the stored
+    /// per-peer `deposit_wei` votes (so a lone byzantine reporter cannot
+    /// inflate it -- and over-stating merely makes `withdrawTo` exceed the
+    /// on-chain balance and revert, never a loss), the op is priced from
+    /// the consensus `fee_vote_median`, and its nonce is the account's
+    /// consensus `DepositRecord.nonce`. No RPC, no wall-clock, no
+    /// `our_peer_id` -- every guardian builds the byte-identical op (its
+    /// fields are part of the signed `userOpHash`).
+    ///
+    /// Defers (enqueues nothing) when: fewer than `threshold` votes exist yet;
+    /// no `fee_vote_median` has landed (the op cannot be priced); the recovered
+    /// `amount` after leaving the op's own gas is not strictly positive; a
+    /// recovery is already in-flight for this account; or this exact op is
+    /// already `Pending`/`Submitted`. Every such defer is idempotent -- a later
+    /// vote (or the same account's next observation) re-drives it.
+    async fn maybe_trigger_residual_recovery(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        account: fedimint_usdt_common::EvmAddress,
+    ) {
+        // Never build a second recovery op for `account` while one is still
+        // in-flight (both would carry the same on-chain nonce and the later
+        // would revert, AA25).
+        if self.residual_recovery_in_flight(dbtx, account).await {
+            return;
+        }
+
+        // Threshold-MEDIAN of the per-peer deposit observations for this
+        // account (mirrors `fee_vote_median`: require at least `threshold`
+        // votes, then take the middle value). A lone over-reporter therefore
+        // cannot inflate the recovered amount.
+        let mut votes: Vec<u64> = dbtx
+            .find_by_prefix(&RecoverResidualVoteAccountPrefix(account))
+            .await
+            .map(|(_, deposit_wei)| deposit_wei)
+            .collect()
+            .await;
+        if votes.len() < self.num_peers.threshold() {
+            return;
+        }
+        votes.sort_unstable();
+        let agreed_deposit_wei = u128::from(votes[votes.len() / 2]);
+
+        // Price the recovery op from the consensus live-gas median (identical to
+        // the sweep path), so every guardian builds the identical op and the
+        // amount left behind to pay its own gas matches its actual price.
+        let Some(median) = self.fee_vote_median(dbtx).await else {
+            debug!(
+                target: "usdt",
+                %account,
+                "no fee median; deferring residual recovery until it can be priced"
+            );
+            return;
+        };
+        let gas_bounds =
+            GasBounds::RECOVER_RESIDUAL_DEVNET.with_median_fees(Some(median.max_fee_per_gas_wei));
+
+        // The op's own worst-case gas `need` (mirrors `rpc.rs`'s prefund
+        // formula: `need = totalGas * maxFeePerGas`), plus a drift margin, must
+        // be LEFT in the account's deposit so the recovery op can pay for
+        // itself; the rest is withdrawn to the recipient. All in wei.
+        let need = GasBounds::RECOVER_RESIDUAL_GAS_UNITS.saturating_mul(gas_bounds.max_fee_per_gas);
+        let need_with_margin =
+            need.saturating_add(need.saturating_mul(RESIDUAL_RECOVERY_NEED_MARGIN_PERCENT) / 100);
+        let Some(amount_wei) = agreed_deposit_wei.checked_sub(need_with_margin) else {
+            debug!(
+                target: "usdt",
+                %account,
+                agreed_deposit_wei,
+                need_with_margin,
+                "agreed deposit does not exceed the recovery op's own gas need; not recovering"
+            );
+            return;
+        };
+        if amount_wei == 0 || agreed_deposit_wei < RESIDUAL_RECOVERY_MIN_WEI {
+            return;
+        }
+
+        // The recovery op runs at the deposit account's current `SimpleAccount`
+        // nonce (a fully-swept, single-use account has done exactly one op --
+        // its deploy-and-sweep -- so this is `1`); the account is already
+        // deployed, so `needs_deploy` is never set.
+        let Some(record) = dbtx.get_value(&DepositRecordKey(account)).await else {
+            return;
+        };
+
+        let op = build_recover_residual_userop(RecoverResidualParams {
+            deposit_account: account,
+            entry_point: self.cfg.consensus.entry_point,
+            recipient: self.cfg.consensus.residual_recovery_recipient,
+            amount_wei,
+            nonce: alloy::primitives::U256::from(record.nonce),
+            paymaster_and_data: Vec::new(),
+            gas_bounds,
+        });
+        let op_hash = user_op_hash(
+            &op,
+            self.cfg.consensus.entry_point,
+            self.cfg.consensus.chain_id,
+        );
+
+        // Idempotent: if this exact op is already pending or submitted, don't
+        // re-enqueue (also protects against a repeat/late threshold-reaching
+        // vote for the same agreed deposit).
+        if dbtx.get_value(&PendingUserOpKey(op_hash)).await.is_some()
+            || dbtx.get_value(&SubmittedUserOpKey(op_hash)).await.is_some()
+        {
+            return;
+        }
+
+        let created_block = self.consensus_block_count(dbtx).await;
+        dbtx.insert_entry(
+            &PendingUserOpKey(op_hash),
+            &PendingUserOp {
+                op: op.clone(),
+                purpose: UserOpPurpose::RecoverResidual { account },
+                created_block,
+            },
+        )
+        .await;
+        info!(
+            target: "usdt",
+            ?op_hash,
+            %account,
+            amount_wei,
+            need_with_margin,
+            nonce = record.nonce,
+            "residual recovery enqueued (PendingUserOp), starting MPC signing session"
+        );
+
+        let digest = eth_signed_message_hash(op_hash);
+        self.start_session(dbtx, SigningPurpose::UserOp(op_hash), digest, 0)
+            .await;
+    }
+
     /// Deterministically batches every currently-`Queued` withdrawal into
     /// ONE `Withdraw`-purpose `UserOp` from the pool `SimpleAccount`, and
     /// starts its MPC signing session, if the batching policy fires (Phase
@@ -4544,6 +5003,11 @@ impl Usdt {
                 UserOpPurpose::Withdraw { .. } => {
                     crate::user_op::decode_batch_transfer_total(&submitted.signed.unsigned)
                 }
+                // Finding A: a recovery op moves broadcaster ETH gas, not pool
+                // USDT, so its swept USDT is always zero (the submitter proposes
+                // `swept = 0` for it); the cross-check below simply confirms
+                // `obs.swept == 0`.
+                UserOpPurpose::RecoverResidual { .. } => Ok(UsdtAmount(0)),
             };
             match expected {
                 Ok(expected) if expected == obs.swept => expected,
@@ -4661,6 +5125,23 @@ impl Usdt {
             UserOpPurpose::Withdraw { outpoints } => {
                 self.apply_withdraw_confirmed(dbtx, outpoints, obs, effective_swept)
                     .await;
+            }
+            UserOpPurpose::RecoverResidual { account } => {
+                // Finding A: a confirmed recovery op consumed the deposit
+                // account's on-chain nonce (the `EntryPoint` validates +
+                // increments it before the `withdrawTo` callData runs, success
+                // OR revert), so advance the tracked `SimpleAccount` nonce
+                // UNCONDITIONALLY -- mirroring the `DeployAndSweep` nonce bump --
+                // so a hypothetical later op for this account is not built at a
+                // stale (already-consumed) nonce. Touch NOTHING else: the
+                // recovered ETH is broadcaster gas, not pool USDT, so
+                // `PoolState.balance` and `DepositRecord.swept` are unchanged
+                // (and no re-sweep is retriggered).
+                if let Some(mut record) = dbtx.get_value(&DepositRecordKey(*account)).await {
+                    record.nonce = record.nonce.saturating_add(1);
+                    dbtx.insert_entry(&DepositRecordKey(*account), &record)
+                        .await;
+                }
             }
         }
 
@@ -5876,6 +6357,27 @@ impl Usdt {
                     bail!("sweep reprice exceeds the gas ceiling; leaving op stuck");
                 }
             }
+            UserOpPurpose::RecoverResidual { .. } => {
+                // Finding A: residual recovery is NOT urgent -- the stranded gas
+                // deposit is safe on-chain (still in the account's `EntryPoint`
+                // balance) and there is no refund concept. Mirror the
+                // `DeployAndSweep` arm: if the repriced fee would exceed the
+                // sweep gas ceiling, DON'T replace -- leave the op stuck
+                // (non-state-changing `bail!`) so it never over-provisions the
+                // recovery's own prefund. A later reprice at a lower median (or
+                // the op confirming as-is) resolves it.
+                if new_max_fee_per_gas > SWEEP_MAX_FEE_PER_GAS_WEI {
+                    warn!(
+                        target: "usdt",
+                        ?op_hash,
+                        new_max_fee_per_gas,
+                        ceiling_wei = SWEEP_MAX_FEE_PER_GAS_WEI,
+                        "residual-recovery reprice exceeds the gas ceiling; leaving the op stuck \
+                         (stranded gas is safe on-chain, no refund needed)"
+                    );
+                    bail!("residual-recovery reprice exceeds the gas ceiling; leaving op stuck");
+                }
+            }
         }
 
         // Within ceiling: enqueue the replacement + start its signing session,
@@ -6560,6 +7062,7 @@ mod tests {
             broadcaster_min_balance_wei: 1_000,
             eth_usd_price_feed: fedimint_usdt_common::EvmAddress([0xd0; 20]),
             price_feed_max_staleness_secs: 3_600,
+            residual_recovery_recipient: fedimint_usdt_common::EvmAddress([0xd1; 20]),
         };
 
         let server_cfgs = UsdtInit::default().trusted_dealer_gen(&peers, &args, &params);
@@ -6576,6 +7079,10 @@ mod tests {
             params.simple_account_impl
         );
         assert_eq!(cfg0.consensus.check_ttl_blocks, 500);
+        assert_eq!(
+            cfg0.consensus.residual_recovery_recipient,
+            params.residual_recovery_recipient
+        );
 
         let client_cfg = UsdtInit::default()
             .get_client_config(&cfg0.clone().to_erased().consensus)
@@ -6658,6 +7165,10 @@ mod tests {
         /// unscripted block falls back to a deterministic block-number-derived
         /// hash (see `mock_block_hash`).
         block_hashes: Mutex<std::collections::HashMap<u64, [u8; 32]>>,
+        /// Scripted `get_entrypoint_deposit` responses (wei), keyed by
+        /// `account` (finding A residual recovery). Unset accounts read as `0`.
+        entrypoint_deposits:
+            Mutex<std::collections::HashMap<fedimint_usdt_common::EvmAddress, u128>>,
     }
 
     /// Deterministic, block-number-derived stand-in for a canonical block hash
@@ -6683,6 +7194,21 @@ mod tests {
                 .lock()
                 .expect("not poisoned")
                 .insert(user_op_hash, receipt);
+        }
+
+        /// Scripts the on-chain `EntryPoint` gas deposit (wei)
+        /// `get_entrypoint_deposit(account)` returns (finding A residual
+        /// recovery). Unset accounts read as `0`.
+        #[allow(dead_code)]
+        fn set_entrypoint_deposit(
+            &self,
+            account: fedimint_usdt_common::EvmAddress,
+            deposit_wei: u128,
+        ) {
+            self.entrypoint_deposits
+                .lock()
+                .expect("not poisoned")
+                .insert(account, deposit_wei);
         }
 
         /// Scripts `get_user_op_receipt(user_op_hash)` to never resolve
@@ -6945,6 +7471,19 @@ mod tests {
                 .expect("not poisoned")
                 .get(&user_op_hash)
                 .copied())
+        }
+
+        async fn get_entrypoint_deposit(
+            &self,
+            account: fedimint_usdt_common::EvmAddress,
+        ) -> anyhow::Result<u128> {
+            Ok(self
+                .entrypoint_deposits
+                .lock()
+                .expect("not poisoned")
+                .get(&account)
+                .copied()
+                .unwrap_or(0))
         }
     }
 
@@ -12575,6 +13114,323 @@ mod tests {
         dbtx.commit_tx().await;
     }
 
+    /// Builds a [`Usdt`] like [`test_module_with_block_count`] but with a
+    /// non-zero `residual_recovery_recipient` in consensus config (finding A),
+    /// so the residual-recovery path builds a `withdrawTo` op to a real
+    /// recipient. Block-count cache is seeded to `cached_head`.
+    #[allow(clippy::unused_async)]
+    async fn test_module_with_recovery_recipient(
+        num_peers: u16,
+        cached_head: u64,
+        recipient: EvmAddress,
+    ) -> Usdt {
+        let peers = (0..num_peers).map(PeerId::from).collect::<Vec<_>>();
+        let args = ConfigGenModuleArgs {
+            network: Network::Regtest,
+            disable_base_fees: false,
+        };
+        let params = fedimint_usdt_common::UsdtGenParams {
+            residual_recovery_recipient: recipient,
+            ..Default::default()
+        };
+        let server_cfgs = UsdtInit::default().trusted_dealer_gen(&peers, &args, &params);
+        let cfg = server_cfgs[&peers[0]]
+            .clone()
+            .to_typed::<UsdtConfig>()
+            .expect("config was just generated by the same configgen");
+        let db = fedimint_core::db::Database::new(
+            fedimint_core::db::mem_impl::MemDatabase::new(),
+            fedimint_core::module::registry::ModuleDecoderRegistry::default(),
+        );
+        let module = Usdt::new_for_test(
+            cfg,
+            MockEvmRpc::default().into_dyn(),
+            db,
+            PeerId::from(0),
+            peers.to_num_peers(),
+        );
+        module.block_count.store(cached_head, Ordering::Relaxed);
+        module
+    }
+
+    /// Writes a FULLY-SWEPT `DepositRecord` for `account` (credited == swept ==
+    /// `amount`, `nonce == 1`: the account has done exactly its one
+    /// deploy-and-sweep op), the minimal setup the residual-recovery tests
+    /// need before driving `RecoverResidual` consensus items.
+    async fn insert_swept_deposit_record(
+        db: &Database,
+        account: EvmAddress,
+        claim_pk: secp256k1::PublicKey,
+        amount: UsdtAmount,
+    ) {
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &DepositRecordKey(account),
+            &DepositRecord {
+                claim_pk,
+                credited: amount,
+                claimed: UsdtAmount(0),
+                last_observed_block: 0,
+                swept: amount,
+                nonce: 1,
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+    }
+
+    /// Every `Pending` `RecoverResidual`-purpose op for `account`.
+    async fn pending_recover_residuals(
+        dbtx: &mut DatabaseTransaction<'_>,
+        account: EvmAddress,
+    ) -> Vec<([u8; 32], PendingUserOp)> {
+        dbtx.find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .map(|(PendingUserOpKey(h), p)| (h, p))
+            .filter(|(_, p)| {
+                std::future::ready(
+                    matches!(p.purpose, UserOpPurpose::RecoverResidual { account: a } if a == account),
+                )
+            })
+            .collect()
+            .await
+    }
+
+    /// Finding A: below the observation threshold, no recovery op may be
+    /// enqueued -- storing per-peer votes is a state change, but the op-build
+    /// gate requires at least `threshold` agreeing votes for an account.
+    #[tokio::test]
+    async fn recover_residual_below_threshold_is_skipped() {
+        let recipient = EvmAddress([0x99; 20]);
+        let module = test_module_with_recovery_recipient(4, 0, recipient).await; // threshold = 3
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        let claim_pk = test_pubkey(0xa1);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        insert_swept_deposit_record(db, account, claim_pk, UsdtAmount(1_000_000)).await;
+
+        let deposit_wei = 50_000_000_000_000_000u64;
+        let mut dbtx = db.begin_transaction().await;
+        // Only 2 of 4 peers vote (< threshold 3): no op is enqueued.
+        for p in [0u16, 1] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::RecoverResidual {
+                        account,
+                        deposit_wei,
+                    },
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            pending_recover_residuals(&mut dbtx.to_ref_nc(), account)
+                .await
+                .is_empty(),
+            "below threshold, no recovery op may be enqueued"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// Finding A: once a threshold of guardians agree on the stranded deposit,
+    /// exactly one `RecoverResidual` op is enqueued whose `withdrawTo` sends
+    /// `deposit - need_with_margin` to the deterministic
+    /// `residual_recovery_recipient` config address (leaving enough deposit to
+    /// pay the op's own gas), and its MPC signing session is started.
+    #[tokio::test]
+    async fn recover_residual_at_threshold_enqueues_op_and_leaves_gas() {
+        let recipient = EvmAddress([0x99; 20]);
+        let module = test_module_with_recovery_recipient(4, 0, recipient).await; // threshold = 3
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        let claim_pk = test_pubkey(0xb1);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        insert_swept_deposit_record(db, account, claim_pk, UsdtAmount(1_000_000)).await;
+
+        let deposit_wei = 50_000_000_000_000_000u64;
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::RecoverResidual {
+                        account,
+                        deposit_wei,
+                    },
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+
+        let ops = pending_recover_residuals(&mut dbtx.to_ref_nc(), account).await;
+        assert_eq!(ops.len(), 1, "exactly one recovery op must be enqueued");
+        let (op_hash, pending) = &ops[0];
+        assert!(
+            matches!(pending.purpose, UserOpPurpose::RecoverResidual { account: a } if a == account)
+        );
+
+        // Expected recovered amount = agreed deposit - need_with_margin (wei).
+        let median = module
+            .fee_vote_median(&mut dbtx.to_ref_nc())
+            .await
+            .expect("median exists");
+        let gas_bounds =
+            GasBounds::RECOVER_RESIDUAL_DEVNET.with_median_fees(Some(median.max_fee_per_gas_wei));
+        let need = GasBounds::RECOVER_RESIDUAL_GAS_UNITS.saturating_mul(gas_bounds.max_fee_per_gas);
+        let need_with_margin = need + need * RESIDUAL_RECOVERY_NEED_MARGIN_PERCENT / 100;
+        let expected_amount = u128::from(deposit_wei) - need_with_margin;
+
+        let (dest, decoded_recipient, decoded_amount) =
+            crate::user_op::decode_recover_residual(&pending.op).expect("op decodes");
+        assert_eq!(dest, module.cfg.consensus.entry_point);
+        assert_eq!(decoded_recipient, recipient);
+        assert_eq!(
+            decoded_recipient,
+            module.cfg.consensus.residual_recovery_recipient
+        );
+        assert_eq!(
+            decoded_amount,
+            alloy::primitives::U256::from(expected_amount)
+        );
+
+        // Op sender is the deposit account, at its record nonce (1), no
+        // (re)deploy.
+        assert_eq!(pending.op.sender, account);
+        assert_eq!(pending.op.nonce, alloy::primitives::U256::from(1u64));
+        assert!(pending.op.init_code.is_empty());
+
+        // A signing session was started for this op.
+        let op_hash = *op_hash;
+        let sessions: Vec<(SigningSessionKey, SigningSession)> = dbtx
+            .to_ref_nc()
+            .find_by_prefix(&SigningSessionPrefix)
+            .await
+            .collect()
+            .await;
+        assert!(
+            sessions
+                .iter()
+                .any(|(_, s)| s.purpose == SigningPurpose::UserOp(op_hash)),
+            "a signing session must be started for the recovery op"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// Finding A: confirming a `RecoverResidual` op advances the deposit
+    /// account's `SimpleAccount` nonce (so a later op is not built at a
+    /// consumed nonce) but touches NOTHING else -- `PoolState.balance` and the
+    /// record's `swept`/`credited` are unchanged (the recovered ETH is
+    /// broadcaster gas, not pool USDT).
+    #[tokio::test]
+    async fn recover_residual_confirm_advances_deposit_nonce_without_pool_change() {
+        let recipient = EvmAddress([0x99; 20]);
+        let module = test_module_with_recovery_recipient(4, 0, recipient).await;
+        let db = module.db_for_test();
+
+        let claim_pk = test_pubkey(0xc1);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        let amount = UsdtAmount(2_000_000);
+        insert_swept_deposit_record(db, account, claim_pk, amount).await;
+
+        let pool_before = UsdtAmount(9_999_999);
+        let op_hash = [0xcd; 32];
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: pool_before,
+                    nonce: 0,
+                },
+            )
+            .await;
+            let mut op = sample_unsigned_user_op_for_test();
+            op.sender = account;
+            op.nonce = alloy::primitives::U256::from(1u64);
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: op,
+                        signature: vec![0xaa; 65],
+                    },
+                    purpose: UserOpPurpose::RecoverResidual { account },
+                    submitted_block: 1,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UserOpConfirmedObservation {
+            success: true,
+            block: 10,
+            block_hash: [0x01; 32],
+            swept: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
+        };
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .apply_user_op_confirmed(&mut dbtx.to_ref_nc(), op_hash, &obs)
+            .await;
+
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record present");
+        assert_eq!(
+            record.nonce, 2,
+            "recovery confirm advances the deposit nonce"
+        );
+        assert_eq!(record.swept, amount, "swept must be unchanged by recovery");
+        assert_eq!(
+            record.credited, amount,
+            "credited must be unchanged by recovery"
+        );
+
+        let pool = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("pool present");
+        assert_eq!(
+            pool.balance, pool_before,
+            "pool balance must be untouched by residual recovery"
+        );
+
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(op_hash))
+                .await
+                .is_none(),
+            "the confirmed recovery op must be cleared"
+        );
+        dbtx.commit_tx().await;
+    }
+
     /// **Security finding 02, adversarial (misc #14).** The finding's core
     /// attack: many freshly-derived deposit accounts each receive a tiny
     /// (1-raw-unit) dust credit and are never claimed. Before this fix,
@@ -15235,6 +16091,11 @@ mod tests {
             },
         )
         .await;
+        dbtx.insert_new_entry(
+            &RecoverResidualVoteKey(EvmAddress([0x63; 20]), PeerId::from(0)),
+            &5_000_000_000_000_000u64,
+        )
+        .await;
 
         dbtx.commit_tx().await;
 
@@ -15264,6 +16125,7 @@ mod tests {
             "Withdrawal Incurred Fees",
             "Block Hash Ring",
             "Block Hash Votes",
+            "Recover Residual Votes",
         ];
         assert_eq!(
             dumped.len(),

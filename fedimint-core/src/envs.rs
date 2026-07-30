@@ -106,6 +106,18 @@ pub const FM_USDT_BROADCASTER_PRIVATE_KEY_FILE_ENV: &str = "FM_USDT_BROADCASTER_
 /// (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.
 pub const FM_USDT_ETH_USD_PRICE_FEED_ENV: &str = "FM_USDT_ETH_USD_PRICE_FEED";
 
+/// Overrides the USDT module's `residual_recovery_recipient` config-gen param
+/// (a 0x-prefixed 20-byte hex EVM address) for the config-gen leader.
+///
+/// This is the DETERMINISTIC recipient the federation withdraws stranded,
+/// single-use deposit-account `EntryPoint` gas deposits to (finding A). Every
+/// guardian builds the byte-identical `EntryPoint.withdrawTo(recipient,
+/// amount)` recovery op, so it must be a consensus-agreed value -- the
+/// per-guardian broadcaster EOA is non-deterministic and cannot be used.
+/// Typically the federation's broadcaster-refill/treasury address. Defaults to
+/// the placeholder zero address (accepted only on dev chains).
+pub const FM_USDT_RESIDUAL_RECOVERY_RECIPIENT_ENV: &str = "FM_USDT_RESIDUAL_RECOVERY_RECIPIENT";
+
 /// Overrides the USDT module's `chain_id` config-gen param for the config-gen
 /// leader (a decimal EVM chain id, e.g. `11155111` for Sepolia).
 ///

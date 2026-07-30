@@ -2374,6 +2374,23 @@ mod fedimint_migration_tests {
                         );
                         info!("Validated BlockHashVote (new prefix, empty)");
                     }
+                    DbKeyPrefix::RecoverResidualVote => {
+                        // Finding A: a brand-new per-peer residual-recovery vote
+                        // prefix, like `BlockHashVote` above -- the pre-migration
+                        // v0 snapshot predates it and no migration writes to it,
+                        // so it must read back cleanly as EMPTY.
+                        let votes = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::RecoverResidualVotePrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(
+                            votes.is_empty(),
+                            "RecoverResidualVote is a brand-new prefix; the pre-migration v0 \
+                             snapshot must not contain any rows for it"
+                        );
+                        info!("Validated RecoverResidualVote (new prefix, empty)");
+                    }
                 }
             }
 

@@ -183,6 +183,7 @@ async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint(
         // ETH/USD price-feed plan).
         eth_usd_price_feed: EvmAddress([0u8; 20]),
         price_feed_max_staleness_secs: 14_400,
+        residual_recovery_recipient: EvmAddress([0u8; 20]),
     };
 
     // Crediting is now proof-driven, and a deposit-by-proof submission credits

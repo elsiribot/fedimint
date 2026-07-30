@@ -325,6 +325,7 @@ pub(crate) async fn distributed_gen(
             broadcaster_min_balance_wei: params.broadcaster_min_balance_wei,
             eth_usd_price_feed: params.eth_usd_price_feed,
             price_feed_max_staleness_secs: params.price_feed_max_staleness_secs,
+            residual_recovery_recipient: params.residual_recovery_recipient,
         },
     })
 }

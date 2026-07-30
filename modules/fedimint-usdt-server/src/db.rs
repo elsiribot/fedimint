@@ -111,6 +111,16 @@ pub enum DbKeyPrefix {
     /// IDENTICAL `(height, block_hash)` pair, `write_block_hash_ring` persists
     /// it into the [`Self::BlockHashRing`] window (see [`BlockHashVoteKey`]).
     BlockHashVote = 0x14,
+    /// Per-peer, per-account votes on a fully-swept, single-use deposit
+    /// account's observed on-chain `EntryPoint` gas deposit (finding A),
+    /// mirroring [`Self::DepositObservationVote`]'s dual-prefix,
+    /// per-`(account, peer)` shape. Once at least a threshold of peers have
+    /// voted for one account, `Usdt::process_consensus_item`'s
+    /// `RecoverResidual` arm takes the threshold-MEDIAN `deposit_wei` and
+    /// (if it clears the op's own gas need) enqueues the recovery op (see
+    /// [`RecoverResidualVoteKey`]). A new keyspace that starts empty and
+    /// fills at runtime -- no migration.
+    RecoverResidualVote = 0x15,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -230,6 +240,33 @@ impl_db_lookup!(
     key = DepositObservationVoteKey,
     query_prefix = DepositObservationVotePrefix,
     query_prefix = DepositObservationVoteAccountPrefix,
+);
+
+/// A single peer's vote on a fully-swept deposit account's observed on-chain
+/// `EntryPoint` gas deposit, in wei (finding A residual recovery). The
+/// `EvmAddress` is ordered first so [`RecoverResidualVoteAccountPrefix`] can
+/// look up every peer's vote for one account, mirroring
+/// [`DepositObservationVoteKey`]'s dual-prefix shape. The stored `u64` is the
+/// observed `deposit_wei` (the codebase's wire representation for wei; a
+/// single-op gas deposit is far below `u64::MAX` wei).
+#[derive(Debug, Clone, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct RecoverResidualVoteKey(pub EvmAddress, pub PeerId);
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct RecoverResidualVotePrefix;
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+pub struct RecoverResidualVoteAccountPrefix(pub EvmAddress);
+
+impl_db_record!(
+    key = RecoverResidualVoteKey,
+    value = u64,
+    db_prefix = DbKeyPrefix::RecoverResidualVote,
+);
+impl_db_lookup!(
+    key = RecoverResidualVoteKey,
+    query_prefix = RecoverResidualVotePrefix,
+    query_prefix = RecoverResidualVoteAccountPrefix,
 );
 
 /// What a signing session's digest is being signed for. Deterministically
@@ -379,6 +416,15 @@ pub enum UserOpPurpose {
     /// covers even after some of them may have been superseded/re-queued by
     /// a later batch.
     Withdraw { outpoints: Vec<OutPoint> },
+    /// Recovers a fully-swept, single-use deposit account's stranded on-chain
+    /// `EntryPoint` gas deposit (finding A): a `withdrawTo(recipient, amount)`
+    /// `UserOp` on the deposit `account` sending its residual `EntryPoint`
+    /// balance to the deterministic `residual_recovery_recipient` consensus
+    /// config address. Unlike `DeployAndSweep`/`Withdraw`, a confirmed
+    /// `RecoverResidual` op moves broadcaster gas, not pool USDT, so
+    /// `apply_user_op_confirmed` advances the account's `SimpleAccount` nonce
+    /// but does NOT touch `PoolState.balance`/`swept`.
+    RecoverResidual { account: EvmAddress },
 }
 
 /// A `UserOp` deterministically built from consensus DB state and enqueued
