@@ -564,6 +564,19 @@ impl AlloyEvmRpc {
 /// feed is configured (e.g. local anvil). A real deployment configures a feed.
 const STATIC_USDT_PER_ETH_E6: u64 = 3_000_000_000;
 
+/// Extra percentage the `submit_user_ops` auto-prefund adds on top of `need`
+/// (finding A1). `need` is already worst-case: worst-case gas *limits*
+/// (`verificationGasLimit + callGasLimit + preVerificationGas`) priced at a
+/// `2x`-headroom `maxFeePerGas` (see `GasBounds::with_median_fees`,
+/// `user_op.rs:180-188`). The `EntryPoint` only *requires* `need` (1x) to be
+/// present at validation time, so this margin is not a buffer against
+/// underfunding -- it's a small cushion against fee/gas drift between reading
+/// the sender's deposit here and the op's on-chain inclusion. Whatever of it
+/// goes unused strands in the sender's single-use deposit account; the
+/// residual is recovered later by the batched sweep (finding A2), so this is
+/// kept small.
+const PREFUND_MARGIN_PERCENT: u128 = 5;
+
 #[async_trait::async_trait]
 impl IServerEvmRpc for AlloyEvmRpc {
     async fn get_chain_id(&self) -> anyhow::Result<u64> {
@@ -867,9 +880,12 @@ impl IServerEvmRpc for AlloyEvmRpc {
                     .saturating_add(U256::from(u.call_gas_limit))
                     .saturating_add(u.pre_verification_gas);
                 let need = total_gas.saturating_mul(U256::from(u.max_fee_per_gas));
-                // Safety margin (need * 1.5) to absorb fee/estimate drift
+                // Small drift cushion (see `PREFUND_MARGIN_PERCENT`) on top of
+                // an already-worst-case `need`, to absorb fee/estimate drift
                 // between now and inclusion.
-                let need_with_margin = need.saturating_add(need / U256::from(2u8));
+                let need_with_margin = need.saturating_add(
+                    need.saturating_mul(U256::from(PREFUND_MARGIN_PERCENT)) / U256::from(100u8),
+                );
 
                 // Read the sender's current EntryPoint *deposit* FIRST (a call,
                 // no tx) so the common already-funded case sends no extra tx and
