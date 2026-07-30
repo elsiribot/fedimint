@@ -43,6 +43,9 @@ struct State {
     submitted_user_ops: Vec<Vec<SignedUserOp>>,
     /// Scripted `get_user_op_receipt` responses, keyed by `user_op_hash`.
     user_op_receipts: HashMap<[u8; 32], UserOpReceipt>,
+    /// Scripted `get_entrypoint_deposit` responses (wei), keyed by `account`
+    /// (finding A residual recovery). An unscripted account reads as `0`.
+    entrypoint_deposits: HashMap<EvmAddress, u128>,
     /// Scripted `get_block_hash` overrides, keyed by block number. An
     /// unscripted block falls back to a deterministic block-number-derived
     /// hash (see [`mock_block_hash`]) so every guardian agrees on a stable,
@@ -94,6 +97,7 @@ impl Default for State {
             submitted_user_ops: Vec::new(),
             user_op_receipts: HashMap::new(),
             block_hashes: HashMap::new(),
+            entrypoint_deposits: HashMap::new(),
         }
     }
 }
@@ -230,6 +234,13 @@ impl MockEvmRpc {
         self.lock().block_hashes.insert(block, hash);
     }
 
+    /// Scripts the on-chain `EntryPoint` gas deposit (wei)
+    /// [`IServerEvmRpc::get_entrypoint_deposit`] returns for `account`
+    /// (finding A residual recovery). An unscripted account reads as `0`.
+    pub fn set_entrypoint_deposit(&self, account: EvmAddress, deposit_wei: u128) {
+        self.lock().entrypoint_deposits.insert(account, deposit_wei);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -352,6 +363,15 @@ impl IServerEvmRpc for MockEvmRpc {
     ) -> anyhow::Result<Option<UserOpReceipt>> {
         Ok(self.lock().user_op_receipts.get(&user_op_hash).copied())
     }
+
+    async fn get_entrypoint_deposit(&self, account: EvmAddress) -> anyhow::Result<u128> {
+        Ok(self
+            .lock()
+            .entrypoint_deposits
+            .get(&account)
+            .copied()
+            .unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +407,29 @@ mod tests {
                 .await
                 .expect("mock reads never fail"),
             UsdtAmount(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn entrypoint_deposit_round_trips_and_defaults_to_zero() {
+        let mock = MockEvmRpc::new();
+        let account = EvmAddress([0x07; 20]);
+        let unknown = EvmAddress([0x08; 20]);
+
+        // An unscripted account reads as zero.
+        assert_eq!(
+            mock.get_entrypoint_deposit(unknown)
+                .await
+                .expect("mock reads never fail"),
+            0
+        );
+
+        mock.set_entrypoint_deposit(account, 1_234_567_890_123_456u128);
+        assert_eq!(
+            mock.get_entrypoint_deposit(account)
+                .await
+                .expect("mock reads never fail"),
+            1_234_567_890_123_456u128
         );
     }
 
