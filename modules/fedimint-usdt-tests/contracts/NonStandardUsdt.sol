@@ -60,11 +60,18 @@ pragma solidity ^0.8.24;
 ///    fidelity but are inert here (`deprecated == false`, nobody blacklisted),
 ///    so they never affect the transfer path this fixture is testing.
 contract NonStandardUsdt {
-    string public name = "Tether USD";
-    string public symbol = "USDT";
-    uint8 public decimals = 6;
+    // `constant` so they occupy NO storage slots -- this places `balanceOf` on
+    // storage slot 2 below, matching mainnet USDT (TetherToken) and
+    // `fedimint_usdt_common::USDT_BALANCES_SLOT`. The deposit-by-proof path
+    // reads the balances mapping by that RAW slot (via `eth_getProof`).
+    string public constant name = "Tether USD";
+    string public constant symbol = "USDT";
+    uint8 public constant decimals = 6;
 
     uint256 public totalSupply;
+
+    // Padding so `balanceOf` lands on storage slot 2 (see above).
+    uint256 private _slot1Reserved;
 
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;

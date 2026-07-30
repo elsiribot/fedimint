@@ -77,12 +77,14 @@ use fedimint_core::PeerId;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
 use fedimint_core::runtime::{Instant, sleep};
-use fedimint_mint_client::MintClientInit;
-use fedimint_mint_server::MintInit;
+use fedimint_mintv2_client::MintClientInit as Mintv2ClientInit;
+use fedimint_mintv2_common::KIND as MINTV2_KIND;
+use fedimint_mintv2_common::config::MintGenParams;
+use fedimint_mintv2_server::MintInit as Mintv2Init;
 use fedimint_testing::federation::FederationTest;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_usdt_client::{UsdtClientInit, UsdtClientModule};
-use fedimint_usdt_common::{EvmAddress, UsdtAmount, UsdtGenParams, UserOpStatus};
+use fedimint_usdt_common::{EvmAddress, USDT_UNIT, UsdtAmount, UsdtGenParams, UserOpStatus};
 use fedimint_usdt_server::UsdtInit;
 use fedimint_usdt_server::db::{PendingUserOpKey, PendingUserOpPrefix};
 use fedimint_usdt_server::rpc::{AlloyEvmRpc, IServerEvmRpc};
@@ -131,7 +133,6 @@ async fn find_sole_pending_user_op_hash(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "re-enable in Task 11 (anvil e2e drives the client eth_getProof submit flow)"]
 async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint()
 -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {
@@ -184,12 +185,26 @@ async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint(
         price_feed_max_staleness_secs: 14_400,
     };
 
-    let fed = Fixtures::new_primary(MintClientInit, MintInit)
+    // Crediting is now proof-driven, and a deposit-by-proof submission credits
+    // AND mints the proven balance in one transaction (see
+    // `UsdtClientModule::submit_deposit_proof`) -- so this federation needs a
+    // `mintv2` instance registered as the `USDT_UNIT` primary module (mirroring
+    // `withdraw_e2e.rs`/`tests.rs`'s `dual_mint_fixtures`) for the proof input
+    // to balance; the previous plain `mint`-primary fixture (which never minted
+    // e-cash) could not credit a proof at all.
+    let fed = Fixtures::new_primary(Mintv2ClientInit, Mintv2Init)
+        .with_extra_module_instance(
+            MINTV2_KIND,
+            MintGenParams {
+                amount_unit: USDT_UNIT,
+            },
+        )
         .with_module(
             UsdtClientInit,
             UsdtInit::with_evm_rpc(evm_rpc.clone()).with_gen_params(gen_params),
         )
         .new_fed_builder(0)
+        .disable_mint_fees()
         .build()
         .await;
 
@@ -271,11 +286,16 @@ async fn deposit_account_is_deployed_and_swept_via_real_mpc_and_real_entrypoint(
             .context("failed to mine an anvil block past the funding transfer")?;
     }
 
-    // 7. Poll until the federation credits the deposit.
-    // TODO(Task 11): crediting is now proof-driven -- drive the client's
-    // `submit_deposit_proof` (real `eth_getProof` against anvil) here instead of
-    // the removed `check_deposit` guardian-poll trigger (this anvil e2e test is
-    // `#[ignore]`d until Task 11 wires that up).
+    // 7. Credit the deposit by driving the REAL client `eth_getProof` submit flow
+    //    against the e2e anvil -- NO guardian `balanceOf` poll anywhere (the
+    //    scanner is gone; crediting is proof-only). `allocate_deposit` above handed
+    //    out seed-derivation index 0 (the first allocation), so
+    //    `submit_deposit_proof(0, ..)` re-derives the SAME claim key/account and
+    //    credits + mints the proven balance in one no-fee transaction.
+    common::credit_deposit_via_anvil_proof(&usdt, &anvil, 0, Duration::from_secs(180)).await?;
+
+    // The proof credited the account's high-water `credited` to the full
+    // deposited balance, which the automatic deploy-and-sweep below consumes.
     let credited_deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let status = usdt.deposit_status(claim_keypair.public_key()).await?;

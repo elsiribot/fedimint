@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 
+use alloy::providers::{Provider as _, ProviderBuilder};
 use alloy_consensus::Header;
 use alloy_primitives::{B256, U256, keccak256};
 use alloy_rlp::Encodable as _;
@@ -29,6 +30,7 @@ use fedimint_core::secp256k1::Keypair;
 use fedimint_usdt_client::UsdtClientModule;
 use fedimint_usdt_common::{DepositProof, EvmAddress, UsdtAmount, balances_storage_key};
 
+use super::anvil::AnvilHandle;
 use super::mock::MockEvmRpc;
 
 /// Builds a synthetic single-leaf MPT deposit proof the real
@@ -149,6 +151,69 @@ pub async fn credit_deposit_via_proof(
                     ));
                 }
                 sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+}
+
+/// Live-chain (`anvil`) analogue of [`credit_deposit_via_proof`]: drives the
+/// REAL client `eth_getProof` submit flow
+/// ([`UsdtClientModule::submit_deposit_proof`]) against the e2e `anvil` node,
+/// crediting AND minting the deposit at seed-derivation `index` with NO fee.
+///
+/// Unlike the hermetic helper (which scripts a `MockEvmRpc`'s block hash and
+/// hands the server a synthetic proof), this points the client at `anvil`'s own
+/// JSON-RPC: the client asks the federation for its newest anchored,
+/// confirmation-deep block ([`UsdtClientModule::latest_anchored_block`]),
+/// fetches a real `eth_getProof`/`eth_getBlockByNumber` for it, self-checks the
+/// reconstructed header hashes to the block hash, and submits the proof -- with
+/// NO guardian `balanceOf` poll anywhere in the loop (the scanner is gone;
+/// crediting is proof-only).
+///
+/// The guardians' block-hash observer anchors the ring from `anvil` on a ~1s
+/// poll, and `anvil`'s instant-mine head only advances on a transaction, so
+/// this MINES a few empty blocks each attempt to push the head (and hence the
+/// ring's newest confirmation-deep anchor) at/past the funding transfer, then
+/// retries the submit until the anchored block is one where the deposit balance
+/// is present and the proof verifies.
+pub async fn credit_deposit_via_anvil_proof(
+    usdt: &UsdtClientModule,
+    anvil: &AnvilHandle,
+    index: u64,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let provider = ProviderBuilder::new().connect_http(
+        anvil
+            .url()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid anvil url {}: {e}", anvil.url()))?,
+    );
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        // Advance the real chain head so the guardians re-anchor a newer
+        // confirmation-deep block (one at/after the funding transfer) and the
+        // client's proof lands where the balance is present.
+        for _ in 0..3u32 {
+            provider
+                .raw_request::<_, String>("evm_mine".into(), ())
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to mine an anvil block: {e}"))?;
+        }
+
+        match usdt
+            .submit_deposit_proof(index, Some(anvil.url().to_string()))
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    return Err(err.context(
+                        "deposit-by-proof (anvil eth_getProof) submission never succeeded before \
+                         the deadline",
+                    ));
+                }
+                sleep(Duration::from_millis(500)).await;
             }
         }
     }
