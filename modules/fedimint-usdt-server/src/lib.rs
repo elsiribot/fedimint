@@ -16889,7 +16889,16 @@ mod tests {
         // Advance the consensus block count to exactly confirmation-deep.
         seed_block_count_votes(&db, 4, receipt_block + confirmation_depth).await;
 
-        let deadline = fedimint_core::time::now() + Duration::from_secs(10);
+        // Budget the wait to cover the submitter's NEXT tick under BOTH test
+        // runners. Under `cargo nextest` (CI) the `NEXTEST` env var makes
+        // `is_running_in_test_env()` true, so `poll_interval_secs()` is 1s and
+        // the proposal appears within ~1 tick. Under plain `cargo test` that
+        // check is false -- `fedimint-core`'s `cfg!(test)` is false when it is
+        // compiled as a *dependency*, and `NEXTEST` is unset -- so the interval
+        // falls back to the DEFAULT_POLL_INTERVAL_SECS (15s), and the next tick
+        // lands at ~15s. A 25s budget passes under either runner, and the loop
+        // breaks the instant the proposal appears (so nextest stays fast).
+        let deadline = fedimint_core::time::now() + Duration::from_secs(25);
         loop {
             if let Some(p) = proposals.lock().expect("not poisoned").first().cloned() {
                 assert_eq!(p.op_hash, op_hash);
