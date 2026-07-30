@@ -30,6 +30,14 @@ alloy::sol! {
     interface IERC20Transfer {
         function transfer(address to, uint256 amount) external returns (bool);
     }
+
+    // Finding A (residual recovery): the ERC-4337 `EntryPoint`'s gas-deposit
+    // withdrawal. Only its ABI encoding (`withdrawToCall`) is used here, to
+    // build the inner calldata a fully-swept deposit account's recovery op
+    // wraps in `SimpleAccount.execute` (see `build_recover_residual_userop`).
+    interface IEntryPointWithdraw {
+        function withdrawTo(address payable withdrawAddress, uint256 amount) external;
+    }
 }
 
 /// Conservative, static gas bounds for a v0.7 `UserOp`. Gas *estimation*
@@ -144,6 +152,38 @@ impl GasBounds {
             max_fee_per_gas: 30_000_000_000,
         }
     }
+
+    /// Sized for a residual-recovery `UserOp` (finding A): a single
+    /// `SimpleAccount.execute` wrapping one `EntryPoint.withdrawTo` on a
+    /// fully-swept, ALREADY-DEPLOYED single-use deposit account. Fixed bounds
+    /// (one call, no batch, never `needs_deploy`), deliberately generous like
+    /// the sweep bounds (the `EntryPoint` refunds unused gas). Reasoning:
+    /// - `verification_gas_limit = 100_000`: signature check only (the account
+    ///   is already deployed), matching `withdrawal_batch`'s non-deploy case.
+    /// - `call_gas_limit = 60_000`: one `execute` dispatch wrapping
+    ///   `withdrawTo` (a balance-decrement + ETH send, ~30k, doubled for
+    ///   `execute`'s dispatch overhead).
+    /// - `pre_verification_gas = 100_000`: same generous fixed
+    ///   calldata/overhead allowance as the sweep bounds.
+    /// - fee fields are placeholders overwritten by [`Self::with_median_fees`].
+    pub const RECOVER_RESIDUAL_DEVNET: GasBounds = GasBounds {
+        verification_gas_limit: 100_000,
+        call_gas_limit: 60_000,
+        pre_verification_gas: 100_000,
+        max_priority_fee_per_gas: 1_500_000_000,
+        max_fee_per_gas: 30_000_000_000,
+    };
+
+    /// Total gas *units* a residual-recovery op provisions
+    /// ([`Self::RECOVER_RESIDUAL_DEVNET`]'s three gas-limit fields summed).
+    /// Exposed as a constant so the consensus recovery path can compute the
+    /// op's own worst-case gas `need` (`RECOVER_RESIDUAL_GAS_UNITS *
+    /// max_fee_per_gas`) it must leave behind in the account's deposit, without
+    /// re-summing the bound fields at the call site.
+    pub const RECOVER_RESIDUAL_GAS_UNITS: u128 = Self::RECOVER_RESIDUAL_DEVNET
+        .verification_gas_limit
+        + Self::RECOVER_RESIDUAL_DEVNET.call_gas_limit
+        + Self::RECOVER_RESIDUAL_DEVNET.pre_verification_gas;
 
     /// Lower bound applied to a median-derived `max_fee_per_gas` so an idle or
     /// zero-median chain still yields an includable op (1 gwei).
@@ -327,6 +367,103 @@ pub fn decode_transfer_amount(op: &UnsignedUserOp) -> anyhow::Result<UsdtAmount>
     let amount = u64::try_from(transfer.amount).context("transfer() amount overflows u64")?;
 
     Ok(UsdtAmount(amount))
+}
+
+/// Parameters for [`build_recover_residual_userop`] (finding A), grouped into
+/// one struct per this workspace's convention (mirroring
+/// [`DeployAndSweepParams`]).
+#[derive(Debug, Clone)]
+pub struct RecoverResidualParams {
+    /// The fully-swept, single-use deposit account whose stranded `EntryPoint`
+    /// gas deposit is being recovered -- the op's `sender`. Already deployed
+    /// (it did its one deploy-and-sweep op), so this op never carries
+    /// `initCode`.
+    pub deposit_account: EvmAddress,
+    /// The configured ERC-4337 `EntryPoint`
+    /// (`UsdtConfigConsensus::entry_point`) whose `withdrawTo` the op calls
+    /// -- the `execute` target.
+    pub entry_point: EvmAddress,
+    /// The DETERMINISTIC recipient the residual is withdrawn to
+    /// (`UsdtConfigConsensus::residual_recovery_recipient`).
+    pub recipient: EvmAddress,
+    /// The amount of the account's `EntryPoint` deposit to withdraw, in wei
+    /// (the agreed deposit minus the op's own gas `need` with margin -- see
+    /// `Usdt::process_consensus_item`'s `RecoverResidual` arm).
+    pub amount_wei: u128,
+    /// This op's `EntryPoint` nonce. A single-use deposit account submits
+    /// exactly one op before this (its deploy-and-sweep, nonce `0`), so this is
+    /// deterministically `1`; the caller passes it explicitly like the sweep
+    /// path.
+    pub nonce: U256,
+    /// Hook for a future token-paymaster's `paymasterAndData`; empty here
+    /// (broadcaster-EOA-fronted gas, matching
+    /// [`DeployAndSweepParams::paymaster_and_data`]).
+    pub paymaster_and_data: Vec<u8>,
+    pub gas_bounds: GasBounds,
+}
+
+/// Builds the [`UnsignedUserOp`] that recovers `params.deposit_account`'s
+/// stranded `EntryPoint` gas deposit (finding A):
+/// - `sender = params.deposit_account`, `initCode` empty (already deployed).
+/// - `callData = SimpleAccount.execute(entry_point, 0,
+///   EntryPoint.withdrawTo(recipient, amount_wei))`.
+/// - `paymasterAndData = params.paymaster_and_data` (empty).
+/// - Gas fields from `params.gas_bounds`.
+///
+/// Pure function: no RPC, no consensus DB -- consensus logic calls this from
+/// `(consensus DB, config)` alone, so every guardian builds the byte-identical
+/// op (essential, since the op's fields are part of the signed `userOpHash`).
+#[must_use]
+pub fn build_recover_residual_userop(params: RecoverResidualParams) -> UnsignedUserOp {
+    let withdraw_calldata = IEntryPointWithdraw::withdrawToCall {
+        withdrawAddress: Address::from(params.recipient.0),
+        amount: U256::from(params.amount_wei),
+    }
+    .abi_encode();
+
+    let call_data = ISimpleAccount::executeCall {
+        dest: Address::from(params.entry_point.0),
+        value: U256::ZERO,
+        func: Bytes::from(withdraw_calldata),
+    }
+    .abi_encode();
+
+    UnsignedUserOp {
+        sender: params.deposit_account,
+        nonce: params.nonce,
+        init_code: Vec::new(),
+        call_data,
+        verification_gas_limit: params.gas_bounds.verification_gas_limit,
+        call_gas_limit: params.gas_bounds.call_gas_limit,
+        pre_verification_gas: U256::from(params.gas_bounds.pre_verification_gas),
+        max_priority_fee_per_gas: params.gas_bounds.max_priority_fee_per_gas,
+        max_fee_per_gas: params.gas_bounds.max_fee_per_gas,
+        paymaster_and_data: params.paymaster_and_data,
+    }
+}
+
+/// Decodes the `(withdrawAddress, amount)` of the `EntryPoint.withdrawTo`
+/// embedded in a residual-recovery [`UnsignedUserOp`]'s `call_data` (a
+/// `SimpleAccount.execute(entry_point, 0, withdrawTo(recipient, amount))` call
+/// -- see [`build_recover_residual_userop`]). Returns `(execute_dest,
+/// recipient, amount_wei)`.
+///
+/// # Errors
+///
+/// Returns an error if `op.call_data` is not a valid `execute()` call wrapping
+/// a valid `withdrawTo()` call.
+pub fn decode_recover_residual(
+    op: &UnsignedUserOp,
+) -> anyhow::Result<(EvmAddress, EvmAddress, U256)> {
+    let execute = ISimpleAccount::executeCall::abi_decode(&op.call_data)
+        .context("call_data is not a valid execute() call")?;
+    let withdraw = IEntryPointWithdraw::withdrawToCall::abi_decode(&execute.func)
+        .context("execute()'s func arg is not a valid withdrawTo() call")?;
+    Ok((
+        EvmAddress(execute.dest.into()),
+        EvmAddress(withdraw.withdrawAddress.into()),
+        withdraw.amount,
+    ))
 }
 
 /// Parameters for [`build_withdrawal_batch_userop`] (Phase 8, Task 2),
@@ -677,6 +814,49 @@ mod tests {
         let deposit_account = params.deposit_account;
         let op = build_deploy_and_sweep_userop(params);
         assert_eq!(op.sender, deposit_account);
+    }
+
+    #[test]
+    fn recover_residual_builds_execute_wrapped_withdraw_to() {
+        let deposit_account = EvmAddress([0x11; 20]);
+        let entry_point = EvmAddress([0x22; 20]);
+        let recipient = EvmAddress([0x33; 20]);
+        let amount_wei = 4_200_000_000_000_000u128;
+
+        let op = build_recover_residual_userop(RecoverResidualParams {
+            deposit_account,
+            entry_point,
+            recipient,
+            amount_wei,
+            nonce: U256::from(1u64),
+            paymaster_and_data: Vec::new(),
+            gas_bounds: GasBounds::RECOVER_RESIDUAL_DEVNET.with_median_fees(Some(2_000_000_000)),
+        });
+
+        // sender is the deposit account; a fully-swept account is already
+        // deployed, so there is no initCode.
+        assert_eq!(op.sender, deposit_account);
+        assert!(op.init_code.is_empty(), "recovery op must not (re)deploy");
+
+        // callData decodes to execute(entry_point, 0, withdrawTo(recipient,
+        // amount_wei)).
+        let execute = ISimpleAccount::executeCall::abi_decode(&op.call_data)
+            .expect("call_data must be a valid execute() call");
+        assert_eq!(execute.dest, Address::from(entry_point.0));
+        assert_eq!(execute.value, U256::ZERO);
+        let (dest, decoded_recipient, decoded_amount) =
+            decode_recover_residual(&op).expect("recovery op must decode");
+        assert_eq!(dest, entry_point);
+        assert_eq!(decoded_recipient, recipient);
+        assert_eq!(decoded_amount, U256::from(amount_wei));
+    }
+
+    #[test]
+    fn recover_residual_gas_units_matches_bound_sum() {
+        assert_eq!(
+            GasBounds::RECOVER_RESIDUAL_GAS_UNITS,
+            GasBounds::RECOVER_RESIDUAL_DEVNET.total_gas_units()
+        );
     }
 
     #[test]

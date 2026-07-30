@@ -173,6 +173,15 @@ pub struct UsdtConfigConsensus {
     /// abstains (see
     /// `fedimint_usdt_common::UsdtGenParams::price_feed_max_staleness_secs`).
     pub price_feed_max_staleness_secs: u64,
+    /// The DETERMINISTIC recipient the federation withdraws stranded
+    /// deposit-account `EntryPoint` gas deposits to (finding A). Every guardian
+    /// builds the byte-identical `EntryPoint.withdrawTo(recipient, amount)`
+    /// recovery op, so this MUST be a consensus-agreed value -- the
+    /// per-guardian broadcaster EOA
+    /// (`UsdtConfigLocal::broadcaster_private_key`) is non-deterministic
+    /// and cannot be the recipient of a threshold-signed op.
+    /// See `fedimint_usdt_common::UsdtGenParams::residual_recovery_recipient`.
+    pub residual_recovery_recipient: EvmAddress,
 }
 
 // Wire together the configs for this module

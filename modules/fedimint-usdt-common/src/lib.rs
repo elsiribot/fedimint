@@ -104,7 +104,23 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// deterministic apply-path BEHAVIOR change only: no consensus-serialized type,
 /// wire shape, or DB record layout changed, so there is no
 /// `get_database_migrations` entry/snapshot for this bump.
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 10);
+///
+/// Bumped to `0.11` (finding A): batched recovery of stranded `EntryPoint` gas
+/// deposits. Single-use deposit accounts are deployed and swept once and then
+/// abandoned, but the ERC-4337 `EntryPoint` gas deposit funding that
+/// deploy-and-sweep op is left stranded in the account's `EntryPoint` balance.
+/// The federation now automatically recovers that residual by building a
+/// threshold-signed op that calls `EntryPoint.withdrawTo(recipient, amount)`
+/// and sends the residual to a DETERMINISTIC recipient. On the wire,
+/// [`UsdtConsensusItem`] gained a `RecoverResidual` variant (a per-peer
+/// observation vote of a swept account's on-chain `EntryPoint` deposit) and
+/// `UserOpPurpose` gained a `RecoverResidual` variant (both append-only); the
+/// consensus config gained a `residual_recovery_recipient` `EvmAddress` field
+/// (the per-guardian broadcaster is non-deterministic and cannot be the
+/// recipient of a threshold-signed op). No DB migration; the new enum variants
+/// are append-only and no keyspace changed. Existing feds must be reconfigured
+/// to set the new consensus field.
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 11);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///
@@ -1309,6 +1325,16 @@ pub struct UsdtGenParams {
     /// abstains. ~1h heartbeat feeds -> 4h default is comfortably above
     /// cadence.
     pub price_feed_max_staleness_secs: u64,
+    /// The DETERMINISTIC recipient EVM address the federation withdraws
+    /// stranded deposit-account `EntryPoint` gas deposits to (finding A).
+    /// Every guardian builds the byte-identical
+    /// `EntryPoint.withdrawTo(recipient, amount)` recovery op, so the
+    /// recipient MUST be a consensus-agreed value; the per-guardian
+    /// broadcaster EOA (`UsdtConfigLocal::broadcaster_private_key`)
+    /// is non-deterministic and cannot be used. Typically set to the
+    /// federation's broadcaster-refill/treasury address. Placeholder (zero
+    /// address) on dev chains; real deployments must override.
+    pub residual_recovery_recipient: EvmAddress,
 }
 
 impl Default for UsdtGenParams {
@@ -1328,6 +1354,7 @@ impl Default for UsdtGenParams {
                 "5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"
             )),
             price_feed_max_staleness_secs: 14_400,
+            residual_recovery_recipient: EvmAddress([0u8; 20]),
         }
     }
 }
@@ -1373,8 +1400,9 @@ pub const MAX_BROADCASTER_MIN_BALANCE_WEI: u64 = 10_000_000_000_000_000_000;
 /// `0`; if `chain_id` is not a known dev chain and `confirmation_depth` is
 /// below [`MIN_PROD_CONFIRMATION_DEPTH`] without the unsafe-ack env var set;
 /// if `chain_id` is not a known dev chain and any of `usdt_contract`,
-/// `entry_point`, `account_factory`, or `simple_account_impl` is the
-/// placeholder zero address; if `price_feed_max_staleness_secs` is outside
+/// `entry_point`, `account_factory`, `simple_account_impl`, or
+/// `residual_recovery_recipient` is the placeholder zero address; if
+/// `price_feed_max_staleness_secs` is outside
 /// `1..=86_400`; or if `broadcaster_min_balance_wei` is `0` or exceeds
 /// [`MAX_BROADCASTER_MIN_BALANCE_WEI`].
 pub fn validate_usdt_params(p: &UsdtGenParams) -> anyhow::Result<()> {
@@ -1417,6 +1445,13 @@ pub fn validate_usdt_params(p: &UsdtGenParams) -> anyhow::Result<()> {
         ensure!(
             p.simple_account_impl != placeholder,
             "simple_account_impl must not be the placeholder zero address on non-dev chain_id {}",
+            p.chain_id
+        );
+        ensure!(
+            p.residual_recovery_recipient != placeholder,
+            "residual_recovery_recipient must not be the placeholder zero address on non-dev \
+             chain_id {} (stranded EntryPoint gas deposits would be withdrawn to the zero \
+             address and burned)",
             p.chain_id
         );
     }
@@ -1586,6 +1621,37 @@ pub enum UsdtConsensusItem {
     /// is therefore never any single guardian's raw observation; it is a pure
     /// function of the threshold-agreed pair + prior consensus DB.
     BlockHash(BlockHashObservation),
+    /// One guardian's threshold-voted observation of a fully-swept, single-use
+    /// deposit account's stranded on-chain `EntryPoint` gas deposit (finding
+    /// A), mirroring [`Self::Deposit`]'s per-peer observation-vote shape.
+    /// Proposed by `fedimint_usdt_server`'s guardian-local, READ-ONLY residual-
+    /// recovery observer task (it only reads the account's `EntryPoint` balance
+    /// via `IServerEvmRpc::get_entrypoint_deposit` and queues it -- never
+    /// itself a consensus write). `process_consensus_item` stores this
+    /// peer's vote (with a redundancy guard) and, once at least a threshold
+    /// of guardians have proposed observations for the account, takes the
+    /// threshold-MEDIAN `deposit_wei` (so a lone byzantine reporter cannot
+    /// inflate the recovered amount) and — if it exceeds the op's own gas
+    /// need with margin — builds a threshold-signed
+    /// `EntryPoint.withdrawTo(recipient, amount)` op sending the residual
+    /// to the deterministic `residual_recovery_recipient` consensus
+    /// config address. The recovered ETH is broadcaster gas, not USDT pool
+    /// balance, so it never touches `PoolState`. The op-build is a pure
+    /// function of the threshold-agreed `deposit_wei`, the fee-vote median,
+    /// prior consensus DB state, and config -- byte-identical on every
+    /// guardian.
+    RecoverResidual {
+        account: EvmAddress,
+        /// The observed on-chain `EntryPoint` gas deposit of the swept account,
+        /// in wei. Carried as a `u64` (the codebase's wire representation for
+        /// wei, matching `FeeVote::max_fee_per_gas_wei` and
+        /// `broadcaster_min_balance_wei`) -- a single-op gas deposit is far
+        /// below `u64::MAX` wei (~18.4 ETH). The guardian-local observer reads
+        /// the raw balance as `u128` and clamps to this wire type; the
+        /// `process_consensus_item` recovery arm widens back to `u128` for the
+        /// `need`/margin arithmetic.
+        deposit_wei: u64,
+    },
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
@@ -2720,6 +2786,7 @@ mod tests {
             broadcaster_min_balance_wei: 50_000_000_000_000_000,
             eth_usd_price_feed: EvmAddress([0xd0; 20]),
             price_feed_max_staleness_secs: 14_400,
+            residual_recovery_recipient: EvmAddress([0xd1; 20]),
         }
     }
 
@@ -2792,6 +2859,10 @@ mod tests {
         let mut simple_account_impl_zero = valid_prod_params();
         simple_account_impl_zero.simple_account_impl = zero;
         assert!(validate_usdt_params(&simple_account_impl_zero).is_err());
+
+        let mut residual_recipient_zero = valid_prod_params();
+        residual_recipient_zero.residual_recovery_recipient = zero;
+        assert!(validate_usdt_params(&residual_recipient_zero).is_err());
 
         // Same placeholders are fine on a dev chain.
         let dev_zero = UsdtGenParams::default();

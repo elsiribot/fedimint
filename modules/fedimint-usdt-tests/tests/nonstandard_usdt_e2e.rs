@@ -198,6 +198,7 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
         // ETH/USD price-feed plan).
         eth_usd_price_feed: EvmAddress([0u8; 20]),
         price_feed_max_staleness_secs: 14_400,
+        residual_recovery_recipient: EvmAddress([0u8; 20]),
     };
 
     // Crediting is now proof-driven, and a deposit-by-proof submission credits
@@ -425,6 +426,7 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
         // ETH/USD price-feed plan).
         eth_usd_price_feed: EvmAddress([0u8; 20]),
         price_feed_max_staleness_secs: 14_400,
+        residual_recovery_recipient: EvmAddress([0u8; 20]),
     };
 
     let fed = Fixtures::new_primary(Mintv2ClientInit, Mintv2Init)

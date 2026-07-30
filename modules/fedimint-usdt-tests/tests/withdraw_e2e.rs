@@ -195,6 +195,7 @@ async fn withdrawal_is_batched_deployed_and_paid_via_real_mpc_and_real_entrypoin
         // within the feed's fixed `updatedAt` staleness window.
         eth_usd_price_feed: price_feed,
         price_feed_max_staleness_secs: 1_000_000,
+        residual_recovery_recipient: EvmAddress([0u8; 20]),
     };
 
     let fed = Fixtures::new_primary(Mintv2ClientInit, Mintv2Init)
