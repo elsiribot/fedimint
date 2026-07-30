@@ -1006,15 +1006,16 @@ mod tests {
     #[test]
     fn with_median_fees_keeps_the_prefund_affordable_on_a_cheap_mainnet() {
         // The exact regression: at a 1 gwei median the prefund the broadcaster
-        // fronts (need = totalGas * maxFeePerGas, x1.5 margin -- see
-        // rpc.rs::submit_user_ops) is a tiny fraction of an ETH, where the 30
-        // gwei constant produced ~0.036 ETH (which exceeded the test
-        // broadcaster's ~0.0165 ETH and wedged everything).
+        // fronts (need = totalGas * maxFeePerGas, x1.05 margin -- see
+        // rpc.rs::submit_user_ops / PREFUND_MARGIN_PERCENT, finding A1) is a
+        // tiny fraction of an ETH, where the 30 gwei constant produced ~0.036
+        // ETH (which exceeded the test broadcaster's ~0.0165 ETH and wedged
+        // everything).
         let priced = GasBounds::DEPLOY_AND_SWEEP_DEVNET.with_median_fees(Some(1_000_000_000));
         let total_gas =
             priced.verification_gas_limit + priced.call_gas_limit + priced.pre_verification_gas;
         let need = total_gas * priced.max_fee_per_gas;
-        let need_with_margin = need + need / 2;
+        let need_with_margin = need + need * 5 / 100;
         assert!(
             need_with_margin <= 5_000_000_000_000_000, // 0.005 ETH
             "prefund {need_with_margin} wei must stay well under 0.005 ETH on a cheap mainnet"
