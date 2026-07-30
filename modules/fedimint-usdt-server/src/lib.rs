@@ -4976,9 +4976,13 @@ impl Usdt {
     }
 
     /// Turns a terminally-failed withdrawal into a reissued-e-cash refund
-    /// (security finding 09), the shared body of BOTH terminal-`Failed` sites
-    /// ([`Usdt::apply_withdraw_confirmed`]'s isolated-singleton revert and
-    /// [`Usdt::process_replace_user_op`]'s over-ceiling reprice-abort).
+    /// (security finding 09), the body of the sole surviving terminal-`Failed`
+    /// refund site: [`Usdt::apply_withdraw_confirmed`]'s isolated-singleton
+    /// on-chain revert. (Finding B1 removed the second former caller,
+    /// [`Usdt::process_replace_user_op`]'s over-ceiling reprice-abort, which
+    /// now STALLS the still-live op instead of refunding it -- refunding a
+    /// threshold-signed op whose nonce is still unconsumed double-paid on a
+    /// later confirm.)
     ///
     /// The withdrawal's `(amount + max_fee)` e-cash was burned the instant
     /// `process_output` accepted it; here it is reissued MINUS the gas already
@@ -5877,10 +5881,10 @@ impl Usdt {
             UserOpPurpose::Withdraw { outpoints } => {
                 // Ceiling = the sum of the covered withdrawals' committed
                 // `max_fee` (what the users agreed to pay). If the repriced op
-                // would cost more USDT than that, DON'T replace: terminal-fail
-                // every covered withdrawal, reissuing its e-cash as a refund
-                // (security finding 09, via `create_withdrawal_refund`), and
-                // remove the stuck op (+ its votes).
+                // would cost more USDT than that, DON'T replace -- but DON'T
+                // refund either (finding B1): STALL the op (kept live +
+                // superseded) so a later on-chain confirmation still settles it
+                // exactly-once. See the `over_ceiling` block below.
                 let mut ceiling: u64 = 0;
                 for &out_point in outpoints {
                     if let Some(w) = dbtx.get_value(&UnclaimedWithdrawalKey(out_point)).await {
@@ -5898,46 +5902,47 @@ impl Usdt {
                     None => true,
                 };
                 if over_ceiling {
-                    for &out_point in outpoints {
-                        // Security finding 09: terminal failure -> reissue the
-                        // withdrawal's e-cash as a refund. This repriced op
-                        // TIMED OUT and never confirmed on-chain, so it
-                        // incurred no gas of its own; the refund deducts only
-                        // whatever gas prior confirmed-failed batches already
-                        // accumulated into `WithdrawalIncurredFeeKey` (0 for a
-                        // withdrawal that only ever timed out).
-                        self.create_withdrawal_refund(
-                            dbtx,
-                            out_point,
-                            "gas exceeds committed max_fee".to_string(),
-                        )
+                    // Finding B1 (stall, don't refund): the op `op_hash` is
+                    // already threshold-signed and live at its `(sender, nonce)`
+                    // on-chain. It has no on-chain expiry and its nonce is
+                    // unconsumed, so it can still confirm later (once gas falls
+                    // back to its fee level) and pay the recipients. The pre-B1
+                    // behavior reissued the withdrawals' e-cash as a refund AND
+                    // removed/purged the still-live op -- a DOUBLE PAY: the
+                    // refund paid the withdrawer once, then a late confirmation
+                    // paid the recipient a second time. (Worse, the confirm no
+                    // longer found the removed `SubmittedUserOp` and hit the
+                    // silent-ignore branch in `apply_user_op_confirmed`, losing
+                    // the settlement and desyncing the pool nonce.)
+                    //
+                    // Instead we STALL: mark the op superseded -- so
+                    // `propose_replace_user_ops` (which skips superseded ops)
+                    // stops re-proposing a fresh reprice every timeout -- but
+                    // KEEP the `SubmittedUserOp` record LIVE and issue NO refund.
+                    // Because the record survives, a later on-chain confirmation
+                    // is handled normally by `apply_user_op_confirmed`: it finds
+                    // the record, settles the covered withdrawals exactly-once,
+                    // debits `PoolState.balance`, and advances the pool nonce. No
+                    // refund is ever issued, so there is no second payment to
+                    // double.
+                    //
+                    // Tradeoff (accepted, self-healing): the pool account is
+                    // strictly one-batch-at-a-time -- `withdraw_batch_in_flight`
+                    // counts a superseded `Withdraw` op -- so a stuck
+                    // over-ceiling op stalls every SUBSEQUENT withdrawal batch
+                    // until it confirms. That liveness cost is bounded to the
+                    // same rare gas-spike condition that triggered the
+                    // over-ceiling and clears itself the instant gas falls back
+                    // to the op's fee level. The only unbounded case -- a
+                    // PERMANENT gas regime shift, where the op never confirms
+                    // within its mempool window -- is resolved by operator
+                    // intervention. Funds are safe throughout: exactly one live
+                    // `UnclaimedWithdrawal` obligation per covered withdrawal,
+                    // settled exactly once on the eventual confirm.
+                    let mut stalled = submitted.clone();
+                    stalled.superseded = true;
+                    dbtx.insert_entry(&SubmittedUserOpKey(op_hash), &stalled)
                         .await;
-                    }
-                    dbtx.remove_entry(&SubmittedUserOpKey(op_hash)).await;
-                    dbtx.remove_by_prefix(&UserOpConfirmedVoteOpPrefix(op_hash))
-                        .await;
-                    // RBF-nonce cleanup (security finding 03): every withdrawal
-                    // covered by this (sender, nonce) is now terminal-`Failed`,
-                    // so the WHOLE replacement chain at that nonce is dead. If
-                    // this op was itself a replacement, earlier `superseded`
-                    // predecessors (and any still-signing sibling) linger in the
-                    // DB; `withdraw_batch_in_flight` counts any Submitted
-                    // `Withdraw` op IGNORING `superseded`, so an orphaned
-                    // predecessor would make it return `true` forever and wedge
-                    // ALL future withdrawal batches. Tear down the entire chain
-                    // (Submitted/Pending ops + votes + signing sessions) with the
-                    // same helper the confirmation path uses -- `op_hash` was
-                    // already removed above, so pass it as the `except`. The
-                    // covered withdrawals are already terminal-`Failed` with a
-                    // refund created above. Deterministic: reads only the
-                    // committed DB.
-                    self.purge_user_op_nonce_chain(
-                        dbtx,
-                        submitted.signed.unsigned.sender,
-                        submitted.signed.unsigned.nonce,
-                        op_hash,
-                    )
-                    .await;
                     warn!(
                         target: "usdt",
                         ?op_hash,
@@ -5945,8 +5950,10 @@ impl Usdt {
                         gas_cost_wei,
                         ceiling,
                         "withdrawal batch reprice exceeds the covered withdrawals' committed \
-                         max_fee; marking them Failed (refundable in Phase 6.1) and clearing the \
-                         stuck op + its whole replacement chain"
+                         max_fee; STALLING the batch (kept live + superseded, NOT refunded) until \
+                         it confirms on-chain or gas drops. This blocks subsequent withdrawal \
+                         batches until then; a permanent gas regime shift needs operator \
+                         intervention"
                     );
                     return Ok(());
                 }
@@ -15329,10 +15336,14 @@ mod tests {
         );
     }
 
-    /// **Security finding 09, Step 2.** The 5.2 over-ceiling reprice-abort path
-    /// (a withdrawal whose repriced batch would exceed its committed `max_fee`)
-    /// terminal-fails with NO confirmed on-chain attempt, so its incurred gas
-    /// is `0` and the refund is the FULL `(amount + max_fee)`.
+    /// **Security finding 09, Step 2.** A direct unit test of
+    /// [`Usdt::create_withdrawal_refund`]'s zero-incurred branch: a withdrawal
+    /// with no `WithdrawalIncurredFeeKey` accumulator (never confirmed-failed
+    /// on chain) is refunded the FULL `(amount + max_fee)`. (Finding B1
+    /// removed the over-ceiling reprice path as a caller of this helper --
+    /// that path now stalls rather than refunds -- but the
+    /// isolated-singleton on-chain revert still refunds through here, and
+    /// this exercises the helper directly.)
     #[tokio::test]
     async fn over_ceiling_refund_has_zero_incurred_full_refund() {
         let module = test_module_with_block_count(4, 0).await;
@@ -17173,13 +17184,17 @@ mod tests {
         assert_eq!(outpoints, &vec![out2]);
     }
 
-    /// **Task 5.2, step 3.** When the repriced batch's gas would exceed the
-    /// covered withdrawals' committed `max_fee` ceiling, the op is NOT
-    /// replaced: every covered withdrawal becomes terminal `Failed`, its
-    /// `UnclaimedWithdrawal` is KEPT (for the Phase 6.1 refund), and the stuck
-    /// `SubmittedUserOp` is removed.
+    /// **Finding B1.** When the repriced batch's gas would exceed the covered
+    /// withdrawals' committed `max_fee` ceiling, the op is NOT replaced -- but
+    /// it is also NOT refunded. Instead the still-live, threshold-signed op is
+    /// STALLED: marked `superseded` (so it stops being re-priced every timeout)
+    /// while its `SubmittedUserOp` record is KEPT LIVE, so a later on-chain
+    /// confirmation still settles it exactly-once. Asserts: NO `RefundKey`, the
+    /// `SubmittedUserOpKey` still present with `superseded == true`, the
+    /// `WithdrawalState` UNCHANGED (still `Submitted`, NOT `Failed`), and the
+    /// `UnclaimedWithdrawal` still present.
     #[tokio::test]
-    async fn reprice_over_user_max_fee_marks_withdrawals_failed() {
+    async fn over_ceiling_reprice_stalls_op_without_refund() {
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
 
@@ -17223,60 +17238,64 @@ mod tests {
                 PeerId::from(0),
             )
             .await
-            .expect("over-ceiling reprice is a state change (Failed), returns Ok");
+            .expect("over-ceiling reprice is a state change (stall), returns Ok");
 
+        // (a) NO refund is created -- the op is stalled, not terminal-failed.
+        assert!(
+            dbtx.to_ref_nc().get_value(&RefundKey(out1)).await.is_none(),
+            "an over-ceiling reprice must NOT reissue an e-cash refund (finding B1)"
+        );
+        // (b) The SubmittedUserOp is KEPT and now marked superseded.
+        let still = dbtx
+            .to_ref_nc()
+            .get_value(&SubmittedUserOpKey(ha))
+            .await
+            .expect("the stalled op's SubmittedUserOp must be kept live");
+        assert!(
+            still.superseded,
+            "the stalled op must be marked superseded so it is not re-priced every timeout"
+        );
+        // (c) The withdrawal state is UNCHANGED (still Submitted, NOT Failed).
         assert_eq!(
             dbtx.to_ref_nc().get_value(&WithdrawalStateKey(out1)).await,
-            Some(WithdrawalState::Failed {
-                reason: "gas exceeds committed max_fee".to_string()
-            })
+            Some(WithdrawalState::Submitted(ha)),
+            "the covered withdrawal's state must be untouched (not Failed)"
         );
-        // Security finding 09: the over-ceiling terminal failure replaces the
-        // UnclaimedWithdrawal with a reissued-e-cash Refund.
+        // (d) The UnclaimedWithdrawal is still a live obligation.
         assert!(
             dbtx.to_ref_nc()
                 .get_value(&UnclaimedWithdrawalKey(out1))
                 .await
-                .is_none(),
-            "UnclaimedWithdrawal must be replaced by a Refund"
+                .is_some(),
+            "the UnclaimedWithdrawal must remain live (settled exactly-once on the eventual confirm)"
         );
-        assert!(
-            dbtx.to_ref_nc().get_value(&RefundKey(out1)).await.is_some(),
-            "the terminally-failed withdrawal must have a reissued-e-cash Refund"
-        );
-        assert!(
-            dbtx.to_ref_nc()
-                .get_value(&SubmittedUserOpKey(ha))
-                .await
-                .is_none(),
-            "the stuck op must be removed"
-        );
+        // No replacement op is enqueued (the whole point is to NOT reprice).
         assert!(
             pending_withdraw_ops(&mut dbtx.to_ref_nc()).await.is_empty(),
             "no replacement is enqueued when over the ceiling"
         );
     }
 
-    /// **Task 5.2, step 3 (regression, security finding 03).** When the op that
-    /// goes over the ceiling is ITSELF a replacement (a superseded predecessor
-    /// `A` shares its `(sender, nonce)`), the over-ceiling handling must tear
-    /// down the WHOLE chain -- not just the current op. Otherwise the orphaned
-    /// `A` (which `withdraw_batch_in_flight` counts, ignoring `superseded`)
-    /// wedges every future withdrawal batch permanently. Asserts: after the
-    /// over-ceiling apply NO Submitted `Withdraw` op remains at that nonce,
-    /// `withdraw_batch_in_flight` is `false`, and a later `Queued` withdrawal
-    /// can batch again. This is the exact gap the plain over-ceiling test
-    /// (`reprice_over_user_max_fee_marks_withdrawals_failed`) does not cover.
+    /// **Finding B1 (regression).** When the op that goes over the ceiling is
+    /// ITSELF a replacement (a superseded predecessor `A` shares its
+    /// `(sender, nonce)`), the STALL keeps the WHOLE chain live: both the
+    /// current op `B` (now superseded) and its predecessor `A` remain, so a
+    /// later confirmation of EITHER settles exactly-once. Because the chain
+    /// stays live, `withdraw_batch_in_flight` remains `true` and a later
+    /// `Queued` withdrawal is STALLED behind it until the batch confirms -- the
+    /// accepted, self-healing liveness cost of finding B1's "stall, don't
+    /// refund". (Pre-B1 this path purged the chain and refunded, which
+    /// double-paid on a late confirm.)
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn over_ceiling_reprice_of_a_replacement_purges_the_whole_chain() {
+    async fn over_ceiling_reprice_of_a_replacement_stalls_and_keeps_chain_live() {
         let module = test_module_with_block_count(4, 0).await;
         let db = module.db_for_test();
 
-        let ha = [0xa1; 32]; // superseded predecessor (orphan risk)
+        let ha = [0xa1; 32]; // superseded predecessor (kept live)
         let hb = [0xb2; 32]; // current op, over-ceiling on reprice
         let out1 = test_out_point(1); // covered by the (A->B) batch
-        let out2 = test_out_point(2); // later, still Queued behind the wedge
+        let out2 = test_out_point(2); // later, Queued behind the stalled batch
         let total = UsdtAmount(1_000_000);
 
         // High enough for BOTH the ReplaceUserOp timeout gate and the later
@@ -17353,69 +17372,186 @@ mod tests {
                 PeerId::from(0),
             )
             .await
-            .expect("over-ceiling reprice is a state change (Failed), returns Ok");
+            .expect("over-ceiling reprice is a state change (stall), returns Ok");
 
-        // out1 is terminal-Failed; its UnclaimedWithdrawal is replaced by a
-        // reissued-e-cash Refund (security finding 09).
+        // out1 is UNCHANGED (still Signing(hb)) -- not failed, not refunded.
         assert_eq!(
             dbtx.to_ref_nc().get_value(&WithdrawalStateKey(out1)).await,
-            Some(WithdrawalState::Failed {
-                reason: "gas exceeds committed max_fee".to_string()
-            })
+            Some(WithdrawalState::Signing(hb)),
+            "the covered withdrawal must be untouched (not Failed)"
+        );
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&UnclaimedWithdrawalKey(out1))
+                .await
+                .is_some(),
+            "UnclaimedWithdrawal must remain live (no refund)"
+        );
+        assert!(
+            dbtx.to_ref_nc().get_value(&RefundKey(out1)).await.is_none(),
+            "no refund is issued for a stalled over-ceiling op (finding B1)"
+        );
+
+        // The WHOLE chain stays live -- both B (now superseded) AND the
+        // predecessor A (already superseded). A late confirm of either settles.
+        let b = dbtx
+            .to_ref_nc()
+            .get_value(&SubmittedUserOpKey(hb))
+            .await
+            .expect("the current op B must be KEPT live");
+        assert!(b.superseded, "B must now be marked superseded (stalled)");
+        let a = dbtx
+            .to_ref_nc()
+            .get_value(&SubmittedUserOpKey(ha))
+            .await
+            .expect("the predecessor A must be KEPT live");
+        assert!(a.superseded, "A stays superseded");
+        assert!(
+            module.withdraw_batch_in_flight(&mut dbtx.to_ref_nc()).await,
+            "the stalled batch keeps a Withdraw op in flight (blocks subsequent batches)"
+        );
+
+        // The later out2 is STALLED behind the in-flight batch: it must NOT
+        // batch until the stalled op confirms (self-healing liveness cost).
+        dbtx.commit_tx().await;
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
+            .await;
+        assert!(
+            pending_withdraw_ops(&mut dbtx.to_ref_nc()).await.is_empty(),
+            "out2 must stay stalled behind the in-flight over-ceiling batch (finding B1 tradeoff)"
+        );
+    }
+
+    /// **Finding B1, step 4 (the crux).** A stalled over-ceiling op still
+    /// settles EXACTLY ONCE when it eventually confirms on-chain (gas fell back
+    /// to its fee level). Drives the real stall via `ReplaceUserOp` (leaving
+    /// the op live + superseded, no refund), then feeds a threshold of
+    /// `UserOpConfirmed` votes and asserts normal settlement: the covered
+    /// withdrawal moves to `Confirmed`, `PoolState.balance` is debited by the
+    /// swept amount, the pool nonce advances, and NO refund exists.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn stalled_over_ceiling_op_settles_once_on_late_confirm() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let ha = [0xa1; 32];
+        let out1 = test_out_point(1);
+        let total = UsdtAmount(1_000_000);
+
+        seed_block_count_votes(db, 4, submitted_op_timeout_blocks() + 1).await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(5_000_000),
+                    nonce: 7,
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out1),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc1; 20]),
+                    amount: total,
+                    // LOW ceiling: forces the over-ceiling stall.
+                    max_fee: UsdtAmount(50_000_000),
+                    requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out1), &WithdrawalState::Submitted(ha))
+                .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(ha),
+                &submitted_withdraw_op(vec![out1], total, 100_000_000_000, 2_000_000_000, 0, false),
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Drive the real stall: the op is kept live + superseded, no refund.
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::ReplaceUserOp { op_hash: ha },
+                PeerId::from(0),
+            )
+            .await
+            .expect("over-ceiling reprice stalls (Ok)");
+        assert!(
+            dbtx.to_ref_nc()
+                .get_value(&SubmittedUserOpKey(ha))
+                .await
+                .expect("op kept live")
+                .superseded,
+            "precondition: the op is stalled (live + superseded)"
+        );
+        dbtx.commit_tx().await;
+
+        // The op later confirms on-chain: a threshold of UserOpConfirmed votes
+        // for the stalled op_hash. `swept` must equal the op's own decoded
+        // batch total (`total`).
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash: ha,
+            success: true,
+            block: 99,
+            block_hash: [0u8; 32],
+            swept: total,
+            actual_gas_cost_wei: UsdtAmount(0),
+        };
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                .await
+                .expect("a UserOpConfirmed vote for the (live) stalled op processes cleanly");
+        }
+
+        // Settled exactly once: withdrawal Confirmed, obligation cleared.
+        assert_eq!(
+            dbtx.to_ref_nc().get_value(&WithdrawalStateKey(out1)).await,
+            Some(WithdrawalState::Confirmed { block: 99 })
         );
         assert!(
             dbtx.to_ref_nc()
                 .get_value(&UnclaimedWithdrawalKey(out1))
                 .await
                 .is_none(),
-            "UnclaimedWithdrawal must be replaced by a Refund"
+            "the settled withdrawal's UnclaimedWithdrawal is removed"
         );
+        // No refund was EVER created (the whole point of the stall).
         assert!(
-            dbtx.to_ref_nc().get_value(&RefundKey(out1)).await.is_some(),
-            "the terminally-failed withdrawal must have a reissued-e-cash Refund"
+            dbtx.to_ref_nc().get_value(&RefundKey(out1)).await.is_none(),
+            "a stalled-then-confirmed op must never produce a refund (no double pay)"
         );
-
-        // The WHOLE chain is gone -- both B (current) AND the superseded
-        // predecessor A. This is the fix: without the chain purge, A would
-        // linger and wedge every future batch.
-        assert!(
-            dbtx.to_ref_nc()
-                .get_value(&SubmittedUserOpKey(hb))
-                .await
-                .is_none(),
-            "the current op B must be removed"
-        );
+        // Pool debited by the swept amount; nonce advanced once.
+        let pool = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("PoolState present");
+        assert_eq!(pool.balance, UsdtAmount(5_000_000 - total.0));
+        assert_eq!(pool.nonce, 8);
+        // The op is fully cleared -- no in-flight batch remains to stall others.
         assert!(
             dbtx.to_ref_nc()
                 .get_value(&SubmittedUserOpKey(ha))
                 .await
                 .is_none(),
-            "the superseded predecessor A must be purged with the whole chain"
+            "the confirmed op is removed from the in-flight tables"
         );
         assert!(
             !module.withdraw_batch_in_flight(&mut dbtx.to_ref_nc()).await,
-            "no Withdraw op is in flight once the chain is purged"
-        );
-
-        // The previously-wedged out2 can now batch again.
-        dbtx.commit_tx().await;
-        let mut dbtx = db.begin_transaction().await;
-        module
-            .maybe_trigger_withdrawal_batch(&mut dbtx.to_ref_nc())
-            .await;
-        let new_ops = pending_withdraw_ops(&mut dbtx.to_ref_nc()).await;
-        assert_eq!(
-            new_ops.len(),
-            1,
-            "the previously-wedged out2 must now batch: {new_ops:?}"
-        );
-        let UserOpPurpose::Withdraw { outpoints } = &new_ops[0].1.purpose else {
-            panic!("must be a Withdraw op");
-        };
-        assert_eq!(
-            outpoints,
-            &vec![out2],
-            "only the still-Queued out2 batches; the Failed out1 does not"
+            "the stall is cleared once the op confirms"
         );
     }
 
