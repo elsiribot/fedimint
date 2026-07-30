@@ -8,23 +8,31 @@
 //! DB-loss is simulated faithfully by building a SECOND, independent client
 //! with a FRESH (empty) database but the SAME root secret as the first. The
 //! second client therefore starts with no `ClaimKey`/`NextDepositIndex`
-//! entries at all -- exactly the "client DB lost before claiming" scenario
-//! issue #5 is about. It then runs
-//! [`fedimint_usdt_client::UsdtClientModule::recover_deposits`], which rescans
-//! the federation by re-deriving each seed-indexed claim key, and asserts the
-//! deposit account + claimable balance are rediscovered and (via the existing
-//! `claim` path) actually claimable into `USDT_UNIT` e-cash.
+//! entries at all -- exactly the "client DB lost before crediting" scenario
+//! issue #5 is about.
+//!
+//! Crediting is now proof-driven (deposit-by-proof, Task 9): a deposit is
+//! credited AND minted in one no-fee transaction only when someone submits an
+//! on-chain balance proof, so there is no "credited-but-unclaimed" state a
+//! second client could re-claim. This test therefore models the recovery of a
+//! deposit that was FUNDED on-chain but never credited before the DB was lost:
+//! the seed-only client runs
+//! [`fedimint_usdt_client::UsdtClientModule::recover_deposits`] with
+//! `check_uncredited` (security finding 08), which rediscovers the
+//! funded-but-uncredited deposit and re-persists its claim key, then CREDITS +
+//! MINTS it itself via the client proof path -- proving the deposit is fully
+//! recoverable AND spendable from the seed alone. A follow-up `recover` then
+//! sees it credited and advances the deposit index so it is never reused.
 //!
 //! A shared [`MockEvmRpc`] stands in for the EVM chain (mirroring `tests.rs`),
-//! so no anvil is required. Slow (real 4-guardian consensus + deposit-checker
-//! ticks); intentionally run in the foreground.
+//! so no anvil is required. Slow (real 4-guardian consensus); intentionally
+//! run in the foreground.
 
 mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::bail;
 use common::MockEvmRpc;
 use fedimint_client::{ClientHandleArc, RootSecret};
 use fedimint_client_module::secret::{PlainRootSecretStrategy, RootSecretStrategy};
@@ -72,7 +80,6 @@ async fn join_with_root_secret(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "re-enable in Task 11 (anvil e2e drives the client eth_getProof submit flow)"]
 async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> {
     let mock = Arc::new(MockEvmRpc::new());
     // The usdt module's default `UsdtGenParams::usdt_contract` placeholder.
@@ -94,7 +101,9 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     let root_secret =
         RootSecret::StandardDoubleDerive(PlainRootSecretStrategy::to_root_secret(&client_secret));
 
-    // --- Client 1: allocate + fund + get the deposit credited. ---
+    // --- Client 1: the original depositor. Allocates deposit index 0 and
+    //     funds it on-chain, then "loses" its DB BEFORE ever crediting the
+    //     deposit (crediting is now proof-driven -- see below). ---
     let client1 = join_with_root_secret(&fed, root_secret.clone()).await;
     let usdt1 = client1.get_first_module::<UsdtClientModule>()?;
 
@@ -114,116 +123,104 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     );
     common::await_usdt_ready(&usdt1, Duration::from_secs(60)).await?;
 
-    // Wait for a `FeeVote` median to exist before relying on it below.
-    // `MockEvmRpc`'s default `FeeVote` is now sane and nonzero (see
-    // `common::mock::State::default`), but the guardians' 1s poller ticks +
-    // consensus still need real wall-clock time to converge on a median after
-    // boot, and `deposit_fee_quote` returns an `Err` (not a placeholder `Ok`)
-    // until one exists (security finding 06's client-confusion facet) -- so
-    // this retries PAST the `Err`, not just past an `Ok` with a zero fee.
-    // `process_input` would otherwise reject a claim with
-    // `DepositFeeInsufficient` before any median exists, mirroring how the
-    // withdrawal e2e tests wait for `withdraw_fee_quote` to converge first.
-    let fee_deadline = Instant::now() + Duration::from_secs(30);
-    let deposit_fee = loop {
-        if let Ok(quote) = usdt1.deposit_fee_quote().await
-            && quote.fee.0 > 0
-        {
-            break quote.fee;
-        }
-        if Instant::now() >= fee_deadline {
-            bail!("deposit_fee_quote never converged to a nonzero quote before the deadline");
-        }
-        sleep(Duration::from_millis(300)).await;
-    };
-
     let (claim_keypair, account) = usdt1.allocate_deposit().await?;
 
-    // The claim mints the NET `net_deposit_amount` (a multiple of 512 msat --
-    // mintv2's smallest client denomination -- so it's exactly representable
-    // as e-cash with no rounding dust); the on-chain deposit must therefore
-    // fund `net_deposit_amount + deposit_fee` (the fee is deducted at claim
-    // time -- Task 3/4 of the deposit-fee plan).
-    let net_deposit_amount = UsdtAmount(2_560_000);
-    let deposit_amount = UsdtAmount(net_deposit_amount.0 + deposit_fee.0);
-    mock.set_erc20_balance_at(usdt_contract, account, 10, deposit_amount);
-    // TODO(Task 11): crediting is now proof-driven -- drive the client's
-    // `submit_deposit_proof` (real `eth_getProof` against anvil) here instead of
-    // the removed `check_deposit` guardian-poll trigger (this anvil e2e test is
-    // `#[ignore]`d until Task 11 wires that up).
-
-    let credited_deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let status = usdt1.deposit_status(claim_keypair.public_key()).await?;
-        if status.credited == deposit_amount {
-            break;
-        }
-        if Instant::now() >= credited_deadline {
-            bail!("deposit was never credited before the deadline (last status: {status:?})");
-        }
-        sleep(Duration::from_millis(300)).await;
-    }
+    // Deposit-by-proof credits AND mints the full proven balance in one no-fee
+    // transaction (unlike the legacy observe-then-claim path), so the deposit
+    // is a plain 512-msat multiple (mintv2's smallest client denomination, so
+    // it is exactly representable as e-cash with no rounding dust). Client 1
+    // deliberately does NOT submit a proof -- it models a depositor who funded
+    // the account on-chain but lost its DB BEFORE crediting.
+    let deposit_amount = UsdtAmount(2_560_000);
 
     // --- Client 2: SAME seed, FRESH empty DB (simulating total client-DB
     //     loss). It has no ClaimKey/NextDepositIndex entries at all. ---
     let client2 = join_with_root_secret(&fed, root_secret.clone()).await;
     let usdt2 = client2.get_first_module::<UsdtClientModule>()?;
 
-    // Recover from the seed alone. `check_uncredited: true` mirrors the CLI's
-    // default (security finding 08) -- harmless here since the only
-    // seed-derived index in range is already credited before this call.
+    // Recover from the seed alone. The deposit is funded-but-UNCREDITED, so it
+    // is rediscovered via the security-finding-08 `check_uncredited` path
+    // (`checked`, not `accounts`): nothing is credited yet, but its claim key
+    // is re-persisted so the seed-only client can credit it next.
     let summary = usdt2.recover_deposits(20, true).await?;
-
-    // The single credited deposit is rediscovered, at index 0, with the same
-    // account, claim key, and claimable balance.
     assert_eq!(
-        summary.recovered, 1,
-        "exactly one credited deposit must be rediscovered (summary: {summary:?})"
+        summary.recovered, 0,
+        "nothing is credited yet, so no already-credited account is recovered (summary: \
+         {summary:?})"
     );
-    assert_eq!(summary.total_credited, deposit_amount);
-    assert_eq!(summary.total_claimable, deposit_amount);
-    let recovered = &summary.accounts[0];
-    assert_eq!(recovered.index, 0);
-    assert_eq!(recovered.account, account);
-    assert_eq!(recovered.claim_pk, claim_keypair.public_key());
-    assert_eq!(recovered.claimable, deposit_amount);
+    assert_eq!(summary.total_credited, UsdtAmount(0));
+    assert_eq!(summary.total_claimable, UsdtAmount(0));
+    // With nothing credited, the gap-limited scan reports EVERY scanned index as
+    // `checked` (all report `credited == 0`); the one that matters is index 0,
+    // whose re-persisted claim key + account must match the original allocation.
+    let checked = summary
+        .checked
+        .iter()
+        .find(|c| c.index == 0)
+        .unwrap_or_else(|| {
+            panic!("index 0 must be rediscovered via check_uncredited: {summary:?}")
+        });
+    assert_eq!(checked.account, account);
+    assert_eq!(checked.claim_pk, claim_keypair.public_key());
 
-    // Recovery re-stored the claim key, so the existing single-shot `claim`
-    // path works on the second client with only the recovered public key.
-    // `claim` returns both the gross claimed amount and the deposit fee
-    // actually charged against it (Task 5 cleanup: threading the real charged
-    // fee through `ClaimResult` rather than a separately re-fetched quote).
-    // No fee cap under test here (security finding 07 client-side caps) --
-    // `accept_high_fee: true` preserves this test's prior unrestricted-quote
-    // behavior.
-    let result = usdt2.claim(recovered.claim_pk, None, true).await?;
-    assert_eq!(result.claimed, deposit_amount);
-    assert_eq!(result.fee, deposit_fee);
+    // The seed-only client now CREDITS + MINTS the recovered deposit itself by
+    // submitting an on-chain balance proof (the real client proof path; the
+    // hermetic helper scripts the shared mock's block-hash ring and hands the
+    // server a synthetic proof of `deposit_amount`). `claim_keypair` is
+    // identical to what client 2 re-derived at index 0 (same seed), and
+    // recovery re-stored it -- exactly the key the recovered client holds.
+    common::credit_deposit_via_proof(
+        &usdt2,
+        &mock,
+        usdt_contract,
+        &claim_keypair,
+        account,
+        deposit_amount,
+        Duration::from_secs(120),
+    )
+    .await?;
 
-    // The claimed USDT e-cash (net of the deposit fee) lands in the second
-    // client's `USDT_UNIT` balance. Issuance is asynchronous even after the
-    // claim tx is accepted, so poll with a timeout.
+    // The FULL deposited amount (no fee on the proof path) lands in the
+    // seed-only client's `USDT_UNIT` balance. Issuance is asynchronous even
+    // after the proof tx is accepted, so poll with a timeout.
     let poll_deadline = Instant::now() + Duration::from_secs(30);
     let balance = loop {
         let balance = client2.get_balance_for_unit(USDT_UNIT).await?;
-        if balance == Amount::from_msats(net_deposit_amount.0) || Instant::now() >= poll_deadline {
+        if balance == Amount::from_msats(deposit_amount.0) || Instant::now() >= poll_deadline {
             break balance;
         }
         sleep(Duration::from_millis(200)).await;
     };
     assert_eq!(
         balance,
-        Amount::from_msats(net_deposit_amount.0),
-        "the recovered deposit must be claimable into USDT_UNIT e-cash (minus the deposit fee) \
-         on the seed-only client"
+        Amount::from_msats(deposit_amount.0),
+        "the recovered deposit must be creditable+claimable into USDT_UNIT e-cash on the \
+         seed-only client"
     );
 
+    // Re-running recovery now finds the deposit CREDITED (via the proof above):
+    // it moves from `checked` to `accounts`, with `claimable == 0` (deposit-by-
+    // proof already minted the whole balance), and this advances
+    // `NextDepositIndex` past index 0.
+    let summary2 = usdt2.recover_deposits(20, true).await?;
+    assert_eq!(
+        summary2.recovered, 1,
+        "the now-credited deposit must be rediscovered as already-credited (summary: {summary2:?})"
+    );
+    assert_eq!(summary2.total_credited, deposit_amount);
+    assert_eq!(summary2.total_claimable, UsdtAmount(0));
+    let recovered = &summary2.accounts[0];
+    assert_eq!(recovered.index, 0);
+    assert_eq!(recovered.account, account);
+    assert_eq!(recovered.claim_pk, claim_keypair.public_key());
+    assert_eq!(recovered.credited, deposit_amount);
+    assert_eq!(recovered.claimable, UsdtAmount(0));
+
     // A subsequent `allocate_deposit` on the recovered client must not collide
-    // with the recovered index 0: `recover_deposits` advanced
+    // with the recovered index 0: the second recovery advanced
     // `NextDepositIndex` past it, so the next deposit uses index 1 (a distinct
-    // account).
-    // The federation is already `Ready` (same shared mock/consensus DB as
-    // client 1), so this returns immediately; kept for robustness.
+    // account). The federation is already `Ready` (same shared mock/consensus
+    // DB), so this returns immediately; kept for robustness.
     common::await_usdt_ready(&usdt2, Duration::from_secs(60)).await?;
     let (_next_keypair, next_account) = usdt2.allocate_deposit().await?;
     assert_ne!(

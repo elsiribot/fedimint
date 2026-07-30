@@ -209,9 +209,12 @@ async fn main() -> anyhow::Result<()> {
         // with `DepositFeeInsufficient` before any median exists (the quote
         // endpoint reports a `0` sentinel until then), mirroring
         // `withdraw_e2e.rs`'s identical wait.
-        info!("Polling deposit-fee-quote until a nonzero quote is available...");
+        // Deposit-by-proof charges NO fee, but the later withdrawal leg needs a
+        // live `FeeVote` median to exist; poll `deposit-fee-quote` purely as
+        // that warmup gate (its value no longer sizes the deposit).
+        info!("Polling deposit-fee-quote until a nonzero quote is available (FeeVote warmup)...");
         let fee_deadline = fedimint_core::time::now() + Duration::from_secs(60);
-        let deposit_fee = loop {
+        loop {
             let quote = cmd!(client, "module", "usdt", "deposit-fee-quote")
                 .out_json()
                 .await?;
@@ -219,23 +222,19 @@ async fn main() -> anyhow::Result<()> {
                 .as_u64()
                 .context("deposit-fee-quote response missing fee")?;
             if fee > 0 {
-                break fee;
+                break;
             }
             ensure!(
                 fedimint_core::time::now() < fee_deadline,
                 "deposit-fee-quote never converged to a nonzero quote before the deadline"
             );
             fedimint_core::runtime::sleep(Duration::from_secs(1)).await;
-        };
+        }
 
-        info!("Deriving a deposit address...");
+        info!("Deriving a deposit address (seed-derivation index 0)...");
         let deposit_address = cmd!(client, "module", "usdt", "deposit-address")
             .out_json()
             .await?;
-        let claim_pk = deposit_address["claim_pk"]
-            .as_str()
-            .context("deposit-address response missing claim_pk")?
-            .to_string();
         let account: EvmAddress = deposit_address["account"]
             .as_str()
             .context("deposit-address response missing account")?
@@ -246,75 +245,62 @@ async fn main() -> anyhow::Result<()> {
         // the automatic deploy-and-sweep UserOp sent FROM this account.
 
         info!(%account, "Transferring USDT to the deposit address on-chain...");
-        // `min_net_transfer_amount` is the minimum NET e-cash this test needs
-        // (2_048_000 = 4000 * 512, a multiple of the `mintv2` denomination
-        // granularity so it mints into e-cash notes with no sub-denomination
-        // dust remainder). The `deposit_fee` polled above is an early
-        // snapshot, not the exact fee that will be charged: a live
-        // (anvil-default, decaying-over-idle-blocks) gas price can drift
-        // between this read and the claim actually being processed, so the
-        // on-chain `transfer_amount` funds `min_net_transfer_amount` PLUS a 2x
-        // margin over that snapshot -- absorbing the drift without needing to
-        // predict the exact eventual fee (mirrors `withdraw_e2e.rs`'s/
-        // `nonstandard_usdt_e2e.rs`'s identical handling).
+        // Deposit-by-proof mints the FULL on-chain balance with NO fee, so the
+        // on-chain transfer is exactly `min_net_transfer_amount` (2_048_000 =
+        // 4000 * 512, a multiple of the `mintv2` denomination granularity so
+        // the minted e-cash has no sub-denomination dust remainder). No fee
+        // margin is needed any more (unlike the legacy observe-then-claim path).
         let min_net_transfer_amount = UsdtAmount(2_048_000);
-        let transfer_amount = UsdtAmount(min_net_transfer_amount.0 + deposit_fee * 2);
+        let transfer_amount = min_net_transfer_amount;
         transfer_erc20_from_account_1(&anvil, token, account, transfer_amount).await?;
 
         info!("Mining past confirmation_depth...");
-        mine_blocks(&anvil, 3).await?;
+        mine_blocks(&anvil, 6).await?;
 
-        info!("Enqueuing the deposit checker (check-deposit)...");
-        cmd!(client, "module", "usdt", "check-deposit", &claim_pk)
-            .out_json()
-            .await?;
-
-        info!("Polling deposit-status until the guardians credit the deposit...");
-        let deadline = fedimint_core::time::now() + Duration::from_secs(180);
+        // Credit + mint via the client's REAL `eth_getProof` submit flow against
+        // the e2e anvil -- there is NO guardian `balanceOf` poll anywhere in
+        // this loop (the scanner is gone; crediting is proof-only).
+        // `deposit-address` above allocated seed-derivation index 0, so
+        // `submit-deposit-proof --index 0` re-derives the same account and
+        // credits + mints the full proven balance in one no-fee transaction. It
+        // retries while mining, since the guardians' block-hash ring must first
+        // anchor a confirmation-deep block at/after the funding transfer for the
+        // client's proof to land on a block where the balance is present.
+        info!("Submitting the deposit proof (client eth_getProof against anvil)...");
+        let submit_deadline = fedimint_core::time::now() + Duration::from_secs(180);
         loop {
-            let status = cmd!(client, "module", "usdt", "deposit-status", &claim_pk)
-                .out_json()
-                .await?;
-            let claimable = status["claimable"]
-                .as_u64()
-                .context("deposit-status response missing claimable")?;
-            if claimable > 0 {
+            let submitted = cmd!(
+                client,
+                "module",
+                "usdt",
+                "submit-deposit-proof",
+                "--index",
+                "0",
+                "--evm-rpc-url",
+                anvil.rpc_url()
+            )
+            .out_json()
+            .await;
+            if submitted.is_ok() {
                 break;
             }
             ensure!(
-                fedimint_core::time::now() < deadline,
-                "deposit never became claimable before the deadline"
+                fedimint_core::time::now() < submit_deadline,
+                "submit-deposit-proof never succeeded before the deadline (last error: {:?})",
+                submitted.err()
             );
+            // Advance the real chain head so the ring re-anchors a newer
+            // confirmation-deep block, then retry.
+            mine_blocks(&anvil, 3).await?;
             fedimint_core::runtime::sleep(Duration::from_secs(2)).await;
         }
 
-        info!("Claiming...");
-        let claimed = cmd!(client, "module", "usdt", "claim", &claim_pk)
-            .out_json()
-            .await?;
-        let claimed_amount = claimed["claimed"]
-            .as_u64()
-            .context("claim response missing claimed")?;
-        ensure!(
-            claimed_amount == transfer_amount.0,
-            "claimed amount ({claimed_amount}) != transferred amount ({})",
-            transfer_amount.0
-        );
-
-        // The USDT client's `claim` awaits the USDT-denominated `mintv2`
-        // issuance before returning (it uses the unit-aware
-        // `await_primary_module_outputs_for_unit(USDT_UNIT)`), so by the time
-        // the CLI `claim` above returns, the e-cash notes are issued and
-        // persisted; the balance is therefore observable immediately. A short
-        // poll is kept only to absorb any per-process client-load latency.
-        //
-        // The claim mints `transfer_amount` minus the deposit fee ACTUALLY
-        // charged at claim time, which may differ from the early `deposit_fee`
-        // snapshot above (see its funding comment) -- so read the resulting
-        // balance directly rather than asserting an exact value predicted
-        // from a possibly-stale quote (mirrors `withdraw_e2e.rs`'s/
-        // `nonstandard_usdt_e2e.rs`'s identical handling).
-        info!("Verifying the USDT-denominated e-cash balance covers the minimum net amount...");
+        // Deposit-by-proof credited AND minted the full transfer in one no-fee
+        // transaction (the client's `submit-deposit-proof` awaits the
+        // USDT-denominated `mintv2` issuance before returning), so the
+        // USDT-denominated e-cash balance equals the transferred amount exactly.
+        // A short poll only absorbs any per-process client-load latency.
+        info!("Verifying the USDT-denominated e-cash balance equals the deposit...");
         let balance_deadline = fedimint_core::time::now() + Duration::from_secs(30);
         let net_transfer_amount = loop {
             let balance = usdt_ecash_balance_msats(&client).await?;
@@ -328,18 +314,28 @@ async fn main() -> anyhow::Result<()> {
             fedimint_core::runtime::sleep(Duration::from_secs(1)).await;
         };
         ensure!(
-            net_transfer_amount.0 >= min_net_transfer_amount.0,
-            "USDT e-cash balance ({net_transfer_amount}) must comfortably cover the minimum net \
-             transfer amount ({min_net_transfer_amount})"
+            net_transfer_amount == transfer_amount,
+            "USDT e-cash balance ({net_transfer_amount}) must equal the deposited amount \
+             ({transfer_amount}) -- deposit-by-proof mints the full balance with no fee"
         );
 
-        info!("Verifying a second claim of the same (already fully-claimed) deposit fails...");
-        let second_claim = cmd!(client, "module", "usdt", "claim", &claim_pk)
-            .out_json()
-            .await;
+        info!("Verifying a second proof of the same (already-credited) deposit fails...");
+        let second_submit = cmd!(
+            client,
+            "module",
+            "usdt",
+            "submit-deposit-proof",
+            "--index",
+            "0",
+            "--evm-rpc-url",
+            anvil.rpc_url()
+        )
+        .out_json()
+        .await;
         ensure!(
-            second_claim.is_err(),
-            "a second claim of an already-fully-claimed deposit must not succeed"
+            second_submit.is_err(),
+            "a second proof of an already-credited deposit must not succeed (nothing new to \
+             credit)"
         );
 
         // ---- Withdrawal leg: sweep -> claim -> withdraw back to a fresh EVM

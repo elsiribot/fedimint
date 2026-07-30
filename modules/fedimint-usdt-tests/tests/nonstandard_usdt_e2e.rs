@@ -58,8 +58,6 @@ use fedimint_core::PeerId;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
 use fedimint_core::runtime::{Instant, sleep};
-use fedimint_mint_client::MintClientInit;
-use fedimint_mint_server::MintInit;
 use fedimint_mintv2_client::MintClientInit as Mintv2ClientInit;
 use fedimint_mintv2_common::KIND as MINTV2_KIND;
 use fedimint_mintv2_common::config::MintGenParams;
@@ -150,7 +148,6 @@ async fn mine_empty_blocks(anvil: &common::AnvilHandle, count: u32) -> anyhow::R
 /// `SimpleAccount.execute(transfer(pool, amount))` runs and moves real tokens
 /// despite the token pushing no return data.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "re-enable in Task 11 (anvil e2e drives the client eth_getProof submit flow)"]
 async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {
         eprintln!(
@@ -203,12 +200,23 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
         price_feed_max_staleness_secs: 14_400,
     };
 
-    let fed = Fixtures::new_primary(MintClientInit, MintInit)
+    // Crediting is now proof-driven, and a deposit-by-proof submission credits
+    // AND mints the proven balance in one transaction -- so this federation
+    // needs a `mintv2` instance registered as the `USDT_UNIT` primary module
+    // (mirroring `withdraw_e2e.rs`) for the proof input to balance.
+    let fed = Fixtures::new_primary(Mintv2ClientInit, Mintv2Init)
+        .with_extra_module_instance(
+            MINTV2_KIND,
+            MintGenParams {
+                amount_unit: USDT_UNIT,
+            },
+        )
         .with_module(
             UsdtClientInit,
             UsdtInit::with_evm_rpc(evm_rpc.clone()).with_gen_params(gen_params),
         )
         .new_fed_builder(0)
+        .disable_mint_fees()
         .build()
         .await;
 
@@ -263,10 +271,13 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
     .context("failed to fund the counterfactual deposit account with non-standard USDT")?;
     mine_empty_blocks(&anvil, 5).await?;
 
-    // TODO(Task 11): crediting is now proof-driven -- drive the client's
-    // `submit_deposit_proof` (real `eth_getProof` against anvil) here instead of
-    // the removed `check_deposit` guardian-poll trigger (this anvil e2e test is
-    // `#[ignore]`d until Task 11 wires that up).
+    // Credit the deposit via the REAL client `eth_getProof` submit flow against
+    // the e2e anvil -- NO guardian `balanceOf` poll in the loop (the scanner is
+    // gone). `allocate_deposit` handed out index 0, so `submit_deposit_proof(0)`
+    // re-derives the same claim key/account and credits + mints the proven
+    // (void-`transfer`-funded) balance in one no-fee transaction.
+    common::credit_deposit_via_anvil_proof(&usdt, &anvil, 0, Duration::from_secs(180)).await?;
+
     let credited_deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let status = usdt.deposit_status(claim_keypair.public_key()).await?;
@@ -365,7 +376,6 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
 /// USDT's void return: the pool `SimpleAccount` is deployed by the batch's
 /// `initCode` and pays a fresh EOA in real (non-standard) tokens.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "re-enable in Task 11 (anvil e2e drives the client eth_getProof submit flow)"]
 async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {
         eprintln!(
@@ -465,27 +475,11 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
     // Part C: wait for the readiness state machine to report Ready first.
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
 
-    // Wait for a live `FeeVote` median to exist (mirrors `withdraw_e2e.rs`'s
-    // identical wait): `process_input` rejects a claim with
-    // `DepositFeeInsufficient` before any median exists.
-    let deposit_fee_deadline = Instant::now() + Duration::from_secs(30);
-    let deposit_fee = loop {
-        let quote = usdt.deposit_fee_quote().await?;
-        if quote.fee.0 != 0 {
-            break quote.fee;
-        }
-        if Instant::now() >= deposit_fee_deadline {
-            bail!("deposit_fee_quote never converged to a nonzero quote before the deadline");
-        }
-        sleep(Duration::from_millis(300)).await;
-    };
-    // This is an early snapshot, not the exact fee that will be charged (the
-    // real anvil gas price can drift between this read and the claim actually
-    // being processed) -- fund with a 2x margin and read the actual net e-cash
-    // minted below rather than asserting an exact predicted value (mirrors
-    // `withdraw_e2e.rs`'s identical handling).
-
-    let (claim_keypair, deposit_account) = usdt.allocate_deposit().await?;
+    // Deposit-by-proof charges NO fee (unlike the legacy observe-then-claim
+    // path): the full on-chain balance is credited AND minted, so the on-chain
+    // deposit needs no fee margin. `_claim_keypair` is unused because crediting
+    // is driven by seed-derivation index (0) below, not the keypair object.
+    let (_claim_keypair, deposit_account) = usdt.allocate_deposit().await?;
     assert_eq!(
         evm_rpc.get_code_len(deposit_account).await?,
         0,
@@ -502,13 +496,12 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
         .context("failed to confirm EntryPoint.depositTo(deposit_account)")?;
 
     // Fund the deposit account with the NON-STANDARD USDT ONLY (void transfer),
-    // 512-aligned exactly like `withdraw_e2e.rs` (`5_120_000 == 512 * 10_000`).
-    // `min_net_deposit_amount` is the minimum NET e-cash this test needs for the
-    // later withdrawal; the on-chain `deposit_amount` funds that PLUS a 2x
-    // margin over the early `deposit_fee` snapshot above (Task 3/4 of the
-    // deposit-fee plan).
+    // exactly `min_net_deposit_amount` (`5_120_000 == 512 * 10_000`, 512-msat-
+    // aligned so the minted e-cash has no denomination-rounding dust). Deposit-
+    // by-proof mints the FULL balance with no fee, so no funding margin is
+    // needed and `net_deposit_amount == deposit_amount`.
     let min_net_deposit_amount = UsdtAmount(5_120_000);
-    let deposit_amount = UsdtAmount(min_net_deposit_amount.0 + deposit_fee.0 * 2);
+    let deposit_amount = min_net_deposit_amount;
     common::transfer_nonstandard_from_account_1(
         &anvil,
         stack.usdt,
@@ -519,12 +512,10 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
     .context("failed to fund the counterfactual deposit account with non-standard USDT")?;
     mine_empty_blocks(&anvil, 5).await?;
 
-    // Check + claim: mints `deposit_amount` minus the deposit fee ACTUALLY
-    // charged (which may differ slightly from the early `deposit_fee` snapshot
-    // above). Read the resulting balance directly rather than asserting an
-    // exact value predicted from a possibly-stale quote.
-    usdt.check_and_claim(&claim_keypair, Duration::from_secs(120))
-        .await?;
+    // Credit + mint via the REAL client `eth_getProof` submit flow against the
+    // e2e anvil (NO guardian `balanceOf` poll). This mints the full
+    // `deposit_amount` as `USDT_UNIT` e-cash in one no-fee transaction.
+    common::credit_deposit_via_anvil_proof(&usdt, &anvil, 0, Duration::from_secs(180)).await?;
     let claimed_deadline = Instant::now() + Duration::from_secs(30);
     let net_deposit_amount = loop {
         let balance = client.get_balance_for_unit(USDT_UNIT).await?;
@@ -538,7 +529,7 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
     };
     assert!(
         net_deposit_amount.0 >= min_net_deposit_amount.0,
-        "the claimed e-cash balance ({net_deposit_amount}) must comfortably cover the minimum \
+        "the minted e-cash balance ({net_deposit_amount}) must comfortably cover the minimum \
          needed for the later withdrawal ({min_net_deposit_amount})"
     );
 
