@@ -32,6 +32,13 @@ contract TestUsdt {
 
     uint256 public totalSupply;
 
+    // Padding so `balanceOf` lands on storage slot 2, matching mainnet USDT
+    // (TetherToken) and `fedimint_usdt_common::USDT_BALANCES_SLOT`. The
+    // deposit-by-proof path reads the balances mapping by that RAW slot (via
+    // `eth_getProof`), so the fixture's balances mapping MUST sit at slot 2 for
+    // the anvil e2e proof flow to read a nonzero balance.
+    uint256 private _slot1Reserved;
+
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
