@@ -32,10 +32,19 @@ use tracing::debug;
 /// wins), so a single endpoint being down or rate-limiting degrades to the
 /// next rather than failing the whole submit.
 pub const DEFAULT_EVM_RPC_URLS: &[&str] = &[
+    // All three verified to serve keyless `eth_getProof` on mainnet (llamarpc
+    // returns 5xx and ankr now requires a key for getProof, so they are NOT
+    // usable fallbacks for the proof flow and were dropped).
     "https://ethereum-rpc.publicnode.com",
-    "https://eth.llamarpc.com",
-    "https://rpc.ankr.com/eth",
+    "https://1rpc.io/eth",
+    "https://eth.drpc.org",
 ];
+
+/// Per-endpoint wall-clock cap for one JSON-RPC round-trip. A hung/slow
+/// endpoint must not wedge the whole submit: on timeout the caller advances to
+/// the next URL in [`DEFAULT_EVM_RPC_URLS`]. Uses `fedimint_core::runtime`'s
+/// timer (WASM-safe) rather than `reqwest`'s native-only `.timeout()`.
+const EVM_RPC_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// A minimal WASM-safe JSON-RPC client over a fixed, ordered list of endpoint
 /// URLs (see [`DEFAULT_EVM_RPC_URLS`]).
@@ -68,9 +77,13 @@ impl EthJsonRpc {
 
         let mut last_err: Option<anyhow::Error> = None;
         for url in &self.urls {
-            match self.call_one(url, &body).await {
-                Ok(result) => return Ok(result),
-                Err(err) => {
+            // Bound each round-trip so one hung endpoint can't wedge the submit;
+            // on timeout we fall through to the next URL like any other error.
+            match fedimint_core::runtime::timeout(EVM_RPC_CALL_TIMEOUT, self.call_one(url, &body))
+                .await
+            {
+                Ok(Ok(result)) => return Ok(result),
+                Ok(Err(err)) => {
                     debug!(
                         target: "usdt",
                         %url,
@@ -79,6 +92,19 @@ impl EthJsonRpc {
                         "EVM JSON-RPC endpoint failed, trying next"
                     );
                     last_err = Some(err);
+                }
+                Err(_elapsed) => {
+                    debug!(
+                        target: "usdt",
+                        %url,
+                        method,
+                        timeout_secs = EVM_RPC_CALL_TIMEOUT.as_secs(),
+                        "EVM JSON-RPC endpoint timed out, trying next"
+                    );
+                    last_err = Some(anyhow::anyhow!(
+                        "EVM RPC call to {url} timed out after {}s",
+                        EVM_RPC_CALL_TIMEOUT.as_secs()
+                    ));
                 }
             }
         }
