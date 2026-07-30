@@ -229,6 +229,31 @@ pub struct ClaimResult {
     pub fee: UsdtAmount,
 }
 
+/// Outcome of [`UsdtClientModule::submit_crafted_input_for_test`]: whether the
+/// federation rejected an adversarial hand-crafted input (defense held) or
+/// accepted it and minted value (a security finding). Only available under the
+/// non-default `test-util` feature.
+#[cfg(feature = "test-util")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CraftedInputOutcome {
+    /// The federation ACCEPTED the crafted transaction and issued the paired
+    /// USDT-`mintv2` mint output -- i.e. the crafted input credited/minted
+    /// `minted` of spendable e-cash. For an adversarial input this is a
+    /// SECURITY FINDING.
+    Accepted {
+        /// The value the accepted crafted input minted into e-cash.
+        minted: UsdtAmount,
+    },
+    /// The federation REJECTED the crafted transaction during consensus input
+    /// processing (the expected outcome for a malicious input -- defense held),
+    /// carrying the guardians' rejection reason (the rendered
+    /// [`fedimint_usdt_common::UsdtInputError`]).
+    Rejected {
+        /// The guardians' rejection reason.
+        reason: String,
+    },
+}
+
 /// A single deposit account rediscovered by
 /// [`UsdtClientModule::recover_deposits`].
 #[derive(Debug, Clone, Serialize)]
@@ -1070,6 +1095,96 @@ impl UsdtClientModule {
             keys: vec![*claim_keypair],
             amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(delta)),
         }
+    }
+
+    /// Adversarial/test-only: submit an ARBITRARY, hand-crafted [`UsdtInput`]
+    /// (paired 1:1 with a USDT-`mintv2` mint output funding `declared`)
+    /// directly through the client transaction API, bypassing every honest
+    /// builder (`submit_deposit_proof`/`submit_prebuilt_deposit_proof`/
+    /// `submit_claim`) and their client-side gates
+    /// (delta/`claimable`/fee-cap). This is the raw submission primitive
+    /// the `fedimint-usdt-tests` security harness uses to play a malicious
+    /// client against the deposit-by-proof flow: it replicates exactly what
+    /// [`Self::submit_deposit_proof_input`] does, but with a caller-
+    /// supplied `input`, `keys`, and `declared` value rather than a
+    /// server-validated one.
+    ///
+    /// Returns [`CraftedInputOutcome::Rejected`] (the guardians' rejection
+    /// reason) when the federation refuses the crafted transaction -- the
+    /// expected result for a malicious input, meaning the defense held -- or
+    /// [`CraftedInputOutcome::Accepted`] once the paired mint output is
+    /// actually issued, meaning the crafted input CREDITED/MINTED value (a
+    /// security finding for any adversarial input).
+    ///
+    /// Gated behind the non-default `test-util` feature so it is never compiled
+    /// into the guardian/gateway release image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` only for infrastructure failures (finalizing/submitting
+    /// the transaction, or awaiting issuance of an accepted one) -- NOT for a
+    /// federation rejection, which is reported as
+    /// [`CraftedInputOutcome::Rejected`].
+    #[cfg(feature = "test-util")]
+    pub async fn submit_crafted_input_for_test(
+        &self,
+        input: UsdtInput,
+        keys: Vec<Keypair>,
+        declared: UsdtAmount,
+    ) -> anyhow::Result<CraftedInputOutcome> {
+        let client_input = ClientInput {
+            input,
+            keys,
+            amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(declared)),
+        };
+
+        let operation_id = OperationId::new_random();
+        let tx = TransactionBuilder::new().with_inputs(
+            self.client_ctx
+                .make_client_inputs(ClientInputBundle::new_no_sm(vec![client_input])),
+        );
+
+        let range = self
+            .client_ctx
+            .finalize_and_submit_transaction(
+                operation_id,
+                KIND.as_str(),
+                move |_range| UsdtOperationMeta::Claim {
+                    account: EvmAddress([0u8; 20]),
+                    amount: declared,
+                    fee: UsdtAmount(0),
+                },
+                tx,
+            )
+            .await?;
+        let txid = range.txid();
+
+        // A malicious input is rejected during consensus input-processing, which
+        // surfaces here as a `Rejected` transaction-submission state carrying the
+        // guardians' (deterministic, identical-across-guardians) rejection
+        // reason. That is the EXPECTED outcome -- the defense held.
+        if let Err(reason) = self
+            .client_ctx
+            .transaction_updates(operation_id)
+            .await
+            .await_tx_accepted(txid)
+            .await
+        {
+            return Ok(CraftedInputOutcome::Rejected { reason });
+        }
+
+        // Accepted: the crafted input funded value the federation credited. Await
+        // the paired USDT-`mintv2` issuance to confirm the value was actually
+        // minted into spendable e-cash before reporting the (finding) outcome.
+        self.client_ctx
+            .await_primary_module_outputs_for_unit(
+                operation_id,
+                range.into_iter().collect(),
+                USDT_UNIT,
+            )
+            .await?;
+
+        Ok(CraftedInputOutcome::Accepted { minted: declared })
     }
 
     /// Looks up the claim keypair persisted by [`Self::allocate_deposit`] for

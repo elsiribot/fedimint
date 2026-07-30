@@ -7,9 +7,22 @@ name = "fedimint-usdt-tests"
 publish = false
 version = { workspace = true }
 
+[lib]
+name = "fedimint_usdt_tests"
+path = "src/lib.rs"
+
 [[bin]]
 name = "usdt-e2e-test"
 path = "bin/usdt_e2e.rs"
+
+# Adversarial security tool: joins a LIVE federation via `--invite`, allocates a
+# deposit address, and runs the no-funds deposit-by-proof attacks against it.
+# Needs a live fed to run; not part of any CI lane. Reuses the shared attack
+# constructors in `src/attacks.rs` (the same ones the `tests/adversary.rs`
+# hermetic suite drives).
+[[bin]]
+name = "usdt-adversary"
+path = "bin/usdt_adversary.rs"
 
 # One-shot generator for the deterministic MPT deposit-proof verifier's
 # committed fixtures (real mainnet `eth_getProof` captures). Not run in CI --
@@ -36,8 +49,12 @@ async-trait = { workspace = true }
 clap = { workspace = true }
 devimint = { workspace = true }
 fedimint-api-client = { workspace = true }
+# The adversary bin joins a live federation from an invite code (mirroring
+# `fedimint-cli`'s client-join path).
+fedimint-bip39 = { workspace = true }
 fedimint-client = { workspace = true }
 fedimint-client-module = { workspace = true }
+fedimint-connectors = { workspace = true }
 fedimint-core = { workspace = true }
 fedimint-logging = { workspace = true }
 fedimint-mint-client = { workspace = true }
@@ -48,7 +65,7 @@ fedimint-mintv2-common = { workspace = true }
 fedimint-mintv2-server = { workspace = true }
 fedimint-server = { workspace = true }
 fedimint-testing = { workspace = true }
-fedimint-usdt-client = { workspace = true }
+fedimint-usdt-client = { workspace = true, features = ["test-util"] }
 fedimint-usdt-common = { workspace = true }
 fedimint-usdt-server = { workspace = true }
 futures = { workspace = true }
