@@ -120,6 +120,15 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// recipient of a threshold-signed op). No DB migration; the new enum variants
 /// are append-only and no keyspace changed. Existing feds must be reconfigured
 /// to set the new consensus field.
+///
+/// Residual-recovery vote hygiene (still `0.11`; refines unreleased behavior,
+/// no version bump): a `RecoverResidual` vote is now VALIDATED before it is
+/// stored -- rejected (non-state-changingly) unless its account exists and is
+/// fully swept -- and ALL of an account's recovery votes are GARBAGE-COLLECTED
+/// when a recovery op for it confirms (success or revert). Together this keeps
+/// the vote table bounded and forces every recovery to re-cross a FRESH
+/// threshold of votes, so stale post-recovery votes plus one byzantine
+/// vote-flip can no longer re-trigger a bogus oversized recovery.
 pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 11);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
