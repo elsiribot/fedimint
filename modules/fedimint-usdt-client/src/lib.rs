@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use api::UsdtFederationApi;
+use api::{FediSweepStatusResponse, UsdtFederationApi};
 use db::{
     ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix, EvmRpcUrlKey, EvmRpcUrlPrefixAll,
     NextDepositIndexKey, NextDepositIndexPrefixAll, NextRefundIndexKey, NextRefundIndexPrefixAll,
@@ -135,6 +135,34 @@ const FEE_SANITY_PERCENT: u64 = 25;
 /// BEFORE any irreversible submit -- burning e-cash for a withdrawal or
 /// minting e-cash net of a deposit fee for a claim -- so a rejection never
 /// leaves a signed/submitted transaction behind.
+/// Computes the all-time total balance a deposit proof attests for an
+/// account, mirroring the server's sweep-aware high-water rule (LOCAL fedi
+/// extension; see `submit_prebuilt_deposit_proof`): a proof anchored at a
+/// block strictly LATER than the account's last confirmed sweep proves the
+/// POST-sweep balance, so the all-time total is `swept + proven`; a proof
+/// anchored at or before the last sweep, a never-swept account, or an
+/// unavailable `fedi_sweep_status` endpoint (`sweep: None` -- e.g. an
+/// upstream server build that does not serve the LOCAL endpoint) keeps
+/// upstream's raw-`proven` rule.
+///
+/// Pure and synchronous (no network/DB/wall-clock access, wasm-safe) so it
+/// is unit-testable without a live federation.
+fn sweep_aware_all_time_total(
+    sweep: Option<&FediSweepStatusResponse>,
+    proof_block: u64,
+    proven: UsdtAmount,
+) -> UsdtAmount {
+    match sweep {
+        Some(sweep) => match sweep.last_sweep_block {
+            Some(sweep_block) if proof_block > sweep_block => {
+                UsdtAmount(sweep.swept.0.saturating_add(proven.0))
+            }
+            _ => proven,
+        },
+        None => proven,
+    }
+}
+
 fn check_fee_cap(
     quote_fee: UsdtAmount,
     amount: UsdtAmount,
@@ -999,13 +1027,29 @@ impl UsdtClientModule {
         // `swept + proven`; a proof anchored at or before the last sweep (or
         // for a never-swept account) keeps upstream's raw-`proven` rule.
         let status = self.module_api.deposit_status(claim_pk).await?;
-        let sweep = self.module_api.fedi_sweep_status(claim_pk).await?;
-        let all_time_total = match sweep.last_sweep_block {
-            Some(sweep_block) if proof.block_number > sweep_block => {
-                UsdtAmount(sweep.swept.0.saturating_add(proven.0))
+        // `fedi_sweep_status` is a LOCAL fedi extension endpoint: an upstream
+        // `fedimint-usdt-server` build does not serve it, and
+        // `request_current_consensus` then errors once a threshold of peers
+        // report the method as unknown. Degrade gracefully to upstream's
+        // raw-`proven` rule (never-swept semantics) instead of hard-failing
+        // the whole deposit-proof submission: against an upstream server the
+        // raw rule is exactly what the guardians apply, and against OUR
+        // (sweep-aware) server a fallback can at worst mis-declare the delta,
+        // which the guardians reject as an unbalanced transaction -- it can
+        // never over-credit.
+        let sweep = match self.module_api.fedi_sweep_status(claim_pk).await {
+            Ok(sweep) => Some(sweep),
+            Err(err) => {
+                tracing::debug!(
+                    %account,
+                    err = %err,
+                    "fedi_sweep_status unavailable (upstream server build?); \
+                     falling back to raw-proven deposit-credit semantics"
+                );
+                None
             }
-            _ => proven,
         };
+        let all_time_total = sweep_aware_all_time_total(sweep.as_ref(), proof.block_number, proven);
         let delta = all_time_total.0.saturating_sub(status.credited.0);
         if delta == 0 {
             bail!(
@@ -1877,8 +1921,9 @@ mod tests {
         OutPoint, PeerId, PoolStateResponse, RefundStatusResponse, SECP256K1, StatusResponse,
         USDT_UNIT, UsdtAmount, UsdtClientModule, UsdtFederationApi, UsdtInput,
         UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatusResponse, check_fee_cap,
-        ensure_fee_quote_available, secp256k1,
+        ensure_fee_quote_available, secp256k1, sweep_aware_all_time_total,
     };
+    use crate::api::FediSweepStatusResponse;
     use crate::db::{ClaimKeyKey, NextDepositIndexKey};
 
     /// Deterministic test keypair (mirrors
@@ -1887,6 +1932,58 @@ mod tests {
     /// particular one).
     fn test_keypair() -> Keypair {
         DerivableSecret::new_root(b"usdt-claim-input-test-seed", b"salt").to_secp_key(SECP256K1)
+    }
+
+    /// [`sweep_aware_all_time_total`] mirrors the server's sweep-aware
+    /// high-water rule: post-sweep proofs prove the post-sweep balance
+    /// (`swept + proven`), everything else -- pre-sweep proofs, never-swept
+    /// accounts, and an unavailable `fedi_sweep_status` endpoint (upstream
+    /// server build) -- keeps upstream's raw-`proven` rule.
+    #[test]
+    fn sweep_aware_total_follows_server_high_water_rule() {
+        let account = EvmAddress([0x22; 20]);
+        let sweep = |swept: u64, last_sweep_block: Option<u64>| FediSweepStatusResponse {
+            account,
+            swept: UsdtAmount(swept),
+            last_sweep_block,
+        };
+        let proven = UsdtAmount(1_000_000);
+
+        // Proof anchored strictly after the last sweep: all-time total is
+        // swept + proven.
+        assert_eq!(
+            sweep_aware_all_time_total(Some(&sweep(5_000_000, Some(100))), 101, proven),
+            UsdtAmount(6_000_000),
+        );
+        // Proof anchored AT the last sweep block: raw proven (the proof may
+        // predate the sweep within the block).
+        assert_eq!(
+            sweep_aware_all_time_total(Some(&sweep(5_000_000, Some(100))), 100, proven),
+            proven,
+        );
+        // Proof anchored before the last sweep: raw proven.
+        assert_eq!(
+            sweep_aware_all_time_total(Some(&sweep(5_000_000, Some(100))), 99, proven),
+            proven,
+        );
+        // Never-swept account: raw proven.
+        assert_eq!(
+            sweep_aware_all_time_total(Some(&sweep(0, None)), 101, proven),
+            proven,
+        );
+        // Endpoint unavailable (upstream server build without the LOCAL
+        // `fedi_sweep_status` endpoint): must degrade to raw proven, not
+        // fail.
+        assert_eq!(sweep_aware_all_time_total(None, 101, proven), proven);
+        // Saturating add on pathological totals.
+        assert_eq!(
+            sweep_aware_all_time_total(
+                Some(&sweep(u64::MAX, Some(100))),
+                101,
+                UsdtAmount(u64::MAX)
+            ),
+            UsdtAmount(u64::MAX),
+        );
     }
 
     /// [`UsdtClientModule::claim_input`] must set the input's own `fee`
