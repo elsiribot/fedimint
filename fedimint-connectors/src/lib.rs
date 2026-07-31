@@ -38,6 +38,24 @@ type ConnectorInitFn = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<DynConnector>> + Send>> + Send + Sync,
 >;
 
+/// Middleware applied to every connector produced by the registry.
+///
+/// Receives the transport name (`"ws"`, `"iroh"`, `"http"`, ...) and the
+/// freshly built connector, and returns the connector to actually use.
+/// Useful for instrumenting or intercepting all guardian/gateway traffic
+/// (e.g. logging, testing, protocol visualization).
+pub type ConnectorWrapFn = Arc<dyn Fn(&str, DynConnector) -> DynConnector + Send + Sync>;
+
+/// [`ConnectorWrapFn`] newtype so the builder can stay `Debug`.
+#[derive(Clone)]
+pub struct ConnectorWrapper(pub ConnectorWrapFn);
+
+impl fmt::Debug for ConnectorWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConnectorWrapper(..)")
+    }
+}
+
 /// Builder for [`ConnectorRegistry`]
 ///
 /// See [`ConnectorRegistry::build_from_client_env`] and similar
@@ -64,9 +82,29 @@ pub struct ConnectorRegistryBuilder {
 
     // Enable HTTP
     http_enable: bool,
+
+    /// Optional middleware wrapping every built connector
+    wrapper: Option<ConnectorWrapper>,
 }
 
 impl ConnectorRegistryBuilder {
+    /// Wrap every connector this registry builds with `wrap`.
+    ///
+    /// The wrapper sees the transport name and the real connector and returns
+    /// the connector to use, allowing callers to intercept or instrument all
+    /// guardian/gateway traffic.
+    pub fn with_connector_wrapper(mut self, wrap: ConnectorWrapFn) -> Self {
+        self.wrapper = Some(ConnectorWrapper(wrap));
+        self
+    }
+
+    fn apply_wrapper(&self, transport: &str, connector: DynConnector) -> DynConnector {
+        match &self.wrapper {
+            Some(ConnectorWrapper(wrap)) => wrap(transport, connector),
+            None => connector,
+        }
+    }
+
     #[allow(clippy::unused_async)] // Leave room for async in the future
     pub async fn bind(self) -> anyhow::Result<ConnectorRegistry> {
         // Create initialization functions for each connector type
@@ -82,7 +120,10 @@ impl ConnectorRegistryBuilder {
         let builder_ws = self.clone();
         let ws_connector_init = Arc::new(move || {
             let builder = builder_ws.clone();
-            Box::pin(async move { builder.build_ws_connector().await })
+            Box::pin(async move {
+                let connector = builder.build_ws_connector().await?;
+                Ok(builder.apply_wrapper("ws", connector))
+            })
                 as Pin<Box<dyn Future<Output = anyhow::Result<DynConnector>> + Send>>
         });
         connectors_lazy.insert("ws".into(), (ws_connector_init.clone(), OnceCell::new()));
@@ -97,7 +138,10 @@ impl ConnectorRegistryBuilder {
                 Arc::new(move || {
                     let builder = builder_iroh.clone();
                     let path_change = path_change_iroh.clone();
-                    Box::pin(async move { builder.build_iroh_connector(path_change).await })
+                    Box::pin(async move {
+                        let connector = builder.build_iroh_connector(path_change).await?;
+                        Ok(builder.apply_wrapper("iroh", connector))
+                    })
                         as Pin<Box<dyn Future<Output = anyhow::Result<DynConnector>> + Send>>
                 }),
                 OnceCell::new(),
@@ -107,7 +151,10 @@ impl ConnectorRegistryBuilder {
         let builder_http = self.clone();
         let http_connector_init = Arc::new(move || {
             let builder = builder_http.clone();
-            Box::pin(async move { builder.build_http_connector() })
+            Box::pin(async move {
+                let connector = builder.build_http_connector()?;
+                Ok(builder.apply_wrapper("http", connector))
+            })
                 as Pin<Box<dyn Future<Output = anyhow::Result<DynConnector>> + Send>>
         });
 
@@ -277,6 +324,7 @@ impl ConnectorRegistry {
             http_enable: true,
 
             connection_overrides: BTreeMap::default(),
+            wrapper: None,
         }
     }
 
@@ -292,6 +340,7 @@ impl ConnectorRegistry {
             http_enable: false,
 
             connection_overrides: BTreeMap::default(),
+            wrapper: None,
         }
     }
 
@@ -307,6 +356,7 @@ impl ConnectorRegistry {
             http_enable: true,
 
             connection_overrides: BTreeMap::default(),
+            wrapper: None,
         }
     }
 
