@@ -967,13 +967,25 @@ impl UsdtClientModule {
         // new, mintable value -- mirror the server's `process_deposit_proof`
         // high-water logic so the `ClientInput.amounts` we declare matches the
         // `InputMeta.amount` the server will return (or the transaction would
-        // not balance).
+        // not balance). LOCAL fedi extension (sweep-aware, mirroring our
+        // fork's server rule): a proof anchored at a block strictly LATER
+        // than the account's last confirmed sweep proves the POST-sweep
+        // balance, so the all-time total the server credits is
+        // `swept + proven`; a proof anchored at or before the last sweep (or
+        // for a never-swept account) keeps upstream's raw-`proven` rule.
         let status = self.module_api.deposit_status(claim_pk).await?;
-        let delta = proven.0.saturating_sub(status.credited.0);
+        let sweep = self.module_api.fedi_sweep_status(claim_pk).await?;
+        let all_time_total = match sweep.last_sweep_block {
+            Some(sweep_block) if proof.block_number > sweep_block => {
+                UsdtAmount(sweep.swept.0.saturating_add(proven.0))
+            }
+            _ => proven,
+        };
+        let delta = all_time_total.0.saturating_sub(status.credited.0);
         if delta == 0 {
             bail!(
-                "deposit proof proves {proven} but {} is already credited for {account}; nothing \
-                 new to credit",
+                "deposit proof proves {proven} (all-time total {all_time_total}) but {} is \
+                 already credited for {account}; nothing new to credit",
                 status.credited,
             );
         }
@@ -2174,6 +2186,13 @@ mod tests {
             &self,
         ) -> FederationResult<fedimint_usdt_common::AnchoredBlockResponse> {
             unimplemented!("recover_deposits_scan never calls latest_anchored_block")
+        }
+
+        async fn fedi_sweep_status(
+            &self,
+            _claim_pk: secp256k1::PublicKey,
+        ) -> FederationResult<crate::api::FediSweepStatusResponse> {
+            unimplemented!("recover_deposits_scan never calls fedi_sweep_status")
         }
     }
 

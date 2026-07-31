@@ -6018,7 +6018,7 @@ dependencies = [
  "fedimint-logging",
  "fedimint-usdt-common",
  "futures",
- "reqwest 0.12.28",
+ "reqwest 0.12.22",
  "serde",
  "serde_json",
  "strum 0.27.1",

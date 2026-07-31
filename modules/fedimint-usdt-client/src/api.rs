@@ -12,10 +12,33 @@ use fedimint_usdt_common::endpoint_constants::{
 };
 use fedimint_usdt_common::{
     AnchoredBlockResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositStatusRequest,
-    DepositStatusResponse, PoolStateResponse, RefundStatusRequest, RefundStatusResponse,
-    StatusResponse, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
-    WithdrawFeeQuoteResponse, WithdrawalStatusRequest, WithdrawalStatusResponse,
+    DepositStatusResponse, EvmAddress, PoolStateResponse, RefundStatusRequest,
+    RefundStatusResponse, StatusResponse, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse,
+    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawalStatusRequest,
+    WithdrawalStatusResponse,
 };
+
+/// LOCAL fedi extension (not upstream): the `fedi_sweep_status` endpoint
+/// served by our fork's `fedimint-usdt-server`. The name is `fedi_`-prefixed
+/// (and defined here rather than in `fedimint-usdt-common`'s
+/// `endpoint_constants`, which must stay byte-identical to upstream) so it
+/// can never collide with a future upstream endpoint.
+pub const FEDI_SWEEP_STATUS_ENDPOINT: &str = "fedi_sweep_status";
+
+/// Client-side mirror of the server's `FediSweepStatusResponse` (LOCAL fedi
+/// extension): `claim_pk`'s derived deposit `account`, its all-time `swept`
+/// total, and the consensus-agreed block of its last confirmed sweep (`None`
+/// if never swept). Duplicated field-for-field rather than imported -- the
+/// client crate must not depend on the (non-WASM) server crate, and
+/// serde/JSON is the wire format, so the two definitions are compatible by
+/// construction. Used by `submit_prebuilt_deposit_proof` to mirror the
+/// server's sweep-aware credit delta.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FediSweepStatusResponse {
+    pub account: EvmAddress,
+    pub swept: UsdtAmount,
+    pub last_sweep_block: Option<u64>,
+}
 
 #[apply(async_trait_maybe_send!)]
 pub trait UsdtFederationApi {
@@ -95,6 +118,15 @@ pub trait UsdtFederationApi {
     /// Threshold-agreement (`request_current_consensus`): read directly from
     /// consensus DB, so any guardian answers identically.
     async fn latest_anchored_block(&self) -> FederationResult<AnchoredBlockResponse>;
+
+    /// Reports the sweep bookkeeping of `claim_pk`'s deposit account (its
+    /// all-time `swept` total and last confirmed sweep block), needed to
+    /// mirror the server's sweep-aware deposit-proof credit delta. LOCAL
+    /// fedi extension (not upstream); see [`FediSweepStatusResponse`].
+    async fn fedi_sweep_status(
+        &self,
+        claim_pk: secp256k1::PublicKey,
+    ) -> FederationResult<FediSweepStatusResponse>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -195,6 +227,17 @@ where
         self.request_current_consensus(
             LATEST_ANCHORED_BLOCK_ENDPOINT.to_string(),
             ApiRequestErased::default(),
+        )
+        .await
+    }
+
+    async fn fedi_sweep_status(
+        &self,
+        claim_pk: secp256k1::PublicKey,
+    ) -> FederationResult<FediSweepStatusResponse> {
+        self.request_current_consensus(
+            FEDI_SWEEP_STATUS_ENDPOINT.to_string(),
+            ApiRequestErased::new(DepositStatusRequest { claim_pk }),
         )
         .await
     }
