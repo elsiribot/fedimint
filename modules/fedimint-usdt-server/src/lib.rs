@@ -6308,11 +6308,83 @@ impl Usdt {
     /// op at the same nonce needlessly. The `process_replace_user_op` arm's
     /// own guards (existence, not-superseded, re-checked timeout) are what
     /// actually enforce exactly-once replacement.
+    /// Whether repricing the timed-out `Withdraw`-purpose `submitted` op at the
+    /// current fee `median` would cost more USDT than the covered withdrawals'
+    /// committed `max_fee` ceiling (security review F4). This is the SHARED,
+    /// deterministic affordability decision consulted by BOTH sides of the
+    /// reprice path: [`Usdt::propose_replace_user_ops`] only proposes a reprice
+    /// that is UNDER the ceiling, and [`Usdt::process_replace_user_op`]'s
+    /// `Withdraw` arm STALLS (bails) a reprice that is over it. It MUST
+    /// replicate that arm's reprice fee/gas-cost math byte-for-byte so the two
+    /// sides never disagree:
+    /// `new_max_fee_per_gas =
+    /// with_median_fees(median).max_fee_per_gas.max(bump_10_percent(old))`,
+    /// `gas_cost_wei = total_gas_units * new_max_fee_per_gas`,
+    /// `ceiling = sum of covered UnclaimedWithdrawals' committed max_fee`,
+    /// `over = wei_gas_cost_to_usdt(gas_cost_wei, median.usdt_per_eth_e6) >
+    /// ceiling` (an overflowing/degenerate rate is treated as over-ceiling
+    /// rather than letting an unbounded prefund through).
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of committed consensus DB (the covered
+    /// `UnclaimedWithdrawal`s), the consensus fee `median`, and the
+    /// compile-time gas bounds -- no RPC / wall-clock / `our_peer_id` /
+    /// float -- so every guardian answers identically. Returns `false` for
+    /// a non-`Withdraw` purpose (the ceiling concept is `Withdraw`-only);
+    /// such ops are never passed here.
+    async fn withdraw_reprice_over_ceiling(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        submitted: &SubmittedUserOp,
+        median: &FeeVote,
+    ) -> bool {
+        let UserOpPurpose::Withdraw { outpoints } = &submitted.purpose else {
+            return false;
+        };
+        let old = &submitted.signed.unsigned;
+
+        // Fresh median-derived fee bumped >= 10% over the OLD op's fee -- the
+        // EXACT `new_max_fee_per_gas` `process_replace_user_op` will build.
+        let priced =
+            GasBounds::DEPLOY_AND_SWEEP_DEVNET.with_median_fees(Some(median.max_fee_per_gas_wei));
+        let new_max_fee_per_gas = priced
+            .max_fee_per_gas
+            .max(bump_10_percent(old.max_fee_per_gas));
+
+        // The broadcaster-fronted prefund the replacement would cost, in wei.
+        let total_gas_units = old
+            .verification_gas_limit
+            .saturating_add(old.call_gas_limit)
+            .saturating_add(u128::try_from(old.pre_verification_gas).unwrap_or(u128::MAX));
+        let gas_cost_wei = total_gas_units.saturating_mul(new_max_fee_per_gas);
+
+        // Ceiling = sum of the covered withdrawals' committed `max_fee` (what
+        // the users agreed to pay).
+        let mut ceiling: u64 = 0;
+        for &out_point in outpoints {
+            if let Some(w) = dbtx.get_value(&UnclaimedWithdrawalKey(out_point)).await {
+                ceiling = ceiling.saturating_add(w.max_fee.0);
+            }
+        }
+
+        match fedimint_usdt_common::wei_gas_cost_to_usdt(gas_cost_wei, median.usdt_per_eth_e6) {
+            Some(cost) => cost.0 > ceiling,
+            // An overflowing (byzantine/degenerate) rate is treated as
+            // unaffordable rather than silently letting an unbounded prefund
+            // through.
+            None => true,
+        }
+    }
+
     async fn propose_replace_user_ops(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
     ) -> Vec<UsdtConsensusItem> {
         let ccount = self.consensus_block_count(dbtx).await;
+        // The consensus median used to price a Withdraw reprice's affordability
+        // gate below (None while quorum/freshness is not met).
+        let median = self.fee_vote_median(dbtx).await;
         let submitted: Vec<(SubmittedUserOpKey, SubmittedUserOp)> = dbtx
             .find_by_prefix(&SubmittedUserOpPrefix)
             .await
@@ -6324,11 +6396,34 @@ impl Usdt {
                 continue;
             }
             if ccount
-                > s.submitted_block
+                <= s.submitted_block
                     .saturating_add(submitted_op_timeout_blocks())
             {
-                items.push(UsdtConsensusItem::ReplaceUserOp { op_hash });
+                continue;
             }
+            // Security review F4 (re-reprice a stalled over-ceiling withdrawal):
+            // a timed-out `Withdraw` op is only proposed for reprice if it is
+            // AFFORDABLE at the current median -- i.e. the reprice would stay
+            // under the covered withdrawals' committed `max_fee` ceiling.
+            // Otherwise `process_replace_user_op` would just `bail!` (stall), so
+            // proposing it is pure churn; we silently skip it and let it stay
+            // live + non-superseded. Because we re-check every timeout, the
+            // stall SELF-HEALS: the reprice fires the moment the median prices
+            // the batch back under the ceiling. With no median we cannot price
+            // it, so defer (same non-state-changing deferral as
+            // `process_replace_user_op`). `DeployAndSweep`/`RecoverResidual` ops
+            // have no ceiling concept and are proposed unconditionally (their
+            // own arms decide whether to reprice or bail).
+            if matches!(s.purpose, UserOpPurpose::Withdraw { .. }) {
+                let affordable = match &median {
+                    Some(m) => !self.withdraw_reprice_over_ceiling(dbtx, &s, m).await,
+                    None => false,
+                };
+                if !affordable {
+                    continue;
+                }
+            }
+            items.push(UsdtConsensusItem::ReplaceUserOp { op_hash });
         }
         items
     }
@@ -6427,93 +6522,75 @@ impl Usdt {
         new_op.max_fee_per_gas = new_max_fee_per_gas;
         new_op.max_priority_fee_per_gas = new_max_priority_fee_per_gas;
 
-        // The broadcaster-fronted prefund the replacement will cost, in wei,
-        // priced from the op's ACTUAL (already-2x-headroom) fee fields.
-        let total_gas_units = old
-            .verification_gas_limit
-            .saturating_add(old.call_gas_limit)
-            .saturating_add(u128::try_from(old.pre_verification_gas).unwrap_or(u128::MAX));
-        let gas_cost_wei = total_gas_units.saturating_mul(new_max_fee_per_gas);
-
         match &submitted.purpose {
             UserOpPurpose::Withdraw { outpoints } => {
-                // Ceiling = the sum of the covered withdrawals' committed
-                // `max_fee` (what the users agreed to pay). If the repriced op
-                // would cost more USDT than that, DON'T replace -- but DON'T
-                // refund either (finding B1): STALL the op (kept live +
-                // superseded) so a later on-chain confirmation still settles it
-                // exactly-once. See the `over_ceiling` block below.
-                let mut ceiling: u64 = 0;
-                for &out_point in outpoints {
-                    if let Some(w) = dbtx.get_value(&UnclaimedWithdrawalKey(out_point)).await {
-                        ceiling = ceiling.saturating_add(w.max_fee.0);
-                    }
-                }
-                let over_ceiling = match fedimint_usdt_common::wei_gas_cost_to_usdt(
-                    gas_cost_wei,
-                    median.usdt_per_eth_e6,
-                ) {
-                    Some(cost) => cost.0 > ceiling,
-                    // An overflowing (byzantine/degenerate) rate is treated
-                    // as unaffordable rather than silently letting an
-                    // unbounded prefund through.
-                    None => true,
-                };
-                if over_ceiling {
-                    // Finding B1 (stall, don't refund): the op `op_hash` is
-                    // already threshold-signed and live at its `(sender, nonce)`
-                    // on-chain. It has no on-chain expiry and its nonce is
-                    // unconsumed, so it can still confirm later (once gas falls
-                    // back to its fee level) and pay the recipients. The pre-B1
-                    // behavior reissued the withdrawals' e-cash as a refund AND
-                    // removed/purged the still-live op -- a DOUBLE PAY: the
-                    // refund paid the withdrawer once, then a late confirmation
-                    // paid the recipient a second time. (Worse, the confirm no
-                    // longer found the removed `SubmittedUserOp` and hit the
-                    // silent-ignore branch in `apply_user_op_confirmed`, losing
-                    // the settlement and desyncing the pool nonce.)
+                // Ceiling gate (finding B1 + security review F4). Ceiling = the
+                // sum of the covered withdrawals' committed `max_fee` (what the
+                // users agreed to pay). If repricing this batch at the current
+                // median would cost more USDT than that, DON'T replace -- and
+                // DON'T refund either (finding B1): STALL the op.
+                if self
+                    .withdraw_reprice_over_ceiling(dbtx, &submitted, &median)
+                    .await
+                {
+                    // STALL semantics (finding B1, refined by security review
+                    // F4): the op `op_hash` is already threshold-signed and live
+                    // at its `(sender, nonce)` on-chain. It has no on-chain
+                    // expiry and its nonce is unconsumed, so it can still confirm
+                    // later (once gas falls back to its fee level) and pay the
+                    // recipients. The pre-B1 behavior reissued the withdrawals'
+                    // e-cash as a refund AND removed/purged the still-live op --
+                    // a DOUBLE PAY: the refund paid the withdrawer once, then a
+                    // late confirmation paid the recipient a second time.
                     //
-                    // Instead we STALL: mark the op superseded -- so
-                    // `propose_replace_user_ops` (which skips superseded ops)
-                    // stops re-proposing a fresh reprice every timeout -- but
-                    // KEEP the `SubmittedUserOp` record LIVE and issue NO refund.
-                    // Because the record survives, a later on-chain confirmation
-                    // is handled normally by `apply_user_op_confirmed`: it finds
-                    // the record, settles the covered withdrawals exactly-once,
-                    // debits `PoolState.balance`, and advances the pool nonce. No
+                    // Instead we STALL by returning a non-state-changing `Err`:
+                    // we make NO DB write and issue NO refund, leaving the
+                    // `SubmittedUserOp` LIVE and NON-superseded. Two things
+                    // follow. (a) Because the record survives, a later on-chain
+                    // confirmation is handled normally by
+                    // `apply_user_op_confirmed`: it finds the record, settles
+                    // the covered withdrawals exactly-once, debits
+                    // `PoolState.balance`, and advances the pool nonce -- no
                     // refund is ever issued, so there is no second payment to
-                    // double.
+                    // double. (b) Because the op stays NON-superseded, it remains
+                    // eligible for re-evaluation: `propose_replace_user_ops`
+                    // re-checks affordability (via the same
+                    // `withdraw_reprice_over_ceiling` helper) every timeout and
+                    // re-fires the reprice the MOMENT the median prices the batch
+                    // back under the committed ceiling. The `Err` is dropped by
+                    // the consensus engine and adds no history (mirrors
+                    // `process_rotate_signing`), so re-reaching this branch in a
+                    // rare fees-rose-mid-round race simply bails again with no
+                    // consensus bloat.
                     //
                     // Tradeoff (accepted, self-healing): the pool account is
                     // strictly one-batch-at-a-time -- `withdraw_batch_in_flight`
-                    // counts a superseded `Withdraw` op -- so a stuck
-                    // over-ceiling op stalls every SUBSEQUENT withdrawal batch
-                    // until it confirms. That liveness cost is bounded to the
-                    // same rare gas-spike condition that triggered the
-                    // over-ceiling and clears itself the instant gas falls back
-                    // to the op's fee level. The only unbounded case -- a
-                    // PERMANENT gas regime shift, where the op never confirms
-                    // within its mempool window -- is resolved by operator
-                    // intervention. Funds are safe throughout: exactly one live
+                    // counts the live (non-superseded) stalled `Withdraw` op --
+                    // so a stuck over-ceiling op stalls every SUBSEQUENT
+                    // withdrawal batch until it reprices or confirms. That
+                    // liveness cost is bounded to the same rare gas-spike
+                    // condition that triggered the over-ceiling and clears itself
+                    // the instant the median falls back under the ceiling. The
+                    // only unbounded case -- a PERMANENT gas regime shift, where
+                    // the op never reprices under the ceiling nor confirms within
+                    // its mempool window -- is resolved by operator intervention.
+                    // Funds are safe throughout: exactly one live
                     // `UnclaimedWithdrawal` obligation per covered withdrawal,
                     // settled exactly once on the eventual confirm.
-                    let mut stalled = submitted.clone();
-                    stalled.superseded = true;
-                    dbtx.insert_entry(&SubmittedUserOpKey(op_hash), &stalled)
-                        .await;
                     warn!(
                         target: "usdt",
                         ?op_hash,
                         count = outpoints.len(),
-                        gas_cost_wei,
-                        ceiling,
                         "withdrawal batch reprice exceeds the covered withdrawals' committed \
-                         max_fee; STALLING the batch (kept live + superseded, NOT refunded) until \
-                         it confirms on-chain or gas drops. This blocks subsequent withdrawal \
-                         batches until then; a permanent gas regime shift needs operator \
-                         intervention"
+                         max_fee; STALLING the batch (kept live + non-superseded, NOT refunded) \
+                         until the median falls back under the ceiling (self-healing reprice) or \
+                         the op confirms on-chain. This blocks subsequent withdrawal batches \
+                         until then; a permanent gas regime shift needs operator intervention"
                     );
-                    return Ok(());
+                    bail!(
+                        "withdrawal reprice over the committed max_fee ceiling; stalling until \
+                         fees fall under it"
+                    );
                 }
             }
             UserOpPurpose::DeployAndSweep { .. } => {
@@ -18611,13 +18688,15 @@ mod tests {
         assert_eq!(outpoints, &vec![out2]);
     }
 
-    /// **Finding B1.** When the repriced batch's gas would exceed the covered
-    /// withdrawals' committed `max_fee` ceiling, the op is NOT replaced -- but
-    /// it is also NOT refunded. Instead the still-live, threshold-signed op is
-    /// STALLED: marked `superseded` (so it stops being re-priced every timeout)
-    /// while its `SubmittedUserOp` record is KEPT LIVE, so a later on-chain
-    /// confirmation still settles it exactly-once. Asserts: NO `RefundKey`, the
-    /// `SubmittedUserOpKey` still present with `superseded == true`, the
+    /// **Finding B1, refined by security review F4.** When the repriced batch's
+    /// gas would exceed the covered withdrawals' committed `max_fee` ceiling,
+    /// the op is NOT replaced -- but it is also NOT refunded. Instead the
+    /// still-live, threshold-signed op is STALLED via a non-state-changing
+    /// `Err`: no DB write, no refund, and the `SubmittedUserOp` stays LIVE and
+    /// NON-superseded (so a later on-chain confirmation still settles it
+    /// exactly-once AND it stays eligible for a self-healing reprice once fees
+    /// fall). Asserts: `process_replace_user_op` returns `Err`, NO `RefundKey`,
+    /// the `SubmittedUserOpKey` still present with `superseded == false`, the
     /// `WithdrawalState` UNCHANGED (still `Submitted`, NOT `Failed`), and the
     /// `UnclaimedWithdrawal` still present.
     #[tokio::test]
@@ -18659,28 +18738,25 @@ mod tests {
 
         let mut dbtx = db.begin_transaction().await;
         module
-            .process_consensus_item(
-                &mut dbtx.to_ref_nc(),
-                UsdtConsensusItem::ReplaceUserOp { op_hash: ha },
-                PeerId::from(0),
-            )
+            .process_replace_user_op(&mut dbtx.to_ref_nc(), ha)
             .await
-            .expect("over-ceiling reprice is a state change (stall), returns Ok");
+            .expect_err("over-ceiling reprice stalls via a non-state-changing Err");
 
         // (a) NO refund is created -- the op is stalled, not terminal-failed.
         assert!(
             dbtx.to_ref_nc().get_value(&RefundKey(out1)).await.is_none(),
             "an over-ceiling reprice must NOT reissue an e-cash refund (finding B1)"
         );
-        // (b) The SubmittedUserOp is KEPT and now marked superseded.
+        // (b) The SubmittedUserOp is KEPT LIVE and NON-superseded (so it stays
+        // eligible for a self-healing reprice once fees fall -- F4).
         let still = dbtx
             .to_ref_nc()
             .get_value(&SubmittedUserOpKey(ha))
             .await
             .expect("the stalled op's SubmittedUserOp must be kept live");
         assert!(
-            still.superseded,
-            "the stalled op must be marked superseded so it is not re-priced every timeout"
+            !still.superseded,
+            "the stalled op must stay NON-superseded so it can be re-priced once fees fall (F4)"
         );
         // (c) The withdrawal state is UNCHANGED (still Submitted, NOT Failed).
         assert_eq!(
@@ -18703,16 +18779,198 @@ mod tests {
         );
     }
 
-    /// **Finding B1 (regression).** When the op that goes over the ceiling is
-    /// ITSELF a replacement (a superseded predecessor `A` shares its
-    /// `(sender, nonce)`), the STALL keeps the WHOLE chain live: both the
-    /// current op `B` (now superseded) and its predecessor `A` remain, so a
-    /// later confirmation of EITHER settles exactly-once. Because the chain
-    /// stays live, `withdraw_batch_in_flight` remains `true` and a later
-    /// `Queued` withdrawal is STALLED behind it until the batch confirms -- the
-    /// accepted, self-healing liveness cost of finding B1's "stall, don't
-    /// refund". (Pre-B1 this path purged the chain and refunded, which
-    /// double-paid on a late confirm.)
+    /// **Security review F4.** A timed-out, live (non-superseded) `Withdraw` op
+    /// whose reprice would exceed the covered withdrawals' committed `max_fee`
+    /// ceiling is NOT proposed for reprice by `propose_replace_user_ops` while
+    /// the median keeps it over the ceiling -- the propose-side affordability
+    /// gate silently skips it (no `ReplaceUserOp` churn). The op stays LIVE and
+    /// NON-superseded (still repriceable once fees fall) and still counts as an
+    /// in-flight batch (blocks subsequent batches, the intended stall).
+    #[tokio::test]
+    async fn stalled_over_ceiling_withdraw_is_not_proposed_while_over_ceiling() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let ha = [0xa1; 32];
+        let out1 = test_out_point(1);
+        let total = UsdtAmount(1_000_000);
+
+        seed_block_count_votes(db, 4, submitted_op_timeout_blocks() + 1).await;
+        // usdt_per_eth_e6 = 3e9 -> the reprice is over the 50M ceiling.
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out1),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc1; 20]),
+                    amount: total,
+                    // LOW ceiling: the reprice at the seeded median is over it.
+                    max_fee: UsdtAmount(50_000_000),
+                    requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out1), &WithdrawalState::Submitted(ha))
+                .await;
+            // Live + NON-superseded: the natural stalled state under F4.
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(ha),
+                &submitted_withdraw_op(vec![out1], total, 100_000_000_000, 2_000_000_000, 0, false),
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Even though the op has timed out, it is NOT proposed for reprice: the
+        // reprice would be over the committed ceiling, so proposing it would
+        // just stall (churn). The propose-side affordability gate skips it.
+        let mut dbtx = db.begin_transaction().await;
+        let proposal = module.propose_replace_user_ops(&mut dbtx.to_ref_nc()).await;
+        assert!(
+            !proposal.contains(&UsdtConsensusItem::ReplaceUserOp { op_hash: ha }),
+            "an over-ceiling withdrawal reprice must NOT be proposed (F4): {proposal:?}"
+        );
+
+        // The op stays LIVE and NON-superseded -- still eligible to reprice once
+        // fees fall (proven by the self-heal test).
+        let still = dbtx
+            .to_ref_nc()
+            .get_value(&SubmittedUserOpKey(ha))
+            .await
+            .expect("the stalled op stays live");
+        assert!(
+            !still.superseded,
+            "the stalled op stays non-superseded (repriceable)"
+        );
+        // It still counts as an in-flight batch (blocks new batches as intended).
+        assert!(
+            module.withdraw_batch_in_flight(&mut dbtx.to_ref_nc()).await,
+            "the live stalled op still blocks subsequent withdrawal batches"
+        );
+    }
+
+    /// **Security review F4 (the crux -- self-heal).** The wedge clears itself
+    /// when fees fall: a stalled over-ceiling `Withdraw` op that is skipped by
+    /// `propose_replace_user_ops` while over the ceiling becomes proposable the
+    /// moment the median prices its reprice back UNDER the committed ceiling,
+    /// and `process_replace_user_op` then reprices it normally (a replacement
+    /// `PendingUserOp` is enqueued at the same `(sender, nonce)` and the OLD op
+    /// is marked `superseded` for RBF-nonce safety). No refund is ever issued.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn stalled_over_ceiling_withdraw_reprices_once_fees_fall_under_ceiling() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        let ha = [0xa1; 32];
+        let out1 = test_out_point(1);
+        let total = UsdtAmount(1_000_000);
+
+        seed_block_count_votes(db, 4, submitted_op_timeout_blocks() + 1).await;
+        // Start OVER the ceiling (usdt_per_eth_e6 = 3e9).
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &UnclaimedWithdrawalKey(out1),
+                &UsdtWithdrawalV0 {
+                    recipient: EvmAddress([0xc1; 20]),
+                    amount: total,
+                    max_fee: UsdtAmount(50_000_000),
+                    requested_block: 0,
+                    refund_pubkey: sample_claim_pk(),
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&WithdrawalStateKey(out1), &WithdrawalState::Submitted(ha))
+                .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(ha),
+                &submitted_withdraw_op(vec![out1], total, 100_000_000_000, 2_000_000_000, 0, false),
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // While over the ceiling, the op is not proposed.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let proposal = module.propose_replace_user_ops(&mut dbtx.to_ref_nc()).await;
+            assert!(
+                !proposal.contains(&UsdtConsensusItem::ReplaceUserOp { op_hash: ha }),
+                "over-ceiling: not proposed yet: {proposal:?}"
+            );
+        }
+
+        // Fees fall: the USDT/ETH rate drops 3x so the SAME reprice now prices
+        // UNDER the committed ceiling. Overwrite the stored fee votes in place
+        // (same freshness stamp) with a lower `usdt_per_eth_e6`.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let recorded_block = module.consensus_block_count(&mut dbtx.to_ref_nc()).await;
+            let cheaper = StoredFeeVote {
+                vote: FeeVote {
+                    max_fee_per_gas_wei: 30_000_000_000,
+                    // 3x cheaper -> the reprice's USDT cost drops under 50M.
+                    usdt_per_eth_e6: 1_000_000_000,
+                },
+                recorded_block,
+            };
+            for p in 0..4u16 {
+                dbtx.insert_entry(&FeeVoteKey(PeerId::from(p)), &cheaper)
+                    .await;
+            }
+            dbtx.commit_tx().await;
+        }
+
+        // Now the affordability gate passes: the op IS proposed for reprice.
+        let mut dbtx = db.begin_transaction().await;
+        let proposal = module.propose_replace_user_ops(&mut dbtx.to_ref_nc()).await;
+        assert!(
+            proposal.contains(&UsdtConsensusItem::ReplaceUserOp { op_hash: ha }),
+            "once fees fall under the ceiling, the reprice must be proposed (F4 self-heal): \
+             {proposal:?}"
+        );
+
+        // Applying it reprices: a replacement PendingUserOp is enqueued at the
+        // same (sender, nonce) and the OLD op is marked superseded.
+        module
+            .process_replace_user_op(&mut dbtx.to_ref_nc(), ha)
+            .await
+            .expect("an under-ceiling reprice must process cleanly");
+        let old = dbtx
+            .to_ref_nc()
+            .get_value(&SubmittedUserOpKey(ha))
+            .await
+            .expect("old op kept for RBF-nonce safety");
+        assert!(old.superseded, "old op marked superseded after the reprice");
+        assert_eq!(
+            pending_withdraw_ops(&mut dbtx.to_ref_nc()).await.len(),
+            1,
+            "the reprice enqueues exactly one replacement withdraw op"
+        );
+        // No refund anywhere (the reprice replaces, never refunds).
+        assert!(
+            dbtx.to_ref_nc().get_value(&RefundKey(out1)).await.is_none(),
+            "repricing never issues a refund"
+        );
+    }
+
+    /// **Finding B1 (regression), refined by security review F4.** When the op
+    /// that goes over the ceiling is ITSELF a replacement (a superseded
+    /// predecessor `A` shares its `(sender, nonce)`), the STALL keeps the WHOLE
+    /// chain live: the current op `B` stays LIVE and NON-superseded and its
+    /// predecessor `A` remains superseded, so a later confirmation of EITHER
+    /// settles exactly-once. Because the chain stays live,
+    /// `withdraw_batch_in_flight` remains `true` and a later `Queued`
+    /// withdrawal is STALLED behind it until the batch reprices or confirms
+    /// -- the accepted, self-healing liveness cost of finding B1's "stall,
+    /// don't refund". (Pre-B1 this path purged the chain and refunded,
+    /// which double-paid on a late confirm.)
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn over_ceiling_reprice_of_a_replacement_stalls_and_keeps_chain_live() {
@@ -18790,16 +19048,13 @@ mod tests {
             dbtx.commit_tx().await;
         }
 
-        // Reprice the current op B -- goes over the ceiling.
+        // Reprice the current op B -- goes over the ceiling, so it STALLS via a
+        // non-state-changing Err.
         let mut dbtx = db.begin_transaction().await;
         module
-            .process_consensus_item(
-                &mut dbtx.to_ref_nc(),
-                UsdtConsensusItem::ReplaceUserOp { op_hash: hb },
-                PeerId::from(0),
-            )
+            .process_replace_user_op(&mut dbtx.to_ref_nc(), hb)
             .await
-            .expect("over-ceiling reprice is a state change (stall), returns Ok");
+            .expect_err("over-ceiling reprice stalls via a non-state-changing Err");
 
         // out1 is UNCHANGED (still Signing(hb)) -- not failed, not refunded.
         assert_eq!(
@@ -18819,14 +19074,18 @@ mod tests {
             "no refund is issued for a stalled over-ceiling op (finding B1)"
         );
 
-        // The WHOLE chain stays live -- both B (now superseded) AND the
-        // predecessor A (already superseded). A late confirm of either settles.
+        // The WHOLE chain stays live -- B (still NON-superseded, eligible for a
+        // self-healing reprice) AND the predecessor A (already superseded). A
+        // late confirm of either settles exactly-once.
         let b = dbtx
             .to_ref_nc()
             .get_value(&SubmittedUserOpKey(hb))
             .await
             .expect("the current op B must be KEPT live");
-        assert!(b.superseded, "B must now be marked superseded (stalled)");
+        assert!(
+            !b.superseded,
+            "B must stay NON-superseded (stalled but repriceable -- F4)"
+        );
         let a = dbtx
             .to_ref_nc()
             .get_value(&SubmittedUserOpKey(ha))
@@ -18851,13 +19110,15 @@ mod tests {
         );
     }
 
-    /// **Finding B1, step 4 (the crux).** A stalled over-ceiling op still
-    /// settles EXACTLY ONCE when it eventually confirms on-chain (gas fell back
-    /// to its fee level). Drives the real stall via `ReplaceUserOp` (leaving
-    /// the op live + superseded, no refund), then feeds a threshold of
-    /// `UserOpConfirmed` votes and asserts normal settlement: the covered
-    /// withdrawal moves to `Confirmed`, `PoolState.balance` is debited by the
-    /// swept amount, the pool nonce advances, and NO refund exists.
+    /// **Finding B1, step 4 (the crux), refined by security review F4.** A
+    /// stalled over-ceiling op still settles EXACTLY ONCE when it eventually
+    /// confirms on-chain (gas fell back to its fee level). Drives the real
+    /// stall via `process_replace_user_op` (a non-state-changing `Err`
+    /// leaving the op live + NON-superseded, no refund), then feeds a
+    /// threshold of `UserOpConfirmed` votes and asserts normal settlement:
+    /// the covered withdrawal moves to `Confirmed`, `PoolState.balance` is
+    /// debited by the swept amount, the pool nonce advances, and NO refund
+    /// exists.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn stalled_over_ceiling_op_settles_once_on_late_confirm() {
@@ -18904,23 +19165,21 @@ mod tests {
             dbtx.commit_tx().await;
         }
 
-        // Drive the real stall: the op is kept live + superseded, no refund.
+        // Drive the real stall: a non-state-changing Err leaves the op live +
+        // NON-superseded, no refund.
         let mut dbtx = db.begin_transaction().await;
         module
-            .process_consensus_item(
-                &mut dbtx.to_ref_nc(),
-                UsdtConsensusItem::ReplaceUserOp { op_hash: ha },
-                PeerId::from(0),
-            )
+            .process_replace_user_op(&mut dbtx.to_ref_nc(), ha)
             .await
-            .expect("over-ceiling reprice stalls (Ok)");
+            .expect_err("over-ceiling reprice stalls via a non-state-changing Err");
         assert!(
-            dbtx.to_ref_nc()
+            !dbtx
+                .to_ref_nc()
                 .get_value(&SubmittedUserOpKey(ha))
                 .await
                 .expect("op kept live")
                 .superseded,
-            "precondition: the op is stalled (live + superseded)"
+            "precondition: the op is stalled (live + NON-superseded)"
         );
         dbtx.commit_tx().await;
 

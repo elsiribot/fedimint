@@ -99,11 +99,28 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// withdrawals' e-cash as a refund AND removed the op even though its
 /// `(sender, nonce)` was still live on-chain with an unconsumed nonce, so a
 /// later confirmation paid the recipient a SECOND time (double pay). The op is
-/// now kept live and merely marked `superseded`, so a later confirmation
-/// settles it exactly-once via `apply_user_op_confirmed`. This is a
-/// deterministic apply-path BEHAVIOR change only: no consensus-serialized type,
-/// wire shape, or DB record layout changed, so there is no
-/// `get_database_migrations` entry/snapshot for this bump.
+/// now kept live so a later confirmation settles it exactly-once via
+/// `apply_user_op_confirmed`.
+///
+/// Over-ceiling reprice re-evaluation (still `0.10`; refines unreleased
+/// behavior, no version bump -- security review F4): a withdrawal whose reprice
+/// would exceed the covered withdrawals' committed `max_fee` ceiling now STALLS
+/// but stays eligible to reprice later. Previously the stall marked the op
+/// `superseded`, which permanently removed it from `propose_replace_user_ops`'
+/// re-evaluation, so it could only ever settle at its ORIGINAL fee even if gas
+/// later fell to a level where the reprice would fit under the ceiling --
+/// wedging the one-batch-at-a-time withdrawal queue for that whole window.
+/// Instead the over-ceiling apply path is now a non-state-changing `Err` (no
+/// DB write, no consensus-history bloat) that leaves the `SubmittedUserOp` LIVE
+/// and NON-superseded, and `propose_replace_user_ops` gates a timed-out
+/// `Withdraw` op on a shared, deterministic affordability check: it proposes a
+/// reprice only when the current fee median prices the batch back UNDER the
+/// committed ceiling. The stall thus self-heals -- the reprice fires the moment
+/// fees fall under the ceiling -- while a late on-chain confirm still settles
+/// the live op exactly-once (no double pay). This is a deterministic apply/
+/// propose-path BEHAVIOR change only: no consensus-serialized type, wire shape,
+/// or DB record layout changed, so there is no `get_database_migrations`
+/// entry/snapshot for these bumps.
 ///
 /// Bumped to `0.11` (finding A): batched recovery of stranded `EntryPoint` gas
 /// deposits. Single-use deposit accounts are deployed and swept once and then
