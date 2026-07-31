@@ -81,14 +81,14 @@ use crate::db::{
     HasEverBeenReadyKey, HasEverBeenReadyPrefix, LastSweepBlockKey, LastSweepBlockPrefix,
     MpcRoundChunk, MpcRoundChunkKey, MpcRoundChunkPrefix, MpcRoundChunkSessionPrefix,
     MpcRoundChunkSessionRoundPeerPrefix, MpcRoundChunkSessionRoundPrefix, PendingUserOp,
-    PendingUserOpKey, PendingUserOpPrefix,
-    PoolState, PoolStateKey, PoolStatePrefix, Refund, RefundKey, RefundPrefix, SessionState,
-    SigningPurpose, SigningSession, SigningSessionKey, SigningSessionPrefix, StoredFeeVote,
-    SubmittedUserOp, SubmittedUserOpKey, SubmittedUserOpPrefix, UnclaimedWithdrawalKey,
-    UnclaimedWithdrawalPrefix, UsdtWithdrawalV0, UserOpConfirmedObservation,
-    UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix, UserOpConfirmedVotePrefix, UserOpPurpose,
-    WithdrawalBatchCapKey, WithdrawalBatchCapPrefix, WithdrawalIncurredFeeKey,
-    WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
+    PendingUserOpKey, PendingUserOpPrefix, PoolState, PoolStateKey, PoolStatePrefix, Refund,
+    RefundKey, RefundPrefix, SessionState, SigningPurpose, SigningSession, SigningSessionKey,
+    SigningSessionPrefix, StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey,
+    SubmittedUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
+    UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
+    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalBatchCapKey, WithdrawalBatchCapPrefix,
+    WithdrawalIncurredFeeKey, WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey,
+    WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -106,6 +106,37 @@ pub mod proof;
 pub mod rpc;
 pub mod signing;
 pub mod user_op;
+
+/// LOCAL fedi extension (not upstream): endpoint serving
+/// [`FediSweepStatusResponse`], the sweep bookkeeping a client needs to
+/// mirror [`Usdt::process_deposit_proof`]'s sweep-aware credit delta.
+/// Deliberately `fedi_`-prefixed (and defined here rather than in
+/// `fedimint-usdt-common`'s `endpoint_constants`, which must stay
+/// byte-identical to upstream) so it can never collide with a future
+/// upstream endpoint name.
+pub const FEDI_SWEEP_STATUS_ENDPOINT: &str = "fedi_sweep_status";
+
+/// Response of [`FEDI_SWEEP_STATUS_ENDPOINT`]: `claim_pk`'s derived deposit
+/// `account`, its [`DepositRecord::swept`] total, and the consensus-agreed
+/// [`LastSweepBlockKey`] block (`None` if no sweep ever confirmed). The
+/// client crate mirrors this struct field-for-field (serde/JSON is the wire
+/// format, so the duplicated definition is compatible by construction);
+/// LOCAL fedi extension, see [`Usdt::handle_fedi_sweep_status`].
+#[derive(
+    Debug,
+    Clone,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    fedimint_core::encoding::Encodable,
+    fedimint_core::encoding::Decodable,
+)]
+pub struct FediSweepStatusResponse {
+    pub account: fedimint_usdt_common::EvmAddress,
+    pub swept: UsdtAmount,
+    pub last_sweep_block: Option<u64>,
+}
 
 /// Generates the module
 #[derive(Debug, Clone, Default)]
@@ -2543,6 +2574,21 @@ impl ServerModule for Usdt {
                     Ok(handle_latest_anchored_block(&mut dbtx.to_ref_nc()).await)
                 }
             },
+            api_endpoint! {
+                FEDI_SWEEP_STATUS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, req: DepositStatusRequest| -> FediSweepStatusResponse {
+                    // LOCAL fedi extension: read-only consensus state,
+                    // mirrors `DEPOSIT_STATUS_ENDPOINT` (same request type).
+                    // See `handle_fedi_sweep_status`.
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+
+                    Ok(module
+                        .handle_fedi_sweep_status(&mut dbtx.to_ref_nc(), req.claim_pk)
+                        .await)
+                }
+            },
         ]
     }
 }
@@ -3575,10 +3621,13 @@ impl Usdt {
     /// `claimed` is advanced by that same delta so the freshly-minted value
     /// can never be re-claimed a second time through the [`UsdtInput::V0`]
     /// path (whose over-claim guard reads `credited - claimed`). The high-water
-    /// `credited` is advanced to the proven balance and the SAME
-    /// [`Self::maybe_trigger_sweep`] bookkeeping the observation path fires is
-    /// fired here, so the on-chain USDT is deploy-and-swept into the pool
-    /// exactly as before.
+    /// `credited` is advanced to the proven all-time total -- `swept +
+    /// proven` for a proof anchored past the account's consensus-agreed
+    /// [`LastSweepBlockKey`], raw `proven` otherwise (LOCAL fedi sweep-aware
+    /// credit rule; see the inline comment for the full argument) -- and the
+    /// SAME [`Self::maybe_trigger_sweep`] bookkeeping the observation path
+    /// fires is fired here, so the on-chain USDT is deploy-and-swept into the
+    /// pool exactly as before.
     ///
     /// Unlike [`UsdtInput::V0`], no deposit fee is charged here: the input
     /// carries no `fee` field and its `delta` is minted in full (paired 1:1
@@ -3646,20 +3695,48 @@ impl Usdt {
                     nonce: 0,
                 });
 
+        // Sweep-aware all-time total (LOCAL fedi extension; see
+        // `LastSweepBlockKey`): a proof anchored at a block strictly LATER
+        // than the account's consensus-agreed last sweep block provably saw
+        // the POST-sweep balance (every confirmed sweep had already left the
+        // account by `proof.block_number`), so the account's true all-time
+        // deposit total is `record.swept + proven` -- this is what lets a
+        // brand-new deposit to an already-swept address credit FULLY, where
+        // upstream's raw `proven` high-water would reject it as stale
+        // (`proven <= credited` once anything was swept). A proof anchored AT
+        // or BEFORE the last sweep block (or for a never-swept account) keeps
+        // the conservative raw-`proven` rule: such a proof's balance may
+        // still contain funds a sweep later moved, which `swept` also counts,
+        // so summing there could double-credit. No double credit either way:
+        // `swept` only covers sweeps confirmed at blocks
+        // `<= last_sweep_block < proof.block_number`, whose funds are absent
+        // from the proven balance. Deterministic: `last_sweep_block` and
+        // `record.swept` are consensus DB (written only by
+        // `apply_user_op_confirmed` from threshold-agreed observations) and
+        // `proof.block_number` is part of the ordered input itself.
+        let last_sweep_block = dbtx.get_value(&LastSweepBlockKey(account)).await;
+        let all_time_total = match last_sweep_block {
+            Some(sweep_block) if proof.block_number > sweep_block => {
+                UsdtAmount(record.swept.0.saturating_add(proven.0))
+            }
+            _ => proven,
+        };
+
         // High-water mark: only the delta over what is already credited is
-        // new, spendable value. A resubmitted/stale proof (proven <= credited)
-        // gives delta 0 and is rejected as a duplicate.
+        // new, spendable value. A resubmitted/stale proof
+        // (all_time_total <= credited) gives delta 0 and is rejected as a
+        // duplicate.
         let credited = record.credited;
-        let delta = proven.0.saturating_sub(credited.0);
+        let delta = all_time_total.0.saturating_sub(credited.0);
         if delta == 0 {
             return Err(UsdtInputError::DepositProofStale { proven, credited });
         }
 
-        // Advance the monotonic high-water `credited` to the proven balance
-        // AND advance `claimed` by the minted delta (`claimed <= credited`
-        // stays invariant, keeping `audit` conservative and the `V0` over-claim
-        // guard tight against re-minting this same value).
-        record.credited = proven;
+        // Advance the monotonic high-water `credited` to the proven all-time
+        // total AND advance `claimed` by the minted delta (`claimed <=
+        // credited` stays invariant, keeping `audit` conservative and the
+        // `V0` over-claim guard tight against re-minting this same value).
+        record.credited = all_time_total;
         record.claimed = UsdtAmount(record.claimed.0.saturating_add(delta));
         record.last_observed_block = proof.block_number;
         dbtx.insert_entry(&DepositRecordKey(account), &record).await;
@@ -3869,9 +3946,11 @@ impl Usdt {
     /// method's "Credit rule" doc for why this cannot double-credit an
     /// observation straddling the sweep), growing `credited` past the
     /// already-swept total; this method then re-sweeps exactly that
-    /// `credited - swept` remainder. So the whole re-arm loop is: client
-    /// re-runs `check_deposit` -> observation reaches threshold ->
-    /// `credit_deposit` credits the new deposit -> this method sweeps it.
+    /// `credited - swept` remainder. [`Usdt::process_deposit_proof`] applies
+    /// the same sweep-aware rule on the live proof-driven path, so the whole
+    /// re-arm loop is: client submits a fresh `DepositProofV0` anchored past
+    /// the last sweep -> the proof credits `swept + proven` -> this method
+    /// sweeps the new remainder.
     async fn maybe_trigger_sweep(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -5012,6 +5091,42 @@ impl Usdt {
             credited,
             claimed,
             claimable: UsdtAmount(credited.0.saturating_sub(claimed.0)),
+        }
+    }
+
+    /// Reports `claim_pk`'s deposit account sweep bookkeeping -- its
+    /// [`DepositRecord::swept`] total and consensus-agreed
+    /// [`LastSweepBlockKey`] -- so a client building a `DepositProofV0` can
+    /// mirror [`Usdt::process_deposit_proof`]'s sweep-aware credit delta
+    /// (`swept + proven - credited` for a proof anchored past the last sweep)
+    /// and declare a `ClientInput` amount that balances. All-zero/absent for
+    /// an account that has no record or was never swept. Read-only consensus
+    /// state, mirrors [`Self::handle_deposit_status`].
+    ///
+    /// LOCAL fedi extension (not upstream): serves the fedi-only
+    /// [`FEDI_SWEEP_STATUS_ENDPOINT`].
+    async fn handle_fedi_sweep_status(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        claim_pk: secp256k1::PublicKey,
+    ) -> FediSweepStatusResponse {
+        let account = derive_deposit_account(
+            &self.cfg.consensus.group_public_key,
+            self.cfg.consensus.account_factory,
+            self.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+
+        let swept = dbtx
+            .get_value(&DepositRecordKey(account))
+            .await
+            .map_or(UsdtAmount(0), |record| record.swept);
+        let last_sweep_block = dbtx.get_value(&LastSweepBlockKey(account)).await;
+
+        FediSweepStatusResponse {
+            account,
+            swept,
+            last_sweep_block,
         }
     }
 
@@ -9198,6 +9313,140 @@ mod tests {
             .expect("record still exists");
         assert_eq!(record.credited, UsdtAmount(500_000_000));
         assert_eq!(record.claimed, UsdtAmount(500_000_000));
+    }
+
+    /// **Sweep-aware proof credit (LOCAL fedi extension).** A NEW deposit
+    /// paid to an address whose balance was already fully swept back to `0`
+    /// must credit FULLY through the live deposit-by-proof path: under
+    /// upstream's raw high-water rule its post-sweep proven balance (200M)
+    /// never exceeds the historic `credited` (100M) once 100M was swept, so
+    /// the proof would be rejected as stale and the funds lost to the
+    /// depositor. With the sweep-aware rule, a proof anchored at a block
+    /// LATER than the account's consensus-agreed last sweep block credits
+    /// `swept + proven`, and the credit re-arms the sweep for exactly the new
+    /// remainder.
+    #[tokio::test]
+    async fn deposit_proof_after_sweep_credits_fully_and_re_arms_the_sweep() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0xe4);
+        let usdt_contract = module.cfg.consensus.usdt_contract;
+        // Deposit 100M -> credit -> sweep confirms at block 20 (swept 100M,
+        // `LastSweepBlockKey(account) == 20`, no in-flight op).
+        let account = credit_100_and_confirm_sweep(&module, 20, 0xe4).await;
+
+        // Second deposit: prove the POST-sweep balance of 200M at block
+        // 25 > sweep block 20.
+        let (proof, hash) = synthetic_deposit_proof(usdt_contract, account, 200_000_000, 25);
+        {
+            let mut dbtx = db.begin_transaction().await;
+            write_block_hash_ring(&mut dbtx.to_ref_nc(), 25, hash).await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        let meta = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::DepositProofV0 {
+                    claim_pk,
+                    proof: proof.clone(),
+                },
+                test_in_point(),
+            )
+            .await
+            .expect("a post-sweep proof of a new deposit must credit");
+        assert_eq!(
+            meta.amount.amounts,
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(200_000_000)),
+            "the full new 200M deposit is the minted delta: all-time total \
+             (swept 100M + proven 200M) minus credited (100M)"
+        );
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        let record = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .expect("record present");
+        assert_eq!(
+            record.credited,
+            UsdtAmount(300_000_000),
+            "credited advances to the all-time total: swept (100M) + proven post-sweep \
+             balance (200M)"
+        );
+        assert_eq!(
+            record.claimed,
+            UsdtAmount(200_000_000),
+            "claimed advanced by the minted delta (the first 100M stays claimable via V0)"
+        );
+
+        // The credit auto-re-armed the sweep for exactly the new remainder
+        // (`credited - swept = 200M`) at the advanced nonce, no redeploy.
+        let (_, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+        assert_eq!(
+            crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
+            UsdtAmount(200_000_000),
+            "the re-armed sweep moves exactly the new deposit"
+        );
+        assert_eq!(op.nonce, alloy::primitives::U256::from(1u64));
+        assert!(
+            op.init_code.is_empty(),
+            "an already-deployed account must not redeploy"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// **Sweep-aware proof credit (straddle safety, LOCAL fedi extension).**
+    /// A proof anchored AT OR BEFORE the account's last confirmed sweep block
+    /// proves a balance that may still contain the very funds that sweep
+    /// moved (which `swept` also counts), so it must keep upstream's
+    /// conservative raw-`proven` rule: here the pre-sweep balance (100M at
+    /// block 15 <= sweep block 20) equals the historic `credited`, so the
+    /// proof is rejected as stale rather than double-crediting `swept +
+    /// proven = 200M`.
+    #[tokio::test]
+    async fn deposit_proof_anchored_before_sweep_does_not_double_credit() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+        let claim_pk = test_pubkey(0xe5);
+        let usdt_contract = module.cfg.consensus.usdt_contract;
+        let account = credit_100_and_confirm_sweep(&module, 20, 0xe5).await;
+
+        // A stale proof of the PRE-sweep balance (100M at block 15 <= sweep
+        // block 20) -- e.g. built just before the sweep landed.
+        let (proof, hash) = synthetic_deposit_proof(usdt_contract, account, 100_000_000, 15);
+        {
+            let mut dbtx = db.begin_transaction().await;
+            write_block_hash_ring(&mut dbtx.to_ref_nc(), 15, hash).await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        let err = module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::DepositProofV0 { claim_pk, proof },
+                test_in_point(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            UsdtInputError::DepositProofStale {
+                proven: UsdtAmount(100_000_000),
+                credited: UsdtAmount(100_000_000),
+            },
+            "a proof anchored at or before the last sweep must not credit the swept funds twice"
+        );
+        assert!(
+            pending_deploy_and_sweeps(&mut dbtx.to_ref_nc(), account)
+                .await
+                .is_empty(),
+            "nothing new was credited, so nothing must be re-swept"
+        );
+        dbtx.commit_tx().await;
     }
 
     #[tokio::test]
