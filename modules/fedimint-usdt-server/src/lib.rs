@@ -2206,6 +2206,22 @@ impl ServerModule for Usdt {
                 account,
                 deposit_wei,
             } => {
+                // Security review F2: only a fully-swept, actually-credited
+                // account can have a recoverable stranded `EntryPoint` gas
+                // deposit, so reject (before storing anything) a vote for a
+                // nonexistent or not-fully-swept account. This bounds both the
+                // vote table and consensus-history bloat -- a `bail!` is
+                // non-state-changing, so the rejected item is NOT retained. The
+                // read is of the consensus `DepositRecord`, so every guardian
+                // sees the identical value and decides identically.
+                let Some(record) = dbtx.get_value(&DepositRecordKey(account)).await else {
+                    bail!("residual-recovery vote for an unknown deposit account");
+                };
+                ensure!(
+                    record.credited.0 > 0 && record.swept == record.credited,
+                    "residual-recovery vote for a not-fully-swept deposit account"
+                );
+
                 // Finding A: store the ORDERED item's origin peer's vote on this
                 // swept account's stranded `EntryPoint` deposit (keyed by the
                 // framework-supplied `peer_id`, NEVER `self.our_peer_id`), with
@@ -4209,6 +4225,15 @@ impl Usdt {
             return;
         }
 
+        // Security review F3(b): recovery and a re-deposit's sweep must never
+        // collide on the same `(sender, nonce)`. If a residual recovery is
+        // already in-flight for this reused account, it owns the nonce -- defer
+        // the sweep. The recovery's confirm path re-calls this method (F3(c))
+        // once the recovery finalizes and `record.nonce` has advanced.
+        if self.residual_recovery_in_flight(dbtx, account).await {
+            return;
+        }
+
         // Price the op from the consensus live-gas median (not the 30 gwei
         // devnet default) so the broadcaster-fronted EntryPoint prefund stays
         // affordable on a real chain. Deterministic: the median is a consensus
@@ -4507,11 +4532,36 @@ impl Usdt {
         dbtx: &mut DatabaseTransaction<'_>,
         account: fedimint_usdt_common::EvmAddress,
     ) {
+        // Security review F5: structural guard against ever targeting
+        // address(0). A zero `residual_recovery_recipient` DISABLES recovery
+        // (the vote/proposal task is gated on it elsewhere); enforce that here
+        // too so recovery can never withdraw to the zero address even if votes
+        // somehow reached threshold. Pure read of `cfg.consensus`.
+        if self.cfg.consensus.residual_recovery_recipient
+            == fedimint_usdt_common::EvmAddress([0u8; 20])
+        {
+            return;
+        }
+
         // Never build a second recovery op for `account` while one is still
         // in-flight (both would carry the same on-chain nonce and the later
         // would revert, AA25).
         if self.residual_recovery_in_flight(dbtx, account).await {
             return;
+        }
+
+        // Security review F3(a): recovery and a re-deposit's sweep must never
+        // collide on the same `(sender, nonce)`. If a deploy-and-sweep is
+        // already in-flight for this reused account, the sweep owns the nonce
+        // -- defer recovery. AND re-read the record: if the account is no
+        // longer fully swept (a fresh credit landed), the pending sweep must
+        // take the nonce, so decline recovery until it is fully swept again.
+        if self.deploy_and_sweep_in_flight(dbtx, account).await {
+            return;
+        }
+        match dbtx.get_value(&DepositRecordKey(account)).await {
+            Some(record) if record.swept == record.credited => {}
+            _ => return,
         }
 
         // Threshold-MEDIAN of the per-peer deposit observations for this
@@ -5142,6 +5192,32 @@ impl Usdt {
                     dbtx.insert_entry(&DepositRecordKey(*account), &record)
                         .await;
                 }
+
+                // Security review F1: consume ALL of this account's recovery
+                // votes on confirm (success OR revert), mirroring how the
+                // `UserOpConfirmedVote` rows are cleared below. The votes are
+                // never otherwise removed, so without this a real recovery
+                // drains the account while >=threshold honest votes persist --
+                // a single byzantine guardian flipping its vote would then
+                // re-cross the median/redundancy gates and re-trigger a bogus
+                // oversized recovery op forever (each an MPC session + a
+                // broadcaster-gas prefund + an on-chain revert). Clearing them
+                // makes any subsequent recovery require a FRESH threshold of
+                // votes, which a byzantine minority alone can never reach.
+                dbtx.remove_by_prefix(&RecoverResidualVoteAccountPrefix(*account))
+                    .await;
+
+                // Security review F3(c): a re-deposit to this reused account
+                // whose sweep was blocked by THIS in-flight recovery (F3(b) --
+                // the recovery held the `(sender, nonce)`) must self-heal. Defer
+                // to the shared `retrigger_source` tail below, which fires
+                // `maybe_trigger_sweep` only AFTER this op is removed from the
+                // `SubmittedUserOp` table and its nonce chain is purged -- so
+                // `residual_recovery_in_flight` no longer sees THIS (now
+                // finalized) op and the sweep can proceed at the freshly
+                // advanced `record.nonce`. Runs on success OR revert (the nonce
+                // is consumed either way); a no-op when nothing is unswept.
+                retrigger_source = Some(*account);
             }
         }
 
@@ -5173,8 +5249,12 @@ impl Usdt {
         // Re-trigger AFTER the op is cleared from the in-flight tables, so
         // `maybe_trigger_sweep`'s per-account in-flight guard no longer sees
         // THIS (now-finalized) op and can enqueue the next sweep at the
-        // freshly-advanced `record.nonce`. Only on success (see
-        // `retrigger_source`'s comment for why failure does not auto-retry).
+        // freshly-advanced `record.nonce`. Set by a SUCCESSFUL `DeployAndSweep`
+        // (see `retrigger_source`'s comment for why a failed sweep does not
+        // auto-retry) OR by a confirmed `RecoverResidual` (success or revert --
+        // security review F3(c): the recovery consumed the nonce either way, so
+        // a re-deposit's blocked sweep must self-heal; re-triggering a SWEEP,
+        // not a re-recovery, so there is no revert tight-loop concern).
         if let Some(source) = retrigger_source {
             self.maybe_trigger_sweep(dbtx, source).await;
         }
@@ -6358,25 +6438,24 @@ impl Usdt {
                 }
             }
             UserOpPurpose::RecoverResidual { .. } => {
-                // Finding A: residual recovery is NOT urgent -- the stranded gas
-                // deposit is safe on-chain (still in the account's `EntryPoint`
-                // balance) and there is no refund concept. Mirror the
-                // `DeployAndSweep` arm: if the repriced fee would exceed the
-                // sweep gas ceiling, DON'T replace -- leave the op stuck
-                // (non-state-changing `bail!`) so it never over-provisions the
-                // recovery's own prefund. A later reprice at a lower median (or
-                // the op confirming as-is) resolves it.
-                if new_max_fee_per_gas > SWEEP_MAX_FEE_PER_GAS_WEI {
-                    warn!(
-                        target: "usdt",
-                        ?op_hash,
-                        new_max_fee_per_gas,
-                        ceiling_wei = SWEEP_MAX_FEE_PER_GAS_WEI,
-                        "residual-recovery reprice exceeds the gas ceiling; leaving the op stuck \
-                         (stranded gas is safe on-chain, no refund needed)"
-                    );
-                    bail!("residual-recovery reprice exceeds the gas ceiling; leaving op stuck");
-                }
+                // Security review F6: residual recovery is NOT urgent and must
+                // NEVER be repriced -- ALWAYS bail (non-state-changing), for any
+                // fee. A `RecoverResidual` op's `withdrawTo(recipient, amount)`
+                // callData carries an `amount` computed at build time from the
+                // then-current agreed deposit net of that build's gas price; a
+                // reprice bumps only the gas fields and keeps that STALE
+                // `amount`, so the repriced op can only over/under-provision and
+                // revert on-chain. The stranded gas is safe on-chain (still in
+                // the account's `EntryPoint` balance) and there is no refund
+                // concept, so leaving the op stuck loses nothing; a fresh
+                // recovery is re-derived from votes once the stuck op finalizes.
+                warn!(
+                    target: "usdt",
+                    ?op_hash,
+                    "residual recovery is not urgent; never repricing (stale withdrawTo amount \
+                     would only revert; stranded gas is safe on-chain)"
+                );
+                bail!("residual recovery is not urgent; never reprice");
             }
         }
 
@@ -13427,6 +13506,486 @@ mod tests {
                 .await
                 .is_none(),
             "the confirmed recovery op must be cleared"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// Every stored `RecoverResidualVote` for `account`.
+    async fn stored_recovery_votes(
+        dbtx: &mut DatabaseTransaction<'_>,
+        account: EvmAddress,
+    ) -> Vec<(PeerId, u64)> {
+        dbtx.find_by_prefix(&RecoverResidualVoteAccountPrefix(account))
+            .await
+            .map(|(RecoverResidualVoteKey(_, peer), wei)| (peer, wei))
+            .collect()
+            .await
+    }
+
+    /// Builds a `Pending` `UserOp` for `account` with the given `purpose`, the
+    /// minimal in-flight marker the collision-guard tests need. The op's
+    /// concrete fields are irrelevant -- the in-flight guards match only on
+    /// `purpose`'s `account`/`source`.
+    async fn insert_pending_op_for(
+        db: &Database,
+        op_hash: [u8; 32],
+        account: EvmAddress,
+        purpose: UserOpPurpose,
+    ) {
+        let mut op = sample_unsigned_user_op_for_test();
+        op.sender = account;
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &PendingUserOpKey(op_hash),
+            &PendingUserOp {
+                op,
+                purpose,
+                created_block: 1,
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security review F1.** A recovery op confirming garbage-collects ALL of
+    /// the account's `RecoverResidualVote` rows (success OR revert), so a later
+    /// lone byzantine vote-flip -- the only vote left standing -- cannot reach
+    /// threshold and re-trigger a bogus oversized recovery. Drives a real
+    /// threshold recovery, confirms it, then asserts the votes are gone and one
+    /// flipped vote enqueues nothing.
+    #[tokio::test]
+    async fn recover_residual_votes_gc_on_confirm_blocks_byzantine_reflip() {
+        let recipient = EvmAddress([0x99; 20]);
+        let module = test_module_with_recovery_recipient(4, 0, recipient).await; // threshold = 3
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        let claim_pk = test_pubkey(0xe1);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        insert_swept_deposit_record(db, account, claim_pk, UsdtAmount(1_000_000)).await;
+
+        // A threshold of honest votes enqueues exactly one recovery op.
+        let deposit_wei = 50_000_000_000_000_000u64;
+        let op_hash = {
+            let mut dbtx = db.begin_transaction().await;
+            for p in [0u16, 1, 2] {
+                module
+                    .process_consensus_item(
+                        &mut dbtx.to_ref_nc(),
+                        UsdtConsensusItem::RecoverResidual {
+                            account,
+                            deposit_wei,
+                        },
+                        PeerId::from(p),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let ops = pending_recover_residuals(&mut dbtx.to_ref_nc(), account).await;
+            assert_eq!(
+                ops.len(),
+                1,
+                "a threshold of votes enqueues one recovery op"
+            );
+            assert_eq!(
+                stored_recovery_votes(&mut dbtx.to_ref_nc(), account)
+                    .await
+                    .len(),
+                3,
+                "all three votes are stored pre-confirm"
+            );
+            dbtx.commit_tx().await;
+            ops[0].0
+        };
+
+        // Promote + confirm the recovery op (a revert would clear votes just the
+        // same; use success here).
+        promote_pending_to_submitted(db, op_hash).await;
+        {
+            let obs = UserOpConfirmedObservation {
+                success: true,
+                block: 10,
+                block_hash: [0x02; 32],
+                swept: UsdtAmount(0),
+                actual_gas_cost_wei: UsdtAmount(0),
+            };
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(&mut dbtx.to_ref_nc(), op_hash, &obs)
+                .await;
+            assert!(
+                stored_recovery_votes(&mut dbtx.to_ref_nc(), account)
+                    .await
+                    .is_empty(),
+                "F1: confirming the recovery must consume ALL of the account's votes"
+            );
+            dbtx.commit_tx().await;
+        }
+
+        // A single byzantine guardian now flips its vote. With the honest votes
+        // GC'd, this lone vote is 1 < threshold 3, so NO new recovery is built.
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::RecoverResidual {
+                    account,
+                    deposit_wei: 999_000_000_000_000_000u64,
+                },
+                PeerId::from(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_recovery_votes(&mut dbtx.to_ref_nc(), account)
+                .await
+                .len(),
+            1,
+            "only the lone flipped vote is stored after GC"
+        );
+        assert!(
+            pending_recover_residuals(&mut dbtx.to_ref_nc(), account)
+                .await
+                .is_empty(),
+            "F1: a lone byzantine vote-flip cannot re-reach threshold; no op enqueued"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security review F2.** A `RecoverResidual` vote is validated against
+    /// the consensus `DepositRecord` BEFORE it is stored: a vote for an
+    /// unknown or not-fully-swept account is a non-state-changing `bail!`
+    /// that stores nothing (bounding vote-table + consensus-history bloat).
+    #[tokio::test]
+    async fn recover_residual_vote_rejected_unless_account_fully_swept() {
+        let recipient = EvmAddress([0x99; 20]);
+        let module = test_module_with_recovery_recipient(4, 0, recipient).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        // Case A: no `DepositRecord` at all.
+        let unknown = EvmAddress([0x42; 20]);
+        // Case B: a record that is only partially swept (a live deposit).
+        let claim_pk = test_pubkey(0xf3);
+        let partial = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(partial),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(1_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(400_000), // NOT fully swept
+                    nonce: 0,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        for account in [unknown, partial] {
+            let res = module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::RecoverResidual {
+                        account,
+                        deposit_wei: 50_000_000_000_000_000u64,
+                    },
+                    PeerId::from(0),
+                )
+                .await;
+            assert!(
+                res.is_err(),
+                "F2: a vote for an unknown/not-fully-swept account must bail"
+            );
+            assert!(
+                stored_recovery_votes(&mut dbtx.to_ref_nc(), account)
+                    .await
+                    .is_empty(),
+                "F2: the rejected vote must store nothing"
+            );
+        }
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security review F3(a).** Recovery must defer while a deploy-and-sweep
+    /// for the same reused account is in flight (the sweep owns the
+    /// `(sender, nonce)`), even with a full threshold of votes.
+    #[tokio::test]
+    async fn recover_residual_skipped_while_sweep_in_flight() {
+        let recipient = EvmAddress([0x99; 20]);
+        let module = test_module_with_recovery_recipient(4, 0, recipient).await; // threshold = 3
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        let claim_pk = test_pubkey(0xa7);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        insert_swept_deposit_record(db, account, claim_pk, UsdtAmount(1_000_000)).await;
+        // A deploy-and-sweep is already in flight for this account.
+        insert_pending_op_for(
+            db,
+            [0x5a; 32],
+            account,
+            UserOpPurpose::DeployAndSweep { source: account },
+        )
+        .await;
+
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::RecoverResidual {
+                        account,
+                        deposit_wei: 50_000_000_000_000_000u64,
+                    },
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            pending_recover_residuals(&mut dbtx.to_ref_nc(), account)
+                .await
+                .is_empty(),
+            "F3(a): recovery must not collide with an in-flight sweep on the same nonce"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security review F3(b).** A sweep must defer while a residual recovery
+    /// for the same account is in flight (the recovery owns the
+    /// `(sender, nonce)`), even with a sweepable remainder.
+    #[tokio::test]
+    async fn sweep_skipped_while_recovery_in_flight() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        let account = EvmAddress([0xb7; 20]);
+        let claim_pk = test_pubkey(0xb8);
+        // A re-deposit grew `credited` past `swept`: a real, economically
+        // sweepable remainder exists.
+        insert_deposit_record(db, account, claim_pk, UsdtAmount(100_000_000)).await;
+        // A residual recovery is already in flight for this account.
+        insert_pending_op_for(
+            db,
+            [0x6b; 32],
+            account,
+            UserOpPurpose::RecoverResidual { account },
+        )
+        .await;
+
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .maybe_trigger_sweep(&mut dbtx.to_ref_nc(), account)
+            .await;
+        assert!(
+            pending_deploy_and_sweeps(&mut dbtx.to_ref_nc(), account)
+                .await
+                .is_empty(),
+            "F3(b): a sweep must not collide with an in-flight recovery on the same nonce"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security review F3(c).** Confirming a recovery re-triggers a pending
+    /// sweep for the same reused account: a re-deposit that landed (and whose
+    /// sweep was blocked by the in-flight recovery, F3(b)) self-heals as soon
+    /// as the recovery finalizes and the nonce advances.
+    #[tokio::test]
+    async fn recover_residual_confirm_retriggers_pending_sweep() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        let account = EvmAddress([0xc7; 20]);
+        let claim_pk = test_pubkey(0xc8);
+        // A re-deposit left a sweepable remainder (`credited > swept`) that
+        // clears the ~86.4M `deposit_fee_quote` dust gate for `sample_fee_vote`.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(300_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(40_000_000),
+                    nonce: 1,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // A submitted recovery op for this account, about to confirm.
+        let op_hash = [0x7c; 32];
+        {
+            let mut op = sample_unsigned_user_op_for_test();
+            op.sender = account;
+            op.nonce = alloy::primitives::U256::from(1u64);
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: op,
+                        signature: vec![0xaa; 65],
+                    },
+                    purpose: UserOpPurpose::RecoverResidual { account },
+                    submitted_block: 1,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UserOpConfirmedObservation {
+            success: true,
+            block: 10,
+            block_hash: [0x03; 32],
+            swept: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
+        };
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .apply_user_op_confirmed(&mut dbtx.to_ref_nc(), op_hash, &obs)
+            .await;
+
+        let (_, op) = single_pending_deploy_and_sweep(&mut dbtx.to_ref_nc(), account).await;
+        assert_eq!(
+            crate::user_op::decode_transfer_amount(&op).expect("op call_data decodes"),
+            UsdtAmount(260_000_000),
+            "F3(c): the recovery confirm must re-trigger the blocked sweep for the remainder"
+        );
+        // The sweep is built at the recovery-advanced nonce (1 -> 2).
+        assert_eq!(op.nonce, alloy::primitives::U256::from(2u64));
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security review F5.** A zero `residual_recovery_recipient`
+    /// structurally disables recovery: even a full threshold of votes never
+    /// enqueues an op (recovery would otherwise target address(0)).
+    #[tokio::test]
+    async fn recover_residual_never_targets_zero_recipient() {
+        let module = test_module_with_recovery_recipient(4, 0, EvmAddress([0u8; 20])).await;
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        let claim_pk = test_pubkey(0xd8);
+        let account = derive_deposit_account(
+            &module.cfg.consensus.group_public_key,
+            module.cfg.consensus.account_factory,
+            module.cfg.consensus.simple_account_impl,
+            &claim_pk,
+        );
+        insert_swept_deposit_record(db, account, claim_pk, UsdtAmount(1_000_000)).await;
+
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            // The vote itself is a valid state change (F2 passes: the account is
+            // fully swept); only the OP-BUILD is gated off by the zero recipient.
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::RecoverResidual {
+                        account,
+                        deposit_wei: 50_000_000_000_000_000u64,
+                    },
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            pending_recover_residuals(&mut dbtx.to_ref_nc(), account)
+                .await
+                .is_empty(),
+            "F5: recovery must never target the zero recipient, even at threshold"
+        );
+        dbtx.commit_tx().await;
+    }
+
+    /// **Security review F6.** A timed-out `RecoverResidual` op is NEVER
+    /// repriced -- the reprice would keep its stale `withdrawTo` amount and can
+    /// only revert -- so `ReplaceUserOp` bails and enqueues no replacement.
+    #[tokio::test]
+    async fn recover_residual_reprice_always_bails() {
+        let recipient = EvmAddress([0x99; 20]);
+        let module = test_module_with_recovery_recipient(4, 0, recipient).await;
+        let db = module.db_for_test();
+        // Consensus block count well past the op's timeout, and a fresh median,
+        // so the ONLY thing stopping a reprice is the F6 always-bail.
+        seed_block_count_votes(db, 4, submitted_op_timeout_blocks() + 5).await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+
+        let account = EvmAddress([0xe9; 20]);
+        let op_hash = [0x8d; 32];
+        {
+            let mut op = sample_unsigned_user_op_for_test();
+            op.sender = account;
+            op.nonce = alloy::primitives::U256::from(1u64);
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: op,
+                        signature: vec![0xaa; 65],
+                    },
+                    purpose: UserOpPurpose::RecoverResidual { account },
+                    submitted_block: 0, // timed out relative to the seeded ccount
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        let res = module
+            .process_replace_user_op(&mut dbtx.to_ref_nc(), op_hash)
+            .await;
+        assert!(
+            res.is_err(),
+            "F6: a recovery reprice must always bail (non-state-changing)"
+        );
+        // No replacement op was enqueued, and the original is untouched.
+        assert!(
+            pending_recover_residuals(&mut dbtx.to_ref_nc(), account)
+                .await
+                .is_empty(),
+            "F6: no replacement recovery op may be enqueued"
+        );
+        let orig = dbtx
+            .to_ref_nc()
+            .get_value(&SubmittedUserOpKey(op_hash))
+            .await
+            .expect("original op is untouched");
+        assert!(
+            !orig.superseded,
+            "F6: the original op must not be marked superseded by a bailed reprice"
         );
         dbtx.commit_tx().await;
     }
