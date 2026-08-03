@@ -140,15 +140,6 @@ alloy = { version = "=2.0.4", default-features = false, features = [
     "essentials",
     "reqwest-rustls-tls",
 ] }
-# Kept separate from the `alloy` umbrella crate above: `fedimint-usdt-common`
-# is WASM-compiled and shipped to clients, so it may only depend on these two
-# leaf crates (pure data types + ABI encoding/keccak, no provider/RPC/tokio
-# surface) -- never the full `alloy` umbrella. Same major/minor as the
-# version `alloy = "2.1"` resolves to (see `Cargo.lock`), so there is exactly
-# one copy of each in the dependency graph.
-alloy-primitives = { version = "=1.5.7", default-features = false, features = [
-    "std",
-] }
 # Leaf crates used by `fedimint-usdt-server`'s deterministic MPT
 # deposit-proof verifier (`proof.rs`). Server-only (never WASM-shipped), so
 # default features are fine. `alloy-consensus` is pinned to the same version
@@ -156,11 +147,20 @@ alloy-primitives = { version = "=1.5.7", default-features = false, features = [
 # the dependency graph; `alloy-trie` is pinned to the newest version that
 # still accepts the `alloy-primitives = "=1.5.7"` pin above.
 alloy-consensus = "=2.0.4"
+# Kept separate from the `alloy` umbrella crate above: `fedimint-usdt-common`
+# is WASM-compiled and shipped to clients, so it may only depend on these two
+# leaf crates (pure data types + ABI encoding/keccak, no provider/RPC/tokio
+# surface) -- never the full `alloy` umbrella. Same major/minor as the
+# version `alloy = "=2.0.4"` resolves to (see `Cargo.lock`), so there is
+# exactly one copy of each in the dependency graph.
+alloy-primitives = { version = "=1.5.7", default-features = false, features = [
+    "std",
+] }
 alloy-rlp = "0.3"
-alloy-trie = "=0.9.5"
 alloy-sol-types = { version = "=1.5.7", default-features = false, features = [
     "std",
 ] }
+alloy-trie = "=0.9.5"
 anyhow = "1.0.98"
 aquamarine = "0.5.0"
 argon2 = "0.5.3"
