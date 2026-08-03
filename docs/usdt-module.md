@@ -77,6 +77,21 @@ rises and `DepositRecord.swept` advances.
 3. On confirmation, `PoolState.balance` is debited and each withdrawal is
    `Confirmed`; a failed on-chain op reverts the withdrawals to `Queued` for
    retry (the pool nonce still advances, matching the EntryPoint).
+4. If a submitted batch times out and gas has risen enough that repricing it
+   would cost more than the sum of its withdrawals' committed `max_fee` (the
+   batch's "ceiling"), the module does **not** execute the batch over-ceiling
+   and does **not** refund the burned e-cash. The already-signed op stays
+   live and non-superseded at its `EntryPoint` `(sender, nonce)` — it can
+   still confirm later if it lands on-chain — and the batch **stalls**:
+   neither paid nor refunded. Every subsequent timeout, the module re-checks
+   affordability against the current fee median and re-fires the reprice the
+   moment the batch is priced back under the ceiling, so the stall
+   **self-heals** with no operator action. Because the pool account is
+   one-batch-at-a-time, a stalled batch also blocks later withdrawal batches
+   until it reprices or confirms — so during a sustained gas spike above a
+   batch's ceiling, its withdrawals can appear "stuck" in `Submitted` for
+   longer than usual. See `docs/usdt-module-audit.md` for the accepted
+   liveness tradeoff.
 
 The client tracks a withdrawal via `withdrawal_status` /
 `await_withdrawal_confirmed`.
