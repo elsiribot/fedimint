@@ -169,7 +169,7 @@ async fn write_fixture(
         "storage_proof": storage_proof,
     });
 
-    std::fs::write(
+    fedimint_core::util::write_overwrite(
         path,
         format!("{}\n", serde_json::to_string_pretty(&fixture)?),
     )?;

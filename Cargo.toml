@@ -134,6 +134,12 @@ alloy = { version = "2.1", default-features = false, features = [
     "essentials",
     "reqwest-rustls-tls",
 ] }
+# Leaf crates used by `fedimint-usdt-server`'s deterministic MPT
+# deposit-proof verifier (`proof.rs`). Server-only (never WASM-shipped), so
+# default features are fine. Same major/minor as the versions `alloy = "2.1"`
+# already resolves to in `Cargo.lock`, so there is exactly one copy of each in
+# the dependency graph.
+alloy-consensus = "2.1"
 # Kept separate from the `alloy` umbrella crate above: `fedimint-usdt-common`
 # is WASM-compiled and shipped to clients, so it may only depend on these two
 # leaf crates (pure data types + ABI encoding/keccak, no provider/RPC/tokio
@@ -143,17 +149,11 @@ alloy = { version = "2.1", default-features = false, features = [
 alloy-primitives = { version = "1.6", default-features = false, features = [
     "std",
 ] }
-# Leaf crates used by `fedimint-usdt-server`'s deterministic MPT
-# deposit-proof verifier (`proof.rs`). Server-only (never WASM-shipped), so
-# default features are fine. Same major/minor as the versions `alloy = "2.1"`
-# already resolves to in `Cargo.lock`, so there is exactly one copy of each in
-# the dependency graph.
-alloy-consensus = "2.1"
 alloy-rlp = "0.3"
-alloy-trie = "0.9"
 alloy-sol-types = { version = "1.6", default-features = false, features = [
     "std",
 ] }
+alloy-trie = "0.9"
 anyhow = "1.0.98"
 aquamarine = "0.5.0"
 argon2 = "0.5.3"
