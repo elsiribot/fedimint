@@ -20,6 +20,8 @@ use alloy_consensus::Header;
 use alloy_primitives::{B256, U256, hex, keccak256};
 use alloy_rlp::Encodable as _;
 use anyhow::{Context as _, bail, ensure};
+use fedimint_core::util::FmtCompactAnyhow as _;
+use fedimint_logging::LOG_CLIENT_MODULE_USDT;
 use fedimint_usdt_common::{
     DepositProof, EvmAddress, MAX_DEPOSIT_PROOF_BYTES, UsdtAmount, balances_storage_key,
 };
@@ -85,17 +87,17 @@ impl EthJsonRpc {
                 Ok(Ok(result)) => return Ok(result),
                 Ok(Err(err)) => {
                     debug!(
-                        target: "usdt",
+                        target: LOG_CLIENT_MODULE_USDT,
                         %url,
                         method,
-                        err = %err,
+                        err = %err.fmt_compact_anyhow(),
                         "EVM JSON-RPC endpoint failed, trying next"
                     );
                     last_err = Some(err);
                 }
                 Err(_elapsed) => {
                     debug!(
-                        target: "usdt",
+                        target: LOG_CLIENT_MODULE_USDT,
                         %url,
                         method,
                         timeout_secs = EVM_RPC_CALL_TIMEOUT.as_secs(),

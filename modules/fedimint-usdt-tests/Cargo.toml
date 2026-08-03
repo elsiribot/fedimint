@@ -7,10 +7,6 @@ name = "fedimint-usdt-tests"
 publish = false
 version = { workspace = true }
 
-[lib]
-name = "fedimint_usdt_tests"
-path = "src/lib.rs"
-
 [[bin]]
 name = "usdt-e2e-test"
 path = "bin/usdt_e2e.rs"
@@ -30,6 +26,10 @@ path = "bin/usdt_adversary.rs"
 [[bin]]
 name = "capture-deposit-proof-fixtures"
 path = "bin/capture_deposit_proof_fixtures.rs"
+
+[lib]
+name = "fedimint_usdt_tests"
+path = "src/lib.rs"
 
 [[test]]
 name = "fedimint_usdt_tests"
