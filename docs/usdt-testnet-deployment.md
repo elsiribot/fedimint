@@ -132,6 +132,7 @@ FM_USDT_ENTRY_POINT=0x0000000071727De22E5E9d8BAf0edAc6f37da032
 FM_USDT_ETH_USD_PRICE_FEED=0x694AA1769357215DE4FAC081bf1f309aDC325306   # verify!
 FM_USDT_CHAIN_ID=11155111          # REQUIRED — bound into signed userOpHash
 FM_USDT_CONFIRMATION_DEPTH=3       # reorg cushion for testnet (raise for mainnet)
+FM_USDT_RESIDUAL_RECOVERY_RECIPIENT=0x<your treasury/broadcaster-refill address>  # REQUIRED — see note below
 # Do NOT set FM_USDT_ACCOUNT_FACTORY / FM_USDT_SIMPLE_ACCOUNT_IMPL:
 #   the module derives them from the entry_point and self-deploys the factory.
 ```
@@ -147,6 +148,54 @@ FM_USDT_BROADCASTER_PRIVATE_KEY=0x<this guardian's funded Sepolia EOA key>
 > the ERC-4337 `userOpHash` the federation signs; left at the `31337` anvil
 > default, every signature would be rejected on-chain. Likewise raise
 > `FM_USDT_CONFIRMATION_DEPTH` above the `1` anvil default.
+
+> **`FM_USDT_RESIDUAL_RECOVERY_RECIPIENT` is REQUIRED on Sepolia (and any
+> non-dev chain).** It's the deterministic EVM address the federation
+> withdraws stranded ERC-4337 `EntryPoint` gas deposits to when a deposit
+> account's gas prefund goes unused (typically your treasury /
+> broadcaster-refill address) — every guardian must build the
+> byte-identical `EntryPoint.withdrawTo(recipient, amount)` recovery
+> transaction, so it has to be a single consensus-agreed value, never a
+> per-guardian broadcaster key. Config-gen (`validate_usdt_params` in
+> `modules/fedimint-usdt-common/src/lib.rs`, enforced again at DKG in
+> `modules/fedimint-usdt-server/src/dkg.rs`) **REJECTS** the all-zero
+> placeholder address on any non-dev `chain_id` — leaving this env var unset
+> (it defaults to the zero address) makes config-gen fail loudly with a clear
+> error rather than silently configuring recovery to burn funds to `0x0`.
+> Only the anvil/hardhat dev chain ids (`31337`/`1337`) are exempt from this
+> check.
+
+## Mainnet vs. testnet
+
+This doc only walks through **Sepolia**. Nothing here should be pointed at
+Ethereum mainnet without first reading `docs/usdt-module-audit.md` (no
+external audit, no real-network soak, and the fee-charging-token risk in
+particular). If/when that changes, mainnet needs a few parameters set
+differently from the Sepolia values above; the module enforces the safety-
+relevant ones at config-gen (`validate_usdt_params`), so getting them wrong
+fails config-gen rather than silently deploying something unsafe:
+
+- `FM_USDT_CHAIN_ID=1` (mainnet), not `11155111`.
+- `FM_USDT_CONFIRMATION_DEPTH` must be **>= 6**
+  (`MIN_PROD_CONFIRMATION_DEPTH` in `fedimint-usdt-common`) on any non-dev
+  chain id. Config-gen **rejects** a lower value unless you also set
+  `FM_USDT_UNSAFE_LOW_CONFIRMATION_DEPTH=1` to explicitly acknowledge the
+  reorg risk — don't set that on mainnet; raise the depth instead.
+- `FM_USDT_CONTRACT` — the real Tether USDT mainnet contract address.
+  **Verify the address yourself against Etherscan** before using it; don't
+  trust it blindly from any single doc (fake "USDT" contracts are a common
+  scam).
+- `FM_USDT_ENTRY_POINT` — the same canonical ERC-4337 v0.7 address used above
+  for Sepolia (`0x0000000071727De22E5E9d8BAf0edAc6f37da032`); it's identical
+  on every chain.
+- `FM_USDT_ACCOUNT_FACTORY` / `FM_USDT_SIMPLE_ACCOUNT_IMPL` — still leave
+  unset. The module derives and self-deploys them exactly as on Sepolia.
+- `FM_USDT_ETH_USD_PRICE_FEED` can be **omitted** on mainnet — it defaults to
+  the canonical mainnet Chainlink ETH/USD feed, which is correct there
+  (Sepolia is the chain that needs the explicit override used above).
+- `FM_USDT_RESIDUAL_RECOVERY_RECIPIENT` — **required**, exactly as on
+  Sepolia (see the note above); config-gen rejects the placeholder zero
+  address on mainnet just as it does on Sepolia.
 
 ## Step 5 — Config-gen + DKG
 
