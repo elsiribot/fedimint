@@ -4521,7 +4521,7 @@ impl Usdt {
                 target: "usdt",
                 ?op_hash,
                 state = "Pending",
-                "withdrawal batch trigger blocked: a Withdraw op is already in-flight (awaiting/undergoing MPC signing)"
+                "withdrawal batch trigger blocked: a pool op (Withdraw or WithdrawFees) is already in-flight (awaiting/undergoing MPC signing)"
             );
             return true;
         }
@@ -4541,7 +4541,7 @@ impl Usdt {
                 target: "usdt",
                 ?op_hash,
                 state = "Submitted",
-                "withdrawal batch trigger blocked: a Withdraw op is already in-flight (signed, awaiting on-chain confirmation)"
+                "withdrawal batch trigger blocked: a pool op (Withdraw or WithdrawFees) is already in-flight (signed, awaiting on-chain confirmation)"
             );
             return true;
         }
@@ -16620,6 +16620,73 @@ mod tests {
             .collect()
             .await;
         assert!(remaining.is_empty(), "votes GC'd on confirm");
+    }
+
+    /// **Phase 8, Task 5.** `Usdt::apply_fee_withdrawal_confirmed` on a
+    /// REVERTED observation must NOT debit `PoolState.balance` or
+    /// `PoolState.accrued_fees` (the on-chain transfer never happened), but
+    /// must still advance `PoolState.nonce` unconditionally (the `EntryPoint`
+    /// consumed it regardless of outcome) and still GC every
+    /// `WithdrawFeesVote` (so a stuck vote can't retrigger a stale
+    /// withdrawal). Mirrors `withdraw_fees_confirm_debits_and_gcs_votes`
+    /// above, but drives a `success: false` observation.
+    #[tokio::test]
+    async fn withdraw_fees_confirm_revert_preserves_balances_but_gcs_votes() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let recipient = EvmAddress([0xab; 20]);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(1_000),
+                    nonce: 5,
+                    accrued_fees: UsdtAmount(300),
+                },
+            )
+            .await;
+            // seed a threshold of matching votes so GC is observable
+            for p in [0u16, 1, 2] {
+                dbtx.insert_entry(
+                    &WithdrawFeesVoteKey(PeerId::from(p)),
+                    &fedimint_usdt_common::WithdrawFeesVote {
+                        recipient,
+                        amount: UsdtAmount(120),
+                    },
+                )
+                .await;
+            }
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .apply_fee_withdrawal_confirmed(
+                &mut dbtx.to_ref_nc(),
+                &UserOpConfirmedObservation {
+                    success: false,
+                    block: 10,
+                    block_hash: [0x01; 32],
+                    swept: UsdtAmount(0),
+                    actual_gas_cost_wei: UsdtAmount(0),
+                },
+                UsdtAmount(120),
+            )
+            .await;
+        let pool = dbtx.to_ref_nc().get_value(&PoolStateKey).await.unwrap();
+        assert_eq!(pool.balance, UsdtAmount(1_000), "no debit on revert");
+        assert_eq!(pool.accrued_fees, UsdtAmount(300), "no debit on revert");
+        assert_eq!(pool.nonce, 6, "nonce still bumps unconditionally");
+        let remaining: Vec<_> = dbtx
+            .to_ref_nc()
+            .find_by_prefix(&WithdrawFeesVotePrefix)
+            .await
+            .collect()
+            .await;
+        assert!(remaining.is_empty(), "votes GC'd on revert too");
     }
 
     /// **Phase 8, Task 5.** `Withdraw` and `WithdrawFees` share
