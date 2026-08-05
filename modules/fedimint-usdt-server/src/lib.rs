@@ -89,9 +89,9 @@ use crate::db::{
     SigningSessionPrefix, StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey,
     SubmittedUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
     UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
-    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawalBatchCapKey, WithdrawalBatchCapPrefix,
-    WithdrawalIncurredFeeKey, WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey,
-    WithdrawalStatePrefix,
+    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawFeesVotePrefix, WithdrawalBatchCapKey,
+    WithdrawalBatchCapPrefix, WithdrawalIncurredFeeKey, WithdrawalIncurredFeePrefix,
+    WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -407,6 +407,16 @@ impl ModuleInit for UsdtInit {
                         u64,
                         items,
                         "Recover Residual Votes"
+                    );
+                }
+                DbKeyPrefix::WithdrawFeesVote => {
+                    push_db_pair_items!(
+                        dbtx,
+                        WithdrawFeesVotePrefix,
+                        crate::db::WithdrawFeesVoteKey,
+                        fedimint_usdt_common::WithdrawFeesVote,
+                        items,
+                        "Withdraw Fees Votes"
                     );
                 }
                 DbKeyPrefix::LastSweepBlock => {
@@ -3709,7 +3719,11 @@ impl Usdt {
                                                     &record.signed.unsigned,
                                                 )
                                             }
-                                            UserOpPurpose::Withdraw { .. } => {
+                                            // A fee withdrawal is a batch-of-one
+                                            // pool transfer, decoded identically
+                                            // to `Withdraw`.
+                                            UserOpPurpose::Withdraw { .. }
+                                            | UserOpPurpose::WithdrawFees { .. } => {
                                                 crate::user_op::decode_batch_transfer_total(
                                                     &record.signed.unsigned,
                                                 )
@@ -4476,29 +4490,33 @@ impl Usdt {
         }
     }
 
-    /// `true` if a `Withdraw`-purpose `UserOp` is currently `Pending`
-    /// (awaiting/undergoing MPC signing) or `Submitted` (signed, awaiting
-    /// on-chain confirmation) -- i.e. a withdrawal batch is already "in
-    /// flight" and [`Usdt::maybe_trigger_withdrawal_batch`] must not start a
-    /// second one. Both tables are scanned fully and filtered by
-    /// `UserOpPurpose::Withdraw`, since -- unlike `DeployAndSweep` ops,
-    /// which are keyed per deposit account and may legitimately have many
-    /// concurrently pending -- this module never intentionally has more than
-    /// one `Withdraw`-purpose op outstanding at a time (see
-    /// `maybe_trigger_withdrawal_batch`'s doc comment for why: two
-    /// concurrent batches would both be built against the SAME
+    /// `true` if a `Withdraw`- or `WithdrawFees`-purpose `UserOp` is
+    /// currently `Pending` (awaiting/undergoing MPC signing) or `Submitted`
+    /// (signed, awaiting on-chain confirmation) -- i.e. a withdrawal batch
+    /// (user or fee) is already "in flight" and
+    /// [`Usdt::maybe_trigger_withdrawal_batch`] must not start a second one.
+    /// Both tables are scanned fully and filtered by
+    /// `UserOpPurpose::Withdraw | UserOpPurpose::WithdrawFees`, since --
+    /// unlike `DeployAndSweep` ops, which are keyed per deposit account and
+    /// may legitimately have many concurrently pending -- this module never
+    /// intentionally has more than one pool-nonce-consuming op outstanding
+    /// at a time (see `maybe_trigger_withdrawal_batch`'s doc comment for
+    /// why: two concurrent batches would both be built against the SAME
     /// `PoolState.nonce`, since it only advances on confirm, and would
-    /// collide on-chain).
+    /// collide on-chain). `Withdraw` and `WithdrawFees` share that same
+    /// nonce, so they must be mutually exclusive too.
     async fn withdraw_batch_in_flight(&self, dbtx: &mut DatabaseTransaction<'_>) -> bool {
         let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
             .find_by_prefix(&PendingUserOpPrefix)
             .await
             .collect()
             .await;
-        if let Some((PendingUserOpKey(op_hash), _)) = pending
-            .iter()
-            .find(|(_, p)| matches!(p.purpose, UserOpPurpose::Withdraw { .. }))
-        {
+        if let Some((PendingUserOpKey(op_hash), _)) = pending.iter().find(|(_, p)| {
+            matches!(
+                p.purpose,
+                UserOpPurpose::Withdraw { .. } | UserOpPurpose::WithdrawFees { .. }
+            )
+        }) {
             debug!(
                 target: "usdt",
                 ?op_hash,
@@ -4513,10 +4531,12 @@ impl Usdt {
             .await
             .collect()
             .await;
-        if let Some((SubmittedUserOpKey(op_hash), _)) = submitted
-            .iter()
-            .find(|(_, s)| matches!(s.purpose, UserOpPurpose::Withdraw { .. }))
-        {
+        if let Some((SubmittedUserOpKey(op_hash), _)) = submitted.iter().find(|(_, s)| {
+            matches!(
+                s.purpose,
+                UserOpPurpose::Withdraw { .. } | UserOpPurpose::WithdrawFees { .. }
+            )
+        }) {
             debug!(
                 target: "usdt",
                 ?op_hash,
@@ -5153,7 +5173,9 @@ impl Usdt {
                 UserOpPurpose::DeployAndSweep { .. } => {
                     crate::user_op::decode_transfer_amount(&submitted.signed.unsigned)
                 }
-                UserOpPurpose::Withdraw { .. } => {
+                // A fee withdrawal is a batch-of-one pool transfer, decoded
+                // identically to `Withdraw`.
+                UserOpPurpose::Withdraw { .. } | UserOpPurpose::WithdrawFees { .. } => {
                     crate::user_op::decode_batch_transfer_total(&submitted.signed.unsigned)
                 }
                 // Finding A: a recovery op moves broadcaster ETH gas, not pool
@@ -5307,6 +5329,10 @@ impl Usdt {
             }
             UserOpPurpose::Withdraw { outpoints } => {
                 self.apply_withdraw_confirmed(dbtx, outpoints, obs, effective_swept)
+                    .await;
+            }
+            UserOpPurpose::WithdrawFees { .. } => {
+                self.apply_fee_withdrawal_confirmed(dbtx, obs, effective_swept)
                     .await;
             }
             UserOpPurpose::RecoverResidual { account } => {
@@ -5618,6 +5644,38 @@ impl Usdt {
                  halved batch cap for isolation retry (pool balance untouched)"
             );
         }
+    }
+
+    /// Confirm handling for a `WithdrawFees` payout, called only from
+    /// [`Usdt::apply_user_op_confirmed`]. On success, debit both
+    /// `PoolState.balance` and `PoolState.accrued_fees` by the transferred
+    /// amount (`swept`, re-derived from calldata and cross-checked upstream,
+    /// security finding 21). The pool nonce advances unconditionally (the
+    /// `EntryPoint` consumed it whether the transfer succeeded or reverted --
+    /// mirrors `apply_withdraw_confirmed`'s doc comment). Votes are GC'd
+    /// unconditionally so any subsequent fee withdrawal needs a FRESH 2f+1
+    /// threshold (mirrors `RecoverResidual`'s vote GC) -- preventing a
+    /// stuck-vote retrigger loop after a revert.
+    async fn apply_fee_withdrawal_confirmed(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        obs: &UserOpConfirmedObservation,
+        swept: UsdtAmount,
+    ) {
+        let mut pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
+            account: self.pool_account(),
+            balance: UsdtAmount(0),
+            nonce: 0,
+            accrued_fees: UsdtAmount(0),
+        });
+        pool.nonce += 1;
+        if obs.success {
+            pool.balance = UsdtAmount(pool.balance.0.saturating_sub(swept.0));
+            pool.accrued_fees = UsdtAmount(pool.accrued_fees.0.saturating_sub(swept.0));
+        }
+        dbtx.insert_entry(&PoolStateKey, &pool).await;
+
+        dbtx.remove_by_prefix(&WithdrawFeesVotePrefix).await;
     }
 
     /// Turns a terminally-failed withdrawal into a reissued-e-cash refund
@@ -6731,6 +6789,23 @@ impl Usdt {
                 );
                 bail!("residual recovery is not urgent; never reprice");
             }
+            UserOpPurpose::WithdrawFees { .. } => {
+                // A fee withdrawal is an internal treasury operation with no
+                // user-facing deadline and no refund concept -- the accrued
+                // fees stay safely tracked in `PoolState.accrued_fees`
+                // on-chain regardless of when (or whether) this particular
+                // payout op confirms. Mirrors `RecoverResidual`'s policy
+                // exactly: NEVER reprice, ALWAYS bail (non-state-changing). A
+                // fresh withdrawal is re-derived from a fresh vote threshold
+                // once the stuck op finalizes.
+                warn!(
+                    target: "usdt",
+                    ?op_hash,
+                    "fee withdrawal is not urgent; never repricing (mirrors RecoverResidual's \
+                     stall policy)"
+                );
+                bail!("fee withdrawal is not urgent; never reprice");
+            }
         }
 
         // Within ceiling: enqueue the replacement + start its signing session,
@@ -7340,6 +7415,7 @@ mod tests {
     use fedimint_usdt_common::{EvmAddress, UsdtInputV0};
 
     use super::*;
+    use crate::db::WithdrawFeesVoteKey;
 
     /// An arbitrary [`InPoint`] for `process_input` tests, which never read
     /// `_in_point` today (the txid/index are irrelevant to claim processing).
@@ -16472,6 +16548,116 @@ mod tests {
         assert_eq!(pool.accrued_fees, UsdtAmount(9)); // += max_fee
     }
 
+    /// A successful [`UserOpConfirmedObservation`] fixture (mirrors the
+    /// literal used by the `RecoverResidual` confirm tests above): `swept`
+    /// here is irrelevant since `Usdt::apply_fee_withdrawal_confirmed` never
+    /// reads `obs.swept` (the authoritative debited amount is always the
+    /// separately-passed, calldata-re-derived `swept` parameter, security
+    /// finding 21).
+    fn successful_obs() -> UserOpConfirmedObservation {
+        UserOpConfirmedObservation {
+            success: true,
+            block: 10,
+            block_hash: [0x01; 32],
+            swept: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
+        }
+    }
+
+    /// **Phase 8, Task 5.** `Usdt::apply_fee_withdrawal_confirmed` on a
+    /// successful observation must debit BOTH `PoolState.balance` and
+    /// `PoolState.accrued_fees` by the swept amount, advance `PoolState.nonce`
+    /// unconditionally, and GC every `WithdrawFeesVote` (so a subsequent fee
+    /// withdrawal needs a fresh threshold).
+    #[tokio::test]
+    async fn withdraw_fees_confirm_debits_and_gcs_votes() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let recipient = EvmAddress([0xab; 20]);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(1_000),
+                    nonce: 5,
+                    accrued_fees: UsdtAmount(300),
+                },
+            )
+            .await;
+            // seed a threshold of matching votes so GC is observable
+            for p in [0u16, 1, 2] {
+                dbtx.insert_entry(
+                    &WithdrawFeesVoteKey(PeerId::from(p)),
+                    &fedimint_usdt_common::WithdrawFeesVote {
+                        recipient,
+                        amount: UsdtAmount(120),
+                    },
+                )
+                .await;
+            }
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .apply_fee_withdrawal_confirmed(
+                &mut dbtx.to_ref_nc(),
+                &successful_obs(),
+                UsdtAmount(120),
+            )
+            .await;
+        let pool = dbtx.to_ref_nc().get_value(&PoolStateKey).await.unwrap();
+        assert_eq!(pool.balance, UsdtAmount(880));
+        assert_eq!(pool.accrued_fees, UsdtAmount(180));
+        assert_eq!(pool.nonce, 6);
+        let remaining: Vec<_> = dbtx
+            .to_ref_nc()
+            .find_by_prefix(&WithdrawFeesVotePrefix)
+            .await
+            .collect()
+            .await;
+        assert!(remaining.is_empty(), "votes GC'd on confirm");
+    }
+
+    /// **Phase 8, Task 5.** `Withdraw` and `WithdrawFees` share
+    /// `PoolState.nonce`, so `Usdt::withdraw_batch_in_flight` must block a
+    /// fee withdrawal while a user withdrawal is in flight, and vice versa.
+    #[tokio::test]
+    async fn in_flight_guard_serializes_withdraw_and_fee_withdraw() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let mut dbtx = db.begin_transaction().await;
+        // A pending user Withdraw must block a fee-withdrawal trigger.
+        dbtx.insert_entry(
+            &PendingUserOpKey([0x01; 32]),
+            &PendingUserOp {
+                op: sample_unsigned_user_op_for_test(),
+                purpose: UserOpPurpose::Withdraw { outpoints: vec![] },
+                created_block: 0,
+            },
+        )
+        .await;
+        assert!(module.withdraw_batch_in_flight(&mut dbtx.to_ref_nc()).await);
+        dbtx.remove_entry(&PendingUserOpKey([0x01; 32])).await;
+        // A pending WithdrawFees must ALSO block (both share the pool nonce).
+        dbtx.insert_entry(
+            &PendingUserOpKey([0x02; 32]),
+            &PendingUserOp {
+                op: sample_unsigned_user_op_for_test(),
+                purpose: UserOpPurpose::WithdrawFees {
+                    recipient: EvmAddress([0x03; 20]),
+                    amount: UsdtAmount(1),
+                },
+                created_block: 0,
+            },
+        )
+        .await;
+        assert!(module.withdraw_batch_in_flight(&mut dbtx.to_ref_nc()).await);
+    }
+
     /// **Security finding 05 (poisoned-batch isolation), the finding's core
     /// scenario.** One poisoned recipient among several honest ones must be
     /// isolated -- not permanently wedge the whole withdrawal pipeline.
@@ -17642,6 +17828,7 @@ mod tests {
             "Block Hash Ring",
             "Block Hash Votes",
             "Recover Residual Votes",
+            "Withdraw Fees Votes",
             "Last Sweep Blocks",
         ];
         assert_eq!(

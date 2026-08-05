@@ -1510,6 +1510,15 @@ pub fn validate_usdt_params(p: &UsdtGenParams) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A guardian's vote to withdraw `amount` of accrued fee revenue from the pool
+/// to `recipient`. A 2f+1 threshold agreeing on the IDENTICAL `(recipient,
+/// amount)` pair triggers a `WithdrawFees` payout `UserOp`.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
+pub struct WithdrawFeesVote {
+    pub recipient: EvmAddress,
+    pub amount: UsdtAmount,
+}
+
 /// Non-transaction items that will be submitted to consensus
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub enum UsdtConsensusItem {
