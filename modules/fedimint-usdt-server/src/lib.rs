@@ -31,10 +31,11 @@ use fedimint_core::envs::{
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    Amounts, ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
-    ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
-    api_endpoint,
+    Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion,
+    InputMeta, ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions,
+    TransactionItemAmounts, api_endpoint,
 };
+use fedimint_core::net::auth::check_auth;
 use fedimint_core::task::TaskGroup;
 use fedimint_core::util::FmtCompactAnyhow as _;
 use fedimint_core::{InPoint, NumPeers, NumPeersExt, OutPoint, PeerId, push_db_pair_items};
@@ -52,7 +53,7 @@ use fedimint_usdt_common::endpoint_constants::{
     DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
     LATEST_ANCHORED_BLOCK_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT,
     USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
-    WITHDRAWAL_STATUS_ENDPOINT,
+    WITHDRAW_FEES_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::user_op::{SignedUserOp, eth_signed_message_hash, user_op_hash};
 use fedimint_usdt_common::{
@@ -64,10 +65,10 @@ use fedimint_usdt_common::{
     UsdtAmount, UsdtCommonInit, UsdtConsensusItem, UsdtGenParams, UsdtInput, UsdtInputError,
     UsdtModuleTypes, UsdtOutput, UsdtOutputError, UsdtOutputOutcome, UserOpStatus,
     UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
-    WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse, deposit_fee_quote,
-    deposit_salt, derive_deposit_account, derive_pool_account, evm_address, fee_vote_in_sane_range,
-    is_dev_chain, pool_salt, signing_session_id, usdt_amount, validate_usdt_params,
-    wei_gas_cost_to_usdt, withdrawal_fee_quote,
+    WithdrawFeesRequest, WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse,
+    deposit_fee_quote, deposit_salt, derive_deposit_account, derive_pool_account, evm_address,
+    fee_vote_in_sane_range, is_dev_chain, pool_salt, signing_session_id, usdt_amount,
+    validate_usdt_params, wei_gas_cost_to_usdt, withdrawal_fee_quote,
 };
 use futures::{FutureExt as _, StreamExt as _};
 use rand::rngs::OsRng;
@@ -1468,6 +1469,11 @@ pub struct Usdt {
     /// this guardian stops proposing/refreshing its `FeeVote` while its fee
     /// source is unreachable; see [`Usdt::spawn_fee_estimate_poller`]).
     fee_estimate: Arc<Mutex<Option<FeeVote>>>,
+    /// Guardian-local, in-memory pending fee-withdrawal vote set by the
+    /// authenticated `withdraw_fees` endpoint and drained (one-shot) by
+    /// `consensus_proposal`. In-memory so a restart before proposal just means
+    /// the guardian re-casts; no value is at risk. Mirrors `fee_estimate`.
+    fee_withdrawal_intent: Arc<Mutex<Option<fedimint_usdt_common::WithdrawFeesVote>>>,
     /// Readiness observations gathered by the background bootstrap-observer
     /// task (Part C; spawned in [`Usdt::new`], see
     /// [`Usdt::spawn_bootstrap_observer`]), drained into
@@ -1741,6 +1747,18 @@ impl ServerModule for Usdt {
                     deposit_wei,
                 });
             }
+        }
+
+        // One-shot drain of this guardian's pending fee-withdrawal vote, set
+        // by the authenticated `withdraw_fees` endpoint. One-shot (rather
+        // than dedup-on-change like `FeeVote`/`BootstrapObservation`) since a
+        // guardian re-casts explicitly per withdrawal; proposing it more than
+        // once would risk a stale intent being re-submitted after it has
+        // already been acted on.
+        if let Some(vote) =
+            std::mem::take(&mut *self.fee_withdrawal_intent.lock().expect("not poisoned"))
+        {
+            items.push(UsdtConsensusItem::WithdrawFeesVote(vote));
         }
 
         // Propose this guardian's payload for the current round of every
@@ -2824,6 +2842,26 @@ impl ServerModule for Usdt {
                 }
             },
             api_endpoint! {
+                WITHDRAW_FEES_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Usdt, context, req: WithdrawFeesRequest| -> () {
+                    // Guardian-only: casting a fee-withdrawal vote is a
+                    // deliberate, authenticated action (Phase 8, Task 5).
+                    check_auth(context)?;
+                    if req.amount.0 == 0 {
+                        return Err(ApiError::bad_request(
+                            "fee-withdrawal amount must be positive".to_string(),
+                        ));
+                    }
+                    *module.fee_withdrawal_intent.lock().expect("not poisoned") =
+                        Some(fedimint_usdt_common::WithdrawFeesVote {
+                            recipient: req.recipient,
+                            amount: req.amount,
+                        });
+                    Ok(())
+                }
+            },
+            api_endpoint! {
                 FEDI_SWEEP_STATUS_ENDPOINT,
                 ApiVersion::new(0, 0),
                 async |module: &Usdt, context, req: DepositStatusRequest| -> FediSweepStatusResponse {
@@ -3000,6 +3038,7 @@ impl Usdt {
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
             user_op_confirmed_proposals,
             fee_estimate,
+            fee_withdrawal_intent: Arc::new(Mutex::new(None)),
             bootstrap_proposals,
             block_hash_proposals,
             residual_recovery_proposals,
@@ -3030,6 +3069,7 @@ impl Usdt {
             pending_signature_proposals: Arc::new(Mutex::new(Vec::new())),
             user_op_confirmed_proposals: Arc::new(Mutex::new(Vec::new())),
             fee_estimate: Arc::new(Mutex::new(None)),
+            fee_withdrawal_intent: Arc::new(Mutex::new(None)),
             // The bootstrap-observer poller is NOT spawned in tests (mirroring
             // the other pollers, skipped by `new_for_test`); tests drive
             // readiness by feeding `BootstrapObservation` items through
@@ -11317,6 +11357,31 @@ mod tests {
             !items
                 .iter()
                 .any(|i| matches!(i, UsdtConsensusItem::FeeVote(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_proposal_drains_fee_withdrawal_intent_once() {
+        let module = test_module_with_block_count(4, 0).await;
+        let recipient = EvmAddress([0x0f; 20]);
+        *module.fee_withdrawal_intent.lock().unwrap() =
+            Some(fedimint_usdt_common::WithdrawFeesVote {
+                recipient,
+                amount: UsdtAmount(42),
+            });
+
+        let mut dbtx = module.db_for_test().begin_transaction().await;
+        let first = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert!(first.iter().any(|it| matches!(
+            it,
+            UsdtConsensusItem::WithdrawFeesVote(v)
+                if v.recipient == recipient && v.amount == UsdtAmount(42)
+        )));
+        let second = module.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert!(
+            !second
+                .iter()
+                .any(|it| matches!(it, UsdtConsensusItem::WithdrawFeesVote(_)))
         );
     }
 
