@@ -121,6 +121,15 @@ pub enum DbKeyPrefix {
     /// [`RecoverResidualVoteKey`]). A new keyspace that starts empty and
     /// fills at runtime -- no migration.
     RecoverResidualVote = 0x15,
+    /// Per-peer votes on a proposed `WithdrawFees` payout (Phase 8, Task 5):
+    /// a guardian's proposed `(recipient, amount)` pair for sweeping accrued
+    /// fee revenue out of the pool. Once at least a threshold of peers vote
+    /// the IDENTICAL pair, the fee-withdrawal trigger (Task 6) enqueues the
+    /// payout op. GC'd unconditionally on the resulting `WithdrawFees` op's
+    /// confirmation (success OR revert), so a stuck vote can't retrigger a
+    /// revert loop -- any subsequent withdrawal needs a FRESH threshold. See
+    /// [`WithdrawFeesVoteKey`].
+    WithdrawFeesVote = 0x16,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -274,6 +283,25 @@ impl_db_lookup!(
     key = RecoverResidualVoteKey,
     query_prefix = RecoverResidualVotePrefix,
     query_prefix = RecoverResidualVoteAccountPrefix,
+);
+
+/// A single peer's vote to withdraw accrued fee revenue from the pool
+/// (Phase 8, Task 5). See [`fedimint_usdt_common::WithdrawFeesVote`] and
+/// [`DbKeyPrefix::WithdrawFeesVote`].
+#[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
+pub struct WithdrawFeesVoteKey(pub PeerId);
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct WithdrawFeesVotePrefix;
+
+impl_db_record!(
+    key = WithdrawFeesVoteKey,
+    value = fedimint_usdt_common::WithdrawFeesVote,
+    db_prefix = DbKeyPrefix::WithdrawFeesVote,
+);
+impl_db_lookup!(
+    key = WithdrawFeesVoteKey,
+    query_prefix = WithdrawFeesVotePrefix
 );
 
 /// What a signing session's digest is being signed for. Deterministically
@@ -432,6 +460,14 @@ pub enum UserOpPurpose {
     /// `apply_user_op_confirmed` advances the account's `SimpleAccount` nonce
     /// but does NOT touch `PoolState.balance`/`swept`.
     RecoverResidual { account: EvmAddress },
+    /// A fee-revenue payout `UserOp` FROM the pool `SimpleAccount`: a single
+    /// ERC-20 `transfer(recipient, amount)` moving accrued fee USDT out of the
+    /// pool. Shares `PoolState.nonce` with `Withdraw`, so the two are mutually
+    /// serialized by `withdraw_batch_in_flight`. Appended in consensus 0.12.
+    WithdrawFees {
+        recipient: EvmAddress,
+        amount: UsdtAmount,
+    },
 }
 
 /// A `UserOp` deterministically built from consensus DB state and enqueued
