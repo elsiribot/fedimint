@@ -268,6 +268,7 @@ pub(crate) async fn handle_cli_command(
             json(serde_json::json!({
                 "account": pool.account.to_string(),
                 "balance": pool.balance.0,
+                "accrued_fees": pool.accrued_fees.0,
             }))
         }
         Opts::Status => json(usdt.status().await?),

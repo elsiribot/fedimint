@@ -1131,6 +1131,7 @@ pub struct DepositStatusResponse {
 pub struct PoolStateResponse {
     pub account: EvmAddress,
     pub balance: UsdtAmount,
+    pub accrued_fees: UsdtAmount,
 }
 
 /// Response to the `latest_anchored_block` endpoint: the newest height
