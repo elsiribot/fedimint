@@ -66,8 +66,8 @@ use fedimint_usdt_common::{
     UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse,
     WithdrawalStatus, WithdrawalStatusRequest, WithdrawalStatusResponse, deposit_fee_quote,
     deposit_salt, derive_deposit_account, derive_pool_account, evm_address, fee_vote_in_sane_range,
-    pool_salt, signing_session_id, usdt_amount, validate_usdt_params, wei_gas_cost_to_usdt,
-    withdrawal_fee_quote,
+    is_dev_chain, pool_salt, signing_session_id, usdt_amount, validate_usdt_params,
+    wei_gas_cost_to_usdt, withdrawal_fee_quote,
 };
 use futures::{FutureExt as _, StreamExt as _};
 use rand::rngs::OsRng;
@@ -89,9 +89,9 @@ use crate::db::{
     SigningSessionPrefix, StoredFeeVote, SubmittedUserOp, SubmittedUserOpKey,
     SubmittedUserOpPrefix, UnclaimedWithdrawalKey, UnclaimedWithdrawalPrefix, UsdtWithdrawalV0,
     UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpConfirmedVoteOpPrefix,
-    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawFeesVotePrefix, WithdrawalBatchCapKey,
-    WithdrawalBatchCapPrefix, WithdrawalIncurredFeeKey, WithdrawalIncurredFeePrefix,
-    WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
+    UserOpConfirmedVotePrefix, UserOpPurpose, WithdrawFeesVoteKey, WithdrawFeesVotePrefix,
+    WithdrawalBatchCapKey, WithdrawalBatchCapPrefix, WithdrawalIncurredFeeKey,
+    WithdrawalIncurredFeePrefix, WithdrawalState, WithdrawalStateKey, WithdrawalStatePrefix,
 };
 use crate::rpc::{AlloyEvmRpc, DynServerEvmRpc, IServerEvmRpc as _};
 use crate::signing::{SessionSlot, SessionStore, pump_slot_outgoing, spawn_signing_session};
@@ -2271,6 +2271,45 @@ impl ServerModule for Usdt {
                 // prior consensus DB state, and config -- byte-identical on
                 // every guardian.
                 self.maybe_trigger_residual_recovery(dbtx, account).await;
+
+                Ok(())
+            }
+            UsdtConsensusItem::WithdrawFeesVote(vote) => {
+                // Non-state-changing sanity gates (pure functions of `vote`
+                // alone/`cfg.consensus`, so every guardian rejects
+                // identically): a zero-amount vote can never usefully reach
+                // threshold, and on a non-dev chain a zero-address recipient
+                // would burn the withdrawn fee revenue on-chain.
+                ensure!(
+                    vote.amount.0 > 0,
+                    "fee-withdrawal vote amount must be positive"
+                );
+                if !is_dev_chain(self.cfg.consensus.chain_id) {
+                    ensure!(
+                        vote.recipient != fedimint_usdt_common::EvmAddress([0u8; 20]),
+                        "fee-withdrawal recipient must not be the zero address on non-dev \
+                         chain_id {}",
+                        self.cfg.consensus.chain_id
+                    );
+                }
+
+                // Store the ORDERED item's origin peer's vote (keyed by the
+                // framework-supplied `peer_id`, NEVER `self.our_peer_id`),
+                // with an equality-based redundancy guard mirroring the
+                // `FeeVote`/`BootstrapObservation` arms: reject an EXACT
+                // repeat of this peer's current vote so a re-proposed
+                // unchanged vote is non-state-changing and cannot bloat
+                // consensus history.
+                let key = WithdrawFeesVoteKey(peer_id);
+                if dbtx.insert_entry(&key, &vote).await == Some(vote.clone()) {
+                    bail!("fee-withdrawal vote is redundant");
+                }
+
+                // Storing a fresh vote IS a state change, so returning `Ok`
+                // below is correct even when the threshold/economic/physical
+                // gates in `maybe_trigger_fee_withdrawal` decline to enqueue
+                // an op this round (a later vote re-drives it).
+                self.maybe_trigger_fee_withdrawal(dbtx).await;
 
                 Ok(())
             }
@@ -4787,6 +4826,137 @@ impl Usdt {
             need_with_margin,
             nonce = record.nonce,
             "residual recovery enqueued (PendingUserOp), starting MPC signing session"
+        );
+
+        let digest = eth_signed_message_hash(op_hash);
+        self.start_session(dbtx, SigningPurpose::UserOp(op_hash), digest, 0)
+            .await;
+    }
+
+    /// If a 2f+1 threshold of guardians has voted for the IDENTICAL
+    /// `(recipient, amount)` fee withdrawal, and `amount` is within both the
+    /// accrued fee revenue and the physical pool balance, and no pool op is in
+    /// flight, build and enqueue a `WithdrawFees` payout `UserOp` (a batch-of-
+    /// one transfer) and start its MPC signing session. Called from the
+    /// `WithdrawFeesVote` consensus-item arm, mirroring where
+    /// [`Usdt::maybe_trigger_residual_recovery`] sits in the `RecoverResidual`
+    /// arm.
+    ///
+    /// # Guards
+    ///
+    /// - [`Usdt::withdraw_batch_in_flight`]: never starts a `WithdrawFees` op
+    ///   while a `Withdraw`/`WithdrawFees` op is already `Pending`/ `Submitted`
+    ///   (both share the pool `SimpleAccount`'s nonce).
+    /// - Economic: `amount` must not exceed the pool's realized `accrued_fees`
+    ///   -- fee withdrawal can never dip into user deposit principal.
+    /// - Physical: `amount` must not exceed the pool's on-chain `balance` --
+    ///   never build a transfer the pool can't fund (it would revert on-chain);
+    ///   wait until in-transit backing settles instead.
+    ///
+    /// # Determinism (consensus-critical)
+    ///
+    /// A pure function of the full `WithdrawFeesVote`/`PoolState` consensus-DB
+    /// tables and this module's config (`account_factory`/`usdt_contract`/
+    /// `entry_point`/`chain_id`/`group_public_key`) -- no RPC, no wall-clock,
+    /// no `our_peer_id`. Votes are tallied via a `BTreeMap` keyed on the exact
+    /// `(recipient, amount)` pair, so every guardian scans the identical
+    /// ordered tally and reaches the identical `(recipient, amount)`
+    /// conclusion (at most one pair can reach a 2f+1 threshold at a time).
+    async fn maybe_trigger_fee_withdrawal(&self, dbtx: &mut DatabaseTransaction<'_>) {
+        // Serialize against user withdrawals on the shared pool nonce.
+        if self.withdraw_batch_in_flight(dbtx).await {
+            return;
+        }
+
+        let votes: Vec<fedimint_usdt_common::WithdrawFeesVote> = dbtx
+            .find_by_prefix(&WithdrawFeesVotePrefix)
+            .await
+            .map(|(_, v)| v)
+            .collect()
+            .await;
+        if votes.is_empty() {
+            return;
+        }
+
+        // Tally by exact (recipient, amount). BTreeMap keeps the scan
+        // deterministic; with a 2f+1 threshold at most one pair can qualify.
+        let mut counts: std::collections::BTreeMap<([u8; 20], u64), usize> =
+            std::collections::BTreeMap::new();
+        for v in &votes {
+            *counts.entry((v.recipient.0, v.amount.0)).or_default() += 1;
+        }
+        let threshold = self.num_peers.threshold();
+        let Some((&(recipient_bytes, amount_u64), _)) =
+            counts.iter().find(|&(_, &c)| c >= threshold)
+        else {
+            return;
+        };
+        let recipient = fedimint_usdt_common::EvmAddress(recipient_bytes);
+        let amount = UsdtAmount(amount_u64);
+
+        let pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
+            account: self.pool_account(),
+            balance: UsdtAmount(0),
+            nonce: 0,
+            accrued_fees: UsdtAmount(0),
+        });
+        // Economic guard: never pay out more than realized fee revenue.
+        if amount.0 > pool.accrued_fees.0 {
+            return;
+        }
+        // Physical guard: never build a transfer the pool can't fund (would
+        // revert on-chain); wait until in-transit backing settles.
+        if amount.0 > pool.balance.0 {
+            return;
+        }
+
+        let median = self.fee_vote_median(dbtx).await;
+        let owner = evm_address(&self.cfg.consensus.group_public_key);
+        let needs_deploy = pool.nonce == 0;
+        let params = WithdrawalBatchParams {
+            account_factory: self.cfg.consensus.account_factory,
+            usdt_contract: self.cfg.consensus.usdt_contract,
+            pool: pool.account,
+            owner,
+            withdrawals: vec![(recipient, amount)],
+            nonce: alloy::primitives::U256::from(pool.nonce),
+            needs_deploy,
+            paymaster_and_data: Vec::new(),
+            gas_bounds: GasBounds::withdrawal_batch(1, needs_deploy)
+                .with_median_fees(median.map(|m| m.max_fee_per_gas_wei)),
+        };
+        let op = crate::user_op::build_withdrawal_batch_userop(params);
+        let op_hash = user_op_hash(
+            &op,
+            self.cfg.consensus.entry_point,
+            self.cfg.consensus.chain_id,
+        );
+        // Idempotent: if this exact op is already pending or submitted, don't
+        // re-enqueue (also protects against a repeat/late threshold-reaching
+        // vote for the same agreed (recipient, amount)).
+        if dbtx.get_value(&PendingUserOpKey(op_hash)).await.is_some()
+            || dbtx.get_value(&SubmittedUserOpKey(op_hash)).await.is_some()
+        {
+            return;
+        }
+
+        let created_block = self.consensus_block_count(dbtx).await;
+        dbtx.insert_entry(
+            &PendingUserOpKey(op_hash),
+            &PendingUserOp {
+                op: op.clone(),
+                purpose: UserOpPurpose::WithdrawFees { recipient, amount },
+                created_block,
+            },
+        )
+        .await;
+        info!(
+            target: "usdt",
+            ?op_hash,
+            %recipient,
+            amount = amount.0,
+            nonce = pool.nonce,
+            "fee withdrawal reached threshold; enqueued WithdrawFees op, starting MPC signing"
         );
 
         let digest = eth_signed_message_hash(op_hash);
@@ -16723,6 +16893,174 @@ mod tests {
         )
         .await;
         assert!(module.withdraw_batch_in_flight(&mut dbtx.to_ref_nc()).await);
+    }
+
+    async fn pending_withdraw_fees(dbtx: &mut DatabaseTransaction<'_>) -> Option<PendingUserOp> {
+        let pending: Vec<(PendingUserOpKey, PendingUserOp)> = dbtx
+            .find_by_prefix(&PendingUserOpPrefix)
+            .await
+            .collect()
+            .await;
+        pending
+            .into_iter()
+            .map(|(_, p)| p)
+            .find(|p| matches!(p.purpose, UserOpPurpose::WithdrawFees { .. }))
+    }
+
+    /// **Phase 8, Task 6.** A 2f+1 threshold of guardians voting for the
+    /// IDENTICAL `(recipient, amount)` fee withdrawal enqueues a
+    /// `WithdrawFees` op; a below-threshold split of votes does not.
+    #[tokio::test]
+    async fn fee_withdrawal_triggers_only_on_threshold_and_within_limits() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_block_count_votes(db, 4, 10).await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let recipient = EvmAddress([0xcd; 20]);
+
+        // Pool has 500 balance and 200 accrued fees.
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(500),
+                    nonce: 1,
+                    accrued_fees: UsdtAmount(200),
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Two votes for (recipient, 150): below threshold (3) -> no op.
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::WithdrawFeesVote(fedimint_usdt_common::WithdrawFeesVote {
+                        recipient,
+                        amount: UsdtAmount(150),
+                    }),
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(pending_withdraw_fees(&mut dbtx.to_ref_nc()).await.is_none());
+
+        // Third matching vote reaches threshold -> op enqueued.
+        module
+            .process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                UsdtConsensusItem::WithdrawFeesVote(fedimint_usdt_common::WithdrawFeesVote {
+                    recipient,
+                    amount: UsdtAmount(150),
+                }),
+                PeerId::from(2),
+            )
+            .await
+            .unwrap();
+        let op = pending_withdraw_fees(&mut dbtx.to_ref_nc())
+            .await
+            .expect("enqueued");
+        assert!(matches!(
+            op.purpose,
+            UserOpPurpose::WithdrawFees { recipient: r, amount: a }
+                if r == recipient && a == UsdtAmount(150)
+        ));
+    }
+
+    /// **Phase 8, Task 6.** A threshold vote for an `amount` exceeding the
+    /// pool's `accrued_fees` must never enqueue a `WithdrawFees` op -- fee
+    /// withdrawal can never dip into user deposit principal.
+    #[tokio::test]
+    async fn fee_withdrawal_does_not_trigger_above_accrued_fees() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_block_count_votes(db, 4, 10).await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let recipient = EvmAddress([0xcd; 20]);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(500),
+                    nonce: 1,
+                    accrued_fees: UsdtAmount(200),
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Three matching votes for 300 (> accrued 200) reach threshold, but
+        // the economic guard must still decline to enqueue.
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::WithdrawFeesVote(fedimint_usdt_common::WithdrawFeesVote {
+                        recipient,
+                        amount: UsdtAmount(300),
+                    }),
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(pending_withdraw_fees(&mut dbtx.to_ref_nc()).await.is_none());
+    }
+
+    /// **Phase 8, Task 6.** A threshold vote for an `amount` exceeding the
+    /// pool's physical `balance` must never enqueue a `WithdrawFees` op --
+    /// never build a transfer the pool can't fund (it would revert on-chain).
+    #[tokio::test]
+    async fn fee_withdrawal_does_not_trigger_above_pool_balance() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        seed_block_count_votes(db, 4, 10).await;
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let recipient = EvmAddress([0xcd; 20]);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(500),
+                    nonce: 1,
+                    accrued_fees: UsdtAmount(600),
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // Three matching votes for 600 (> balance 500, though <= accrued 600)
+        // reach threshold, but the physical guard must still decline.
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(
+                    &mut dbtx.to_ref_nc(),
+                    UsdtConsensusItem::WithdrawFeesVote(fedimint_usdt_common::WithdrawFeesVote {
+                        recipient,
+                        amount: UsdtAmount(600),
+                    }),
+                    PeerId::from(p),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(pending_withdraw_fees(&mut dbtx.to_ref_nc()).await.is_none());
     }
 
     /// **Security finding 05 (poisoned-batch isolation), the finding's core

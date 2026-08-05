@@ -1398,7 +1398,8 @@ impl Default for UsdtGenParams {
 /// checks in [`validate_usdt_params`] (minimum confirmation depth,
 /// non-placeholder contract addresses) since a dev federation intentionally
 /// runs with the compiled-in placeholder/fast-confirmation defaults.
-fn is_dev_chain(chain_id: u64) -> bool {
+#[must_use]
+pub fn is_dev_chain(chain_id: u64) -> bool {
     matches!(chain_id, 31337 | 1337)
 }
 
@@ -1695,6 +1696,9 @@ pub enum UsdtConsensusItem {
         /// `need`/margin arithmetic.
         deposit_wei: u64,
     },
+    /// A guardian's fee-withdrawal vote (consensus 0.12). See
+    /// [`WithdrawFeesVote`].
+    WithdrawFeesVote(WithdrawFeesVote),
     #[encodable_default]
     Default { variant: u64, bytes: Vec<u8> },
 }
