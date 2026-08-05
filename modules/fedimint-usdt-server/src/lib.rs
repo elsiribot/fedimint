@@ -16193,6 +16193,121 @@ mod tests {
         );
     }
 
+    /// **Task 3 (withdrawal-fee accrual), NON-terminal-failure branch.** When a
+    /// multi-member (`n > 1`) withdrawal batch reverts on-chain it is NOT
+    /// terminal -- every covered withdrawal is re-queued (with a halved cap)
+    /// and stays live, so NO fee is realized yet. This test proves the
+    /// re-queue branch credits NOTHING into `PoolState.accrued_fees` (and
+    /// does not debit `balance`): it seeds a NON-zero `accrued_fees` and
+    /// asserts it is UNCHANGED after the failed confirm, so a regression
+    /// that wrongly credited the batch's `max_fee` sum here would flip
+    /// the assertion.
+    #[tokio::test]
+    async fn requeued_failed_batch_accrues_no_fee() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let op_hash = [0xc7; 32];
+        let out_points: Vec<OutPoint> = (0..4).map(|i| test_out_point(40 + i)).collect();
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(40_000_000),
+                    nonce: 0,
+                    // Seed NON-zero so "unchanged" is a load-bearing assertion,
+                    // not a vacuous 0 == 0.
+                    accrued_fees: UsdtAmount(500),
+                },
+            )
+            .await;
+            for (i, &out_point) in out_points.iter().enumerate() {
+                let byte = u8::try_from(i).expect("small index fits u8");
+                dbtx.insert_new_entry(
+                    &UnclaimedWithdrawalKey(out_point),
+                    &UsdtWithdrawalV0 {
+                        recipient: EvmAddress([byte; 20]),
+                        amount: UsdtAmount(1_000_000),
+                        max_fee: UsdtAmount(1_000),
+                        requested_block: 0,
+                        refund_pubkey: sample_claim_pk(),
+                    },
+                )
+                .await;
+                dbtx.insert_new_entry(
+                    &WithdrawalStateKey(out_point),
+                    &WithdrawalState::Signing(op_hash),
+                )
+                .await;
+            }
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: sample_unsigned_user_op_for_test(),
+                        signature: vec![0xee; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: out_points.clone(),
+                    },
+                    submitted_block: 5,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        // n = 4 (> 1) reverted batch -> non-terminal re-queue branch.
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: false,
+            block: 101,
+            block_hash: [0u8; 32],
+            swept: UsdtAmount(0),
+            actual_gas_cost_wei: UsdtAmount(0),
+        };
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for p in [0u16, 1, 2] {
+                module
+                    .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                    .await
+                    .expect("vote processes cleanly");
+            }
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        // Sanity: this really exercised the re-queue branch (still Queued, not
+        // Failed/Confirmed), so the no-accrual assertion below is meaningful.
+        assert_eq!(
+            dbtx.to_ref_nc()
+                .get_value(&WithdrawalStateKey(out_points[0]))
+                .await,
+            Some(WithdrawalState::Queued),
+            "n>1 revert must re-queue (non-terminal), not settle or refund"
+        );
+        let pool = dbtx
+            .to_ref_nc()
+            .get_value(&PoolStateKey)
+            .await
+            .expect("pool state exists");
+        assert_eq!(
+            pool.accrued_fees,
+            UsdtAmount(500),
+            "a re-queued (non-terminal) failure must realize NO fee"
+        );
+        assert_eq!(
+            pool.balance,
+            UsdtAmount(40_000_000),
+            "a failed batch must not debit pool.balance"
+        );
+    }
+
     /// **Task 3 (withdrawal-fee accrual).** On a successful confirmation the
     /// federation keeps the FULL `max_fee` of every settled withdrawal (the
     /// recipient was only ever paid `amount`; `max_fee` never left the pool

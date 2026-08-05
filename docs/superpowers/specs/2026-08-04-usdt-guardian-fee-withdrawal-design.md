@@ -111,10 +111,23 @@ UserOp confirms (see flow below).
 
 ### Invariant
 
-At all times `accrued_fees ≤ pool.balance`. A fee withdrawal may request at most
-`accrued_fees`, so it can never dip into the USDT that backs outstanding e-cash.
-The tally gate re-checks `amount ≤ accrued_fees` at trigger time, and the
-threshold-ECDSA-signed UserOp transfers at most that amount out of the pool.
+In the **settled state** (no deposit sweep or withdrawal in flight),
+`accrued_fees ≤ pool.balance`. Transiently the two can cross during an in-transit
+window — e.g. a successful withdrawal debits `pool.balance` by `amount` (the
+pool-funding gate covers only `amount`, not `max_fee`) at the same confirm that
+credits `max_fee` into `accrued_fees`, while the backing deposit for that fee may
+not yet have swept in — so `accrued_fees` can briefly exceed `pool.balance`.
+
+That transient does **not** weaken safety, because the payout is gated by **two**
+independent checks, and the *physical* one is the binding constraint here: a fee
+withdrawal fires only if `amount ≤ accrued_fees` (economic: never more than
+realized fee revenue) **and** `amount ≤ pool.balance` (physical: never more than
+USDT physically in the pool). The physical guard alone guarantees a payout never
+dips into e-cash backing regardless of the transient, and the condition
+self-heals once the backing deposit sweeps in. `accrued_fees` always equals
+genuine federation fee equity (`pool + in-transit-credited − e-cash owed`); it is
+the physical guard, not the literal `accrued_fees ≤ pool.balance` relation, that
+bounds what can actually leave.
 
 ### Migration
 
