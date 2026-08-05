@@ -2410,6 +2410,13 @@ impl ServerModule for Usdt {
         // sweep pulls the whole thing into the pool, at which point it
         // becomes federation fee revenue (see `audit`'s doc comment).
         record.claimed = UsdtAmount(record.claimed.0.saturating_add(input.amount.0));
+
+        // Accrue the deposit fee onto this account's record. It is credited
+        // into PoolState.accrued_fees (and reset) only when the sweep confirms
+        // (see apply_user_op_confirmed's DeployAndSweep arm), so a deposit fee
+        // becomes withdrawable revenue only once its USDT is physically pooled.
+        record.fees_accrued = UsdtAmount(record.fees_accrued.0.saturating_add(input.fee.0));
+
         dbtx.insert_entry(&DepositRecordKey(input.account), &record)
             .await;
 
@@ -5193,6 +5200,17 @@ impl Usdt {
                     // against `obs.swept` above, security finding 21), not
                     // the raw vote field.
                     pool.balance = UsdtAmount(pool.balance.0.saturating_add(effective_swept.0));
+
+                    // Realize this account's accrued deposit fees now that its
+                    // USDT (fee portion included) is physically in the pool --
+                    // see `process_input`'s doc comment. Reset to zero in the
+                    // `DepositRecord` update below (same success arm) so each
+                    // deposit fee is credited exactly once.
+                    if let Some(record) = dbtx.get_value(&DepositRecordKey(source)).await {
+                        pool.accrued_fees =
+                            UsdtAmount(pool.accrued_fees.0.saturating_add(record.fees_accrued.0));
+                    }
+
                     dbtx.insert_entry(&PoolStateKey, &pool).await;
 
                     retrigger_source = Some(source);
@@ -5221,6 +5239,7 @@ impl Usdt {
                                 .saturating_add(effective_swept.0)
                                 .min(record.credited.0),
                         );
+                        record.fees_accrued = UsdtAmount(0);
                     }
                     dbtx.insert_entry(&DepositRecordKey(source), &record).await;
                 }
@@ -10154,6 +10173,54 @@ mod tests {
             .await
             .expect("record still exists");
         assert_eq!(record.claimed, UsdtAmount(0));
+    }
+
+    #[tokio::test]
+    async fn process_input_accrues_deposit_fee_onto_record() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let account = EvmAddress([0x57; 20]);
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let quote = deposit_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk: test_pubkey(0xef),
+                    credited: UsdtAmount(500_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                    fees_accrued: UsdtAmount(0),
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &UsdtInput::V0(UsdtInputV0 {
+                    account,
+                    amount: UsdtAmount(200_000_000),
+                    fee: quote,
+                }),
+                test_in_point(),
+            )
+            .await
+            .expect("valid claim");
+        let rec = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(account))
+            .await
+            .unwrap();
+        assert_eq!(rec.fees_accrued, quote);
+        assert_eq!(rec.claimed, UsdtAmount(200_000_000));
     }
 
     #[tokio::test]
@@ -17536,6 +17603,81 @@ mod tests {
             );
             dbtx.commit_tx().await;
         }
+    }
+
+    /// **Task 2 (deposit-fee accrual).** A successful `DeployAndSweep`
+    /// confirmation realizes the swept deposit account's
+    /// `DepositRecord.fees_accrued` into `PoolState.accrued_fees` (in
+    /// addition to the pre-existing `pool.balance` credit and
+    /// `record.nonce`/`record.swept` advances), and resets the record's
+    /// `fees_accrued` back to zero so the same deposit fee is never
+    /// credited twice.
+    #[tokio::test]
+    async fn deploy_and_sweep_confirm_credits_accrued_deposit_fee_into_pool() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+        let source = EvmAddress([0xe1; 20]);
+        let claim_pk = test_pubkey(0xe2);
+        let op_hash = [0xe3; 32];
+        let real_amount = UsdtAmount(2_500_000);
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(source),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(2_500_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                    fees_accrued: UsdtAmount(777),
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_deploy_and_sweep_op_for_test(source, real_amount),
+                        signature: vec![0x22; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep { source },
+                    submitted_block: 1,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .apply_user_op_confirmed(
+                &mut dbtx.to_ref_nc(),
+                op_hash,
+                &UserOpConfirmedObservation {
+                    success: true,
+                    block: 10,
+                    block_hash: [0u8; 32],
+                    swept: real_amount,
+                    actual_gas_cost_wei: UsdtAmount(0),
+                },
+            )
+            .await;
+
+        let pool = dbtx.to_ref_nc().get_value(&PoolStateKey).await.unwrap();
+        assert_eq!(pool.balance, real_amount);
+        assert_eq!(pool.accrued_fees, UsdtAmount(777));
+        let rec = dbtx
+            .to_ref_nc()
+            .get_value(&DepositRecordKey(source))
+            .await
+            .unwrap();
+        assert_eq!(rec.fees_accrued, UsdtAmount(0)); // reset after crediting
+        assert_eq!(rec.swept, real_amount);
+        assert_eq!(rec.nonce, 1);
     }
 
     /// **Security finding 04 (Task 5.1).** The user-op submitter must NOT
