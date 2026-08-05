@@ -1871,6 +1871,7 @@ mod fedimint_migration_tests {
                 last_observed_block: 1,
                 swept: UsdtAmount(0),
                 nonce: 0,
+                fees_accrued: UsdtAmount(0),
             },
         )
         .await;
@@ -1954,6 +1955,7 @@ mod fedimint_migration_tests {
                 account,
                 balance: UsdtAmount(1_000_000),
                 nonce: 0,
+                accrued_fees: UsdtAmount(0),
             },
         )
         .await;
@@ -2034,17 +2036,20 @@ mod fedimint_migration_tests {
     /// `PendingCheck` row, so the snapshot reader test alone cannot exercise
     /// the drop. This builds a fresh module-namespaced DB carrying a raw
     /// `0x05` row (the exact on-disk shape the deleted code produced) plus
-    /// a `DepositRecord`, runs the module's FULL migration chain (v0..=v4)
-    /// through the real `apply_migrations` path, and asserts the
-    /// `PendingCheck` row is gone and the `DepositRecord` survives
-    /// untouched. Uses a `MemDatabase` (not the committed RocksDB snapshot
-    /// fixture) so it neither depends on nor dirties the frozen snapshot.
+    /// a pre-0.12 `DepositRecord` row (current shape minus its trailing
+    /// `fees_accrued`, so `migrate_db_v5` also gets exercised), runs the
+    /// module's FULL migration chain (now v0..=v5) through the real
+    /// `apply_migrations` path, and asserts the `PendingCheck` row is gone
+    /// and the `DepositRecord` survives (fees_accrued defaulted to zero).
+    /// Uses a `MemDatabase` (not the committed RocksDB snapshot fixture) so
+    /// it neither depends on nor dirties the frozen snapshot.
     #[tokio::test(flavor = "multi_thread")]
     async fn migrate_v4_drops_residual_pending_check_rows() -> anyhow::Result<()> {
         use std::sync::Arc;
 
         use fedimint_core::db::apply_migrations;
         use fedimint_core::db::mem_impl::MemDatabase;
+        use fedimint_core::encoding::Encodable;
         use fedimint_core::module::registry::ModuleDecoderRegistry;
         use fedimint_server::consensus::db::ServerDbMigrationContext;
         use fedimint_testing::db::TEST_MODULE_INSTANCE_ID;
@@ -2061,6 +2066,12 @@ mod fedimint_migration_tests {
         let module_db = db.with_prefix_module_id(TEST_MODULE_INSTANCE_ID).0;
 
         let account = EvmAddress([0x31; 20]);
+        // The CURRENT (0.12) shape -- includes `fees_accrued`, which
+        // `migrate_db_v5` is responsible for producing (as `UsdtAmount(0)`)
+        // out of a pre-0.12 row. What is actually written below is this
+        // struct's encoding MINUS its trailing `fees_accrued` (an old-shape
+        // row), so the full migration chain run by this test (now v0..=v5)
+        // exercises `migrate_db_v5` too, not just `migrate_db_v4`.
         let record = DepositRecord {
             claim_pk: test_pubkey(),
             credited: UsdtAmount(1_000_000),
@@ -2068,7 +2079,15 @@ mod fedimint_migration_tests {
             last_observed_block: 7,
             swept: UsdtAmount(0),
             nonce: 0,
+            fees_accrued: UsdtAmount(0),
         };
+        // `UsdtAmount`'s inner `u64` is `BigSize`-encoded (variable-length:
+        // `UsdtAmount(0)` is exactly 1 byte, not a fixed width), so the
+        // trailing field is stripped by its own encoded length, not a
+        // hardcoded byte count.
+        let zero_fee_len = UsdtAmount(0).consensus_encode_to_vec().len();
+        let mut old_record_bytes = record.consensus_encode_to_vec();
+        old_record_bytes.truncate(old_record_bytes.len() - zero_fee_len); // drop fees_accrued
 
         // A residual `PendingCheck` row in the removed table's on-disk shape:
         // prefix `0x05` followed by arbitrary key/value bytes. The deleted
@@ -2081,8 +2100,12 @@ mod fedimint_migration_tests {
             dbtx.raw_insert_bytes(&residual_pending_check_key, b"residual pending check")
                 .await
                 .expect("DB error");
-            dbtx.insert_new_entry(&DepositRecordKey(account), &record)
-                .await;
+            let mut record_key_bytes = vec![DbKeyPrefix::DepositRecord as u8];
+            record_key_bytes
+                .extend_from_slice(&DepositRecordKey(account).consensus_encode_to_vec());
+            dbtx.raw_insert_bytes(&record_key_bytes, &old_record_bytes)
+                .await
+                .expect("DB error");
             dbtx.commit_tx().await;
         }
 

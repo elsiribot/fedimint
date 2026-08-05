@@ -212,6 +212,13 @@ pub struct DepositRecord {
     pub last_observed_block: u64,
     pub swept: UsdtAmount,
     pub nonce: u64,
+    /// Cumulative deposit-fee USDT charged against this account in
+    /// `process_input` but not yet moved into the pool. Credited into
+    /// `PoolState.accrued_fees` (and reset to 0) when a `DeployAndSweep`
+    /// confirms and sweeps this account's balance into the pool, so a deposit
+    /// fee counts as withdrawable revenue only once its USDT is physically in
+    /// the pool. Appended in `MODULE_CONSENSUS_VERSION` 0.12 (`migrate_db_v5`).
+    pub fees_accrued: UsdtAmount,
 }
 
 #[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
@@ -547,6 +554,12 @@ pub struct PoolState {
     pub account: EvmAddress,
     pub balance: UsdtAmount,
     pub nonce: u64,
+    /// Realized, withdrawable federation fee revenue physically held in the
+    /// pool `SimpleAccount`, in USDT units. Credited by confirmed deposit
+    /// sweeps and confirmed/failed withdrawals; debited by confirmed
+    /// `WithdrawFees` payouts. Invariant: `accrued_fees <= balance`. Appended
+    /// in `MODULE_CONSENSUS_VERSION` 0.12 (`migrate_db_v5`).
+    pub accrued_fees: UsdtAmount,
 }
 
 #[derive(Clone, Debug, Encodable, Decodable, Eq, PartialEq, Hash)]
@@ -948,6 +961,7 @@ mod tests {
             last_observed_block: 100,
             swept: UsdtAmount(0),
             nonce: 0,
+            fees_accrued: UsdtAmount(0),
         };
 
         let mut dbtx = db.begin_transaction().await;
@@ -1248,6 +1262,7 @@ mod tests {
             account: EvmAddress([0x61; 20]),
             balance: UsdtAmount(9_000_000),
             nonce: 3,
+            accrued_fees: UsdtAmount(0),
         };
 
         let mut dbtx = db.begin_transaction().await;

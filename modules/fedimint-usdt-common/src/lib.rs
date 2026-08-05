@@ -146,7 +146,14 @@ pub const KIND: ModuleKind = ModuleKind::from_static_str("usdt");
 /// the vote table bounded and forces every recovery to re-cross a FRESH
 /// threshold of votes, so stale post-recovery votes plus one byzantine
 /// vote-flip can no longer re-trigger a bogus oversized recovery.
-pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 11);
+///
+/// Bumped to `0.12`: guardian fee withdrawal. Appends two trailing
+/// `UsdtAmount` fields (`DepositRecord.fees_accrued`, `PoolState.accrued_fees`,
+/// migrated by `migrate_db_v5`), appends `UserOpPurpose::WithdrawFees` and
+/// `UsdtConsensusItem::WithdrawFeesVote` (both append-only wire variants), and
+/// adds the `WithdrawFeesVote` keyspace (`0x16`). Read-side:
+/// `PoolStateResponse` gains an `accrued_fees` field.
+pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 12);
 
 /// The [`AmountUnit`] that USDT-denominated ecash is issued in.
 ///

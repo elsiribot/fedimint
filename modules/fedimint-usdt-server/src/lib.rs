@@ -18,6 +18,7 @@ use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCore,
     IDatabaseTransactionOpsCoreTyped,
 };
+use fedimint_core::encoding::Encodable as _;
 use fedimint_core::envs::{
     FM_ENABLE_MODULE_USDT_ENV, FM_USDT_ACCOUNT_FACTORY_ENV,
     FM_USDT_BROADCASTER_MIN_BALANCE_WEI_ENV, FM_USDT_BROADCASTER_PRIVATE_KEY_ENV,
@@ -1105,6 +1106,14 @@ impl ServerModuleInit for UsdtInit {
     /// they require only a `MODULE_CONSENSUS_VERSION` bump and `dump_database`
     /// coverage. Existing [`DepositRecord`](crate::db::DepositRecord)s are left
     /// untouched (their `credited` high-water marks carry forward).
+    ///
+    /// `DatabaseVersion(5)` (guardian fee withdrawal,
+    /// `MODULE_CONSENSUS_VERSION` 0.12): both
+    /// [`DepositRecord`](crate::db::DepositRecord) and
+    /// [`PoolState`](crate::db::PoolState) gained a trailing `UsdtAmount`
+    /// (`fees_accrued`/`accrued_fees`). See [`migrate_db_v5`] for why this
+    /// REWRITES (rather than drops) the existing rows, appending a zero
+    /// counter.
     fn get_database_migrations(
         &self,
     ) -> BTreeMap<DatabaseVersion, ServerModuleDbMigrationFn<Usdt>> {
@@ -1129,6 +1138,10 @@ impl ServerModuleInit for UsdtInit {
         migrations.insert(
             DatabaseVersion(4),
             Box::new(|ctx| migrate_db_v4(ctx).boxed()),
+        );
+        migrations.insert(
+            DatabaseVersion(5),
+            Box::new(|ctx| migrate_db_v5(ctx).boxed()),
         );
         migrations
     }
@@ -1336,6 +1349,41 @@ async fn migrate_db_v4(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> a
         .raw_remove_by_prefix(&[REMOVED_PENDING_CHECK_PREFIX])
         .await
         .expect("DB error");
+    Ok(())
+}
+
+/// `MODULE_CONSENSUS_VERSION` 0.12: append `DepositRecord.fees_accrued` and
+/// `PoolState.accrued_fees` (each a trailing `UsdtAmount`). A pre-0.12 row
+/// lacks the field, so append `UsdtAmount(0)`'s encoding to every existing row
+/// of both keyspaces -- correct regardless of the field's own byte width
+/// (`UsdtAmount`'s inner `u64` is `BigSize`-encoded, i.e. variable-length: 1
+/// byte for `0`), since a struct's `Encodable` is just its fields'
+/// encodings concatenated in order, so appending the new field's own encoding
+/// to an old row's bytes is exactly the new row's encoding. `PoolState` is a
+/// singleton (0 or 1 row); `DepositRecord` is prefix-scanned. Pre-upgrade fees
+/// are therefore not retroactively withdrawable (counter starts at 0) --
+/// intentional.
+async fn migrate_db_v5(mut ctx: ServerModuleDbMigrationFnContext<'_, Usdt>) -> anyhow::Result<()> {
+    let zero = UsdtAmount(0).consensus_encode_to_vec();
+    for prefix in [
+        DbKeyPrefix::DepositRecord as u8,
+        DbKeyPrefix::PoolState as u8,
+    ] {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = ctx
+            .dbtx()
+            .raw_find_by_prefix(&[prefix])
+            .await
+            .expect("DB error")
+            .collect()
+            .await;
+        for (key, mut value) in entries {
+            value.extend_from_slice(&zero);
+            ctx.dbtx()
+                .raw_insert_bytes(&key, &value)
+                .await
+                .expect("DB error");
+        }
+    }
     Ok(())
 }
 
@@ -2581,6 +2629,7 @@ impl ServerModule for Usdt {
                         account: module.pool_account(),
                         balance: UsdtAmount(0),
                         nonce: 0,
+                        accrued_fees: UsdtAmount(0),
                     });
 
                     Ok(PoolStateResponse {
@@ -3984,6 +4033,7 @@ impl Usdt {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 });
 
         // Sweep-aware all-time total (LOCAL fedi extension; see
@@ -4138,6 +4188,7 @@ impl Usdt {
                 last_observed_block: 0,
                 swept: UsdtAmount(0),
                 nonce: 0,
+                fees_accrued: UsdtAmount(0),
             });
         // Sweep-aware credit rule (see this method's doc comment). Every
         // input is consensus state or the ordered item itself:
@@ -4857,6 +4908,7 @@ impl Usdt {
             account: self.pool_account(),
             balance: UsdtAmount(0),
             nonce: 0,
+            accrued_fees: UsdtAmount(0),
         });
 
         // POOL-BALANCE GATE: only build a batch the pool can actually pay.
@@ -5171,6 +5223,7 @@ impl Usdt {
                         account: self.pool_account(),
                         balance: UsdtAmount(0),
                         nonce: 0,
+                        accrued_fees: UsdtAmount(0),
                     });
                     // `saturating_add` (Phase 9, Task 1 hardening, N1): both
                     // adds below are bounded in practice (a pool balance /
@@ -5401,6 +5454,7 @@ impl Usdt {
             account: self.pool_account(),
             balance: UsdtAmount(0),
             nonce: 0,
+            accrued_fees: UsdtAmount(0),
         });
         pool.nonce += 1;
 
@@ -10173,6 +10227,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -10294,6 +10349,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -10351,6 +10407,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -10411,6 +10468,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -11192,6 +11250,7 @@ mod tests {
                     last_observed_block: 42,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -12918,6 +12977,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -13209,6 +13269,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -13357,6 +13418,7 @@ mod tests {
                 last_observed_block: 0,
                 swept: UsdtAmount(0),
                 nonce: 0,
+                fees_accrued: UsdtAmount(0),
             },
         )
         .await;
@@ -13559,6 +13621,7 @@ mod tests {
                 last_observed_block: 0,
                 swept: amount,
                 nonce: 1,
+                fees_accrued: UsdtAmount(0),
             },
         )
         .await;
@@ -13748,6 +13811,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: pool_before,
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -13996,6 +14060,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(400_000), // NOT fully swept
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -14139,6 +14204,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(40_000_000),
                     nonce: 1,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -14385,6 +14451,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -14848,6 +14915,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -14953,6 +15021,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -15057,6 +15126,7 @@ mod tests {
                 last_observed_block: 0,
                 swept: UsdtAmount(5_000_000),
                 nonce: 0,
+                fees_accrued: UsdtAmount(0),
             },
         )
         .await;
@@ -15069,6 +15139,7 @@ mod tests {
                 last_observed_block: 0,
                 swept: UsdtAmount(1_000_000),
                 nonce: 0,
+                fees_accrued: UsdtAmount(0),
             },
         )
         .await;
@@ -15081,6 +15152,7 @@ mod tests {
                 last_observed_block: 0,
                 swept: UsdtAmount(0),
                 nonce: 0,
+                fees_accrued: UsdtAmount(0),
             },
         )
         .await;
@@ -15093,6 +15165,7 @@ mod tests {
                 account: module.pool_account(),
                 balance: UsdtAmount(6_000_000),
                 nonce: 1,
+                accrued_fees: UsdtAmount(0),
             },
         )
         .await;
@@ -15156,6 +15229,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(6_000_000),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -15302,6 +15376,7 @@ mod tests {
                 account: module.pool_account(),
                 balance: UsdtAmount(40_000_000),
                 nonce: 0,
+                accrued_fees: UsdtAmount(0),
             },
         )
         .await;
@@ -15455,6 +15530,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(total_amount - 1),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -15498,6 +15574,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(total_amount),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -15568,6 +15645,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(5_000_000),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -15744,6 +15822,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(3_000_000),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -15875,6 +15954,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(3_000_000),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -15999,6 +16079,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(40_000_000),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -16146,6 +16227,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(3_000_000),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -16250,6 +16332,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(40_000_000),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -16570,6 +16653,7 @@ mod tests {
                 account: module.pool_account(),
                 balance: UsdtAmount(10_000_000),
                 nonce: 0,
+                accrued_fees: UsdtAmount(0),
             },
         )
         .await;
@@ -16723,6 +16807,7 @@ mod tests {
                 account: module.pool_account(),
                 balance: UsdtAmount(10_000_000),
                 nonce: 0,
+                accrued_fees: UsdtAmount(0),
             },
         )
         .await;
@@ -17007,6 +17092,7 @@ mod tests {
                 account: module.pool_account(),
                 balance: UsdtAmount(10_000_000),
                 nonce: 0,
+                accrued_fees: UsdtAmount(0),
             },
         )
         .await;
@@ -17112,6 +17198,7 @@ mod tests {
                 last_observed_block: 1,
                 swept: UsdtAmount(0),
                 nonce: 0,
+                fees_accrued: UsdtAmount(0),
             },
         )
         .await;
@@ -17175,6 +17262,7 @@ mod tests {
                 account,
                 balance: UsdtAmount(1_000_000),
                 nonce: 0,
+                accrued_fees: UsdtAmount(0),
             },
         )
         .await;
@@ -17704,6 +17792,7 @@ mod tests {
                     last_observed_block: 0,
                     swept: UsdtAmount(0),
                     nonce: 0,
+                    fees_accrued: UsdtAmount(0),
                 },
             )
             .await;
@@ -17821,6 +17910,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(5_000_000),
                     nonce: 0,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -18588,6 +18678,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(10_000_000),
                     nonce: 5,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -19001,6 +19092,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(10_000_000),
                     nonce: 5,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -19140,6 +19232,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(5_000_000),
                     nonce: 7,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -19267,6 +19360,7 @@ mod tests {
                     account: module.pool_account(),
                     balance: UsdtAmount(5_000_000),
                     nonce: 7,
+                    accrued_fees: UsdtAmount(0),
                 },
             )
             .await;
@@ -19519,6 +19613,103 @@ mod tests {
             !decoded.superseded,
             "a migrated pre-0.6 row must default superseded to false"
         );
+    }
+
+    /// **Task 1 migration test.** `migrate_db_v5` (`MODULE_CONSENSUS_VERSION`
+    /// 0.12, guardian fee withdrawal) appends a trailing `UsdtAmount` to both
+    /// `PoolState` (`accrued_fees`) and `DepositRecord` (`fees_accrued`).
+    ///
+    /// Mirrors [`migrate_v2_appends_superseded_false_and_round_trips`]'s
+    /// approach rather than invoking `migrate_db_v5` directly: a real
+    /// `ServerModuleDbMigrationFnContext` cannot be constructed from this
+    /// crate's own unit tests, because its concrete `IServerDbMigrationContext`
+    /// implementation (`ServerDbMigrationContext`) lives only in
+    /// `fedimint-server`, and `fedimint-usdt-server` cannot depend on
+    /// `fedimint-server` (which itself depends on every server module,
+    /// including this one) without a circular dependency. So this verifies
+    /// the migration's exact byte-level transform instead: a pre-0.12 row
+    /// (the current struct's bytes minus the trailing field) fails to decode
+    /// as the new shape -- proving the migration is actually necessary, not a
+    /// no-op -- and appending `migrate_db_v5`'s exact zero encoding fixes it
+    /// up with a ZERO trailing field (never garbage).
+    ///
+    /// Note `UsdtAmount`'s inner `u64` is `BigSize`-encoded (variable-length,
+    /// like Bitcoin's `CompactSize`): `UsdtAmount(0)` happens to be exactly 1
+    /// byte, not a fixed 8. The byte-append transform is correct regardless
+    /// of the field's width, since a struct's `Encodable` is just its fields'
+    /// encodings concatenated in declaration order.
+    ///
+    /// `fedimint-usdt-tests`' `migrate_v4_drops_residual_pending_check_rows`
+    /// and `test_server_db_migrations` additionally exercise the REAL
+    /// `migrate_db_v5` function (via `apply_migrations`, from that crate,
+    /// which can depend on `fedimint-server`) against a raw pre-0.12 row and
+    /// the frozen `usdt-server-v0` snapshot fixture, respectively.
+    #[tokio::test]
+    async fn migrate_v5_appends_zero_fee_fields_and_round_trips() {
+        use fedimint_core::encoding::{Decodable, Encodable};
+        use fedimint_core::module::registry::ModuleDecoderRegistry;
+
+        #[derive(Encodable)]
+        struct OldPoolState {
+            account: EvmAddress,
+            balance: UsdtAmount,
+            nonce: u64,
+        }
+        #[derive(Encodable)]
+        struct OldDepositRecord {
+            claim_pk: secp256k1::PublicKey,
+            credited: UsdtAmount,
+            claimed: UsdtAmount,
+            last_observed_block: u64,
+            swept: UsdtAmount,
+            nonce: u64,
+        }
+
+        // The exact transform `migrate_db_v5` applies to each raw value:
+        // append `UsdtAmount(0)`'s own encoding.
+        let zero_fee = UsdtAmount(0).consensus_encode_to_vec();
+
+        let old_pool = OldPoolState {
+            account: EvmAddress([0x71; 20]),
+            balance: UsdtAmount(1_234),
+            nonce: 7,
+        };
+        let mut pool_bytes = old_pool.consensus_encode_to_vec();
+        assert!(
+            PoolState::consensus_decode_whole(&pool_bytes, &ModuleDecoderRegistry::default())
+                .is_err(),
+            "a pre-0.12 PoolState row must not decode as the new shape before migrating"
+        );
+        pool_bytes.extend_from_slice(&zero_fee);
+        let decoded_pool =
+            PoolState::consensus_decode_whole(&pool_bytes, &ModuleDecoderRegistry::default())
+                .expect("a migrated (byte-appended) row must decode as a 0.12 PoolState");
+        assert_eq!(decoded_pool.account, EvmAddress([0x71; 20]));
+        assert_eq!(decoded_pool.balance, UsdtAmount(1_234));
+        assert_eq!(decoded_pool.nonce, 7);
+        assert_eq!(decoded_pool.accrued_fees, UsdtAmount(0));
+
+        let old_rec = OldDepositRecord {
+            claim_pk: test_pubkey(0x72),
+            credited: UsdtAmount(500),
+            claimed: UsdtAmount(100),
+            last_observed_block: 3,
+            swept: UsdtAmount(50),
+            nonce: 1,
+        };
+        let mut rec_bytes = old_rec.consensus_encode_to_vec();
+        assert!(
+            DepositRecord::consensus_decode_whole(&rec_bytes, &ModuleDecoderRegistry::default())
+                .is_err(),
+            "a pre-0.12 DepositRecord row must not decode as the new shape before migrating"
+        );
+        rec_bytes.extend_from_slice(&zero_fee);
+        let decoded_rec =
+            DepositRecord::consensus_decode_whole(&rec_bytes, &ModuleDecoderRegistry::default())
+                .expect("a migrated (byte-appended) row must decode as a 0.12 DepositRecord");
+        assert_eq!(decoded_rec.swept, UsdtAmount(50));
+        assert_eq!(decoded_rec.nonce, 1);
+        assert_eq!(decoded_rec.fees_accrued, UsdtAmount(0));
     }
 }
 
