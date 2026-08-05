@@ -49,6 +49,9 @@ pub const WITHDRAWAL_STATUS_ENDPOINT: &str = "withdrawal_status";
 /// mirroring [`WITHDRAWAL_STATUS_ENDPOINT`]).
 pub const REFUND_STATUS_ENDPOINT: &str = "refund_status";
 
+/// Guardian-authenticated: cast this guardian's fee-withdrawal vote.
+pub const WITHDRAW_FEES_ENDPOINT: &str = "withdraw_fees";
+
 /// Reports the module's consensus-agreed readiness state (Part C):
 /// `AwaitingInfra`/`Ready`/`Degraded`, plus the per-condition tally it was
 /// derived from. Read from the threshold-aggregated `BootstrapObservation`

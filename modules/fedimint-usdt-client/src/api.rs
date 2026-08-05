@@ -1,20 +1,21 @@
 use fedimint_api_client::api::{
     FederationApiExt, FederationError, FederationResult, IModuleFederationApi,
 };
-use fedimint_core::module::ApiRequestErased;
+use fedimint_core::module::{ApiAuth, ApiRequestErased};
 use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::{OutPoint, PeerId, apply, async_trait_maybe_send, secp256k1};
 use fedimint_usdt_common::endpoint_constants::{
     DEPOSIT_FEE_QUOTE_ENDPOINT, DEPOSIT_STATUS_ENDPOINT, GROUP_PUBLIC_KEY_ENDPOINT,
     LATEST_ANCHORED_BLOCK_ENDPOINT, POOL_STATE_ENDPOINT, REFUND_STATUS_ENDPOINT,
     USDT_STATUS_ENDPOINT, USEROP_STATUS_ENDPOINT, WITHDRAW_FEE_QUOTE_ENDPOINT,
-    WITHDRAWAL_STATUS_ENDPOINT,
+    WITHDRAW_FEES_ENDPOINT, WITHDRAWAL_STATUS_ENDPOINT,
 };
 use fedimint_usdt_common::{
     AnchoredBlockResponse, DepositFeeQuoteRequest, DepositFeeQuoteResponse, DepositStatusRequest,
-    DepositStatusResponse, PoolStateResponse, RefundStatusRequest, RefundStatusResponse,
-    StatusResponse, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse, WithdrawFeeQuoteRequest,
-    WithdrawFeeQuoteResponse, WithdrawalStatusRequest, WithdrawalStatusResponse,
+    DepositStatusResponse, EvmAddress, PoolStateResponse, RefundStatusRequest,
+    RefundStatusResponse, StatusResponse, UsdtAmount, UserOpStatusRequest, UserOpStatusResponse,
+    WithdrawFeeQuoteRequest, WithdrawFeeQuoteResponse, WithdrawFeesRequest,
+    WithdrawalStatusRequest, WithdrawalStatusResponse,
 };
 
 #[apply(async_trait_maybe_send!)]
@@ -95,6 +96,18 @@ pub trait UsdtFederationApi {
     /// Threshold-agreement (`request_current_consensus`): read directly from
     /// consensus DB, so any guardian answers identically.
     async fn latest_anchored_block(&self) -> FederationResult<AnchoredBlockResponse>;
+
+    /// Casts this guardian's vote to withdraw `amount` of accrued fee
+    /// revenue to `recipient` (Phase 8, Task 5). Guardian-authenticated
+    /// (`ApiAuth`); the vote is proposed to consensus and, once a 2f+1
+    /// threshold agrees on the identical `(recipient, amount)` pair,
+    /// triggers a `WithdrawFees` payout `UserOp`.
+    async fn withdraw_fees(
+        &self,
+        recipient: EvmAddress,
+        amount: UsdtAmount,
+        auth: ApiAuth,
+    ) -> FederationResult<()>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -195,6 +208,20 @@ where
         self.request_current_consensus(
             LATEST_ANCHORED_BLOCK_ENDPOINT.to_string(),
             ApiRequestErased::default(),
+        )
+        .await
+    }
+
+    async fn withdraw_fees(
+        &self,
+        recipient: EvmAddress,
+        amount: UsdtAmount,
+        auth: ApiAuth,
+    ) -> FederationResult<()> {
+        self.request_admin(
+            WITHDRAW_FEES_ENDPOINT,
+            ApiRequestErased::new(WithdrawFeesRequest { recipient, amount }),
+            auth,
         )
         .await
     }

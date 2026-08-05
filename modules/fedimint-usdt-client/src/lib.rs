@@ -2222,6 +2222,15 @@ mod tests {
         ) -> FederationResult<fedimint_usdt_common::AnchoredBlockResponse> {
             unimplemented!("recover_deposits_scan never calls latest_anchored_block")
         }
+
+        async fn withdraw_fees(
+            &self,
+            _recipient: EvmAddress,
+            _amount: UsdtAmount,
+            _auth: fedimint_core::module::ApiAuth,
+        ) -> FederationResult<()> {
+            unimplemented!("recover_deposits_scan never calls withdraw_fees")
+        }
     }
 
     /// The crux of security finding 08's fix: a funded-but-uncredited deposit
