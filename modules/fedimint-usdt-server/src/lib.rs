@@ -2670,6 +2670,7 @@ impl ServerModule for Usdt {
                     Ok(PoolStateResponse {
                         account: pool.account,
                         balance: pool.balance,
+                        accrued_fees: pool.accrued_fees,
                     })
                 }
             },
