@@ -165,6 +165,72 @@ startup warning if the factory/impl are left at the all-zero placeholder.
   minutes-long DKG at setup (pregenerate Paillier primes / raise the DKG
   timeout for devnet).
 
+## Guardian fee withdrawal
+
+The federation retains two sources of fee revenue in the pool, both tracked
+in `PoolState.accrued_fees` (invariant: `accrued_fees ≤ balance` — realized
+fee revenue can never exceed the USDT the pool physically holds):
+
+- **Deposit fees.** The `max_fee`-equivalent quote a claim pays (see "2.
+  Claim → e-cash" above) accrues onto the `DepositRecord` at claim time and is
+  realized into `PoolState.accrued_fees` when that deposit's sweep confirms
+  (so the fee is only counted once its USDT is actually in the pool).
+- **Withdrawal fees.** On a **successful** withdrawal confirmation the
+  federation keeps the FULL `max_fee` the client posted (the recipient is
+  only ever paid `amount`). On a **refunded** (terminally failed) withdrawal
+  the federation keeps only the `incurred` gas cost actually spent
+  attempting it, not the full `max_fee`.
+
+This accrued balance is guardian-only revenue and is never spent
+automatically — a guardian must explicitly vote to pay it out to an EVM
+address. Read the current figure via the `pool_state` endpoint
+(`fedimint-cli module usdt pool-state`), whose response now includes
+`accrued_fees` alongside `account`/`balance`.
+
+### Casting a fee-withdrawal vote
+
+Casting a vote is a **guardian action**, not a client operation — there is no
+`fedimint-cli module usdt withdraw-fees` subcommand, because the module
+*client* CLI talks to the federation's regular (unauthenticated) module API
+and has no guardian credentials. Fee withdrawal instead goes through the
+**admin API**, authenticated with each guardian's own password, against
+**that guardian's own node**:
+
+```bash
+# each guardian, independently, against their own node:
+fedimint-cli dev api \
+  --peer-id <N> --module <usdt-module-id-or-kind> --password <guardian-pw> \
+  withdraw_fees \
+  '{"recipient":"0x…","amount":<usdt_e6>}'
+```
+
+(`dev api` is the generic authenticated JSON-RPC caller; `--password` requires
+`--peer-id`, and `--module` selects the USDT module by its id or kind so the
+method is the bare endpoint name `withdraw_fees`.)
+
+`amount` is in raw USDT units (6 decimals, matching every other `UsdtAmount`
+in this module). Operationally:
+
+- **2f+1 threshold on the identical pair.** The vote is tallied by the exact
+  `(recipient, amount)` pair — guardians must agree on both fields byte-for-
+  byte before a payout is built; a guardian who votes a different amount (or
+  recipient) simply doesn't count toward the same tally. Only once
+  `threshold` guardians have cast the identical pair does the federation
+  build and MPC-sign the payout `UserOp`.
+- **Waits behind in-flight user activity.** A `WithdrawFees` payout shares
+  the pool `SimpleAccount`'s nonce with ordinary user withdrawals, so it is
+  never built while a `Withdraw`/`WithdrawFees` op is already
+  `Pending`/`Submitted`; it is retried automatically once the pool is free.
+- **Amount is bounded by both accrued fees and physical balance.** The
+  federation refuses to build the payout — and simply keeps waiting — unless
+  `amount` is within *both* `pool.accrued_fees` (never dips into user deposit
+  principal) *and* `pool.balance` (never builds a transfer the pool can't
+  fund on-chain). In practice, request `amount ≤ min(accrued_fees,
+  pool_balance)`.
+- Once threshold is reached and the payout confirms, ALL stored
+  `WithdrawFeesVote`s are cleared (success or on-chain revert alike), so a
+  subsequent fee withdrawal always needs a fresh round of votes.
+
 ## CLI
 
 `fedimint-cli module usdt {deposit-address, check-deposit, deposit-status,

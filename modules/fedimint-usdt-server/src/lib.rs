@@ -16924,6 +16924,256 @@ mod tests {
         assert!(remaining.is_empty(), "votes GC'd on revert too");
     }
 
+    /// **Task 8 (solvency invariant).** Drives a single `module`/`db`
+    /// through a realistic mixed sequence -- a deposit's fee accrual +
+    /// `DeployAndSweep` confirm, a successful user withdrawal's fee
+    /// accrual, then a partial `WithdrawFees` payout -- reusing the exact
+    /// setups from `process_input_accrues_deposit_fee_onto_record`,
+    /// `deploy_and_sweep_confirm_credits_accrued_deposit_fee_into_pool`,
+    /// `successful_withdrawal_confirm_accrues_max_fee`, and
+    /// `withdraw_fees_confirm_debits_and_gcs_votes` (grepped verbatim, only
+    /// the fixture byte constants/`out_point`/`op_hash` values are changed
+    /// so the three stages don't collide in the shared `db`). After EVERY
+    /// stage this asserts the core solvency invariant: the federation must
+    /// never claim to have accrued more fee revenue than it currently holds
+    /// in the pool.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn solvency_invariant_holds_across_fee_lifecycle() {
+        async fn assert_solvent(dbtx: &mut DatabaseTransaction<'_>, stage: &str) {
+            let pool = dbtx
+                .to_ref_nc()
+                .get_value(&PoolStateKey)
+                .await
+                .expect("pool exists by this stage");
+            assert!(
+                pool.accrued_fees.0 <= pool.balance.0,
+                "fee revenue ({}) must never exceed pool balance ({}) after {stage}",
+                pool.accrued_fees.0,
+                pool.balance.0
+            );
+        }
+
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+        seed_fee_votes(db, 4, sample_fee_vote()).await;
+        let quote = deposit_fee_quote(&sample_fee_vote()).expect("realistic vote must quote");
+
+        // --- Stage A: deposit fee accrual (`process_input`) then its
+        // `DeployAndSweep` confirm -- accrued_fees rises together with
+        // balance. Setup verbatim from
+        // `process_input_accrues_deposit_fee_onto_record` /
+        // `deploy_and_sweep_confirm_credits_accrued_deposit_fee_into_pool`.
+        let account = EvmAddress([0xd1; 20]);
+        let claim_pk = test_pubkey(0xd2);
+        let claimed_amount = UsdtAmount(200_000_000);
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &DepositRecordKey(account),
+                &DepositRecord {
+                    claim_pk,
+                    credited: UsdtAmount(500_000_000),
+                    claimed: UsdtAmount(0),
+                    last_observed_block: 0,
+                    swept: UsdtAmount(0),
+                    nonce: 0,
+                    fees_accrued: UsdtAmount(0),
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .process_input(
+                    &mut dbtx.to_ref_nc(),
+                    &UsdtInput::V0(UsdtInputV0 {
+                        account,
+                        amount: claimed_amount,
+                        fee: quote,
+                    }),
+                    test_in_point(),
+                )
+                .await
+                .expect("valid claim");
+            dbtx.commit_tx().await;
+        }
+        let sweep_op_hash = [0xd3; 32];
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(sweep_op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_deploy_and_sweep_op_for_test(account, claimed_amount),
+                        signature: vec![0x22; 65],
+                    },
+                    purpose: UserOpPurpose::DeployAndSweep { source: account },
+                    submitted_block: 1,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_user_op_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    sweep_op_hash,
+                    &UserOpConfirmedObservation {
+                        success: true,
+                        block: 10,
+                        block_hash: [0u8; 32],
+                        swept: claimed_amount,
+                        actual_gas_cost_wei: UsdtAmount(0),
+                    },
+                )
+                .await;
+            assert_solvent(&mut dbtx.to_ref_nc(), "stage A (deposit sweep)").await;
+            dbtx.commit_tx().await;
+        }
+        // Sanity: the deposit fee really did land on the pool (otherwise
+        // stage A's assertion above would be vacuous -- accrued_fees would
+        // still be zero).
+        {
+            let mut dbtx = db.begin_transaction().await;
+            let pool = dbtx.to_ref_nc().get_value(&PoolStateKey).await.unwrap();
+            assert_eq!(pool.balance, claimed_amount);
+            assert_eq!(pool.accrued_fees, quote);
+        }
+
+        // --- Stage B: a withdrawal's successful confirm -- balance -=
+        // amount, accrued_fees += max_fee. Setup verbatim from
+        // `successful_withdrawal_confirm_accrues_max_fee` (PoolState itself
+        // is intentionally NOT re-seeded here -- it already exists from
+        // stage A, and both `apply_withdraw_confirmed`/
+        // `apply_user_op_confirmed` read-modify-write it via `get_value(..)
+        // .unwrap_or(default)`, so building on top of stage A's balance is
+        // exactly what the real system does).
+        let withdraw_op_hash = [0xd4; 32];
+        let out_point = test_out_point(310);
+        let withdrawal = UsdtWithdrawalV0 {
+            recipient: EvmAddress([0xd5; 20]),
+            amount: UsdtAmount(100),
+            max_fee: UsdtAmount(9),
+            requested_block: 0,
+            refund_pubkey: sample_claim_pk(),
+        };
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_point), &withdrawal)
+                .await;
+            dbtx.insert_new_entry(
+                &WithdrawalStateKey(out_point),
+                &WithdrawalState::Signing(withdraw_op_hash),
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(withdraw_op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_withdraw_op_for_test(withdrawal.amount),
+                        signature: vec![0xff; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: vec![out_point],
+                    },
+                    submitted_block: 5,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+        let withdraw_obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash: withdraw_op_hash,
+            success: true,
+            block: 102,
+            block_hash: [0u8; 32],
+            swept: withdrawal.amount,
+            actual_gas_cost_wei: UsdtAmount(0),
+        };
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for p in [0u16, 1, 2] {
+                module
+                    .process_consensus_item(
+                        &mut dbtx.to_ref_nc(),
+                        withdraw_obs.clone(),
+                        PeerId::from(p),
+                    )
+                    .await
+                    .expect("vote processes cleanly");
+            }
+            assert_solvent(&mut dbtx.to_ref_nc(), "stage B (withdrawal confirm)").await;
+            dbtx.commit_tx().await;
+        }
+        let pool_after_b = {
+            let mut dbtx = db.begin_transaction().await;
+            let pool = dbtx.to_ref_nc().get_value(&PoolStateKey).await.unwrap();
+            assert_eq!(pool.balance, UsdtAmount(claimed_amount.0 - 100)); // -= amount
+            assert_eq!(pool.accrued_fees, UsdtAmount(quote.0 + 9)); // += max_fee
+            pool
+        };
+
+        // --- Stage C: a `WithdrawFees` confirm draining part of
+        // accrued_fees. Setup (the seeded threshold votes for GC
+        // observability) verbatim from
+        // `withdraw_fees_confirm_debits_and_gcs_votes`, but applied on TOP
+        // of the real pool state accumulated by stages A+B rather than an
+        // arbitrary fixture, so the invariant is exercised against the
+        // actual accrued numbers.
+        let recipient = EvmAddress([0xd6; 20]);
+        let fee_withdrawal_amount = UsdtAmount(pool_after_b.accrued_fees.0 / 2);
+        {
+            let mut dbtx = db.begin_transaction().await;
+            for p in [0u16, 1, 2] {
+                dbtx.insert_entry(
+                    &WithdrawFeesVoteKey(PeerId::from(p)),
+                    &fedimint_usdt_common::WithdrawFeesVote {
+                        recipient,
+                        amount: fee_withdrawal_amount,
+                    },
+                )
+                .await;
+            }
+            dbtx.commit_tx().await;
+        }
+        {
+            let mut dbtx = db.begin_transaction().await;
+            module
+                .apply_fee_withdrawal_confirmed(
+                    &mut dbtx.to_ref_nc(),
+                    &successful_obs(),
+                    fee_withdrawal_amount,
+                )
+                .await;
+            assert_solvent(&mut dbtx.to_ref_nc(), "stage C (fee withdrawal confirm)").await;
+            dbtx.commit_tx().await;
+        }
+        let mut dbtx = db.begin_transaction().await;
+        let pool = dbtx.to_ref_nc().get_value(&PoolStateKey).await.unwrap();
+        assert_eq!(
+            pool.balance,
+            UsdtAmount(pool_after_b.balance.0 - fee_withdrawal_amount.0)
+        );
+        assert_eq!(
+            pool.accrued_fees,
+            UsdtAmount(pool_after_b.accrued_fees.0 - fee_withdrawal_amount.0)
+        );
+        let remaining: Vec<_> = dbtx
+            .to_ref_nc()
+            .find_by_prefix(&WithdrawFeesVotePrefix)
+            .await
+            .collect()
+            .await;
+        assert!(remaining.is_empty(), "votes GC'd on confirm");
+    }
+
     /// **Phase 8, Task 5.** `Withdraw` and `WithdrawFees` share
     /// `PoolState.nonce`, so `Usdt::withdraw_batch_in_flight` must block a
     /// fee withdrawal while a user withdrawal is in flight, and vice versa.
