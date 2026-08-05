@@ -2400,6 +2400,15 @@ mod tests {
             unimplemented!("recover_deposits_scan never calls latest_anchored_block")
         }
 
+        async fn withdraw_fees(
+            &self,
+            _recipient: EvmAddress,
+            _amount: UsdtAmount,
+            _auth: fedimint_core::module::ApiAuth,
+        ) -> FederationResult<()> {
+            unimplemented!("recover_deposits_scan never calls withdraw_fees")
+        }
+
         async fn fedi_sweep_status(
             &self,
             _claim_pk: secp256k1::PublicKey,

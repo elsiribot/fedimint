@@ -1520,6 +1520,15 @@ pub struct WithdrawFeesVote {
     pub amount: UsdtAmount,
 }
 
+/// Request body for the guardian-authenticated `withdraw_fees` endpoint
+/// (Phase 8, Task 5): casts this guardian's vote to withdraw `amount` of
+/// accrued fee revenue to `recipient`. See [`WithdrawFeesVote`].
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+pub struct WithdrawFeesRequest {
+    pub recipient: EvmAddress,
+    pub amount: UsdtAmount,
+}
+
 /// Non-transaction items that will be submitted to consensus
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub enum UsdtConsensusItem {
