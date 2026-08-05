@@ -77,14 +77,34 @@ invariant `accrued_fees ≤ pool.balance`:
   (`apply_user_op_confirmed`, DeployAndSweep success arm, server lib.rs
   ~5127–5143): `accrued_fees += record.fees_accrued`. This guarantees a deposit
   fee is counted only once its USDT has physically landed in the pool.
-- **Withdrawal `max_fee`** — incremented when the withdrawal output is processed
-  (`process_output`, server lib.rs ~2396–2450), because the `max_fee`'s backing
-  USDT was already swept into the pool by an earlier confirmed deposit (the same
-  confirmed-deposit precondition the existing withdrawal solvency logic relies
-  on). `max_fee` is fixed on the output at that point.
+- **Withdrawal fee** — incremented at withdrawal **confirm**
+  (`apply_withdraw_confirmed`), because how much fee is actually retained is only
+  known at the terminal on-chain outcome, and it must match the existing `audit`
+  accounting (`lib.rs:2525`, which already treats a successful withdrawal's
+  `max_fee` as retained federation revenue):
+  - **success** → `pool.accrued_fees += Σ max_fee` (read each `max_fee` from the
+    `UnclaimedWithdrawal` record before it is removed);
+  - **terminal failure (refund, batch size ≤ 1)** → `pool.accrued_fees +=
+    incurred` (the actual gas charged, clamped to `amount + max_fee`); the rest
+    of `max_fee` is refunded to the user, so only `incurred` is real revenue.
+    Done inside `create_withdrawal_refund`, past its already-refunded guard, so
+    it never double-counts;
+  - **non-terminal failure (re-queue, batch size > 1)** → add nothing; the
+    withdrawal is still live and no fee is realized yet.
 
-Both increment sites are inside consensus apply paths, so the counter is
+All increment sites are inside consensus apply paths, so the counter is
 identical across all honest guardians.
+
+### Trigger-time physical guard
+
+Because a fee's USDT can be briefly *in transit* (charged but its backing sweep
+not yet landed), the trigger requires **both** `amount ≤ accrued_fees`
+(economic: only realized fee revenue) **and** `amount ≤ pool.balance` (physical:
+the pool actually holds the USDT to send). The second guard makes a fee-payout
+UserOp that would revert on-chain for insufficient pool USDT simply wait a round
+instead. Combined with the pool-op serialization below (a fee sweep never fires
+while a user `Withdraw` is in flight), this keeps the payout safe under all
+in-flight orderings.
 
 `accrued_fees` is **decremented** by the sent amount when a fee-withdrawal
 UserOp confirms (see flow below).
@@ -158,7 +178,8 @@ then calls `maybe_trigger_fee_withdrawal`.
   a pool op already in flight (see Serialization), or no votes.
 - Collect all peers' votes. Group by the exact `(recipient, amount)` pair.
 - If some pair has `≥ self.num_peers.threshold()` (2f+1) agreeing votes **and**
-  `amount ≤ accrued_fees` → proceed; otherwise return.
+  `amount ≤ pool.accrued_fees` **and** `amount ≤ pool.balance` → proceed;
+  otherwise return.
 - Build `UserOpPurpose::WithdrawFees { recipient, amount }` (new, appended last
   in the `UserOpPurpose` enum, db.rs ~404–428, to preserve wire tags). The
   UserOp is a single ERC-20 `transfer(recipient, amount)` from the pool
