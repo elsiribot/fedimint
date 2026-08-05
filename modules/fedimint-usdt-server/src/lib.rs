@@ -5402,6 +5402,7 @@ impl Usdt {
     /// directly here, so this function can never be called with an
     /// unverified amount. `UsdtAmount(0)` (irrelevant, unused) when
     /// `!obs.success`.
+    #[allow(clippy::too_many_lines)]
     async fn apply_withdraw_confirmed(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -5419,6 +5420,18 @@ impl Usdt {
 
         if obs.success {
             pool.balance = UsdtAmount(pool.balance.0.saturating_sub(swept.0));
+            // Realize retained withdrawal fees: on success the federation keeps
+            // the FULL max_fee of each settled withdrawal (the recipient was
+            // only ever paid `amount`; max_fee never left the pool -- see
+            // `audit`). Read max_fee before the loop below removes the
+            // UnclaimedWithdrawal records.
+            let mut fee_total: u64 = 0;
+            for &out_point in outpoints {
+                if let Some(w) = dbtx.get_value(&UnclaimedWithdrawalKey(out_point)).await {
+                    fee_total = fee_total.saturating_add(w.max_fee.0);
+                }
+            }
+            pool.accrued_fees = UsdtAmount(pool.accrued_fees.0.saturating_add(fee_total));
         }
         dbtx.insert_entry(&PoolStateKey, &pool).await;
 
@@ -5608,6 +5621,20 @@ impl Usdt {
             .map_or(0, |f| f.0)
             .min(gross);
         let refund_amount = UsdtAmount(gross.saturating_sub(incurred));
+
+        // Realize the retained withdrawal fee on terminal failure: the refund
+        // returns `gross - incurred`, so the federation keeps exactly the
+        // `incurred` gas it actually burned. (Non-terminal, re-queued failures
+        // reach `apply_withdraw_confirmed`'s `n > 1` branch, not here, and
+        // realize nothing yet.)
+        let mut pool = dbtx.get_value(&PoolStateKey).await.unwrap_or(PoolState {
+            account: self.pool_account(),
+            balance: UsdtAmount(0),
+            nonce: 0,
+            accrued_fees: UsdtAmount(0),
+        });
+        pool.accrued_fees = UsdtAmount(pool.accrued_fees.0.saturating_add(incurred));
+        dbtx.insert_entry(&PoolStateKey, &pool).await;
 
         dbtx.insert_entry(
             &RefundKey(out_point),
@@ -15854,6 +15881,86 @@ mod tests {
         );
     }
 
+    /// **Task 3 (withdrawal-fee accrual).** On a successful confirmation the
+    /// federation keeps the FULL `max_fee` of every settled withdrawal (the
+    /// recipient was only ever paid `amount`; `max_fee` never left the pool
+    /// -- see `audit`, and mirrors the existing DEPOSIT-fee accrual). This
+    /// must be credited into `PoolState.accrued_fees` in the SAME write that
+    /// debits `PoolState.balance`, read from `UnclaimedWithdrawalKey` before
+    /// that record is removed.
+    #[tokio::test]
+    async fn successful_withdrawal_confirm_accrues_max_fee() {
+        let module = test_module_with_block_count(4, 0).await; // threshold = 3
+        let db = module.db_for_test();
+
+        let op_hash = [0xf5; 32];
+        let out_point = test_out_point(31);
+        let withdrawal = UsdtWithdrawalV0 {
+            recipient: EvmAddress([0x9b; 20]),
+            amount: UsdtAmount(100),
+            max_fee: UsdtAmount(9),
+            requested_block: 0,
+            refund_pubkey: sample_claim_pk(),
+        };
+
+        {
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &PoolStateKey,
+                &PoolState {
+                    account: module.pool_account(),
+                    balance: UsdtAmount(1_000),
+                    nonce: 0,
+                    accrued_fees: UsdtAmount(0),
+                },
+            )
+            .await;
+            dbtx.insert_new_entry(&UnclaimedWithdrawalKey(out_point), &withdrawal)
+                .await;
+            dbtx.insert_new_entry(
+                &WithdrawalStateKey(out_point),
+                &WithdrawalState::Signing(op_hash),
+            )
+            .await;
+            dbtx.insert_new_entry(
+                &SubmittedUserOpKey(op_hash),
+                &SubmittedUserOp {
+                    signed: fedimint_usdt_common::user_op::SignedUserOp {
+                        unsigned: real_withdraw_op_for_test(withdrawal.amount),
+                        signature: vec![0xff; 65],
+                    },
+                    purpose: UserOpPurpose::Withdraw {
+                        outpoints: vec![out_point],
+                    },
+                    submitted_block: 5,
+                    superseded: false,
+                },
+            )
+            .await;
+            dbtx.commit_tx().await;
+        }
+
+        let obs = UsdtConsensusItem::UserOpConfirmed {
+            op_hash,
+            success: true,
+            block: 102,
+            block_hash: [0u8; 32],
+            swept: withdrawal.amount,
+            actual_gas_cost_wei: UsdtAmount(0),
+        };
+        let mut dbtx = db.begin_transaction().await;
+        for p in [0u16, 1, 2] {
+            module
+                .process_consensus_item(&mut dbtx.to_ref_nc(), obs.clone(), PeerId::from(p))
+                .await
+                .expect("vote processes cleanly");
+        }
+
+        let pool = dbtx.to_ref_nc().get_value(&PoolStateKey).await.unwrap();
+        assert_eq!(pool.balance, UsdtAmount(900)); // -= amount
+        assert_eq!(pool.accrued_fees, UsdtAmount(9)); // += max_fee
+    }
+
     /// **Security finding 05 (poisoned-batch isolation), the finding's core
     /// scenario.** One poisoned recipient among several honest ones must be
     /// isolated -- not permanently wedge the whole withdrawal pipeline.
@@ -16465,6 +16572,111 @@ mod tests {
             after_refund,
             10_000_000 - i64::try_from(expected_refund).expect("fits")
         );
+    }
+
+    /// **Task 3 (withdrawal-fee accrual).** A terminal-failure refund still
+    /// realizes the gas the federation actually burned:
+    /// `create_withdrawal_refund` credits `PoolState.accrued_fees` by
+    /// exactly `incurred` (the same value the refund subtracts from `gross
+    /// = amount + max_fee`), never the full `max_fee` -- the rest of the
+    /// fee is refunded back to the user.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn terminally_failed_withdrawal_accrues_incurred_fee() {
+        let module = test_module_with_block_count(4, 0).await;
+        let db = module.db_for_test();
+
+        // 1 USDT/ETH exchange rate: makes `wei_gas_cost_to_usdt` a clean
+        // divide-by-1e12, so `actual_gas_cost_wei = 1e17` -> 100_000 raw USDT.
+        seed_fee_votes(
+            db,
+            4,
+            FeeVote {
+                max_fee_per_gas_wei: 1_000_000_000,
+                usdt_per_eth_e6: 1_000_000,
+            },
+        )
+        .await;
+
+        let out_point = test_out_point(0);
+        let op_hash = [0x92; 32];
+        let amount = UsdtAmount(100);
+        let max_fee = UsdtAmount(20);
+        let refund_pubkey = sample_claim_pk();
+        // A gas cost small enough that the resulting `incurred` (7) fits well
+        // under `gross = amount + max_fee = 120`.
+        let gas_wei = UsdtAmount(7_000_000_000_000); // 7e12 wei
+        let expected_incurred = 7u64; // 7e12 * 1e6 / 1e18
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_new_entry(
+            &PoolStateKey,
+            &PoolState {
+                account: module.pool_account(),
+                balance: UsdtAmount(10_000_000),
+                nonce: 0,
+                accrued_fees: UsdtAmount(0),
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &UnclaimedWithdrawalKey(out_point),
+            &UsdtWithdrawalV0 {
+                recipient: EvmAddress([0x56; 20]),
+                amount,
+                max_fee,
+                requested_block: 0,
+                refund_pubkey,
+            },
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &WithdrawalStateKey(out_point),
+            &WithdrawalState::Submitted(op_hash),
+        )
+        .await;
+        dbtx.insert_new_entry(
+            &SubmittedUserOpKey(op_hash),
+            &SubmittedUserOp {
+                signed: fedimint_usdt_common::user_op::SignedUserOp {
+                    unsigned: real_withdraw_op_for_test(amount),
+                    signature: vec![0x12; 65],
+                },
+                purpose: UserOpPurpose::Withdraw {
+                    outpoints: vec![out_point],
+                },
+                submitted_block: 1,
+                superseded: false,
+            },
+        )
+        .await;
+        dbtx.commit_tx().await;
+
+        // The singleton batch's UserOp reverted on-chain (success = false),
+        // consuming `gas_wei` of gas -- terminal for a singleton, so this
+        // drives straight into `create_withdrawal_refund`.
+        let mut dbtx = db.begin_transaction().await;
+        module
+            .apply_user_op_confirmed(
+                &mut dbtx.to_ref_nc(),
+                op_hash,
+                &UserOpConfirmedObservation {
+                    success: false,
+                    block: 56,
+                    block_hash: [0u8; 32],
+                    swept: UsdtAmount(0),
+                    actual_gas_cost_wei: gas_wei,
+                },
+            )
+            .await;
+        dbtx.commit_tx().await;
+
+        let mut dbtx = db.begin_transaction().await;
+        let refund = dbtx.get_value(&RefundKey(out_point)).await.unwrap();
+        assert_eq!(refund.amount, UsdtAmount(113)); // (100+20) - 7
+        let pool = dbtx.get_value(&PoolStateKey).await.unwrap();
+        assert_eq!(pool.accrued_fees, UsdtAmount(expected_incurred)); // += incurred
+        assert_eq!(pool.accrued_fees, UsdtAmount(7));
     }
 
     /// **Security finding 09, Step 2.** A direct unit test of
