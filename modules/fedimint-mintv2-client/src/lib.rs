@@ -352,6 +352,7 @@ pub struct MintClientContext {
     tbs_agg_pks: BTreeMap<Denomination, AggregatePublicKey>,
     tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, tbs::PublicKeyShare>>,
     pub balance_update_sender: tokio::sync::watch::Sender<()>,
+    pub amount_unit: AmountUnit,
 }
 
 impl Context for MintClientContext {
@@ -372,6 +373,7 @@ impl ClientModule for MintClientModule {
             tbs_agg_pks: self.cfg.tbs_agg_pks.clone(),
             tbs_pks: self.cfg.tbs_pks.clone(),
             balance_update_sender: self.balance_update_sender.clone(),
+            amount_unit: self.cfg.amount_unit,
         }
     }
 
