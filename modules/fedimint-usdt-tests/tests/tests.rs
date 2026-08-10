@@ -2414,6 +2414,24 @@ mod fedimint_migration_tests {
                         );
                         info!("Validated RecoverResidualVote (new prefix, empty)");
                     }
+                    DbKeyPrefix::WithdrawFeesVote => {
+                        // Consensus 0.12 (guardian fee withdrawal): a
+                        // brand-new prefix that starts empty and fills at
+                        // runtime -- the v0 snapshot fixture predates it and
+                        // no migration writes to it, so it must read back
+                        // cleanly as EMPTY (never populated pre-migration).
+                        let votes = dbtx
+                            .find_by_prefix(&fedimint_usdt_server::db::WithdrawFeesVotePrefix)
+                            .await
+                            .collect::<Vec<_>>()
+                            .await;
+                        ensure!(
+                            votes.is_empty(),
+                            "WithdrawFeesVote is a brand-new prefix; the pre-migration v0 \
+                             snapshot must not contain any rows for it"
+                        );
+                        info!("Validated WithdrawFeesVote (new prefix, empty)");
+                    }
                     DbKeyPrefix::LastSweepBlock => {
                         // LOCAL fedi extension (sweep-aware credit rule): a
                         // brand-new prefix holding only new `u64` data -- the
