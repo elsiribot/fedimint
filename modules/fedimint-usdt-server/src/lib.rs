@@ -522,6 +522,26 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 15;
 /// small it degenerates into a busy loop hammering the RPC endpoint.
 const MIN_POLL_INTERVAL_SECS: u64 = 5;
 
+/// How far the guardian's local EVM head may lead the *consensus* block count
+/// before [`Usdt::spawn_block_hash_observer`] warns the operator. Normal lag is
+/// only `confirmation_depth` plus a few blocks of catch-up, so a lag this large
+/// means block-count consensus has stalled while the chain keeps moving -- the
+/// silent failure that freezes the deposit-by-proof anchor and leaves deposits
+/// unclaimable (proofs can only be made at the anchored block). Chosen well
+/// above any healthy transient lag.
+const ANCHOR_LAG_WARN_BLOCKS: u64 = 100;
+
+/// True when the guardian's local EVM head (`cached_head`) leads the consensus
+/// block count by more than `threshold` blocks -- i.e. block-count consensus
+/// has fallen behind a chain that is still advancing. A zero on either side
+/// means "not yet observed" (bootstrap), which is not a stall. Pure so the
+/// warn threshold is unit-testable without a live RPC.
+fn anchor_lag_exceeds(cached_head: u64, consensus_block_count: u64, threshold: u64) -> bool {
+    cached_head != 0
+        && consensus_block_count != 0
+        && cached_head.saturating_sub(consensus_block_count) > threshold
+}
+
 /// Multiplier applied to [`poll_interval_secs`] for loops whose data changes
 /// far slower than the base tick and so need not poll as often: the fee/price
 /// estimate (a Chainlink feed with a multi-minute heartbeat) and the
@@ -3515,6 +3535,22 @@ impl Usdt {
 
                 let at = ccount.saturating_sub(confirmation_depth);
                 let cached_head = block_count.load(Ordering::Relaxed);
+
+                // Observability: a guardian whose local head keeps advancing
+                // while the CONSENSUS block count does not is the silent
+                // failure that freezes the deposit-by-proof anchor and leaves
+                // deposits unclaimable. Nothing else surfaces this divergence,
+                // so warn (rate-limited by this loop's poll cadence) to make a
+                // stalled anchor diagnosable from the logs alone.
+                if anchor_lag_exceeds(cached_head, ccount, ANCHOR_LAG_WARN_BLOCKS) {
+                    warn!(
+                        target: "usdt",
+                        cached_head,
+                        consensus_block_count = ccount,
+                        lag = cached_head.saturating_sub(ccount),
+                        "deposit anchor is far behind the chain: local EVM head is advancing but consensus block-count is not keeping up; deposits may be unclaimable until it catches up"
+                    );
+                }
 
                 // Abstain until consensus has observed the chain (`ccount != 0`)
                 // and this guardian's own node has imported the
@@ -7541,6 +7577,34 @@ mod tests {
     }
 
     const NUM_PEERS: u16 = 4;
+
+    #[test]
+    fn anchor_lag_warns_only_on_real_divergence() {
+        // Neither side observed yet (bootstrap): not a stall.
+        assert!(!anchor_lag_exceeds(0, 0, ANCHOR_LAG_WARN_BLOCKS));
+        // Local head observed but consensus not yet: still bootstrap, not a stall.
+        assert!(!anchor_lag_exceeds(1_000, 0, ANCHOR_LAG_WARN_BLOCKS));
+        // Healthy small lag (confirmation depth + a little catch-up).
+        assert!(!anchor_lag_exceeds(1_000, 990, ANCHOR_LAG_WARN_BLOCKS));
+        // Exactly at the threshold is not yet "exceeds".
+        assert!(!anchor_lag_exceeds(
+            1_000 + ANCHOR_LAG_WARN_BLOCKS,
+            1_000,
+            ANCHOR_LAG_WARN_BLOCKS
+        ));
+        // One block beyond the threshold: flagged.
+        assert!(anchor_lag_exceeds(
+            1_001 + ANCHOR_LAG_WARN_BLOCKS,
+            1_000,
+            ANCHOR_LAG_WARN_BLOCKS
+        ));
+        // The real BTC+USDT freeze: local head 25,739,050 vs consensus 25,737,551.
+        assert!(anchor_lag_exceeds(
+            25_739_050,
+            25_737_551,
+            ANCHOR_LAG_WARN_BLOCKS
+        ));
+    }
 
     #[test]
     fn trusted_dealer_gen_produces_consistent_valid_configs() {
