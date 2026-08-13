@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail, ensure};
 use async_trait::async_trait;
@@ -73,7 +73,7 @@ use fedimint_usdt_common::{
 use futures::{FutureExt as _, StreamExt as _};
 use rand::rngs::OsRng;
 use strum::IntoEnumIterator;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{UsdtConfig, UsdtConfigConsensus, UsdtConfigLocal, UsdtConfigPrivate};
 use crate::db::{
@@ -540,6 +540,44 @@ fn anchor_lag_exceeds(cached_head: u64, consensus_block_count: u64, threshold: u
     cached_head != 0
         && consensus_block_count != 0
         && cached_head.saturating_sub(consensus_block_count) > threshold
+}
+
+/// Base seconds the deposit anchor (newest block-hash ring height) may go
+/// without advancing before [`Usdt::spawn_anchor_watchdog`] self-restarts this
+/// guardian. The anchor advances every poll ([`poll_interval_secs`]) plus a
+/// short consensus catch-up, so a gap this large means the deposit pipeline
+/// (poller -> `BlockCount` consensus -> block-hash observer -> ring) has
+/// silently wedged -- a state a full guardian restart reliably clears (observed
+/// twice on the live btc-usdt fed) but nothing else does. Set well above any
+/// healthy transient, including the slow live-fed poll interval (300s) and the
+/// post-restart recovery sessions that briefly hold the anchor flat.
+const ANCHOR_STALL_RESTART_SECS: u64 = 1200;
+
+/// Per-guardian stagger, added to [`ANCHOR_STALL_RESTART_SECS`] as
+/// `peer_id * this`, so the guardians never reach the restart deadline in
+/// lockstep. Staggered restarts keep a live quorum throughout recovery -- the
+/// lockstep-abort livelock lesson from the consensus-watchdog design.
+const ANCHOR_STALL_RESTART_STAGGER_SECS: u64 = 300;
+
+/// How often [`Usdt::spawn_anchor_watchdog`] re-evaluates anchor/consensus
+/// liveness.
+const ANCHOR_WATCHDOG_CHECK_SECS: u64 = 60;
+
+/// Whether the anchor watchdog should trigger a supervised restart. True only
+/// when ALL hold: the anchor has been stuck at least `deadline`; the chain has
+/// produced blocks beyond it (`chain_ahead_of_anchor`, so there is genuinely
+/// something to catch up to -- an unreachable RPC or a quiet chain is not a
+/// wedged guardian); and consensus is otherwise live (`consensus_alive`) --
+/// restarting during a federation-wide consensus stall (e.g. lost quorum) would
+/// only crash-loop without restoring quorum. Pure so the policy is
+/// unit-testable without a live node, mirroring [`anchor_lag_exceeds`].
+fn anchor_stall_warrants_restart(
+    anchor_stalled_for: Duration,
+    deadline: Duration,
+    consensus_alive: bool,
+    chain_ahead_of_anchor: bool,
+) -> bool {
+    anchor_stalled_for >= deadline && consensus_alive && chain_ahead_of_anchor
 }
 
 /// Multiplier applied to [`poll_interval_secs`] for loops whose data changes
@@ -1468,6 +1506,14 @@ pub struct Usdt {
     /// `consensus_proposal`, since EVM RPC calls are not guaranteed to be as
     /// cheap/local as the wallet's bitcoind status cache).
     block_count: Arc<AtomicU64>,
+    /// Monotonic counter bumped once per [`Usdt::consensus_proposal`] call
+    /// (which the consensus engine invokes once per session). A cheap
+    /// "consensus is still producing sessions" heartbeat that
+    /// [`Usdt::spawn_anchor_watchdog`] reads to tell the isolated
+    /// deposit-anchor freeze (consensus healthy, only the anchor stuck ->
+    /// safe to self-restart) apart from a federation-wide stall (e.g. lost
+    /// quorum -> a restart would only crash-loop).
+    consensus_progress: Arc<AtomicU64>,
     /// Kept for test scaffolding; the deposit-checker task spawned in
     /// [`Usdt::new`] is handed its own reference before this field is set,
     /// so no production method reads it directly.
@@ -1643,6 +1689,28 @@ struct BlockHashObserverHandles {
     block_hash_proposals: Arc<Mutex<Option<BlockHashObservation>>>,
 }
 
+/// Grouped handles/config for [`Usdt::spawn_anchor_watchdog`] (deposit-anchor
+/// self-heal). Read-only: the watchdog reads the block-hash ring height and
+/// `consensus_block_count` from the guardian-local DB, reads the live chain
+/// head via `evm_rpc.get_block_number`, and reads the `consensus_progress`
+/// heartbeat. Its only side effect is `std::process::exit` on a confirmed,
+/// isolated anchor freeze -- never a DB or consensus write.
+struct AnchorWatchdogHandles {
+    db: Database,
+    evm_rpc: DynServerEvmRpc,
+    confirmation_depth: u64,
+    /// Needed to read `consensus_block_count(dbtx, num_peers)` for the
+    /// diagnostic log (poller vs. `BlockCount`-consensus vs. ring stall).
+    num_peers: NumPeers,
+    /// Used only to stagger the restart deadline across guardians
+    /// ([`ANCHOR_STALL_RESTART_STAGGER_SECS`]) so they never restart in
+    /// lockstep.
+    our_peer_id: PeerId,
+    /// The per-session heartbeat (see the `Usdt::consensus_progress` field);
+    /// distinguishes an isolated anchor freeze from a broader consensus stall.
+    consensus_progress: Arc<AtomicU64>,
+}
+
 /// Grouped handles/config for [`Usdt::spawn_residual_recovery_observer`]
 /// (finding A), mirroring [`BlockHashObserverHandles`]'s convention. All uses
 /// are read-only: the observer opens a NON-committing dbtx to scan
@@ -1676,6 +1744,12 @@ impl ServerModule for Usdt {
         dbtx: &mut DatabaseTransaction<'_>,
     ) -> Vec<UsdtConsensusItem> {
         let mut items = Vec::new();
+
+        // Heartbeat for `spawn_anchor_watchdog`: this method is invoked once per
+        // consensus session, so a rising counter proves consensus is still
+        // producing sessions. The watchdog uses it to gate the anchor
+        // self-restart -- see the `consensus_progress` field doc.
+        self.consensus_progress.fetch_add(1, Ordering::Relaxed);
 
         let head = self.block_count.load(Ordering::Relaxed);
         let current_consensus = self.consensus_block_count(dbtx).await;
@@ -3005,6 +3079,8 @@ impl Usdt {
         let block_count = Arc::new(AtomicU64::new(0));
         Self::spawn_block_count_poller(&task_group, evm_rpc.clone(), block_count.clone());
 
+        let consensus_progress = Arc::new(AtomicU64::new(0));
+
         let user_op_confirmed_proposals = Arc::new(Mutex::new(Vec::new()));
         Self::spawn_user_op_submitter(
             &task_group,
@@ -3047,6 +3123,18 @@ impl Usdt {
             },
         );
 
+        Self::spawn_anchor_watchdog(
+            &task_group,
+            AnchorWatchdogHandles {
+                db: db.clone(),
+                evm_rpc: evm_rpc.clone(),
+                confirmation_depth: cfg.consensus.confirmation_depth,
+                num_peers,
+                our_peer_id,
+                consensus_progress: consensus_progress.clone(),
+            },
+        );
+
         let residual_recovery_proposals = Arc::new(Mutex::new(Vec::new()));
         Self::spawn_residual_recovery_observer(
             &task_group,
@@ -3065,6 +3153,7 @@ impl Usdt {
             our_peer_id,
             num_peers,
             block_count,
+            consensus_progress,
             task_group,
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3096,6 +3185,7 @@ impl Usdt {
             our_peer_id,
             num_peers,
             block_count: Arc::new(AtomicU64::new(0)),
+            consensus_progress: Arc::new(AtomicU64::new(0)),
             task_group: TaskGroup::new(),
             signing_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             completed_signatures: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3576,6 +3666,143 @@ impl Usdt {
                 }
 
                 fedimint_core::runtime::sleep(Duration::from_secs(poll_interval_secs())).await;
+            }
+        });
+    }
+
+    /// Spawns the deposit-anchor self-heal watchdog. The deposit-by-proof
+    /// pipeline (block-count poller -> `BlockCount` consensus -> block-hash
+    /// observer -> ring) can silently wedge while the guardian stays up and in
+    /// consensus, freezing the anchor so deposits become unclaimable; the only
+    /// known recovery is a full guardian restart (observed twice on the live
+    /// btc-usdt fed). This watchdog detects that state END-TO-END -- the anchor
+    /// (ring height) not advancing past its staggered deadline while the chain
+    /// and consensus are both provably live -- and `exit`s so the process
+    /// supervisor restarts the guardian with fresh pollers.
+    ///
+    /// It monitors the END result (the ring), not any one task's heartbeat, so
+    /// it catches a stall at ANY pipeline stage -- including a `BlockCount`
+    /// consensus stall that no task respawn could fix. The restart is gated by
+    /// [`anchor_stall_warrants_restart`]: never during a chain/RPC outage
+    /// (nothing to catch up to) and never during a broader consensus stall
+    /// (`consensus_progress` frozen -> a restart cannot restore quorum, only
+    /// crash-loop). The deadline is staggered per guardian
+    /// ([`ANCHOR_STALL_RESTART_STAGGER_SECS`]) so a quorum stays live
+    /// throughout recovery. Read-only apart from the process exit.
+    fn spawn_anchor_watchdog(task_group: &TaskGroup, handles: AnchorWatchdogHandles) {
+        let AnchorWatchdogHandles {
+            db,
+            evm_rpc,
+            confirmation_depth,
+            num_peers,
+            our_peer_id,
+            consensus_progress,
+        } = handles;
+
+        // The watchdog's only action is to exit the process, so never arm it
+        // under the test harness: integration tests run a real `new()` but must
+        // not be killed by it, and the long deadline could not fire in a test.
+        if is_running_in_test_env() {
+            return;
+        }
+
+        // Stagger the deadline across guardians so they never restart in
+        // lockstep -- a staggered restart keeps a live quorum through recovery.
+        let deadline = Duration::from_secs(
+            ANCHOR_STALL_RESTART_SECS
+                + u64::from(u16::from(our_peer_id)) * ANCHOR_STALL_RESTART_STAGGER_SECS,
+        );
+
+        task_group.spawn_cancellable("usdt-anchor-watchdog", async move {
+            // Baselines: the first observed anchor / heartbeat sets the
+            // reference, which also gives post-restart recovery its grace period
+            // for free (the clock only starts once we have something to compare).
+            let mut last_anchor: Option<u64> = None;
+            let mut anchor_since = Instant::now();
+            let mut last_progress = consensus_progress.load(Ordering::Relaxed);
+            let mut consensus_since = Instant::now();
+
+            loop {
+                fedimint_core::runtime::sleep(Duration::from_secs(ANCHOR_WATCHDOG_CHECK_SECS))
+                    .await;
+
+                // Consensus liveness: reset the clock whenever a new session was
+                // proposed since the last check.
+                let progress = consensus_progress.load(Ordering::Relaxed);
+                if progress != last_progress {
+                    last_progress = progress;
+                    consensus_since = Instant::now();
+                }
+                let consensus_alive = consensus_since.elapsed() < deadline;
+
+                // Anchor liveness: reset the clock whenever the ring grew.
+                let mut dbtx = db.begin_transaction_nc().await;
+                let anchor = ring_latest_height(&mut dbtx.to_ref_nc()).await.unwrap_or(0);
+                let ccount = consensus_block_count(&mut dbtx.to_ref_nc(), num_peers).await;
+                drop(dbtx);
+
+                match last_anchor {
+                    None => {
+                        last_anchor = Some(anchor);
+                        anchor_since = Instant::now();
+                        continue;
+                    }
+                    Some(prev) if anchor > prev => {
+                        last_anchor = Some(anchor);
+                        anchor_since = Instant::now();
+                        continue;
+                    }
+                    Some(_) => {}
+                }
+
+                let stalled_for = anchor_since.elapsed();
+                if stalled_for < deadline {
+                    continue;
+                }
+
+                // The chain must be genuinely ahead of the anchor, else there is
+                // nothing to catch up to. An unreachable RPC is an endpoint
+                // problem (already WARNed by the poller), not a wedged guardian,
+                // so treat it as "not ahead" and hold.
+                let chain_ahead = match rpc_deadline(evm_rpc.get_block_number()).await {
+                    Ok(head) => head > anchor.saturating_add(confirmation_depth),
+                    Err(err) => {
+                        warn!(
+                            target: "usdt",
+                            err = %err.fmt_compact_anyhow(),
+                            stalled_secs = stalled_for.as_secs(),
+                            "anchor watchdog: EVM head unreadable while the anchor is stalled; holding (RPC issue, not a task wedge)"
+                        );
+                        false
+                    }
+                };
+
+                if anchor_stall_warrants_restart(
+                    stalled_for,
+                    deadline,
+                    consensus_alive,
+                    chain_ahead,
+                ) {
+                    error!(
+                        target: "usdt",
+                        anchor,
+                        consensus_block_count = ccount,
+                        stalled_secs = stalled_for.as_secs(),
+                        "USDT deposit anchor has not advanced while the chain and consensus are both live: the deposit-by-proof pipeline is wedged. Exiting for a supervised restart (the only known recovery)."
+                    );
+                    // Let the log flush before the supervisor (systemd /
+                    // `podman --restart`) restarts us with fresh pollers.
+                    fedimint_core::runtime::sleep(Duration::from_secs(2)).await;
+                    std::process::exit(1);
+                } else if !consensus_alive {
+                    warn!(
+                        target: "usdt",
+                        stalled_secs = stalled_for.as_secs(),
+                        "anchor watchdog: anchor stalled but consensus is not progressing either -- a broader stall (e.g. lost quorum), not the isolated anchor freeze; NOT self-restarting"
+                    );
+                }
+                // Guards unmet (chain not ahead / consensus down): hold and
+                // re-check next tick without resetting the stall clock.
             }
         });
     }
@@ -7604,6 +7831,37 @@ mod tests {
             25_737_551,
             ANCHOR_LAG_WARN_BLOCKS
         ));
+    }
+
+    #[test]
+    fn anchor_watchdog_restarts_only_on_isolated_live_freeze() {
+        let deadline = Duration::from_secs(ANCHOR_STALL_RESTART_SECS);
+        let past = deadline + Duration::from_secs(1);
+        let under = deadline.saturating_sub(Duration::from_secs(1));
+
+        // The isolated anchor freeze we actually recover from: stalled past the
+        // deadline, chain advancing beyond the anchor, consensus still live.
+        assert!(anchor_stall_warrants_restart(past, deadline, true, true));
+
+        // Not yet past the deadline -> hold, even with all else true. (The stall
+        // clock is generous on purpose; a short blip must not restart a guardian.)
+        assert!(!anchor_stall_warrants_restart(under, deadline, true, true));
+        // Exactly at the deadline is enough (`>=`).
+        assert!(anchor_stall_warrants_restart(
+            deadline, deadline, true, true
+        ));
+
+        // Chain not ahead of the anchor (RPC down or genuinely no new blocks):
+        // nothing to catch up to, a restart would not help -> hold.
+        assert!(!anchor_stall_warrants_restart(past, deadline, true, false));
+
+        // Consensus itself is not progressing: a broader stall (e.g. lost
+        // quorum), NOT the isolated freeze. Restarting could only crash-loop
+        // without restoring quorum -> hold. This is the load-bearing guard.
+        assert!(!anchor_stall_warrants_restart(past, deadline, false, true));
+
+        // Both guards failing -> definitely hold.
+        assert!(!anchor_stall_warrants_restart(past, deadline, false, false));
     }
 
     #[test]
