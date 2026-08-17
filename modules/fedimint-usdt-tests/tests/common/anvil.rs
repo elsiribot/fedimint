@@ -343,7 +343,7 @@ pub async fn deploy_nonstandard_usdt(
 /// account with the void-`transfer`-returning token: it drives
 /// [`INonStandardUsdt::transfer`] (no `bool` return), so it exercises exactly
 /// the wire shape the real TetherToken exposes. Reverts here would prove alloy
-/// wrongly decodes a void return -- it does not.
+/// mis-decodes a void return -- it does not.
 pub async fn transfer_nonstandard_from_account_1(
     anvil: &AnvilHandle,
     token: EvmAddress,
