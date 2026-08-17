@@ -3536,6 +3536,7 @@ dependencies = [
 name = "devimint"
 version = "0.11.0-rc.1"
 dependencies = [
+ "alloy",
  "anyhow",
  "axum 0.8.8",
  "bitcoin",
@@ -4261,6 +4262,7 @@ dependencies = [
  "fedimint-mint-client",
  "fedimint-mintv2-client",
  "fedimint-rocksdb",
+ "fedimint-usdt-client",
  "fedimint-wallet-client",
  "fedimint-walletv2-client",
  "fs-lock",
@@ -6449,6 +6451,7 @@ dependencies = [
  "fedimint-server-ui",
  "fedimint-unknown-common",
  "fedimint-unknown-server",
+ "fedimint-usdt-server",
  "fedimint-wallet-server",
  "fedimint-walletv2-common",
  "fedimint-walletv2-server",
