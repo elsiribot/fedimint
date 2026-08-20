@@ -11,13 +11,13 @@ use fedimint_core::config::{
     ServerModuleConfig, ServerModuleConsensusConfig, TypedServerModuleConfig,
 };
 use fedimint_core::core::ModuleInstanceId;
-use fedimint_core::db::{DatabaseTransaction, DatabaseVersion};
+use fedimint_core::db::{DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    ApiEndpoint, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta, ModuleConsensusVersion,
-    ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
+    Amounts, ApiEndpoint, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
+    ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
 };
-use fedimint_core::{InPoint, OutPoint, PeerId, push_db_pair_items};
+use fedimint_core::{Amount, InPoint, OutPoint, PeerId, push_db_pair_items};
 use fedimint_server_core::config::PeerHandleOps;
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
 use fedimint_server_core::{
@@ -28,13 +28,13 @@ use fedimint_swap_common::config::{
     SwapClientConfig, SwapConfig, SwapConfigConsensus, SwapConfigPrivate,
 };
 use fedimint_swap_common::{
-    MODULE_CONSENSUS_VERSION, Offer, SwapCommonInit, SwapConsensusItem, SwapInput, SwapInputError,
-    SwapModuleTypes, SwapOutput, SwapOutputError, SwapOutputOutcome,
+    MODULE_CONSENSUS_VERSION, Offer, OfferState, Party, SwapCommonInit, SwapConsensusItem,
+    SwapInput, SwapInputError, SwapModuleTypes, SwapOutput, SwapOutputError, SwapOutputOutcome,
 };
 use futures::StreamExt;
 use strum::IntoEnumIterator;
 
-use crate::db::{ConsensusTsPrefix, DbKeyPrefix, OfferPrefix};
+use crate::db::{ConsensusTsPrefix, DbKeyPrefix, OfferKey, OfferPrefix};
 
 pub mod db;
 
@@ -201,22 +201,166 @@ impl ServerModule for Swap {
 
     async fn process_input<'a, 'b, 'c>(
         &'a self,
-        _dbtx: &mut DatabaseTransaction<'c>,
-        _input: &'b SwapInput,
+        dbtx: &mut DatabaseTransaction<'c>,
+        input: &'b SwapInput,
         _in_point: InPoint,
     ) -> Result<InputMeta, SwapInputError> {
-        // Phase 3 implements the offer lifecycle (Claim/Reclaim).
-        Err(SwapInputError::UnknownOffer)
+        match input {
+            SwapInput::Claim { offer_id, party } => {
+                let mut offer = dbtx
+                    .get_value(&OfferKey(*offer_id))
+                    .await
+                    .ok_or(SwapInputError::UnknownOffer)?;
+
+                // Only a filled offer has claimable legs; `taker_pk` comes from
+                // the `Filled` state so a `Taker` claim demands the taker's key.
+                let taker_pk = match &offer.state {
+                    OfferState::Filled { taker_pk } => *taker_pk,
+                    OfferState::Open => return Err(SwapInputError::OfferNotFilled),
+                };
+
+                // Each party withdraws the OTHER party's leg, in that leg's own
+                // unit. The `*_claimed` flag is the exactly-once replay guard: a
+                // second claim of the same leg errors instead of double-paying.
+                let (amounts, pub_key) = match party {
+                    Party::Maker => {
+                        if offer.maker_claimed {
+                            return Err(SwapInputError::LegAlreadyClaimed);
+                        }
+                        offer.maker_claimed = true;
+                        (
+                            Amounts::new_custom(offer.taker_unit, offer.taker_amount),
+                            offer.maker_pk,
+                        )
+                    }
+                    Party::Taker => {
+                        if offer.taker_claimed {
+                            return Err(SwapInputError::LegAlreadyClaimed);
+                        }
+                        offer.taker_claimed = true;
+                        (
+                            Amounts::new_custom(offer.maker_unit, offer.maker_amount),
+                            taker_pk,
+                        )
+                    }
+                };
+
+                // Once both legs are claimed the offer is fully settled and can
+                // be garbage-collected; otherwise persist the updated flags.
+                if offer.maker_claimed && offer.taker_claimed {
+                    dbtx.remove_entry(&OfferKey(*offer_id)).await;
+                } else {
+                    dbtx.insert_entry(&OfferKey(*offer_id), &offer).await;
+                }
+
+                Ok(InputMeta {
+                    amount: TransactionItemAmounts {
+                        amounts,
+                        fees: Amounts::ZERO,
+                    },
+                    pub_key,
+                })
+            }
+            SwapInput::Reclaim { offer_id } => {
+                let offer = dbtx
+                    .get_value(&OfferKey(*offer_id))
+                    .await
+                    .ok_or(SwapInputError::UnknownOffer)?;
+
+                // Reclaim is only valid while the offer is still Open (covers both
+                // voluntary cancel and post-expiry reclaim). A filled offer's
+                // maker leg belongs to the taker now, so it cannot be reclaimed.
+                if offer.state != OfferState::Open {
+                    return Err(SwapInputError::OfferNotOpen);
+                }
+
+                dbtx.remove_entry(&OfferKey(*offer_id)).await;
+
+                Ok(InputMeta {
+                    amount: TransactionItemAmounts {
+                        amounts: Amounts::new_custom(offer.maker_unit, offer.maker_amount),
+                        fees: Amounts::ZERO,
+                    },
+                    pub_key: offer.maker_pk,
+                })
+            }
+            SwapInput::Default { .. } => Err(SwapInputError::UnknownOffer),
+        }
     }
 
     async fn process_output<'a, 'b>(
         &'a self,
-        _dbtx: &mut DatabaseTransaction<'b>,
-        _output: &'a SwapOutput,
-        _out_point: OutPoint,
+        dbtx: &mut DatabaseTransaction<'b>,
+        output: &'a SwapOutput,
+        out_point: OutPoint,
     ) -> Result<TransactionItemAmounts, SwapOutputError> {
-        // Phase 3 implements the offer lifecycle (MakeOffer/Fill).
-        Err(SwapOutputError::UnknownOffer)
+        match output {
+            SwapOutput::MakeOffer {
+                maker_unit,
+                maker_amount,
+                taker_unit,
+                taker_amount,
+                expiry,
+                maker_pk,
+            } => {
+                if *maker_amount == Amount::ZERO || *taker_amount == Amount::ZERO {
+                    return Err(SwapOutputError::ZeroAmount);
+                }
+                if maker_unit == taker_unit {
+                    return Err(SwapOutputError::SameUnit);
+                }
+                if *expiry <= consensus_timestamp(dbtx).await {
+                    return Err(SwapOutputError::ExpiryInPast);
+                }
+
+                let offer = Offer {
+                    maker_pk: *maker_pk,
+                    maker_unit: *maker_unit,
+                    maker_amount: *maker_amount,
+                    taker_unit: *taker_unit,
+                    taker_amount: *taker_amount,
+                    expiry: *expiry,
+                    state: OfferState::Open,
+                    maker_claimed: false,
+                    taker_claimed: false,
+                };
+                // The offer id is this output's `OutPoint`.
+                dbtx.insert_new_entry(&OfferKey(out_point), &offer).await;
+
+                // The maker leg's e-cash is provided by a mint input in the same
+                // tx; balance it here in the maker leg's own unit, at par.
+                Ok(TransactionItemAmounts {
+                    amounts: Amounts::new_custom(*maker_unit, *maker_amount),
+                    fees: Amounts::ZERO,
+                })
+            }
+            SwapOutput::Fill { offer_id, taker_pk } => {
+                let mut offer = dbtx
+                    .get_value(&OfferKey(*offer_id))
+                    .await
+                    .ok_or(SwapOutputError::UnknownOffer)?;
+
+                if offer.state != OfferState::Open {
+                    return Err(SwapOutputError::OfferAlreadyFilled);
+                }
+                if consensus_timestamp(dbtx).await >= offer.expiry {
+                    return Err(SwapOutputError::OfferExpired);
+                }
+
+                offer.state = OfferState::Filled {
+                    taker_pk: *taker_pk,
+                };
+                dbtx.insert_entry(&OfferKey(*offer_id), &offer).await;
+
+                // The taker leg's e-cash is provided by a mint input in the same
+                // tx; balance it here in the taker leg's own unit, at par.
+                Ok(TransactionItemAmounts {
+                    amounts: Amounts::new_custom(offer.taker_unit, offer.taker_amount),
+                    fees: Amounts::ZERO,
+                })
+            }
+            SwapOutput::Default { .. } => Err(SwapOutputError::UnknownOffer),
+        }
     }
 
     async fn output_status(
@@ -229,11 +373,52 @@ impl ServerModule for Swap {
 
     async fn audit(
         &self,
-        _dbtx: &mut DatabaseTransaction<'_>,
-        _audit: &mut Audit,
-        _module_instance_id: ModuleInstanceId,
+        dbtx: &mut DatabaseTransaction<'_>,
+        audit: &mut Audit,
+        module_instance_id: ModuleInstanceId,
     ) {
-        // Phase 3: sum locked offer legs as per-unit liabilities
+        // The module physically holds each unclaimed leg's e-cash and owes it
+        // back, so every held leg is a LIABILITY (negative). A swap holds two
+        // DIFFERENT units, so the maker leg (maker_unit) and taker leg
+        // (taker_unit) are reported in TWO separate passes — one `AuditItem`
+        // per leg, each in its own unit — so that no single item ever mixes
+        // units. (The core `Audit`/`AuditSummary` API carries only a scalar
+        // `milli_sat` per item and sums them into one `net_assets`, so the
+        // whole-federation figure collapses units regardless — a core-level
+        // limitation shared by every module; see the phase-3 report. Each leg
+        // is balanced at par against a same-unit mint leg in its own tx, so
+        // the collapsed net remains solvency-consistent.)
+        //
+        // Maker leg held while: Open (maker deposited it, no taker yet), or
+        // Filled and the taker has not yet claimed it.
+        audit
+            .add_items(dbtx, module_instance_id, &OfferPrefix, |_k, offer| {
+                let held = match &offer.state {
+                    OfferState::Open => true,
+                    OfferState::Filled { .. } => !offer.taker_claimed,
+                };
+                if held {
+                    -i64::try_from(offer.maker_amount.msats).unwrap_or(i64::MAX)
+                } else {
+                    0
+                }
+            })
+            .await;
+        // Taker leg held only once Filled (the taker deposited it) and the
+        // maker has not yet claimed it.
+        audit
+            .add_items(dbtx, module_instance_id, &OfferPrefix, |_k, offer| {
+                let held = match &offer.state {
+                    OfferState::Open => false,
+                    OfferState::Filled { .. } => !offer.maker_claimed,
+                };
+                if held {
+                    -i64::try_from(offer.taker_amount.msats).unwrap_or(i64::MAX)
+                } else {
+                    0
+                }
+            })
+            .await;
     }
 
     fn api_endpoints(&self) -> Vec<ApiEndpoint<Self>> {
@@ -246,5 +431,942 @@ impl Swap {
     /// Create new module instance
     pub fn new(cfg: SwapConfig) -> Swap {
         Swap { cfg }
+    }
+}
+
+/// Median of the latest per-peer proposed timestamps; `0` if none yet.
+///
+/// PURE consensus-DB read — deterministic (no wall-clock, no `our_peer_id`), so
+/// it is safe to call inside `process_input`/`process_output`. Phase 4
+/// populates the `ConsensusTsKey` table (one row per peer); here we only read
+/// it.
+///
+/// The median-selection matches `consensus_block_count` (sort ascending, take
+/// the element at index `len / 2`). Unlike `consensus_block_count` we do NOT
+/// zero-pad up to the peer count: the swap module's config carries no
+/// peer/threshold count (`SwapConfigConsensus` is empty), and Phase 4 writes
+/// one row per peer, so at steady state `len` already equals the peer count.
+async fn consensus_timestamp(dbtx: &mut DatabaseTransaction<'_>) -> u64 {
+    let mut timestamps = dbtx
+        .find_by_prefix(&ConsensusTsPrefix)
+        .await
+        .map(|(_, ts)| ts)
+        .collect::<Vec<u64>>()
+        .await;
+
+    if timestamps.is_empty() {
+        return 0;
+    }
+
+    timestamps.sort_unstable();
+    timestamps[timestamps.len() / 2]
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped};
+    use fedimint_core::module::AmountUnit;
+    use fedimint_core::module::registry::ModuleDecoderRegistry;
+    use fedimint_core::secp256k1::PublicKey;
+    use fedimint_core::{Amount, BitcoinHash as _, InPoint, OutPoint, TransactionId, secp256k1};
+    use fedimint_swap_common::config::{SwapConfig, SwapConfigConsensus, SwapConfigPrivate};
+    use fedimint_swap_common::{OfferState, Party, SwapInput, SwapInputError, SwapOutput};
+
+    use super::*;
+    use crate::db::ConsensusTsKey;
+
+    // Fixed per-leg fixtures. The two legs are deliberately in DIFFERENT units
+    // and DIFFERENT amounts so any accidental unit/leg swap is caught.
+    const MAKER_UNIT: AmountUnit = AmountUnit::new_custom(1);
+    const TAKER_UNIT: AmountUnit = AmountUnit::new_custom(2);
+    const MAKER_AMOUNT: Amount = Amount::from_msats(1_000_000);
+    const TAKER_AMOUNT: Amount = Amount::from_msats(3_000_000);
+    const EXPIRY: u64 = 1_800_000_000;
+    // A consensus clock strictly before `EXPIRY`.
+    const NOW: u64 = 1_000_000_000;
+
+    fn module() -> Swap {
+        Swap::new(SwapConfig {
+            private: SwapConfigPrivate,
+            consensus: SwapConfigConsensus,
+        })
+    }
+
+    fn new_db() -> Database {
+        Database::new(MemDatabase::new(), ModuleDecoderRegistry::default())
+    }
+
+    fn pk(seed: u8) -> PublicKey {
+        secp256k1::SecretKey::from_slice(&[seed; 32])
+            .expect("valid scalar")
+            .public_key(secp256k1::SECP256K1)
+    }
+
+    fn maker_pk() -> PublicKey {
+        pk(0x11)
+    }
+
+    fn taker_pk() -> PublicKey {
+        pk(0x22)
+    }
+
+    fn out_point(out_idx: u64) -> OutPoint {
+        OutPoint {
+            txid: TransactionId::all_zeros(),
+            out_idx,
+        }
+    }
+
+    fn in_point(in_idx: u64) -> InPoint {
+        InPoint {
+            txid: TransactionId::all_zeros(),
+            in_idx,
+        }
+    }
+
+    /// Seed the consensus clock. Each `ts` is a distinct peer row; the module's
+    /// `consensus_timestamp` returns their median.
+    async fn seed_clock(dbtx: &mut DatabaseTransaction<'_>, timestamps: &[u64]) {
+        for (i, ts) in timestamps.iter().enumerate() {
+            let peer = u16::try_from(i).expect("test seeds few peers");
+            dbtx.insert_new_entry(&ConsensusTsKey(PeerId::from(peer)), ts)
+                .await;
+        }
+    }
+
+    fn make_offer() -> SwapOutput {
+        SwapOutput::MakeOffer {
+            maker_unit: MAKER_UNIT,
+            maker_amount: MAKER_AMOUNT,
+            taker_unit: TAKER_UNIT,
+            taker_amount: TAKER_AMOUNT,
+            expiry: EXPIRY,
+            maker_pk: maker_pk(),
+        }
+    }
+
+    fn amounts(unit: AmountUnit, amount: Amount) -> Amounts {
+        Amounts::new_custom(unit, amount)
+    }
+
+    // ---- consensus_timestamp (median) ---------------------------------------
+
+    #[tokio::test]
+    async fn consensus_timestamp_is_zero_when_unseeded() {
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        assert_eq!(consensus_timestamp(&mut dbtx.to_ref_nc()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn consensus_timestamp_is_median_of_peer_rows() {
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        // Insert out of order; median of {10, 20, 30} is 20 (index len/2 = 1).
+        seed_clock(&mut dbtx.to_ref_nc(), &[30, 10, 20]).await;
+        assert_eq!(consensus_timestamp(&mut dbtx.to_ref_nc()).await, 20);
+    }
+
+    // ---- MakeOffer ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn make_offer_writes_open_offer_and_returns_maker_leg() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+
+        let op = out_point(0);
+        let meta = m
+            .process_output(&mut dbtx.to_ref_nc(), &make_offer(), op)
+            .await
+            .expect("valid MakeOffer");
+
+        assert_eq!(meta.amounts, amounts(MAKER_UNIT, MAKER_AMOUNT));
+        assert_eq!(meta.fees, Amounts::ZERO);
+
+        let stored = dbtx
+            .to_ref_nc()
+            .get_value(&OfferKey(op))
+            .await
+            .expect("offer stored");
+        assert_eq!(stored.maker_pk, maker_pk());
+        assert_eq!(stored.maker_unit, MAKER_UNIT);
+        assert_eq!(stored.maker_amount, MAKER_AMOUNT);
+        assert_eq!(stored.taker_unit, TAKER_UNIT);
+        assert_eq!(stored.taker_amount, TAKER_AMOUNT);
+        assert_eq!(stored.expiry, EXPIRY);
+        assert_eq!(stored.state, OfferState::Open);
+        assert!(!stored.maker_claimed);
+        assert!(!stored.taker_claimed);
+    }
+
+    #[tokio::test]
+    async fn make_offer_rejects_zero_maker_amount() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+
+        let output = SwapOutput::MakeOffer {
+            maker_unit: MAKER_UNIT,
+            maker_amount: Amount::ZERO,
+            taker_unit: TAKER_UNIT,
+            taker_amount: TAKER_AMOUNT,
+            expiry: EXPIRY,
+            maker_pk: maker_pk(),
+        };
+        assert_eq!(
+            m.process_output(&mut dbtx.to_ref_nc(), &output, out_point(0))
+                .await,
+            Err(SwapOutputError::ZeroAmount)
+        );
+    }
+
+    #[tokio::test]
+    async fn make_offer_rejects_zero_taker_amount() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+
+        let output = SwapOutput::MakeOffer {
+            maker_unit: MAKER_UNIT,
+            maker_amount: MAKER_AMOUNT,
+            taker_unit: TAKER_UNIT,
+            taker_amount: Amount::ZERO,
+            expiry: EXPIRY,
+            maker_pk: maker_pk(),
+        };
+        assert_eq!(
+            m.process_output(&mut dbtx.to_ref_nc(), &output, out_point(0))
+                .await,
+            Err(SwapOutputError::ZeroAmount)
+        );
+    }
+
+    #[tokio::test]
+    async fn make_offer_rejects_same_unit() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+
+        let output = SwapOutput::MakeOffer {
+            maker_unit: MAKER_UNIT,
+            maker_amount: MAKER_AMOUNT,
+            taker_unit: MAKER_UNIT,
+            taker_amount: TAKER_AMOUNT,
+            expiry: EXPIRY,
+            maker_pk: maker_pk(),
+        };
+        assert_eq!(
+            m.process_output(&mut dbtx.to_ref_nc(), &output, out_point(0))
+                .await,
+            Err(SwapOutputError::SameUnit)
+        );
+    }
+
+    #[tokio::test]
+    async fn make_offer_rejects_expiry_at_or_before_clock() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[EXPIRY]).await;
+
+        // expiry == clock is in the past (must be strictly greater).
+        assert_eq!(
+            m.process_output(&mut dbtx.to_ref_nc(), &make_offer(), out_point(0))
+                .await,
+            Err(SwapOutputError::ExpiryInPast)
+        );
+    }
+
+    // ---- Fill ---------------------------------------------------------------
+
+    /// Make an offer at `NOW`, returning its id.
+    async fn open_offer(m: &Swap, dbtx: &mut DatabaseTransaction<'_>) -> OutPoint {
+        let op = out_point(0);
+        m.process_output(&mut dbtx.to_ref_nc(), &make_offer(), op)
+            .await
+            .expect("valid MakeOffer");
+        op
+    }
+
+    #[tokio::test]
+    async fn fill_flips_open_to_filled_and_returns_taker_leg() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = open_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        let meta = m
+            .process_output(
+                &mut dbtx.to_ref_nc(),
+                &SwapOutput::Fill {
+                    offer_id,
+                    taker_pk: taker_pk(),
+                },
+                out_point(1),
+            )
+            .await
+            .expect("valid Fill");
+
+        assert_eq!(meta.amounts, amounts(TAKER_UNIT, TAKER_AMOUNT));
+        assert_eq!(meta.fees, Amounts::ZERO);
+
+        let stored = dbtx
+            .to_ref_nc()
+            .get_value(&OfferKey(offer_id))
+            .await
+            .expect("offer stored");
+        assert_eq!(
+            stored.state,
+            OfferState::Filled {
+                taker_pk: taker_pk()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_rejects_unknown_offer() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+
+        assert_eq!(
+            m.process_output(
+                &mut dbtx.to_ref_nc(),
+                &SwapOutput::Fill {
+                    offer_id: out_point(99),
+                    taker_pk: taker_pk(),
+                },
+                out_point(1),
+            )
+            .await,
+            Err(SwapOutputError::UnknownOffer)
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_rejects_already_filled() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = open_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        let fill = SwapOutput::Fill {
+            offer_id,
+            taker_pk: taker_pk(),
+        };
+        m.process_output(&mut dbtx.to_ref_nc(), &fill, out_point(1))
+            .await
+            .expect("first Fill");
+        assert_eq!(
+            m.process_output(&mut dbtx.to_ref_nc(), &fill, out_point(2))
+                .await,
+            Err(SwapOutputError::OfferAlreadyFilled)
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_rejects_expired_offer() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = open_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        // Advance the clock to exactly the expiry (clock >= expiry rejects).
+        dbtx.to_ref_nc()
+            .insert_entry(&ConsensusTsKey(PeerId::from(0)), &EXPIRY)
+            .await;
+
+        assert_eq!(
+            m.process_output(
+                &mut dbtx.to_ref_nc(),
+                &SwapOutput::Fill {
+                    offer_id,
+                    taker_pk: taker_pk(),
+                },
+                out_point(1),
+            )
+            .await,
+            Err(SwapOutputError::OfferExpired)
+        );
+    }
+
+    // ---- Claim --------------------------------------------------------------
+
+    /// Make + Fill an offer, returning its id.
+    async fn filled_offer(m: &Swap, dbtx: &mut DatabaseTransaction<'_>) -> OutPoint {
+        let offer_id = open_offer(m, &mut dbtx.to_ref_nc()).await;
+        m.process_output(
+            &mut dbtx.to_ref_nc(),
+            &SwapOutput::Fill {
+                offer_id,
+                taker_pk: taker_pk(),
+            },
+            out_point(1),
+        )
+        .await
+        .expect("valid Fill");
+        offer_id
+    }
+
+    #[tokio::test]
+    async fn claim_maker_pays_taker_leg_to_maker_pk() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = filled_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        let meta = m
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Claim {
+                    offer_id,
+                    party: Party::Maker,
+                },
+                in_point(0),
+            )
+            .await
+            .expect("valid Maker claim");
+
+        // Maker withdraws the TAKER leg, to the maker's key.
+        assert_eq!(meta.amount.amounts, amounts(TAKER_UNIT, TAKER_AMOUNT));
+        assert_eq!(meta.amount.fees, Amounts::ZERO);
+        assert_eq!(meta.pub_key, maker_pk());
+
+        let stored = dbtx
+            .to_ref_nc()
+            .get_value(&OfferKey(offer_id))
+            .await
+            .expect("offer still present (taker unclaimed)");
+        assert!(stored.maker_claimed);
+        assert!(!stored.taker_claimed);
+    }
+
+    #[tokio::test]
+    async fn claim_taker_pays_maker_leg_to_taker_pk() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = filled_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        let meta = m
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Claim {
+                    offer_id,
+                    party: Party::Taker,
+                },
+                in_point(0),
+            )
+            .await
+            .expect("valid Taker claim");
+
+        // Taker withdraws the MAKER leg, to the taker's key.
+        assert_eq!(meta.amount.amounts, amounts(MAKER_UNIT, MAKER_AMOUNT));
+        assert_eq!(meta.pub_key, taker_pk());
+
+        let stored = dbtx
+            .to_ref_nc()
+            .get_value(&OfferKey(offer_id))
+            .await
+            .expect("offer still present (maker unclaimed)");
+        assert!(!stored.maker_claimed);
+        assert!(stored.taker_claimed);
+    }
+
+    #[tokio::test]
+    async fn both_claims_delete_offer() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = filled_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        m.process_input(
+            &mut dbtx.to_ref_nc(),
+            &SwapInput::Claim {
+                offer_id,
+                party: Party::Maker,
+            },
+            in_point(0),
+        )
+        .await
+        .expect("Maker claim");
+        m.process_input(
+            &mut dbtx.to_ref_nc(),
+            &SwapInput::Claim {
+                offer_id,
+                party: Party::Taker,
+            },
+            in_point(1),
+        )
+        .await
+        .expect("Taker claim");
+
+        assert_eq!(dbtx.to_ref_nc().get_value(&OfferKey(offer_id)).await, None);
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_open_offer() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = open_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        assert_eq!(
+            m.process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Claim {
+                    offer_id,
+                    party: Party::Maker,
+                },
+                in_point(0),
+            )
+            .await,
+            Err(SwapInputError::OfferNotFilled)
+        );
+    }
+
+    #[tokio::test]
+    async fn second_claim_of_same_party_rejected() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = filled_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        let claim = SwapInput::Claim {
+            offer_id,
+            party: Party::Maker,
+        };
+        m.process_input(&mut dbtx.to_ref_nc(), &claim, in_point(0))
+            .await
+            .expect("first Maker claim");
+        assert_eq!(
+            m.process_input(&mut dbtx.to_ref_nc(), &claim, in_point(1))
+                .await,
+            Err(SwapInputError::LegAlreadyClaimed)
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_unknown_offer() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+
+        assert_eq!(
+            m.process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Claim {
+                    offer_id: out_point(99),
+                    party: Party::Maker,
+                },
+                in_point(0),
+            )
+            .await,
+            Err(SwapInputError::UnknownOffer)
+        );
+    }
+
+    // ---- Reclaim ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reclaim_open_pays_maker_leg_and_deletes_offer() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = open_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        let meta = m
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Reclaim { offer_id },
+                in_point(0),
+            )
+            .await
+            .expect("valid Reclaim");
+
+        assert_eq!(meta.amount.amounts, amounts(MAKER_UNIT, MAKER_AMOUNT));
+        assert_eq!(meta.pub_key, maker_pk());
+        assert_eq!(dbtx.to_ref_nc().get_value(&OfferKey(offer_id)).await, None);
+    }
+
+    #[tokio::test]
+    async fn reclaim_rejects_filled_offer() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = filled_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        assert_eq!(
+            m.process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Reclaim { offer_id },
+                in_point(0),
+            )
+            .await,
+            Err(SwapInputError::OfferNotOpen)
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_rejects_unknown_offer() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+
+        assert_eq!(
+            m.process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Reclaim {
+                    offer_id: out_point(99),
+                },
+                in_point(0),
+            )
+            .await,
+            Err(SwapInputError::UnknownOffer)
+        );
+    }
+
+    // ---- Consensus / safety -------------------------------------------------
+
+    #[tokio::test]
+    async fn fill_then_reclaim_serializes_reclaim_loses() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = open_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        // Fill wins the race.
+        m.process_output(
+            &mut dbtx.to_ref_nc(),
+            &SwapOutput::Fill {
+                offer_id,
+                taker_pk: taker_pk(),
+            },
+            out_point(1),
+        )
+        .await
+        .expect("Fill wins");
+
+        // Reclaim now sees a Filled offer and loses with no state change.
+        assert_eq!(
+            m.process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Reclaim { offer_id },
+                in_point(0),
+            )
+            .await,
+            Err(SwapInputError::OfferNotOpen)
+        );
+        // Offer is still there, Filled — untouched by the losing Reclaim.
+        let stored = dbtx
+            .to_ref_nc()
+            .get_value(&OfferKey(offer_id))
+            .await
+            .expect("offer intact");
+        assert_eq!(
+            stored.state,
+            OfferState::Filled {
+                taker_pk: taker_pk()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_then_fill_serializes_fill_loses() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = open_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        // Reclaim wins the race, deleting the offer.
+        m.process_input(
+            &mut dbtx.to_ref_nc(),
+            &SwapInput::Reclaim { offer_id },
+            in_point(0),
+        )
+        .await
+        .expect("Reclaim wins");
+
+        // Fill now sees no offer and loses with no state change.
+        assert_eq!(
+            m.process_output(
+                &mut dbtx.to_ref_nc(),
+                &SwapOutput::Fill {
+                    offer_id,
+                    taker_pk: taker_pk(),
+                },
+                out_point(1),
+            )
+            .await,
+            Err(SwapOutputError::UnknownOffer)
+        );
+        assert_eq!(dbtx.to_ref_nc().get_value(&OfferKey(offer_id)).await, None);
+    }
+
+    #[tokio::test]
+    async fn two_taker_race_second_fill_rejected() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = open_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        // First taker fills.
+        m.process_output(
+            &mut dbtx.to_ref_nc(),
+            &SwapOutput::Fill {
+                offer_id,
+                taker_pk: taker_pk(),
+            },
+            out_point(1),
+        )
+        .await
+        .expect("first taker fills");
+
+        // Second taker (different key) is rejected; the offer keeps the first
+        // taker's key.
+        assert_eq!(
+            m.process_output(
+                &mut dbtx.to_ref_nc(),
+                &SwapOutput::Fill {
+                    offer_id,
+                    taker_pk: pk(0x33),
+                },
+                out_point(2),
+            )
+            .await,
+            Err(SwapOutputError::OfferAlreadyFilled)
+        );
+        let stored = dbtx
+            .to_ref_nc()
+            .get_value(&OfferKey(offer_id))
+            .await
+            .expect("offer intact");
+        assert_eq!(
+            stored.state,
+            OfferState::Filled {
+                taker_pk: taker_pk()
+            }
+        );
+    }
+
+    // ---- Per-unit solvency invariant ----------------------------------------
+
+    #[tokio::test]
+    async fn per_unit_value_conserved_over_full_lifecycle() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+
+        // Outputs consume tx funding into escrow; inputs release it. Track both
+        // per unit; value must be conserved per unit (no mint, no burn).
+        let mut consumed = Amounts::ZERO;
+        let mut released = Amounts::ZERO;
+
+        // MakeOffer consumes the maker leg.
+        let offer_id = out_point(0);
+        let make = m
+            .process_output(&mut dbtx.to_ref_nc(), &make_offer(), offer_id)
+            .await
+            .expect("MakeOffer");
+        consumed = consumed.checked_add(&make.amounts).expect("no overflow");
+
+        // Fill consumes the taker leg.
+        let fill = m
+            .process_output(
+                &mut dbtx.to_ref_nc(),
+                &SwapOutput::Fill {
+                    offer_id,
+                    taker_pk: taker_pk(),
+                },
+                out_point(1),
+            )
+            .await
+            .expect("Fill");
+        consumed = consumed.checked_add(&fill.amounts).expect("no overflow");
+
+        // Maker claim releases the taker leg.
+        let maker_claim = m
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Claim {
+                    offer_id,
+                    party: Party::Maker,
+                },
+                in_point(0),
+            )
+            .await
+            .expect("Maker claim");
+        released = released
+            .checked_add(&maker_claim.amount.amounts)
+            .expect("no overflow");
+
+        // Taker claim releases the maker leg.
+        let taker_claim = m
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Claim {
+                    offer_id,
+                    party: Party::Taker,
+                },
+                in_point(1),
+            )
+            .await
+            .expect("Taker claim");
+        released = released
+            .checked_add(&taker_claim.amount.amounts)
+            .expect("no overflow");
+
+        // Value conserved PER UNIT: what escrow consumed equals what it released,
+        // unit by unit. `Amounts` equality is per-unit, so this proves no
+        // over/under-release and no unit collapse.
+        assert_eq!(consumed, released);
+        assert_eq!(consumed.get(&MAKER_UNIT).copied(), Some(MAKER_AMOUNT));
+        assert_eq!(consumed.get(&TAKER_UNIT).copied(), Some(TAKER_AMOUNT));
+    }
+
+    #[tokio::test]
+    async fn rejected_reclaim_after_partial_claim_releases_nothing() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = filled_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        // Maker claims the taker leg.
+        let maker_claim = m
+            .process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Claim {
+                    offer_id,
+                    party: Party::Maker,
+                },
+                in_point(0),
+            )
+            .await
+            .expect("Maker claim");
+        let mut released = Amounts::ZERO;
+        released = released
+            .checked_add(&maker_claim.amount.amounts)
+            .expect("no overflow");
+
+        // A Reclaim now (offer is Filled) must be rejected and release NOTHING —
+        // the maker leg is still owed to the taker, so over-release is prevented.
+        assert_eq!(
+            m.process_input(
+                &mut dbtx.to_ref_nc(),
+                &SwapInput::Reclaim { offer_id },
+                in_point(1),
+            )
+            .await,
+            Err(SwapInputError::OfferNotOpen)
+        );
+
+        // Only the taker leg has been released so far; the maker leg is intact.
+        assert_eq!(released, amounts(TAKER_UNIT, TAKER_AMOUNT));
+        let stored = dbtx
+            .to_ref_nc()
+            .get_value(&OfferKey(offer_id))
+            .await
+            .expect("offer intact, maker leg still escrowed");
+        assert!(stored.maker_claimed);
+        assert!(!stored.taker_claimed);
+    }
+
+    // ---- Audit (per-unit liability) -----------------------------------------
+
+    /// Net assets summed by the core `Audit` over this module's items.
+    async fn audit_net(m: &Swap, dbtx: &mut DatabaseTransaction<'_>) -> i64 {
+        let mut audit = Audit::default();
+        m.audit(&mut dbtx.to_ref_nc(), &mut audit, 0).await;
+        audit.net_assets().expect("no overflow").milli_sat
+    }
+
+    #[tokio::test]
+    async fn audit_open_offer_is_maker_leg_liability() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        open_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        // Open: only the maker leg is held (a liability).
+        assert_eq!(
+            audit_net(&m, &mut dbtx.to_ref_nc()).await,
+            -(MAKER_AMOUNT.msats as i64)
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_filled_offer_holds_both_legs() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        filled_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        // Filled, nothing claimed: both legs held.
+        assert_eq!(
+            audit_net(&m, &mut dbtx.to_ref_nc()).await,
+            -((MAKER_AMOUNT.msats + TAKER_AMOUNT.msats) as i64)
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_drops_claimed_legs() {
+        let m = module();
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        seed_clock(&mut dbtx.to_ref_nc(), &[NOW]).await;
+        let offer_id = filled_offer(&m, &mut dbtx.to_ref_nc()).await;
+
+        // Maker claims the taker leg → only the maker leg remains held.
+        m.process_input(
+            &mut dbtx.to_ref_nc(),
+            &SwapInput::Claim {
+                offer_id,
+                party: Party::Maker,
+            },
+            in_point(0),
+        )
+        .await
+        .expect("Maker claim");
+        assert_eq!(
+            audit_net(&m, &mut dbtx.to_ref_nc()).await,
+            -(MAKER_AMOUNT.msats as i64)
+        );
+
+        // Taker claims the maker leg → offer deleted, no liability.
+        m.process_input(
+            &mut dbtx.to_ref_nc(),
+            &SwapInput::Claim {
+                offer_id,
+                party: Party::Taker,
+            },
+            in_point(1),
+        )
+        .await
+        .expect("Taker claim");
+        assert_eq!(audit_net(&m, &mut dbtx.to_ref_nc()).await, 0);
     }
 }
