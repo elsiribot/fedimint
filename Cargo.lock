@@ -5920,6 +5920,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fedimint-swap-server"
+version = "0.12.0-alpha"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "erased-serde",
+ "fedimint-core",
+ "fedimint-server-core",
+ "fedimint-swap-common",
+ "futures",
+ "serde",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
+ "tokio",
+]
+
+[[package]]
 name = "fedimint-tbs"
 version = "0.12.0-alpha"
 dependencies = [
@@ -6475,6 +6492,7 @@ dependencies = [
  "fedimint-server-bitcoin-rpc",
  "fedimint-server-core",
  "fedimint-server-ui",
+ "fedimint-swap-server",
  "fedimint-unknown-common",
  "fedimint-unknown-server",
  "fedimint-usdt-server",
