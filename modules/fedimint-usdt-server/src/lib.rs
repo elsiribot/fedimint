@@ -3718,9 +3718,12 @@ impl Usdt {
             // reference, which also gives post-restart recovery its grace period
             // for free (the clock only starts once we have something to compare).
             let mut last_anchor: Option<u64> = None;
-            let mut anchor_since = Instant::now();
+            // Instant is deliberate here: the watchdog needs a MONOTONIC clock
+            // for its stall deadline (a wall-clock/NTP jump must not spuriously
+            // trip or mask a freeze). This crate is server-only, never wasm.
+            let mut anchor_since = Instant::now(); // nosemgrep: ban-instant-now
             let mut last_progress = consensus_progress.load(Ordering::Relaxed);
-            let mut consensus_since = Instant::now();
+            let mut consensus_since = Instant::now(); // nosemgrep: ban-instant-now
 
             loop {
                 fedimint_core::runtime::sleep(Duration::from_secs(ANCHOR_WATCHDOG_CHECK_SECS))
@@ -3731,9 +3734,9 @@ impl Usdt {
                 let progress = consensus_progress.load(Ordering::Relaxed);
                 if progress != last_progress {
                     last_progress = progress;
-                    consensus_since = Instant::now();
+                    consensus_since = Instant::now(); // nosemgrep: ban-instant-now
                 }
-                let consensus_alive = consensus_since.elapsed() < deadline;
+                let consensus_alive = consensus_since.elapsed() < deadline; // nosemgrep: ban-system-time-elapsed
 
                 // Anchor liveness: reset the clock whenever the ring grew.
                 let mut dbtx = db.begin_transaction_nc().await;
@@ -3744,25 +3747,25 @@ impl Usdt {
                 match last_anchor {
                     None => {
                         last_anchor = Some(anchor);
-                        anchor_since = Instant::now();
+                        anchor_since = Instant::now(); // nosemgrep: ban-instant-now
                         continue;
                     }
                     Some(prev) if anchor > prev => {
                         last_anchor = Some(anchor);
-                        anchor_since = Instant::now();
+                        anchor_since = Instant::now(); // nosemgrep: ban-instant-now
                         continue;
                     }
                     Some(_) => {}
                 }
 
-                let stalled_for = anchor_since.elapsed();
+                let stalled_for = anchor_since.elapsed(); // nosemgrep: ban-system-time-elapsed
                 if stalled_for < deadline {
                     continue;
                 }
 
                 // The chain must be genuinely ahead of the anchor, else there is
                 // nothing to catch up to. An unreachable RPC is an endpoint
-                // problem (already WARNed by the poller), not a wedged guardian,
+                // problem (already logged at WARN by the poller), not a wedged guardian,
                 // so treat it as "not ahead" and hold.
                 let chain_ahead = match rpc_deadline(evm_rpc.get_block_number()).await {
                     Ok(head) => head > anchor.saturating_add(confirmation_depth),

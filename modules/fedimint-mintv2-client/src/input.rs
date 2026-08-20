@@ -6,6 +6,7 @@ use fedimint_core::TransactionId;
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{AmountUnit, Amounts};
+use fedimint_core::util::FmtCompactAnyhow as _;
 use fedimint_mintv2_common::MintInput;
 
 use crate::{MintClientContext, SpendableNote};
@@ -106,7 +107,7 @@ impl InputStateMachine {
             Ok(change_range) => InputSMState::Refunding(change_range),
             Err(err) => {
                 tracing::warn!(
-                    error = %err,
+                    error = %err.fmt_compact_anyhow(),
                     "Failed to claim refund inputs after transaction rejection"
                 );
 

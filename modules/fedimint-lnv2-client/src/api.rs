@@ -35,8 +35,11 @@ pub trait LightningFederationApi {
 
     async fn gateways_from_peer(&self, peer: PeerId) -> ServerResult<Vec<SafeUrl>>;
 
+    // Only called from the `cli` feature's CLI handler; dead when built without it.
+    #[allow(dead_code)]
     async fn add_gateway(&self, auth: ApiAuth, gateway: SafeUrl) -> FederationResult<bool>;
 
+    #[allow(dead_code)]
     async fn remove_gateway(&self, auth: ApiAuth, gateway: SafeUrl) -> FederationResult<bool>;
 }
 
