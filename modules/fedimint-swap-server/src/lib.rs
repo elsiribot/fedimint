@@ -17,7 +17,7 @@ use fedimint_core::module::{
     Amounts, ApiEndpoint, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
     ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
 };
-use fedimint_core::{Amount, InPoint, OutPoint, PeerId, push_db_pair_items};
+use fedimint_core::{Amount, InPoint, NumPeers, OutPoint, PeerId, push_db_pair_items};
 use fedimint_server_core::config::PeerHandleOps;
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
 use fedimint_server_core::{
@@ -34,9 +34,14 @@ use fedimint_swap_common::{
 use futures::StreamExt;
 use strum::IntoEnumIterator;
 
-use crate::db::{ConsensusTsPrefix, DbKeyPrefix, OfferKey, OfferPrefix};
+use crate::db::{ConsensusTsKey, ConsensusTsPrefix, DbKeyPrefix, OfferKey, OfferPrefix};
 
 pub mod db;
+
+/// Minimum staleness (in seconds) before a guardian re-proposes its
+/// wall-clock time in `consensus_proposal`. Throttles the consensus item to
+/// roughly once per interval instead of once per session.
+const PROPOSE_INTERVAL_SECS: u64 = 60;
 
 /// Generates the module
 #[derive(Debug, Clone)]
@@ -102,7 +107,11 @@ impl ServerModuleInit for SwapInit {
 
     /// Initialize the module
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
-        Ok(Swap::new(args.cfg().to_typed()?))
+        Ok(Swap::new(
+            args.cfg().to_typed()?,
+            args.our_peer_id(),
+            args.num_peers(),
+        ))
     }
 
     /// Generates configs for all peers in a trusted manner for testing
@@ -167,6 +176,13 @@ impl ServerModuleInit for SwapInit {
 #[derive(Debug)]
 pub struct Swap {
     pub cfg: SwapConfig,
+    /// This guardian's own id, used to key its row in `ConsensusTsKey` (both
+    /// `consensus_proposal`'s throttle read and the row it proposes into).
+    our_peer_id: PeerId,
+    /// The federation's peer count, used to zero-pad `consensus_timestamp`'s
+    /// median so a minority of voters cannot move the clock (see
+    /// `consensus_timestamp`'s doc comment).
+    num_peers: NumPeers,
 }
 
 /// Implementation of consensus for the server module
@@ -178,25 +194,51 @@ impl ServerModule for Swap {
 
     async fn consensus_proposal(
         &self,
-        _dbtx: &mut DatabaseTransaction<'_>,
+        dbtx: &mut DatabaseTransaction<'_>,
     ) -> Vec<SwapConsensusItem> {
-        // Phase 4: propose this guardian's current wall-clock time.
-        Vec::new()
+        let now_secs = fedimint_core::time::duration_since_epoch().as_secs();
+        let last = dbtx
+            .get_value(&ConsensusTsKey(self.our_peer_id))
+            .await
+            .unwrap_or(0);
+        // Throttle: only propose when our last accepted value is at least
+        // PROPOSE_INTERVAL_SECS stale, so we don't emit an item every session.
+        if now_secs >= last.saturating_add(PROPOSE_INTERVAL_SECS) {
+            vec![SwapConsensusItem {
+                unix_secs: now_secs,
+            }]
+        } else {
+            vec![]
+        }
     }
 
     async fn process_consensus_item<'a, 'b>(
         &'a self,
-        _dbtx: &mut DatabaseTransaction<'b>,
-        _consensus_item: SwapConsensusItem,
-        _peer_id: PeerId,
+        dbtx: &mut DatabaseTransaction<'b>,
+        consensus_item: SwapConsensusItem,
+        peer_id: PeerId,
     ) -> anyhow::Result<()> {
         // WARNING: `process_consensus_item` should return an `Err` for items that do
         // not change any internal consensus state. Failure to do so, will result in an
         // (potentially significantly) increased consensus history size.
-        // If you are using this code as a template,
-        // make sure to read the [`ServerModule::process_consensus_item`] documentation,
-        // Phase 4 implements the timestamp clock; no consensus items yet.
-        anyhow::bail!("no consensus items yet");
+        let last = dbtx.get_value(&ConsensusTsKey(peer_id)).await.unwrap_or(0);
+        // Monotonic per peer: reject a non-advancing value. This also satisfies
+        // the "process_consensus_item must Err on no-ops" history-size rule
+        // above. CRITICAL: no wall-clock read here -- this must be a pure
+        // function of the item plus prior DB state, so every honest guardian
+        // reaches the same result when replaying consensus. No sanity-clamp
+        // against "now" either, since that would be non-deterministic; per-peer
+        // monotonicity is the only guard, and the median over up to `max_evil`
+        // Byzantine peers among `num_peers` stays honest-bounded without one.
+        if consensus_item.unix_secs <= last {
+            anyhow::bail!(
+                "swap: timestamp {} not newer than stored {last} for peer {peer_id}",
+                consensus_item.unix_secs
+            );
+        }
+        dbtx.insert_entry(&ConsensusTsKey(peer_id), &consensus_item.unix_secs)
+            .await;
+        Ok(())
     }
 
     async fn process_input<'a, 'b, 'c>(
@@ -309,7 +351,7 @@ impl ServerModule for Swap {
                 if maker_unit == taker_unit {
                     return Err(SwapOutputError::SameUnit);
                 }
-                if *expiry <= consensus_timestamp(dbtx).await {
+                if *expiry <= consensus_timestamp(dbtx, self.num_peers).await {
                     return Err(SwapOutputError::ExpiryInPast);
                 }
 
@@ -343,7 +385,7 @@ impl ServerModule for Swap {
                 if offer.state != OfferState::Open {
                     return Err(SwapOutputError::OfferAlreadyFilled);
                 }
-                if consensus_timestamp(dbtx).await >= offer.expiry {
+                if consensus_timestamp(dbtx, self.num_peers).await >= offer.expiry {
                     return Err(SwapOutputError::OfferExpired);
                 }
 
@@ -429,24 +471,33 @@ impl ServerModule for Swap {
 
 impl Swap {
     /// Create new module instance
-    pub fn new(cfg: SwapConfig) -> Swap {
-        Swap { cfg }
+    pub fn new(cfg: SwapConfig, our_peer_id: PeerId, num_peers: NumPeers) -> Swap {
+        Swap {
+            cfg,
+            our_peer_id,
+            num_peers,
+        }
     }
 }
 
-/// Median of the latest per-peer proposed timestamps; `0` if none yet.
+/// Median of the latest per-peer proposed timestamps, zero-padded up to
+/// `num_peers`; `0` if no peer has proposed yet.
 ///
 /// PURE consensus-DB read — deterministic (no wall-clock, no `our_peer_id`), so
 /// it is safe to call inside `process_input`/`process_output`. Phase 4
 /// populates the `ConsensusTsKey` table (one row per peer); here we only read
 /// it.
 ///
-/// The median-selection matches `consensus_block_count` (sort ascending, take
-/// the element at index `len / 2`). Unlike `consensus_block_count` we do NOT
-/// zero-pad up to the peer count: the swap module's config carries no
-/// peer/threshold count (`SwapConfigConsensus` is empty), and Phase 4 writes
-/// one row per peer, so at steady state `len` already equals the peer count.
-async fn consensus_timestamp(dbtx: &mut DatabaseTransaction<'_>) -> u64 {
+/// Matches `consensus_block_count`'s exact padding
+/// (`modules/fedimint-ln-server/src/lib.rs`): sort ascending and zero-pad up
+/// to `num_peers.total()` BEFORE taking the median at index `len / 2`. This
+/// clock gates offer expiry (→ reclaim/fill), which moves money, so a
+/// minority of voters (e.g. during federation ramp-up, or while a peer is
+/// offline) must not be able to move it off the floor -- padding with `0`
+/// for peers that haven't voted yet ensures the median only advances once a
+/// majority has proposed a value.
+async fn consensus_timestamp(dbtx: &mut DatabaseTransaction<'_>, num_peers: NumPeers) -> u64 {
+    let peer_count = num_peers.total();
     let mut timestamps = dbtx
         .find_by_prefix(&ConsensusTsPrefix)
         .await
@@ -454,12 +505,13 @@ async fn consensus_timestamp(dbtx: &mut DatabaseTransaction<'_>) -> u64 {
         .collect::<Vec<u64>>()
         .await;
 
-    if timestamps.is_empty() {
-        return 0;
+    assert!(timestamps.len() <= peer_count);
+    while timestamps.len() < peer_count {
+        timestamps.push(0);
     }
 
     timestamps.sort_unstable();
-    timestamps[timestamps.len() / 2]
+    timestamps[peer_count / 2]
 }
 
 #[cfg(test)]
@@ -486,11 +538,23 @@ mod tests {
     // A consensus clock strictly before `EXPIRY`.
     const NOW: u64 = 1_000_000_000;
 
+    /// `num_peers = 1` matches the single-row seeding (`seed_clock(&[NOW])`,
+    /// or a lone `ConsensusTsKey(PeerId::from(0))` insert) that the bulk of
+    /// this module's tests use, so `consensus_timestamp`'s zero-padding is a
+    /// no-op for them and the pre-Phase-4 median assertions are unaffected.
     fn module() -> Swap {
-        Swap::new(SwapConfig {
-            private: SwapConfigPrivate,
-            consensus: SwapConfigConsensus,
-        })
+        module_with(PeerId::from(0), NumPeers::from(1))
+    }
+
+    fn module_with(our_peer_id: PeerId, num_peers: NumPeers) -> Swap {
+        Swap::new(
+            SwapConfig {
+                private: SwapConfigPrivate,
+                consensus: SwapConfigConsensus,
+            },
+            our_peer_id,
+            num_peers,
+        )
     }
 
     fn new_db() -> Database {
@@ -556,16 +620,54 @@ mod tests {
     async fn consensus_timestamp_is_zero_when_unseeded() {
         let db = new_db();
         let mut dbtx = db.begin_transaction().await;
-        assert_eq!(consensus_timestamp(&mut dbtx.to_ref_nc()).await, 0);
+        // num_peers = 1: unseeded pads to a single `0` row, median = 0.
+        assert_eq!(
+            consensus_timestamp(&mut dbtx.to_ref_nc(), NumPeers::from(1)).await,
+            0
+        );
     }
 
     #[tokio::test]
     async fn consensus_timestamp_is_median_of_peer_rows() {
         let db = new_db();
         let mut dbtx = db.begin_transaction().await;
-        // Insert out of order; median of {10, 20, 30} is 20 (index len/2 = 1).
+        // Insert out of order; num_peers = 3 matches the 3 seeded rows, so
+        // padding is a no-op. Median of {10, 20, 30} is 20 (index len/2 = 1).
         seed_clock(&mut dbtx.to_ref_nc(), &[30, 10, 20]).await;
-        assert_eq!(consensus_timestamp(&mut dbtx.to_ref_nc()).await, 20);
+        assert_eq!(
+            consensus_timestamp(&mut dbtx.to_ref_nc(), NumPeers::from(3)).await,
+            20
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_timestamp_pads_lone_voter_to_the_floor() {
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        // num_peers = 4, only ONE row seeded to a high value `v`. Padded to
+        // [v, 0, 0, 0], sorted [0, 0, 0, v], index 4/2 = 2 -> 0. A lone voter
+        // cannot move the clock off the floor.
+        let v = 1_800_000_000;
+        seed_clock(&mut dbtx.to_ref_nc(), &[v]).await;
+        assert_eq!(
+            consensus_timestamp(&mut dbtx.to_ref_nc(), NumPeers::from(4)).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_timestamp_reaches_v_once_a_majority_agree() {
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        // Contrast with the lone-voter case above: num_peers = 4, THREE rows
+        // seeded to `v`. Padded to [v, v, v, 0], sorted [0, v, v, v], index
+        // 4/2 = 2 -> v.
+        let v = 1_800_000_000;
+        seed_clock(&mut dbtx.to_ref_nc(), &[v, v, v]).await;
+        assert_eq!(
+            consensus_timestamp(&mut dbtx.to_ref_nc(), NumPeers::from(4)).await,
+            v
+        );
     }
 
     // ---- MakeOffer ----------------------------------------------------------
@@ -1368,5 +1470,232 @@ mod tests {
         .await
         .expect("Taker claim");
         assert_eq!(audit_net(&m, &mut dbtx.to_ref_nc()).await, 0);
+    }
+
+    // ---- process_consensus_item / consensus_proposal (Phase 4 clock) --------
+
+    #[tokio::test]
+    async fn process_consensus_item_stores_value_and_median_reflects_it() {
+        let m = module_with(PeerId::from(0), NumPeers::from(3));
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+
+        for (peer, ts) in [(0u16, 10u64), (1, 30), (2, 20)] {
+            m.process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                SwapConsensusItem { unix_secs: ts },
+                PeerId::from(peer),
+            )
+            .await
+            .expect("first proposal from this peer is accepted");
+        }
+
+        // 3 rows, num_peers = 3: no padding. Median of {10, 20, 30} is 20.
+        assert_eq!(
+            consensus_timestamp(&mut dbtx.to_ref_nc(), NumPeers::from(3)).await,
+            20
+        );
+    }
+
+    #[tokio::test]
+    async fn process_consensus_item_rejects_non_advancing_value() {
+        let m = module_with(PeerId::from(0), NumPeers::from(1));
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        let peer = PeerId::from(0);
+
+        m.process_consensus_item(
+            &mut dbtx.to_ref_nc(),
+            SwapConsensusItem { unix_secs: 100 },
+            peer,
+        )
+        .await
+        .expect("first proposal accepted");
+
+        // A value not strictly newer than the stored one is rejected...
+        assert!(
+            m.process_consensus_item(
+                &mut dbtx.to_ref_nc(),
+                SwapConsensusItem { unix_secs: 50 },
+                peer,
+            )
+            .await
+            .is_err()
+        );
+
+        // ...and leaves the stored value unchanged.
+        assert_eq!(
+            dbtx.to_ref_nc().get_value(&ConsensusTsKey(peer)).await,
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn process_consensus_item_rejects_exact_repeat_as_a_no_op() {
+        let m = module_with(PeerId::from(0), NumPeers::from(1));
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        let peer = PeerId::from(0);
+        let item = SwapConsensusItem { unix_secs: 100 };
+
+        m.process_consensus_item(&mut dbtx.to_ref_nc(), item.clone(), peer)
+            .await
+            .expect("first proposal accepted");
+
+        // Re-applying the exact same value is a no-op and must Err (the
+        // history-size rule: process_consensus_item must Err on no-ops).
+        assert!(
+            m.process_consensus_item(&mut dbtx.to_ref_nc(), item, peer)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            dbtx.to_ref_nc().get_value(&ConsensusTsKey(peer)).await,
+            Some(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_expires_once_clock_advances_past_expiry_via_consensus_items() {
+        let m = module_with(PeerId::from(0), NumPeers::from(1));
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        let peer = PeerId::from(0);
+
+        // Seed the clock through the real population path (not `seed_clock`).
+        m.process_consensus_item(
+            &mut dbtx.to_ref_nc(),
+            SwapConsensusItem { unix_secs: NOW },
+            peer,
+        )
+        .await
+        .expect("seed clock");
+
+        let expiry = NOW + 100;
+        let offer_id = out_point(0);
+        m.process_output(
+            &mut dbtx.to_ref_nc(),
+            &SwapOutput::MakeOffer {
+                maker_unit: MAKER_UNIT,
+                maker_amount: MAKER_AMOUNT,
+                taker_unit: TAKER_UNIT,
+                taker_amount: TAKER_AMOUNT,
+                expiry,
+                maker_pk: maker_pk(),
+            },
+            offer_id,
+        )
+        .await
+        .expect("valid MakeOffer just above the clock");
+
+        // Advance the clock past `expiry` via more `process_consensus_item`
+        // calls.
+        m.process_consensus_item(
+            &mut dbtx.to_ref_nc(),
+            SwapConsensusItem {
+                unix_secs: expiry + 1,
+            },
+            peer,
+        )
+        .await
+        .expect("advance clock past expiry");
+
+        assert_eq!(
+            m.process_output(
+                &mut dbtx.to_ref_nc(),
+                &SwapOutput::Fill {
+                    offer_id,
+                    taker_pk: taker_pk(),
+                },
+                out_point(1),
+            )
+            .await,
+            Err(SwapOutputError::OfferExpired)
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_succeeds_while_clock_still_below_expiry_via_consensus_items() {
+        let m = module_with(PeerId::from(0), NumPeers::from(1));
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+        let peer = PeerId::from(0);
+
+        m.process_consensus_item(
+            &mut dbtx.to_ref_nc(),
+            SwapConsensusItem { unix_secs: NOW },
+            peer,
+        )
+        .await
+        .expect("seed clock");
+
+        let expiry = NOW + 100;
+        let offer_id = out_point(0);
+        m.process_output(
+            &mut dbtx.to_ref_nc(),
+            &SwapOutput::MakeOffer {
+                maker_unit: MAKER_UNIT,
+                maker_amount: MAKER_AMOUNT,
+                taker_unit: TAKER_UNIT,
+                taker_amount: TAKER_AMOUNT,
+                expiry,
+                maker_pk: maker_pk(),
+            },
+            offer_id,
+        )
+        .await
+        .expect("valid MakeOffer just above the clock");
+
+        // Advance the clock, but keep it strictly below `expiry`.
+        m.process_consensus_item(
+            &mut dbtx.to_ref_nc(),
+            SwapConsensusItem {
+                unix_secs: expiry - 1,
+            },
+            peer,
+        )
+        .await
+        .expect("advance clock, still below expiry");
+
+        let meta = m
+            .process_output(
+                &mut dbtx.to_ref_nc(),
+                &SwapOutput::Fill {
+                    offer_id,
+                    taker_pk: taker_pk(),
+                },
+                out_point(1),
+            )
+            .await
+            .expect("Fill succeeds: clock still below expiry");
+        assert_eq!(meta.amounts, amounts(TAKER_UNIT, TAKER_AMOUNT));
+    }
+
+    #[tokio::test]
+    async fn consensus_proposal_is_empty_when_last_value_is_far_future() {
+        let m = module_with(PeerId::from(0), NumPeers::from(1));
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+
+        dbtx.to_ref_nc()
+            .insert_new_entry(&ConsensusTsKey(PeerId::from(0)), &u64::MAX)
+            .await;
+
+        assert_eq!(
+            m.consensus_proposal(&mut dbtx.to_ref_nc()).await,
+            Vec::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_proposal_returns_item_when_stale_or_absent() {
+        let m = module_with(PeerId::from(0), NumPeers::from(1));
+        let db = new_db();
+        let mut dbtx = db.begin_transaction().await;
+
+        // No `ConsensusTsKey(our_peer_id)` row: defaults to 0, which is stale.
+        let items = m.consensus_proposal(&mut dbtx.to_ref_nc()).await;
+        assert_eq!(items.len(), 1);
+        assert!(items[0].unix_secs > 0);
     }
 }
