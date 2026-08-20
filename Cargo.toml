@@ -83,6 +83,7 @@ members = [
     "modules/fedimint-mintv2-common",
     "modules/fedimint-mintv2-server",
     "modules/fedimint-mintv2-tests",
+    "modules/fedimint-swap-common",
     "modules/fedimint-unknown-common",
     "modules/fedimint-unknown-server",
     "modules/fedimint-usdt-client",
@@ -262,6 +263,7 @@ fedimint-server = { path = "./fedimint-server", version = "=0.12.0-alpha" }
 fedimint-server-bitcoin-rpc = { path = "./fedimint-server-bitcoin-rpc", version = "=0.12.0-alpha" }
 fedimint-server-core = { path = "./fedimint-server-core", version = "=0.12.0-alpha" }
 fedimint-server-ui = { path = "./fedimint-server-ui", version = "=0.12.0-alpha" }
+fedimint-swap-common = { path = "./modules/fedimint-swap-common", version = "=0.12.0-alpha" }
 fedimint-testing = { path = "./fedimint-testing", version = "=0.12.0-alpha" }
 fedimint-testing-core = { path = "./fedimint-testing-core", version = "=0.12.0-alpha" }
 fedimint-threshold-ecdsa = { path = "./crypto/threshold-ecdsa", version = "=0.12.0-alpha" }
