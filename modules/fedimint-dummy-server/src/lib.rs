@@ -218,7 +218,12 @@ impl ServerModule for Dummy {
 
         Ok(InputMeta {
             amount: TransactionItemAmounts {
-                amounts: Amounts::new_bitcoin(input.amount),
+                // Honor the input's declared unit so the dummy module can print
+                // funds in ANY unit (not just Bitcoin), letting tests bootstrap
+                // e-cash into a custom-unit primary module. `input.unit ==
+                // AmountUnit::BITCOIN` reproduces the previous behavior exactly,
+                // since `new_custom(BITCOIN, x) == new_bitcoin(x)`.
+                amounts: Amounts::new_custom(input.unit, input.amount),
                 fees: Amounts::ZERO,
             },
             pub_key: input.pub_key,
@@ -235,7 +240,9 @@ impl ServerModule for Dummy {
             .await;
 
         Ok(TransactionItemAmounts {
-            amounts: Amounts::new_bitcoin(output.amount),
+            // Mirror `process_input`: credit the output's declared unit so the
+            // dummy module round-trips custom-unit funds (Bitcoin unchanged).
+            amounts: Amounts::new_custom(output.unit, output.amount),
             fees: Amounts::ZERO,
         })
     }

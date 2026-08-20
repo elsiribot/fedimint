@@ -86,6 +86,7 @@ members = [
     "modules/fedimint-swap-client",
     "modules/fedimint-swap-common",
     "modules/fedimint-swap-server",
+    "modules/fedimint-swap-tests",
     "modules/fedimint-unknown-common",
     "modules/fedimint-unknown-server",
     "modules/fedimint-usdt-client",

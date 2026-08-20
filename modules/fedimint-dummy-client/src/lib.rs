@@ -316,15 +316,24 @@ impl DummyClientModule {
     /// The dummy server accepts any public key, so this can be used to create
     /// funds out of thin air that get converted to e-cash as change.
     pub fn create_input(&self, amount: Amount) -> ClientInputBundle {
+        self.create_input_in_unit(AmountUnit::BITCOIN, amount)
+    }
+
+    /// Like [`Self::create_input`], but prints funds in an arbitrary
+    /// [`AmountUnit`]. Lets a test bootstrap e-cash into a custom-unit primary
+    /// module (e.g. a second `mintv2` instance) the same way `create_input`
+    /// bootstraps Bitcoin e-cash: the surplus is minted as change by whichever
+    /// primary module is registered for `unit`.
+    pub fn create_input_in_unit(&self, unit: AmountUnit, amount: Amount) -> ClientInputBundle {
         let keypair = Keypair::new(&Secp256k1::new(), &mut rand::rngs::OsRng);
 
         let client_input = ClientInput {
             input: DummyInput {
                 amount,
-                unit: AmountUnit::BITCOIN,
+                unit,
                 pub_key: keypair.public_key(),
             },
-            amounts: Amounts::new_bitcoin(amount),
+            amounts: Amounts::new_custom(unit, amount),
             keys: vec![keypair],
         };
 

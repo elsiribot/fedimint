@@ -5960,6 +5960,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "fedimint-swap-tests"
+version = "0.12.0-alpha"
+dependencies = [
+ "anyhow",
+ "fedimint-client",
+ "fedimint-core",
+ "fedimint-dummy-client",
+ "fedimint-dummy-common",
+ "fedimint-dummy-server",
+ "fedimint-mintv2-client",
+ "fedimint-mintv2-common",
+ "fedimint-mintv2-server",
+ "fedimint-swap-client",
+ "fedimint-swap-common",
+ "fedimint-swap-server",
+ "fedimint-testing",
+ "futures",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fedimint-tbs"
 version = "0.12.0-alpha"
 dependencies = [
