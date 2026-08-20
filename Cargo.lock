@@ -4290,6 +4290,7 @@ dependencies = [
  "fedimint-mint-client",
  "fedimint-mintv2-client",
  "fedimint-rocksdb",
+ "fedimint-swap-client",
  "fedimint-usdt-client",
  "fedimint-wallet-client",
  "fedimint-walletv2-client",
@@ -5903,6 +5904,28 @@ dependencies = [
  "qrcode",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "fedimint-swap-client"
+version = "0.12.0-alpha"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "erased-serde",
+ "fedimint-api-client",
+ "fedimint-client-module",
+ "fedimint-core",
+ "fedimint-derive-secret",
+ "fedimint-swap-common",
+ "futures",
+ "serde",
+ "serde_json",
+ "strum 0.27.1",
+ "strum_macros 0.27.1",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

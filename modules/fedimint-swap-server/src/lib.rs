@@ -14,8 +14,9 @@ use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    Amounts, ApiEndpoint, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
+    Amounts, ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
     ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
+    api_endpoint,
 };
 use fedimint_core::{Amount, InPoint, NumPeers, OutPoint, PeerId, push_db_pair_items};
 use fedimint_server_core::config::PeerHandleOps;
@@ -27,6 +28,7 @@ pub use fedimint_swap_common as common;
 use fedimint_swap_common::config::{
     SwapClientConfig, SwapConfig, SwapConfigConsensus, SwapConfigPrivate,
 };
+use fedimint_swap_common::endpoint_constants::{GET_OFFER_ENDPOINT, LIST_OPEN_OFFERS_ENDPOINT};
 use fedimint_swap_common::{
     MODULE_CONSENSUS_VERSION, Offer, OfferState, Party, SwapCommonInit, SwapConsensusItem,
     SwapInput, SwapInputError, SwapModuleTypes, SwapOutput, SwapOutputError, SwapOutputOutcome,
@@ -464,8 +466,40 @@ impl ServerModule for Swap {
     }
 
     fn api_endpoints(&self) -> Vec<ApiEndpoint<Self>> {
-        // Phase 5 adds `list_open_offers`/`get_offer`.
-        Vec::new()
+        vec![
+            api_endpoint! {
+                LIST_OPEN_OFFERS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |_module: &Swap, context, _params: ()| -> Vec<(OutPoint, Offer)> {
+                    // Pure DB read: scan every offer and keep only the `Open`
+                    // ones, mapping each to its offer id (the `MakeOffer`
+                    // output's `OutPoint`, i.e. the `OfferKey`). Deterministic,
+                    // so any guardian answers identically
+                    // (threshold-agreement via `request_current_consensus`).
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+                    let offers = dbtx
+                        .find_by_prefix(&OfferPrefix)
+                        .await
+                        .filter_map(|(key, offer)| async move {
+                            (offer.state == OfferState::Open).then_some((key.0, offer))
+                        })
+                        .collect::<Vec<_>>()
+                        .await;
+                    Ok(offers)
+                }
+            },
+            api_endpoint! {
+                GET_OFFER_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |_module: &Swap, context, offer_id: OutPoint| -> Option<Offer> {
+                    // Pure DB read of a single offer's full record.
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+                    Ok(dbtx.get_value(&OfferKey(offer_id)).await)
+                }
+            },
+        ]
     }
 }
 

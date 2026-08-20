@@ -83,6 +83,7 @@ members = [
     "modules/fedimint-mintv2-common",
     "modules/fedimint-mintv2-server",
     "modules/fedimint-mintv2-tests",
+    "modules/fedimint-swap-client",
     "modules/fedimint-swap-common",
     "modules/fedimint-swap-server",
     "modules/fedimint-unknown-common",
@@ -264,6 +265,7 @@ fedimint-server = { path = "./fedimint-server", version = "=0.12.0-alpha" }
 fedimint-server-bitcoin-rpc = { path = "./fedimint-server-bitcoin-rpc", version = "=0.12.0-alpha" }
 fedimint-server-core = { path = "./fedimint-server-core", version = "=0.12.0-alpha" }
 fedimint-server-ui = { path = "./fedimint-server-ui", version = "=0.12.0-alpha" }
+fedimint-swap-client = { path = "./modules/fedimint-swap-client", version = "=0.12.0-alpha" }
 fedimint-swap-common = { path = "./modules/fedimint-swap-common", version = "=0.12.0-alpha" }
 fedimint-swap-server = { path = "./modules/fedimint-swap-server", version = "=0.12.0-alpha" }
 fedimint-testing = { path = "./fedimint-testing", version = "=0.12.0-alpha" }

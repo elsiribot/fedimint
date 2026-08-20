@@ -64,6 +64,7 @@ use fedimint_ln_client::LightningClientInit;
 use fedimint_logging::{LOG_CLIENT, TracingSetup};
 use fedimint_meta_client::{MetaClientInit, MetaModuleMetaSourceWithFallback};
 use fedimint_mint_client::{MintClientInit, MintClientModule, OOBNotes};
+use fedimint_swap_client::SwapClientInit;
 use fedimint_usdt_client::UsdtClientInit;
 use fedimint_wallet_client::api::WalletFederationApi;
 use fedimint_wallet_client::{WalletClientInit, WalletClientModule};
@@ -842,6 +843,7 @@ impl FedimintCli {
             .with_module(fedimint_lnv2_client::LightningClientInit::default())
             .with_module(fedimint_walletv2_client::WalletClientInit)
             .with_module(UsdtClientInit)
+            .with_module(SwapClientInit)
     }
 
     pub async fn run(&mut self) {
