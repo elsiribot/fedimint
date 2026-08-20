@@ -290,10 +290,11 @@ impl SwapClientModule {
                     operation_id,
                     offer_id,
                     maker_keypair,
+                    index,
                     taker_unit,
                     taker_amount,
                 },
-                state: MakerSMState::AwaitingFill,
+                state: MakerSMState::AwaitingAccept,
             })]
         };
 
@@ -337,12 +338,13 @@ impl SwapClientModule {
             out_idx: 0,
         };
 
-        // Persist `offer_id -> index` so a restarted client can re-derive the
-        // maker keypair for a later `reclaim` (the maker SM also embeds the
-        // keypair directly for its own `Claim`).
-        let mut dbtx = self.db.begin_transaction().await;
-        dbtx.insert_entry(&KeyIndexKey(offer_id), &index).await;
-        dbtx.commit_tx().await;
+        // `KeyIndexKey(offer_id) -> index` is persisted by the maker SM's own
+        // `AwaitingAccept` transition (see `maker_sm::MakerSMState::
+        // AwaitingAccept`), NOT here: that transition's dbtx commits
+        // atomically with the SM's own state advance, and the SM's initial
+        // state was itself persisted atomically with the `MakeOffer`
+        // submission above -- so the mapping `reclaim` depends on survives a
+        // crash at any point, unlike a separate post-submit write here would.
 
         // Await consensus acceptance: turns a rejection (e.g. an expiry already
         // in the past, or the same unit on both legs) into an `Err` rather than
@@ -421,17 +423,11 @@ impl SwapClientModule {
             )
             .await?;
 
-        // Persist `fill_out_point -> index` (keyed by OUR fill output, distinct
-        // from the maker's `offer_id` key) so a restart can re-derive the taker
-        // keypair; the taker SM also embeds it directly for its `Claim`.
-        let fill_out_point = OutPoint {
-            txid: range.txid(),
-            out_idx: 0,
-        };
-        let mut dbtx = self.db.begin_transaction().await;
-        dbtx.insert_entry(&KeyIndexKey(fill_out_point), &index)
-            .await;
-        dbtx.commit_tx().await;
+        // Unlike the maker's `KeyIndexKey(offer_id)` (which `reclaim` reads),
+        // nothing ever reads a `KeyIndexKey` keyed by the taker's fill
+        // output -- the taker SM embeds `taker_keypair` directly for its own
+        // `Claim` -- so, unlike the maker side, there is no mapping to
+        // persist here at all.
 
         // Await acceptance: surfaces a losing fill (e.g. the offer was filled or
         // expired first) as an `Err` rather than a silent `Ok`.
