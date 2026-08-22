@@ -47,8 +47,10 @@ use fedimint_client::secret::RootSecretStrategy;
 use fedimint_client::{AdminCreds, Client, ClientBuilder, ClientHandleArc, RootSecret};
 use fedimint_connectors::{Connectivity, ConnectorRegistry};
 use fedimint_core::base32::FEDIMINT_PREFIX;
-use fedimint_core::config::{FederationId, FederationIdPrefix};
-use fedimint_core::core::ModuleInstanceId;
+use fedimint_core::config::{
+    FederationId, FederationIdPrefix, ServerModuleConfigGenParamsRegistry,
+};
+use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::db::{Database, DatabaseValue, IDatabaseTransactionOpsCoreTyped as _};
 use fedimint_core::encoding::Decodable;
 use fedimint_core::invite_code::InviteCode;
@@ -1928,13 +1930,20 @@ impl FedimintCli {
                 name,
                 federation_name,
                 federation_size,
+                modules,
             } => {
+                let module_params = if modules.is_empty() {
+                    None
+                } else {
+                    Some(parse_module_instances(modules)?)
+                };
+
                 let info = client
                     .set_local_params(
                         name.clone(),
                         federation_name.clone(),
                         None,
-                        None,
+                        module_params,
                         *federation_size,
                         cli.auth()?,
                     )
@@ -2032,5 +2041,133 @@ fn metadata_from_clap_cli_test() {
         ),
     ] {
         assert_eq!(metadata_from_clap_cli(args).unwrap(), expected);
+    }
+}
+
+/// Parses repeatable `--module <kind>[=<json>]` specs into the config-gen
+/// instance list. Instance ids are assigned by position (flag order). `<json>`
+/// is that module's config-gen params (inline, or `@<path>` to read a file);
+/// omitting `=<json>` yields JSON null, matching a paramless (`()`) module's
+/// default. Params are passed through verbatim — the server validates them per
+/// module at DKG — so the CLI stays decoupled from module param types.
+fn parse_module_instances(specs: &[String]) -> anyhow::Result<ServerModuleConfigGenParamsRegistry> {
+    let mut registry = ServerModuleConfigGenParamsRegistry::default();
+
+    for spec in specs {
+        let (kind_str, params) = match spec.split_once('=') {
+            None => (spec.as_str(), serde_json::Value::Null),
+            Some((kind_str, raw)) => {
+                let json = match raw.strip_prefix('@') {
+                    Some(path) => std::fs::read_to_string(path)
+                        .with_context(|| format!("reading module params file {path:?}"))?,
+                    None => raw.to_string(),
+                };
+                let value: serde_json::Value = serde_json::from_str(&json)
+                    .with_context(|| format!("parsing JSON params for module {kind_str:?}"))?;
+                (kind_str, value)
+            }
+        };
+
+        anyhow::ensure!(!kind_str.is_empty(), "module kind must not be empty");
+        registry.attach_config_gen_params(ModuleKind::clone_from_str(kind_str), params);
+    }
+
+    Ok(registry)
+}
+
+#[cfg(test)]
+mod module_instances_tests {
+    use fedimint_core::core::ModuleKind;
+
+    use super::parse_module_instances;
+
+    #[test]
+    fn parses_full_deployment_topology() {
+        let specs: Vec<String> = [
+            "walletv2",
+            r#"mintv2={"amount_unit":0}"#,
+            "lnv2",
+            r#"usdt={"chain_id":1}"#,
+            r#"mintv2={"amount_unit":1}"#,
+            "swap",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let registry = parse_module_instances(&specs).expect("valid specs must parse");
+
+        let instances: Vec<(u16, String)> = registry
+            .iter_modules()
+            .map(|(id, kind, _)| (id, kind.to_string()))
+            .collect();
+        assert_eq!(
+            instances,
+            vec![
+                (0, "walletv2".to_string()),
+                (1, "mintv2".to_string()),
+                (2, "lnv2".to_string()),
+                (3, "usdt".to_string()),
+                (4, "mintv2".to_string()),
+                (5, "swap".to_string()),
+            ],
+            "instances keep flag order with ids 0..5"
+        );
+
+        // The two mintv2 instances carry their distinct units.
+        let mintv2_params: Vec<serde_json::Value> = registry
+            .iter_modules()
+            .filter(|(_, kind, _)| **kind == ModuleKind::clone_from_str("mintv2"))
+            .map(|(_, _, params)| params.clone())
+            .collect();
+        assert_eq!(
+            mintv2_params,
+            vec![
+                serde_json::json!({ "amount_unit": 0 }),
+                serde_json::json!({ "amount_unit": 1 }),
+            ]
+        );
+
+        // Paramless modules serialize to JSON null.
+        let walletv2_params = registry
+            .iter_modules()
+            .find(|(_, kind, _)| **kind == ModuleKind::clone_from_str("walletv2"))
+            .map(|(_, _, params)| params.clone())
+            .expect("walletv2 present");
+        assert_eq!(walletv2_params, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn reads_params_from_at_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("fm-test-usdt-params.json");
+        std::fs::write(&path, r#"{"chain_id":42}"#).expect("write temp params");
+
+        let spec = format!("usdt=@{}", path.display());
+        let registry = parse_module_instances(&[spec]).expect("@file params must parse");
+
+        let params = registry
+            .iter_modules()
+            .next()
+            .map(|(_, _, params)| params.clone())
+            .expect("one instance");
+        assert_eq!(params, serde_json::json!({ "chain_id": 42 }));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rejects_malformed_json() {
+        let err = parse_module_instances(&[r#"mintv2={not json}"#.to_string()])
+            .expect_err("malformed JSON must error");
+        assert!(
+            err.to_string().contains("mintv2"),
+            "error should name the offending module kind, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_kind() {
+        parse_module_instances(&[r#"={"a":1}"#.to_string()]).expect_err("empty kind must error");
     }
 }

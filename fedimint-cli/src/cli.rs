@@ -181,6 +181,18 @@ pub(crate) enum SetupAdminCmd {
         federation_name: Option<String>,
         #[clap(long)]
         federation_size: Option<u32>,
+        /// Leader-only: define one module instance for config generation.
+        /// Repeatable; instance ids are assigned in the order given.
+        /// Format: `<kind>[=<json>]`, where <json> is that module's config-gen
+        /// params, inline or `@<path>` to read from a file. Omit `=<json>` for
+        /// modules with no params (e.g. `--module lnv2`). Consensus-relevant
+        /// params (mintv2 amount_unit, usdt contract/chain/addresses) MUST be
+        /// set here so every guardian shares one authoritative value;
+        /// local params (RPC, poll interval, secrets) stay per-guardian
+        /// env. Only the leader passes these; other guardians inherit
+        /// them via the setup code.
+        #[clap(long = "module")]
+        modules: Vec<String>,
     },
     AddPeer {
         info: String,
