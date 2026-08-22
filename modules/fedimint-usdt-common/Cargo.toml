@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 hex = { workspace = true }
 hex_lit = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -170,8 +170,28 @@ pub const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVers
 pub const USDT_UNIT: AmountUnit = AmountUnit::new_custom(1);
 
 /// A 20-byte EVM (Ethereum-style) address.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Encodable, Decodable)]
 pub struct EvmAddress(pub [u8; 20]);
+
+impl<'de> serde::Deserialize<'de> for EvmAddress {
+    /// Accepts EITHER a `0x`-hex string (human-authored config-gen params) OR a
+    /// 20-byte array (the previously-derived form), so existing serialized
+    /// values still round-trip. `Serialize` remains the derived byte array, so
+    /// no persisted/wire format changes.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Hex(String),
+            Bytes([u8; 20]),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Hex(s) => s.parse().map_err(serde::de::Error::custom),
+            Repr::Bytes(bytes) => Ok(EvmAddress(bytes)),
+        }
+    }
+}
 
 impl fmt::Display for EvmAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2947,5 +2967,63 @@ mod tests {
         let mut at_ceiling = valid_prod_params();
         at_ceiling.broadcaster_min_balance_wei = MAX_BROADCASTER_MIN_BALANCE_WEI;
         validate_usdt_params(&at_ceiling).expect("exactly at the ceiling must be accepted");
+    }
+
+    #[test]
+    fn evm_address_deserializes_from_hex_string() {
+        let json = "\"0xdac17f958d2ee523a2206206994597c13d831ec7\"";
+        let addr: EvmAddress = serde_json::from_str(json).expect("hex string must deserialize");
+        assert_eq!(
+            addr,
+            "0xdac17f958d2ee523a2206206994597c13d831ec7"
+                .parse::<EvmAddress>()
+                .expect("FromStr must parse the same address"),
+        );
+    }
+
+    #[test]
+    fn evm_address_deserializes_from_byte_array() {
+        // Backward compatibility: the pre-existing derived form was a 20-number array.
+        let bytes = [0u8; 20];
+        let json = serde_json::to_string(&bytes).expect("serialize byte array");
+        let addr: EvmAddress =
+            serde_json::from_str(&json).expect("byte array must still deserialize");
+        assert_eq!(addr, EvmAddress([0u8; 20]));
+    }
+
+    #[test]
+    fn evm_address_serialize_deserialize_round_trips() {
+        let addr = "0x0000000071727de22e5e9d8baf0edac6f37da032"
+            .parse::<EvmAddress>()
+            .expect("valid address");
+        let json = serde_json::to_string(&addr).expect("serialize");
+        let back: EvmAddress = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(addr, back);
+    }
+
+    #[test]
+    fn usdt_gen_params_deserializes_with_hex_addresses() {
+        let json = serde_json::json!({
+            "usdt_contract": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+            "chain_id": 1,
+            "confirmation_depth": 12,
+            "entry_point": "0x0000000071727de22e5e9d8baf0edac6f37da032",
+            "account_factory": "0x1111111111111111111111111111111111111111",
+            "simple_account_impl": "0x2222222222222222222222222222222222222222",
+            "check_ttl_blocks": 200,
+            "broadcaster_min_balance_wei": 10000000000000000u64,
+            "eth_usd_price_feed": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+            "price_feed_max_staleness_secs": 14400,
+            "residual_recovery_recipient": "0x3333333333333333333333333333333333333333"
+        });
+        let params: UsdtGenParams =
+            serde_json::from_value(json).expect("hex-authored usdt params must deserialize");
+        assert_eq!(params.chain_id, 1);
+        assert_eq!(
+            params.usdt_contract,
+            "0xdac17f958d2ee523a2206206994597c13d831ec7"
+                .parse::<EvmAddress>()
+                .expect("valid"),
+        );
     }
 }
