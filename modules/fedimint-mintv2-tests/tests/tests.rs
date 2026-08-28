@@ -22,9 +22,12 @@ use fedimint_mintv2_common::config::MintGenParams;
 use fedimint_mintv2_server::MintInit;
 use fedimint_testing::federation::FederationTest;
 use fedimint_testing::fixtures::Fixtures;
-use fedimint_usdt_common::USDT_UNIT;
 use futures::StreamExt;
 use serde_json::Value;
+
+/// A custom non-Bitcoin test unit, formerly `fedimint_usdt_common::USDT_UNIT`.
+/// Kept local so these platform tests carry no out-of-tree module dependency.
+const USDT_UNIT: AmountUnit = AmountUnit::new_custom(1);
 
 #[derive(Debug, PartialEq, Eq)]
 enum MintEvent {
@@ -500,9 +503,9 @@ async fn transaction_with_invalid_signature_is_rejected() -> anyhow::Result<()> 
 
 /// Boots a federation with TWO mintv2 instances: the default
 /// Bitcoin-denominated one plus a second instance denominated in
-/// [`USDT_UNIT`] (`fedimint_usdt_common::USDT_UNIT`, the same constant a
-/// future usdt module must credit into). This is the concrete capability the
-/// USDT-on-EVM wallet module depends on: a configurable-unit mintv2 instance
+/// [`USDT_UNIT`] (a custom non-Bitcoin unit). This is the concrete capability
+/// an out-of-tree module (e.g. a USDT-on-EVM wallet) depends on: a
+/// configurable-unit mintv2 instance
 /// coexisting with the Bitcoin one in a single federation, with the client
 /// routing balance queries to the correct instance based on `AmountUnit`.
 #[tokio::test(flavor = "multi_thread")]

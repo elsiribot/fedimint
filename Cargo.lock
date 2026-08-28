@@ -4290,8 +4290,6 @@ dependencies = [
  "fedimint-mint-client",
  "fedimint-mintv2-client",
  "fedimint-rocksdb",
- "fedimint-swap-client",
- "fedimint-usdt-client",
  "fedimint-wallet-client",
  "fedimint-walletv2-client",
  "fs-lock",
@@ -5639,7 +5637,6 @@ dependencies = [
  "fedimint-tbs",
  "fedimint-testing",
  "fedimint-threshold-crypto",
- "fedimint-usdt-common",
  "ff",
  "futures",
  "rand 0.8.5",
@@ -5910,78 +5907,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fedimint-swap-client"
-version = "0.12.0-alpha"
-dependencies = [
- "anyhow",
- "async-trait",
- "erased-serde",
- "fedimint-api-client",
- "fedimint-client-module",
- "fedimint-core",
- "fedimint-derive-secret",
- "fedimint-swap-common",
- "futures",
- "serde",
- "serde_json",
- "strum 0.27.1",
- "strum_macros 0.27.1",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "fedimint-swap-common"
-version = "0.12.0-alpha"
-dependencies = [
- "anyhow",
- "fedimint-core",
- "secp256k1 0.29.1",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "fedimint-swap-server"
-version = "0.12.0-alpha"
-dependencies = [
- "anyhow",
- "async-trait",
- "erased-serde",
- "fedimint-core",
- "fedimint-server-core",
- "fedimint-swap-common",
- "futures",
- "serde",
- "strum 0.27.1",
- "strum_macros 0.27.1",
- "tokio",
-]
-
-[[package]]
-name = "fedimint-swap-tests"
-version = "0.12.0-alpha"
-dependencies = [
- "anyhow",
- "fedimint-client",
- "fedimint-core",
- "fedimint-dummy-client",
- "fedimint-dummy-common",
- "fedimint-dummy-server",
- "fedimint-mintv2-client",
- "fedimint-mintv2-common",
- "fedimint-mintv2-server",
- "fedimint-swap-client",
- "fedimint-swap-common",
- "fedimint-swap-server",
- "fedimint-testing",
- "futures",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "fedimint-tbs"
 version = "0.12.0-alpha"
 dependencies = [
@@ -6169,122 +6094,6 @@ dependencies = [
  "fedimint-unknown-common",
  "strum 0.27.1",
  "strum_macros 0.27.1",
-]
-
-[[package]]
-name = "fedimint-usdt-client"
-version = "0.12.0-alpha"
-dependencies = [
- "alloy-consensus",
- "alloy-primitives",
- "alloy-rlp",
- "anyhow",
- "async-trait",
- "clap",
- "erased-serde",
- "fedimint-api-client",
- "fedimint-client-module",
- "fedimint-core",
- "fedimint-derive-secret",
- "fedimint-logging",
- "fedimint-usdt-common",
- "futures",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "strum 0.27.1",
- "strum_macros 0.27.1",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "fedimint-usdt-common"
-version = "0.12.0-alpha"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
- "anyhow",
- "fedimint-core",
- "hex",
- "hex_lit",
- "secp256k1 0.29.1",
- "serde",
- "serde_json",
- "sha3 0.10.8",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "fedimint-usdt-server"
-version = "0.12.0-alpha"
-dependencies = [
- "alloy",
- "alloy-consensus",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-trie",
- "anyhow",
- "async-trait",
- "bls12_381",
- "cggmp21",
- "erased-serde",
- "fedimint-core",
- "fedimint-server-core",
- "fedimint-threshold-ecdsa",
- "fedimint-usdt-common",
- "futures",
- "hex",
- "rand 0.8.5",
- "secp256k1 0.29.1",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "strum 0.27.1",
- "strum_macros 0.27.1",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "fedimint-usdt-tests"
-version = "0.12.0-alpha"
-dependencies = [
- "alloy",
- "alloy-consensus",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-trie",
- "anyhow",
- "async-trait",
- "clap",
- "devimint",
- "fedimint-api-client",
- "fedimint-bip39",
- "fedimint-client",
- "fedimint-client-module",
- "fedimint-connectors",
- "fedimint-core",
- "fedimint-logging",
- "fedimint-mint-client",
- "fedimint-mint-common",
- "fedimint-mint-server",
- "fedimint-mintv2-client",
- "fedimint-mintv2-common",
- "fedimint-mintv2-server",
- "fedimint-server",
- "fedimint-testing",
- "fedimint-usdt-client",
- "fedimint-usdt-common",
- "fedimint-usdt-server",
- "futures",
- "hex",
- "serde_json",
- "strum 0.27.1",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -6538,10 +6347,8 @@ dependencies = [
  "fedimint-server-bitcoin-rpc",
  "fedimint-server-core",
  "fedimint-server-ui",
- "fedimint-swap-server",
  "fedimint-unknown-common",
  "fedimint-unknown-server",
- "fedimint-usdt-server",
  "fedimint-wallet-server",
  "fedimint-walletv2-common",
  "fedimint-walletv2-server",

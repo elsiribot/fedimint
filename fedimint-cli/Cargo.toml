@@ -47,8 +47,6 @@ fedimint-meta-client = { workspace = true, features = ["cli"] }
 fedimint-mint-client = { workspace = true, features = ["cli"] }
 fedimint-mintv2-client = { workspace = true, features = ["cli"] }
 fedimint-rocksdb = { workspace = true }
-fedimint-swap-client = { workspace = true }
-fedimint-usdt-client = { workspace = true, features = ["cli"] }
 fedimint-wallet-client = { workspace = true, features = ["cli"] }
 fedimint-walletv2-client = { workspace = true, features = ["cli"] }
 fs-lock = { workspace = true }
