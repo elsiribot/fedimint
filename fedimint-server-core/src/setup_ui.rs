@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
 use fedimint_core::core::ModuleKind;
-use fedimint_core::module::ApiAuth;
+use fedimint_core::module::{ApiAuth, Asset};
 
 pub type DynSetupApi = Arc<dyn ISetupApi + Send + Sync + 'static>;
 
@@ -36,6 +36,17 @@ pub trait ISetupApi {
     /// this to materialize the module instance list from the set of module
     /// kinds the operator selected.
     fn available_module_params(&self) -> ServerModuleConfigGenParamsRegistry;
+
+    /// Every asset the available modules back. The setup UI offers these as
+    /// the denomination choices for modules that take one, so an operator picks
+    /// from what the federation actually holds reserves against rather than
+    /// typing a raw unit id.
+    fn available_assets(&self) -> Vec<Asset>;
+
+    /// For each available module kind denominated in an asset, the config-gen
+    /// params field naming it. Decides which kinds get an asset dropdown, and
+    /// which field the choice is written into.
+    fn asset_param_fields(&self) -> BTreeMap<ModuleKind, String>;
 
     /// Reset the set of other guardians
     async fn reset_setup_codes(&self);

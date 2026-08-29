@@ -22,7 +22,8 @@ use fedimint_core::envs::{
     FM_IROH_P2P_SECRET_KEY_OVERRIDE_ENV, is_env_var_set,
 };
 use fedimint_core::module::{
-    ApiAuth, ApiEndpoint, ApiEndpointContext, ApiError, ApiRequestErased, ApiVersion, api_endpoint,
+    AmountUnit, ApiAuth, ApiEndpoint, ApiEndpointContext, ApiError, ApiRequestErased, ApiVersion,
+    Asset, api_endpoint,
 };
 use fedimint_core::net::auth::check_auth;
 use fedimint_core::setup_code::PeerEndpoints;
@@ -312,6 +313,14 @@ impl ISetupApi for SetupApi {
 
     fn available_module_params(&self) -> ServerModuleConfigGenParamsRegistry {
         self.settings.available_module_params.clone()
+    }
+
+    fn available_assets(&self) -> Vec<Asset> {
+        self.settings.available_assets.clone()
+    }
+
+    fn asset_param_fields(&self) -> BTreeMap<ModuleKind, String> {
+        self.settings.asset_param_fields.clone()
     }
 
     async fn reset_setup_codes(&self) {
@@ -607,6 +616,40 @@ impl ISetupApi for SetupApi {
             );
         }
 
+        // Catch a module denominated in an asset nothing backs here, where the
+        // operator is still looking at the setup screen, rather than letting it
+        // surface as a DKG failure. This only sees assets named through a
+        // module's declared asset field, which is all the setup UI can produce;
+        // `validate_module_assets` re-checks the general case at config gen
+        // with the module registry in hand.
+        for (_, kind, params) in module_params.iter_modules() {
+            let Some(field) = self.settings.asset_param_fields.get(kind) else {
+                continue;
+            };
+            let Some(unit) = params.get(field).and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let unit = AmountUnit::new_custom(unit);
+
+            ensure!(
+                unit.is_bitcoin()
+                    || self
+                        .settings
+                        .available_assets
+                        .iter()
+                        .any(|asset| asset.unit == unit),
+                "Module {kind} is denominated in unit {}, which no module in this build backs. \
+                 Available assets: {}.",
+                unit.id(),
+                self.settings
+                    .available_assets
+                    .iter()
+                    .map(Asset::label)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+
         let our_id = state
             .setup_codes
             .iter()
@@ -867,6 +910,8 @@ mod tests {
                 available_modules: BTreeSet::new(),
                 default_modules: BTreeSet::new(),
                 available_module_params: ServerModuleConfigGenParamsRegistry::default(),
+                available_assets: Vec::new(),
+                asset_param_fields: BTreeMap::new(),
             },
             MemDatabase::new().into_database(),
             sender,

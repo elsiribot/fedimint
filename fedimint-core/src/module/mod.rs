@@ -93,6 +93,51 @@ impl AmountUnit {
     pub const fn bitcoin() -> Self {
         Self::BITCOIN
     }
+
+    /// The raw unit id.
+    ///
+    /// Needed wherever a unit has to survive a round trip through a
+    /// non-Rust representation — an HTML form value, a CLI argument, a
+    /// config-gen params field.
+    pub const fn id(self) -> u64 {
+        self.0
+    }
+}
+
+/// An asset a module can back, i.e. an [`AmountUnit`] together with a name fit
+/// to show an operator.
+///
+/// Modules that hold reserves against an outside system (an on-chain wallet, an
+/// EVM peg) declare what they back via
+/// [`ServerModuleInit::provided_assets`](crate::module::ServerModuleInit); modules
+/// denominated in an asset declare what they need via `required_assets`. Config
+/// generation refuses to build a federation that needs an asset nothing backs,
+/// and the setup UI offers the declared assets as the choices for modules that
+/// take one.
+///
+/// The name is presentational only. Consensus keys off the [`AmountUnit`] alone,
+/// so two modules naming the same unit differently is a config-gen error, not a
+/// consensus split.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct Asset {
+    /// The unit this asset is denominated in.
+    pub unit: AmountUnit,
+    /// Human-readable name, e.g. `"Bitcoin"` or `"USDT"`.
+    pub name: String,
+}
+
+impl Asset {
+    pub fn new(unit: AmountUnit, name: impl Into<String>) -> Self {
+        Self {
+            unit,
+            name: name.into(),
+        }
+    }
+
+    /// Label for a dropdown entry, e.g. `"Bitcoin (unit 0)"`.
+    pub fn label(&self) -> String {
+        format!("{} (unit {})", self.name, self.unit.id())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

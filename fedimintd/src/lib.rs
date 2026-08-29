@@ -380,6 +380,10 @@ pub async fn run(
             &module_init_registry,
             &module_init_registry.kinds(),
         ),
+        available_assets: fedimint_server::config::collect_available_assets(&module_init_registry),
+        asset_param_fields: fedimint_server::config::collect_asset_param_fields(
+            &module_init_registry,
+        ),
     };
 
     let db = Database::new(

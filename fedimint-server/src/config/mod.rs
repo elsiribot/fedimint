@@ -13,7 +13,7 @@ pub use fedimint_core::config::{
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::envs::{is_env_var_set, is_running_in_test_env};
 use fedimint_core::module::{
-    ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, MultiApiVersion,
+    AmountUnit, ApiVersion, Asset, CORE_CONSENSUS_VERSION, CoreConsensusVersion, MultiApiVersion,
     SupportedApiVersionsSummary, SupportedCoreApiVersions,
 };
 use fedimint_core::net::peers::{DynP2PConnections, Recipient};
@@ -228,6 +228,13 @@ pub struct ConfigGenSettings {
     /// id in the canonical instance order. Used to materialize the module
     /// instance list from a set of selected module kinds during setup.
     pub available_module_params: ServerModuleConfigGenParamsRegistry,
+    /// Every asset any available module backs, deduplicated by unit. The setup
+    /// UI offers these as the denomination choices for modules that take one.
+    pub available_assets: Vec<Asset>,
+    /// For each available module kind that is denominated in an asset, the
+    /// config-gen params field naming it. Drives which kinds get an asset
+    /// dropdown in the setup UI, and which field the choice is written to.
+    pub asset_param_fields: BTreeMap<ModuleKind, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -539,6 +546,10 @@ impl ServerConfig {
     ) -> anyhow::Result<Self> {
         let _timing /* logs on drop */ = timing::TimeReporter::new("distributed-gen").info();
 
+        // Before any key material is generated: refuse a topology whose ecash
+        // is denominated in an asset nothing backs.
+        validate_module_assets(&registry, &params.module_params)?;
+
         // in case we are running by ourselves, avoid DKG
         if params.peer_ids().len() == 1 {
             let server = Self::trusted_dealer_gen(
@@ -718,6 +729,110 @@ impl ServerConfig {
 
         Ok(cfg)
     }
+}
+
+/// Every asset any module in `registry` backs, deduplicated by unit and sorted.
+///
+/// Two modules backing the same unit under different names is a
+/// misconfiguration, but not one this function can resolve — it keeps the
+/// first name in kind order and leaves the conflict to
+/// [`validate_module_assets`]'s caller to notice. Consensus keys off the unit
+/// alone, so the name never reaches it.
+pub fn collect_available_assets(registry: &ServerModuleInitRegistry) -> Vec<Asset> {
+    // Bitcoin is the federation's native unit and is always available, whether
+    // or not any module holds on-chain reserves — a lightning-only federation
+    // still denominates in it. Modules that do back it (an on-chain wallet) may
+    // also declare it; deduplication by unit makes that a no-op.
+    let mut by_unit: BTreeMap<AmountUnit, Asset> = BTreeMap::from([(
+        AmountUnit::BITCOIN,
+        Asset::new(AmountUnit::BITCOIN, "Bitcoin"),
+    )]);
+
+    for (_kind, init) in registry.iter() {
+        for asset in init.provided_assets() {
+            by_unit.entry(asset.unit).or_insert(asset);
+        }
+    }
+    by_unit.into_values().collect()
+}
+
+/// For each kind in `registry` that is denominated in an asset, the config-gen
+/// params field naming it.
+pub fn collect_asset_param_fields(
+    registry: &ServerModuleInitRegistry,
+) -> BTreeMap<ModuleKind, String> {
+    registry
+        .iter()
+        .filter_map(|(kind, init)| {
+            init.asset_param_field()
+                .map(|field| (kind.clone(), field.to_owned()))
+        })
+        .collect()
+}
+
+/// Check that every asset some instance requires is backed by some instance.
+///
+/// A mint denominated in a unit no wallet holds reserves against would issue
+/// ecash redeemable against nothing. That is a configuration mistake with no
+/// later recovery — the denomination is baked into the module's consensus
+/// config at DKG — so it is refused here rather than discovered by the first
+/// user who tries to peg out.
+///
+/// Assets are matched on [`AmountUnit`] alone; names are presentational.
+///
+/// Note this validates a *params registry*, so it runs before any key material
+/// exists. Callers that build configs without going through
+/// [`ServerConfig::distributed_gen`] (some tests, `trusted_dealer_gen` used
+/// directly) do not get this check.
+pub fn validate_module_assets(
+    registry: &ServerModuleInitRegistry,
+    module_params: &ServerModuleConfigGenParamsRegistry,
+) -> anyhow::Result<()> {
+    let mut provided: BTreeMap<AmountUnit, String> = BTreeMap::new();
+    for (_id, kind, _params) in module_params.iter_modules() {
+        let Some(init) = registry.get(kind) else {
+            continue;
+        };
+        for asset in init.provided_assets() {
+            provided.insert(asset.unit, asset.name);
+        }
+    }
+
+    for (id, kind, params) in module_params.iter_modules() {
+        let init = registry
+            .get(kind)
+            .with_context(|| format!("Module of kind {kind} not found"))?;
+
+        let required = init
+            .required_assets(params)
+            .with_context(|| format!("Invalid config gen params for {kind} (instance {id})"))?;
+
+        for unit in required {
+            // The native unit needs no backing module: it is what the
+            // federation is denominated in by definition, and a lightning-only
+            // federation has it with no on-chain wallet enabled.
+            if unit.is_bitcoin() {
+                continue;
+            }
+
+            anyhow::ensure!(
+                provided.contains_key(&unit),
+                "Module {kind} (instance {id}) is denominated in unit {}, which no enabled module backs. Enable a module that provides it, or pick one of the available assets: {}.",
+                unit.id(),
+                if provided.is_empty() {
+                    "none are available".to_owned()
+                } else {
+                    provided
+                        .iter()
+                        .map(|(unit, name)| format!("{name} (unit {})", unit.id()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Build a module instance list holding one instance of each module in

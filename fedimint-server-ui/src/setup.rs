@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use anyhow::Context as _;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::http::StatusCode;
@@ -9,6 +10,7 @@ use axum_extra::extract::Form;
 use axum_extra::extract::cookie::CookieJar;
 use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
 use fedimint_core::core::ModuleKind;
+use fedimint_core::module::Asset;
 use fedimint_server_core::setup_ui::DynSetupApi;
 use fedimint_ui_common::assets::WithStaticRoutesExt;
 use fedimint_ui_common::auth::UserAuth;
@@ -40,8 +42,16 @@ pub(crate) struct SetupInput {
     pub federation_size: String,
     #[serde(default)] // will not be sent if disabled
     pub enable_base_fees: bool,
-    #[serde(default)] // list of enabled module kinds
-    pub enabled_modules: Vec<String>,
+    // The module instance list, as three index-aligned arrays: one entry per
+    // row of the setup form. Browsers submit repeated fields in document order,
+    // and every row always submits all three, so entry `i` of each describes
+    // the same instance.
+    #[serde(default)]
+    pub instance_kind: Vec<String>,
+    #[serde(default)]
+    pub instance_asset: Vec<String>,
+    #[serde(default)]
+    pub instance_params: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,10 +218,150 @@ fn restore_error_response(error: impl AsRef<str>) -> axum::response::Response {
         .into_response()
 }
 
+/// Turn the setup form's three parallel row arrays into a module instance list.
+///
+/// Instance ids follow row order, so this produces the same shape as the
+/// `--module` CLI flag for the same sequence of modules.
+///
+/// Params for a row are its JSON text (empty means "no params"), with the
+/// selected asset written into the kind's declared asset field on top. A row
+/// whose kind declares no asset field ignores its asset value entirely — the
+/// form keeps a hidden asset `select` in every row to keep the arrays aligned,
+/// and a hidden `select` still submits whatever option happens to be selected.
+/// Ignoring it here rather than trusting the script to blank it is what keeps a
+/// stale selection out of the wrong module's params.
+///
+/// A row that names no params falls back to the kind's own
+/// `default_config_gen_params` rather than to JSON null. Null is only correct
+/// for modules whose `Params` is `()`; a module with a real params struct
+/// fails to deserialize from it, so defaulting to null would break every
+/// such module configured through the form without touching its fields.
+fn build_module_params(
+    kinds: &[String],
+    assets: &[String],
+    params: &[String],
+    asset_param_fields: &BTreeMap<ModuleKind, String>,
+    default_params: &BTreeMap<ModuleKind, serde_json::Value>,
+) -> anyhow::Result<ServerModuleConfigGenParamsRegistry> {
+    anyhow::ensure!(
+        kinds.len() == assets.len() && kinds.len() == params.len(),
+        "Malformed module list: {} kinds, {} assets, {} params",
+        kinds.len(),
+        assets.len(),
+        params.len(),
+    );
+
+    let mut registry = ServerModuleConfigGenParamsRegistry::default();
+
+    for ((kind_str, asset_str), params_str) in kinds.iter().zip(assets).zip(params) {
+        let kind_str = kind_str.trim();
+        if kind_str.is_empty() {
+            continue;
+        }
+        let kind = ModuleKind::clone_from_str(kind_str);
+
+        let params_str = params_str.trim();
+        let mut value = if params_str.is_empty() {
+            default_params.get(&kind).cloned().unwrap_or_default()
+        } else {
+            serde_json::from_str(params_str)
+                .with_context(|| format!("Invalid JSON params for module {kind_str}"))?
+        };
+
+        if let Some(field) = asset_param_fields.get(&kind) {
+            let asset_str = asset_str.trim();
+            if !asset_str.is_empty() {
+                let unit: u64 = asset_str
+                    .parse()
+                    .with_context(|| format!("Invalid asset id {asset_str:?} for {kind_str}"))?;
+
+                if value.is_null() {
+                    value = serde_json::Value::Object(serde_json::Map::new());
+                }
+                let object = value.as_object_mut().with_context(|| {
+                    format!("Params for module {kind_str} must be a JSON object to carry an asset")
+                })?;
+                object.insert(field.clone(), serde_json::json!(unit));
+            }
+        }
+
+        registry.attach_config_gen_params(kind, value);
+    }
+
+    Ok(registry)
+}
+
+/// One module-instance row: which kind, which asset it is denominated in (for
+/// kinds that take one), and any remaining config-gen params as JSON.
+///
+/// `selected` prefills the kind; `None` renders the blank row that the "+ Add
+/// module" button clones, so the server renders the markup exactly once and the
+/// script only copies it.
+///
+/// Every row submits all three fields, including the ones a given kind does not
+/// use, so that the three parallel arrays stay index-aligned on the server. The
+/// asset column is hidden rather than removed for the same reason. The server
+/// ignores `instance_asset` for kinds that declare no asset field, so a stale
+/// hidden selection cannot leak into the wrong module's params.
+fn module_row(
+    available_modules: &BTreeSet<ModuleKind>,
+    available_assets: &[Asset],
+    asset_param_fields: &BTreeMap<ModuleKind, String>,
+    selected: Option<&ModuleKind>,
+) -> Markup {
+    let takes_asset = selected.is_some_and(|kind| asset_param_fields.contains_key(kind));
+
+    html! {
+        div class="row g-2 align-items-center module-row mb-2" {
+            div class="col-12 col-sm" {
+                select class="form-select form-select-sm module-kind" name="instance_kind" {
+                    @for kind in available_modules {
+                        option value=(kind.as_str()) selected[selected == Some(kind)] {
+                            (kind.as_str())
+                        }
+                    }
+                }
+            }
+
+            div class="col-12 col-sm module-asset-col" style=(if takes_asset { "" } else { "display: none;" }) {
+                select class="form-select form-select-sm module-asset" name="instance_asset" {
+                    option value="" { "(no asset)" }
+                    @for asset in available_assets {
+                        option value=(asset.unit.id().to_string()) { (asset.label()) }
+                    }
+                }
+            }
+
+            div class="col-12 col-sm" {
+                input type="text" class="form-control form-control-sm module-params"
+                    name="instance_params" placeholder="extra params (JSON, optional)";
+            }
+
+            div class="col-auto" {
+                button type="button" class="btn btn-outline-secondary btn-sm module-remove"
+                    aria-label="Remove module" { "\u{00d7}" }
+            }
+        }
+    }
+}
+
 fn setup_form_content(
     available_modules: &BTreeSet<ModuleKind>,
     default_modules: &BTreeSet<ModuleKind>,
+    available_assets: &[Asset],
+    asset_param_fields: &BTreeMap<ModuleKind, String>,
 ) -> Markup {
+    // Only the kind names reach the script; the params field name each maps to
+    // stays server-side, since the server is what writes the chosen unit into
+    // the params.
+    let asset_kinds_json = serde_json::to_string(
+        &asset_param_fields
+            .keys()
+            .map(|kind| (kind.as_str().to_owned(), true))
+            .collect::<BTreeMap<_, _>>(),
+    )
+    .expect("a map of string keys to bools always serializes");
+
     html! {
         form id="setup-form" hx-post=(ROOT_ROUTE) hx-target="#setup-error" hx-swap="innerHTML" {
             style {
@@ -319,32 +469,31 @@ fn setup_form_content(
                                 button class="accordion-button collapsed" type="button"
                                     data-bs-toggle="collapse" data-bs-target="#modulesConfig"
                                     aria-expanded="false" aria-controls="modulesConfig" {
-                                    "Advanced: Configure Enabled Modules"
+                                    "Advanced: Configure Modules"
                                 }
                             }
                             div id="modulesConfig" class="accordion-collapse collapse" data-bs-parent="#modulesAccordion" {
                                 div class="accordion-body" {
-                                    div id="modules-list" {
-                                        @for kind in available_modules {
-                                            div class="form-check" {
-                                                input type="checkbox" class="form-check-input"
-                                                    id=(format!("module_{}", kind.as_str()))
-                                                    name="enabled_modules"
-                                                    value=(kind.as_str())
-                                                    checked[default_modules.contains(kind)];
+                                    p class="text-muted" style="font-size: 0.875rem;" {
+                                        "One row per module instance. A kind may appear more than once — e.g. two mints, each denominated in a different asset."
+                                    }
 
-                                                label class="form-check-label" for=(format!("module_{}", kind.as_str())) {
-                                                    (kind.as_str())
-                                                    @if !default_modules.contains(kind) {
-                                                        span class="badge bg-warning text-dark ms-2" { "experimental" }
-                                                    }
-                                                }
-                                            }
+                                    div id="module-rows" {
+                                        @for kind in default_modules {
+                                            (module_row(available_modules, available_assets, asset_param_fields, Some(kind)))
                                         }
                                     }
 
-                                    div id="modules-warning" class="alert alert-warning mt-2 mb-0" style="font-size: 0.875rem;" {
-                                        "Only modify this if you know what you are doing. Disabled modules cannot be enabled later."
+                                    button type="button" class="btn btn-outline-secondary btn-sm mt-2" id="add-module-row" {
+                                        "+ Add module"
+                                    }
+
+                                    template id="module-row-template" {
+                                        (module_row(available_modules, available_assets, asset_param_fields, None))
+                                    }
+
+                                    div id="modules-warning" class="alert alert-warning mt-3 mb-0" style="font-size: 0.875rem;" {
+                                        "Only modify this if you know what you are doing. The module list cannot be changed after setup."
                                     }
                                 }
                             }
@@ -355,6 +504,53 @@ fn setup_form_content(
 
             div id="setup-error" {}
             button type="submit" class="btn btn-primary w-100 py-2" { "Confirm" }
+        }
+
+        // Add/remove module rows, and show the asset dropdown only for kinds
+        // that are denominated in one. Purely an input aid: the server
+        // re-derives everything from the submitted fields and ignores the asset
+        // for kinds that take none, so this script failing to run degrades to a
+        // fixed list of rows rather than to a wrong config.
+        script {
+            (PreEscaped(format!(
+                r#"
+            (function () {{
+                var assetKinds = {asset_kinds};
+                var rows = document.getElementById('module-rows');
+                var tpl = document.getElementById('module-row-template');
+                var addBtn = document.getElementById('add-module-row');
+                if (!rows || !tpl || !addBtn) {{ return; }}
+
+                function syncAsset(row) {{
+                    var kindEl = row.querySelector('.module-kind');
+                    var col = row.querySelector('.module-asset-col');
+                    var sel = row.querySelector('.module-asset');
+                    if (!kindEl || !col || !sel) {{ return; }}
+                    var takes = Object.prototype.hasOwnProperty.call(assetKinds, kindEl.value);
+                    col.style.display = takes ? '' : 'none';
+                    if (!takes) {{ sel.value = ''; }}
+                }}
+
+                rows.addEventListener('change', function (e) {{
+                    if (e.target && e.target.classList.contains('module-kind')) {{
+                        syncAsset(e.target.closest('.module-row'));
+                    }}
+                }});
+
+                rows.addEventListener('click', function (e) {{
+                    var btn = e.target.closest('.module-remove');
+                    if (btn) {{ btn.closest('.module-row').remove(); }}
+                }});
+
+                addBtn.addEventListener('click', function () {{
+                    var row = tpl.content.firstElementChild.cloneNode(true);
+                    rows.appendChild(row);
+                    syncAsset(row);
+                }});
+            }})();
+            "#,
+                asset_kinds = asset_kinds_json,
+            )))
         }
     }
 }
@@ -380,7 +576,14 @@ async fn start_federation_form(State(state): State<UiState<DynSetupApi>>) -> imp
 
     let available_modules = state.api.available_modules();
     let default_modules = state.api.default_modules();
-    let content = setup_form_content(&available_modules, &default_modules);
+    let available_assets = state.api.available_assets();
+    let asset_param_fields = state.api.asset_param_fields();
+    let content = setup_form_content(
+        &available_modules,
+        &default_modules,
+        &available_assets,
+        &asset_param_fields,
+    );
     let version = state.api.fedimintd_version().await;
     let version_hash = state.api.fedimintd_version_hash().await;
 
@@ -415,23 +618,29 @@ async fn setup_submit(
         None
     };
 
-    // The setup form lets the leader select a set of module kinds via
-    // checkboxes. We materialize that selection into the module instance list
-    // (one instance per selected kind, carrying each module's default config gen
-    // params) by filtering the default params for all available modules. This
-    // preserves the canonical instance order and instance ids.
-    //
-    // NOTE: the current UI can only express a single instance per kind. Adding a
-    // second instance of the same kind (e.g. two mint instances) via the web UI
-    // is a follow-up; the instance list type already supports it.
+    // The leader's form submits one row per module instance, so the instance
+    // list is built directly from it rather than materialized from a set of
+    // kinds. Instance ids follow row order, matching the `--module` CLI.
     let module_params = if input.is_lead {
-        let selected: BTreeSet<ModuleKind> = input
-            .enabled_modules
-            .into_iter()
-            .map(|s| ModuleKind::clone_from_str(&s))
+        let default_params: BTreeMap<ModuleKind, serde_json::Value> = state
+            .api
+            .available_module_params()
+            .iter_modules()
+            .map(|(_id, kind, params)| (kind.clone(), params.clone()))
             .collect();
 
-        Some(state.api.available_module_params().select_kinds(&selected))
+        match build_module_params(
+            &input.instance_kind,
+            &input.instance_asset,
+            &input.instance_params,
+            &state.api.asset_param_fields(),
+            &default_params,
+        ) {
+            Ok(params) => Some(params),
+            Err(e) => {
+                return Html(setup_error_message(&e.to_string()).into_string()).into_response();
+            }
+        }
     } else {
         None
     };
@@ -891,11 +1100,246 @@ pub fn router(api: DynSetupApi) -> Router {
 
 #[cfg(test)]
 mod tests {
+    use fedimint_core::module::AmountUnit;
+
     use super::*;
+
+    fn mintv2() -> ModuleKind {
+        ModuleKind::clone_from_str("mintv2")
+    }
+
+    fn asset_fields() -> BTreeMap<ModuleKind, String> {
+        BTreeMap::from([(mintv2(), "amount_unit".to_owned())])
+    }
+
+    /// Stands in for what `default_config_gen_params` produces per kind:
+    /// `mintv2` has a real params struct, `walletv2`'s `Params` is `()` and so
+    /// serializes to null.
+    fn defaults() -> BTreeMap<ModuleKind, serde_json::Value> {
+        BTreeMap::from([
+            (mintv2(), serde_json::json!({"amount_unit": 0})),
+            (
+                ModuleKind::clone_from_str("walletv2"),
+                serde_json::Value::Null,
+            ),
+        ])
+    }
+
+    fn rows(specs: &[(&str, &str, &str)]) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            specs.iter().map(|(k, _, _)| (*k).to_owned()).collect(),
+            specs.iter().map(|(_, a, _)| (*a).to_owned()).collect(),
+            specs.iter().map(|(_, _, p)| (*p).to_owned()).collect(),
+        )
+    }
+
+    /// The whole point of the change: two instances of one kind, each
+    /// denominated in a different asset, with ids following row order.
+    #[test]
+    fn builds_two_instances_of_one_kind_with_distinct_assets() {
+        let (k, a, p) = rows(&[
+            ("walletv2", "", ""),
+            ("mintv2", "0", ""),
+            ("mintv2", "1", ""),
+        ]);
+
+        let registry =
+            build_module_params(&k, &a, &p, &asset_fields(), &defaults()).expect("valid rows");
+
+        let instances: Vec<(u16, String, serde_json::Value)> = registry
+            .iter_modules()
+            .map(|(id, kind, params)| (id, kind.to_string(), params.clone()))
+            .collect();
+
+        assert_eq!(
+            instances,
+            vec![
+                (0, "walletv2".to_owned(), serde_json::Value::Null),
+                (
+                    1,
+                    "mintv2".to_owned(),
+                    serde_json::json!({"amount_unit": 0})
+                ),
+                (
+                    2,
+                    "mintv2".to_owned(),
+                    serde_json::json!({"amount_unit": 1})
+                ),
+            ]
+        );
+    }
+
+    /// A paramless row must produce JSON `null`, not `{}`.
+    ///
+    /// A module whose `Params` is `()` deserializes from null and *fails* on an
+    /// empty object, so getting this wrong breaks every paramless module at
+    /// config gen rather than in this function.
+    #[test]
+    fn paramless_row_is_null_not_empty_object() {
+        let (k, a, p) = rows(&[("walletv2", "", "")]);
+
+        let registry =
+            build_module_params(&k, &a, &p, &asset_fields(), &defaults()).expect("valid rows");
+        let params = registry
+            .iter_modules()
+            .next()
+            .expect("one instance")
+            .2
+            .clone();
+
+        assert_eq!(params, serde_json::Value::Null);
+        assert_ne!(params, serde_json::json!({}));
+    }
+
+    /// A row that touches nothing gets the kind's own default params, not
+    /// JSON null.
+    ///
+    /// Null only deserializes into a `Params` of `()`. A module with a real
+    /// params struct — `mintv2` — fails on it, so defaulting to null would
+    /// break config generation for every such module added through the form
+    /// and left at its defaults, which is the most ordinary thing an operator
+    /// can do.
+    #[test]
+    fn untouched_row_gets_the_kinds_default_params() {
+        let (k, a, p) = rows(&[("mintv2", "", "")]);
+
+        let registry =
+            build_module_params(&k, &a, &p, &asset_fields(), &defaults()).expect("valid rows");
+        let params = registry
+            .iter_modules()
+            .next()
+            .expect("one instance")
+            .2
+            .clone();
+
+        assert_eq!(params, serde_json::json!({"amount_unit": 0}));
+        assert_ne!(params, serde_json::Value::Null);
+    }
+
+    /// A kind that declares no asset field must ignore whatever the asset
+    /// select submitted.
+    ///
+    /// The form keeps a hidden asset `select` in every row so the three arrays
+    /// stay index-aligned, and a hidden select still submits its current option.
+    /// Without this rule a stale selection would be written into a module that
+    /// has no such param, and config gen would reject it.
+    #[test]
+    fn asset_is_ignored_for_kinds_without_an_asset_field() {
+        let (k, a, p) = rows(&[("walletv2", "1", "")]);
+
+        let registry =
+            build_module_params(&k, &a, &p, &asset_fields(), &defaults()).expect("valid rows");
+        let params = registry
+            .iter_modules()
+            .next()
+            .expect("one instance")
+            .2
+            .clone();
+
+        assert_eq!(params, serde_json::Value::Null);
+    }
+
+    /// The asset selection merges into hand-written params rather than
+    /// replacing them.
+    #[test]
+    fn asset_merges_into_explicit_params() {
+        let (k, a, p) = rows(&[("mintv2", "1", r#"{"other": 7}"#)]);
+
+        let registry =
+            build_module_params(&k, &a, &p, &asset_fields(), &defaults()).expect("valid rows");
+        let params = registry
+            .iter_modules()
+            .next()
+            .expect("one instance")
+            .2
+            .clone();
+
+        assert_eq!(params, serde_json::json!({"other": 7, "amount_unit": 1}));
+    }
+
+    /// Rows with no asset chosen keep their params untouched, so a kind that
+    /// takes an asset can still be configured entirely by hand.
+    #[test]
+    fn empty_asset_leaves_params_alone() {
+        let (k, a, p) = rows(&[("mintv2", "", r#"{"amount_unit": 3}"#)]);
+
+        let registry =
+            build_module_params(&k, &a, &p, &asset_fields(), &defaults()).expect("valid rows");
+        let params = registry
+            .iter_modules()
+            .next()
+            .expect("one instance")
+            .2
+            .clone();
+
+        assert_eq!(params, serde_json::json!({"amount_unit": 3}));
+    }
+
+    /// Misaligned arrays must be rejected rather than silently zipped short.
+    ///
+    /// `zip` truncates to the shortest input, so without the explicit length
+    /// check a dropped field would quietly discard trailing instances.
+    #[test]
+    fn misaligned_rows_are_rejected() {
+        let err = build_module_params(
+            &["mintv2".to_owned(), "walletv2".to_owned()],
+            &["0".to_owned()],
+            &[String::new(), String::new()],
+            &asset_fields(),
+            &defaults(),
+        )
+        .expect_err("misaligned arrays must error");
+
+        assert!(err.to_string().contains("Malformed module list"), "{err}");
+    }
+
+    #[test]
+    fn invalid_params_json_is_rejected() {
+        let (k, a, p) = rows(&[("mintv2", "", "{not json}")]);
+
+        let err = build_module_params(&k, &a, &p, &asset_fields(), &defaults())
+            .expect_err("malformed JSON must error");
+
+        assert!(err.to_string().contains("mintv2"), "{err}");
+    }
+
+    /// Blank rows (a kind cleared to empty) are skipped, not turned into an
+    /// instance with an empty kind.
+    #[test]
+    fn blank_rows_are_skipped() {
+        let (k, a, p) = rows(&[("", "", ""), ("walletv2", "", "")]);
+
+        let registry =
+            build_module_params(&k, &a, &p, &asset_fields(), &defaults()).expect("valid rows");
+
+        assert_eq!(registry.iter_modules().count(), 1);
+    }
+
+    /// The asset dropdown is rendered for kinds that declare an asset field,
+    /// and the script is told which kinds those are.
+    #[test]
+    fn form_offers_declared_assets_for_asset_taking_kinds() {
+        let content = setup_form_content(
+            &BTreeSet::from([mintv2()]),
+            &BTreeSet::from([mintv2()]),
+            &[Asset::new(AmountUnit::new_custom(1), "USDT")],
+            &asset_fields(),
+        )
+        .into_string();
+
+        assert!(content.contains("USDT (unit 1)"), "asset option missing");
+        assert!(content.contains(r#"name="instance_asset""#));
+        assert!(content.contains(r#"name="instance_kind""#));
+        assert!(
+            content.contains(r#"{"mintv2":true}"#),
+            "script must know which kinds take an asset"
+        );
+    }
 
     #[test]
     fn setup_form_targets_error_container() {
-        let content = setup_form_content(&BTreeSet::new(), &BTreeSet::new()).into_string();
+        let content = setup_form_content(&BTreeSet::new(), &BTreeSet::new(), &[], &BTreeMap::new())
+            .into_string();
 
         assert!(content.contains(r##"hx-target="#setup-error""##));
         assert!(content.contains(r#"<div id="setup-error"></div>"#));

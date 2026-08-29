@@ -45,9 +45,9 @@ use fedimint_core::envs::{
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    Amounts, ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
-    ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
-    api_endpoint,
+    AmountUnit, Amounts, ApiEndpoint, ApiVersion, Asset, CORE_CONSENSUS_VERSION,
+    CoreConsensusVersion, InputMeta, ModuleConsensusVersion, ModuleInit,
+    SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
 };
 #[cfg(not(target_family = "wasm"))]
 use fedimint_core::task::TaskGroup;
@@ -283,6 +283,13 @@ impl ServerModuleInit for WalletInit {
             ),
             &[(0, 1)],
         )
+    }
+
+    /// This module holds the federation's on-chain reserves, so it is what
+    /// backs bitcoin for everything else — the mint denominating ecash in it,
+    /// a market trading against it.
+    fn provided_assets(&self) -> Vec<Asset> {
+        vec![Asset::new(AmountUnit::BITCOIN, "Bitcoin")]
     }
 
     fn is_enabled_by_default(&self) -> bool {

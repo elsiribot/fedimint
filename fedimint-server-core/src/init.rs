@@ -16,8 +16,8 @@ use fedimint_core::config::{
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::db::{Database, DatabaseVersion};
 use fedimint_core::module::{
-    CommonModuleInit, CoreConsensusVersion, IDynCommonModuleInit, ModuleConsensusVersion,
-    ModuleInit, SupportedModuleApiVersions, serde_json,
+    AmountUnit, Asset, CommonModuleInit, CoreConsensusVersion, IDynCommonModuleInit,
+    ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, serde_json,
 };
 use fedimint_core::task::{MaybeSend, MaybeSync, TaskGroup};
 use fedimint_core::{NumPeers, PeerId, apply, async_trait_maybe_send, dyn_newtype_define};
@@ -86,6 +86,18 @@ pub trait IServerModuleInit: IDynCommonModuleInit {
     /// params registry during config generation. Returns the type-erased
     /// serialization of [`ServerModuleInit::Params`]'s default.
     fn default_config_gen_params(&self) -> ConfigGenModuleParams;
+
+    /// See [`ServerModuleInit::provided_assets`].
+    fn provided_assets(&self) -> Vec<Asset>;
+
+    /// See [`ServerModuleInit::required_assets`].
+    ///
+    /// Returns an error if `params` do not parse, since the required set can
+    /// depend on them.
+    fn required_assets(&self, params: &ConfigGenModuleParams) -> anyhow::Result<Vec<AmountUnit>>;
+
+    /// See [`ServerModuleInit::asset_param_field`].
+    fn asset_param_field(&self) -> Option<&'static str>;
 
     fn trusted_dealer_gen(
         &self,
@@ -232,6 +244,48 @@ pub trait ServerModuleInit: ModuleInit + Sized {
         Self::Params::default()
     }
 
+    /// Assets this module backs, i.e. holds reserves against some outside
+    /// system for.
+    ///
+    /// An on-chain wallet backs bitcoin; an EVM peg backs its token. Modules
+    /// that merely *use* an asset (a mint denominating ecash in it, a market
+    /// trading it) declare it in [`Self::required_assets`] instead.
+    ///
+    /// Deliberately independent of config-gen params: what a module backs is a
+    /// property of what it is, not of how it is configured. That also lets the
+    /// setup UI list the choices before any params exist.
+    ///
+    /// The default is empty — most modules back nothing.
+    fn provided_assets(&self) -> Vec<Asset> {
+        vec![]
+    }
+
+    /// Units this module needs some *other* module to back.
+    ///
+    /// A mint instance denominated in a unit requires that unit; a market
+    /// requires both sides of its pairs. Config generation fails if any
+    /// required unit is not in the union of every instance's
+    /// [`Self::provided_assets`], which is what stops a federation booting with
+    /// ecash denominated in an asset nothing holds reserves against.
+    ///
+    /// Takes params because the answer usually depends on them — which unit a
+    /// mint is denominated in is a config-gen choice.
+    ///
+    /// The default is empty.
+    fn required_assets(&self, _params: &Self::Params) -> Vec<AmountUnit> {
+        vec![]
+    }
+
+    /// The [`Self::Params`] JSON field that names an [`AmountUnit`], if this
+    /// module has one.
+    ///
+    /// Returning `Some` is what makes the setup UI render an asset dropdown for
+    /// this module kind and write the chosen unit into that field. Modules
+    /// without a configurable asset return `None` and get no dropdown.
+    fn asset_param_field(&self) -> Option<&'static str> {
+        None
+    }
+
     fn trusted_dealer_gen(
         &self,
         peers: &[PeerId],
@@ -335,6 +389,19 @@ where
     fn default_config_gen_params(&self) -> ConfigGenModuleParams {
         serde_json::to_value(<Self as ServerModuleInit>::default_config_gen_params(self))
             .expect("Default config gen params must serialize")
+    }
+
+    fn provided_assets(&self) -> Vec<Asset> {
+        <Self as ServerModuleInit>::provided_assets(self)
+    }
+
+    fn required_assets(&self, params: &ConfigGenModuleParams) -> anyhow::Result<Vec<AmountUnit>> {
+        let params = <Self as ServerModuleInit>::parse_params(self, params)?;
+        Ok(<Self as ServerModuleInit>::required_assets(self, &params))
+    }
+
+    fn asset_param_field(&self) -> Option<&'static str> {
+        <Self as ServerModuleInit>::asset_param_field(self)
     }
 
     fn trusted_dealer_gen(

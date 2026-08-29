@@ -154,6 +154,21 @@ impl ServerModuleInit for MintInit {
         )
     }
 
+    /// A mint holds no reserves of its own: the ecash it issues is a claim on
+    /// whichever module actually backs `amount_unit`. Declaring that here is
+    /// what stops a federation booting with ecash denominated in an asset
+    /// nothing holds reserves against.
+    fn required_assets(&self, params: &Self::Params) -> Vec<AmountUnit> {
+        vec![params.amount_unit]
+    }
+
+    /// Makes the setup UI offer the federation's declared assets as the
+    /// denomination for this instance, instead of asking the operator to type
+    /// a raw unit id.
+    fn asset_param_field(&self) -> Option<&'static str> {
+        Some("amount_unit")
+    }
+
     fn is_enabled_by_default(&self) -> bool {
         is_env_var_set_opt(FM_ENABLE_MODULE_MINTV2_ENV).unwrap_or(false)
     }
