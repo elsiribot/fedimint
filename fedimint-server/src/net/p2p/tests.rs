@@ -16,7 +16,7 @@ use super::{
     P2PConnectionSMCommon, P2PConnectionSMState, P2PConnectionState, P2PConnectionStateMachine,
 };
 use crate::net::p2p_connection::{
-    DynConnectionStatusUpdates, DynIP2PFrame, DynP2PConnection, IP2PConnection,
+    DynConnectionStatusUpdates, DynIP2PFrame, DynP2PConnection, IP2PConnection, IP2PFrame,
 };
 use crate::net::p2p_connector::{DynP2PConnector, IP2PConnector};
 
@@ -97,11 +97,11 @@ impl FakeConnection {
 
 #[async_trait]
 impl IP2PConnection<u64> for FakeConnection {
-    async fn send(&mut self, _message: u64) -> anyhow::Result<()> {
+    async fn send(&self, _message: u64) -> anyhow::Result<()> {
         Ok(())
     }
 
-    async fn receive(&mut self) -> anyhow::Result<DynIP2PFrame<u64>> {
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<u64>> {
         self.control.disconnect.notified().await;
         Err(anyhow!("fake connection disconnected"))
     }
@@ -157,6 +157,61 @@ impl IP2PConnection<u64> for FakeConnection {
     }
 }
 
+/// A connection that models transport flow control: a send only completes once
+/// the connection has been read from, the way QUIC and TCP only release a write
+/// once the peer's application drains the stream.
+struct FlowControlledConnection {
+    /// Signalled by `send`, awaited by `receive`, so the frame only becomes
+    /// available while a send is in flight.
+    send_started: Notify,
+    /// Signalled by `receive`, awaited by `send`.
+    drained: Notify,
+    frame_taken: AtomicUsize,
+}
+
+impl FlowControlledConnection {
+    fn new() -> Self {
+        Self {
+            send_started: Notify::new(),
+            drained: Notify::new(),
+            frame_taken: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl IP2PConnection<u64> for FlowControlledConnection {
+    async fn send(&self, _message: u64) -> anyhow::Result<()> {
+        self.send_started.notify_one();
+        self.drained.notified().await;
+        Ok(())
+    }
+
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<u64>> {
+        if self.frame_taken.fetch_add(1, Ordering::Relaxed) > 0 {
+            return future::pending().await;
+        }
+
+        self.send_started.notified().await;
+        self.drained.notify_one();
+
+        Ok(FakeFrame(1337).into_dyn())
+    }
+
+    fn rtt(&self) -> Option<Duration> {
+        None
+    }
+}
+
+struct FakeFrame(u64);
+
+#[async_trait]
+impl IP2PFrame<u64> for FakeFrame {
+    async fn read_to_end(&mut self) -> anyhow::Result<u64> {
+        Ok(self.0)
+    }
+}
+
 struct PendingConnector {
     fallback: Option<ConnectionType>,
 }
@@ -183,8 +238,8 @@ impl IP2PConnector<u64> for PendingConnector {
 struct StatusMachineHarness {
     connection_sender: async_channel::Sender<DynP2PConnection<u64>>,
     status_receiver: watch::Receiver<P2PConnectionState>,
-    _outgoing_sender: async_channel::Sender<u64>,
-    _incoming_receiver: async_channel::Receiver<u64>,
+    outgoing_sender: async_channel::Sender<u64>,
+    incoming_receiver: async_channel::Receiver<u64>,
     task: JoinHandle<()>,
 }
 
@@ -199,7 +254,10 @@ impl StatusMachineHarness {
         Self::spawn_with_fallback(connection, None)
     }
 
-    fn spawn_with_fallback(connection: FakeConnection, fallback: Option<ConnectionType>) -> Self {
+    fn spawn_with_fallback(
+        connection: impl IP2PConnection<u64>,
+        fallback: Option<ConnectionType>,
+    ) -> Self {
         let (connection_sender, incoming_connections) = async_channel::bounded(4);
         let (outgoing_sender, outgoing_receiver) = async_channel::bounded(5);
         let (incoming_sender, incoming_receiver) = async_channel::bounded(5);
@@ -209,7 +267,7 @@ impl StatusMachineHarness {
         });
         let connector: DynP2PConnector<u64> = Arc::new(PendingConnector { fallback });
         let mut state_machine = P2PConnectionStateMachine {
-            state: P2PConnectionSMState::Connected(Box::new(connection)),
+            state: P2PConnectionSMState::Connected(Arc::new(connection)),
             common: P2PConnectionSMCommon {
                 incoming_sender,
                 outgoing_receiver,
@@ -233,8 +291,8 @@ impl StatusMachineHarness {
         Self {
             connection_sender,
             status_receiver,
-            _outgoing_sender: outgoing_sender,
-            _incoming_receiver: incoming_receiver,
+            outgoing_sender,
+            incoming_receiver,
             task,
         }
     }
@@ -276,6 +334,28 @@ impl Drop for StatusMachineHarness {
     }
 }
 
+/// A send that parks on transport flow control must not stop us from reading:
+/// the peer only releases our write once we drain it, and a peer running the
+/// same state machine is waiting on us for the same reason.
+#[tokio::test]
+async fn receives_while_a_send_is_parked_on_flow_control() {
+    let harness = StatusMachineHarness::spawn_with_fallback(FlowControlledConnection::new(), None);
+
+    harness
+        .outgoing_sender
+        .send(7)
+        .await
+        .expect("state machine accepts outgoing messages");
+
+    assert_eq!(
+        timeout(Duration::from_secs(5), harness.incoming_receiver.recv())
+            .await
+            .expect("incoming message is not blocked by the parked send")
+            .expect("incoming channel remains open"),
+        1337
+    );
+}
+
 #[tokio::test]
 async fn status_event_refreshes_connection_metadata_without_p2p_message() {
     let control = FakeConnectionControl::new(ConnectionType::Relay);
@@ -309,10 +389,14 @@ async fn subscribes_before_snapshot_to_close_status_update_race() {
     control.update_status_during_next_snapshot(ConnectionType::Direct);
     let mut harness = StatusMachineHarness::spawn(FakeConnection::new(control.clone()));
 
+    // Reaching Direct is only possible if we subscribed before snapshotting:
+    // the update fires during the snapshot and would otherwise be lost. One
+    // subscription per connection is enough, the connected state now stays in
+    // its own loop instead of being re-entered per event.
     harness
         .wait_for_status(ExpectedStatus::Connected(ConnectionType::Direct))
         .await;
-    assert!(control.subscriptions() >= 2);
+    assert_eq!(control.subscriptions(), 1);
 }
 
 #[tokio::test]
@@ -326,7 +410,7 @@ async fn superseded_connection_events_do_not_replace_current_status() {
     let new_control = FakeConnectionControl::new(ConnectionType::Direct);
     harness
         .connection_sender
-        .send(Box::new(FakeConnection::new(new_control)))
+        .send(Arc::new(FakeConnection::new(new_control)))
         .await
         .expect("state machine receives replacement connection");
     harness

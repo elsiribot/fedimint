@@ -9,6 +9,7 @@
 mod tests;
 
 use std::collections::BTreeMap;
+use std::pin::pin;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -30,6 +31,10 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use crate::metrics::{PEER_CONNECT_COUNT, PEER_DISCONNECT_COUNT, PEER_MESSAGES_COUNT};
 use crate::net::p2p_connection::{DynConnectionStatusUpdates, DynP2PConnection};
 use crate::net::p2p_connector::DynP2PConnector;
+
+/// How often the connection metadata published to the dashboard is refreshed
+/// while a connection is up.
+const P2P_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct P2PConnectionState {
@@ -288,17 +293,8 @@ impl<M: Send + 'static> P2PConnectionStateMachine<M> {
                 // Subscribe before taking the snapshot so an update racing with
                 // the snapshot remains queued for the connected transition.
                 let status_updates = connection.connection_status_updates();
-                let status = P2PConnectionStatus {
-                    conn_type: connection
-                        .connection_type()
-                        .or_else(|| self.common.connector.connection_type(self.common.peer_id)),
-                    rtt: connection.rtt(),
-                };
 
-                self.common.status_sender.send_replace(P2PConnectionState {
-                    connected: Some(status),
-                    last_error: None,
-                });
+                self.common.publish_connected_status(&connection);
 
                 self.common
                     .transition_connected(connection, status_updates)
@@ -315,58 +311,136 @@ impl<M: Send + 'static> P2PConnectionStateMachine<M> {
 impl<M: Send + 'static> P2PConnectionSMCommon<M> {
     async fn transition_connected(
         &mut self,
-        mut connection: DynP2PConnection<M>,
+        connection: DynP2PConnection<M>,
         mut status_updates: Option<DynConnectionStatusUpdates>,
     ) -> Option<P2PConnectionSMState<M>> {
-        tokio::select! {
-            Some(()) = async {
-                match status_updates.as_mut() {
-                    Some(status_updates) => status_updates.next().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                Some(P2PConnectionSMState::Connected(connection))
-            },
-            () = async {
-                match self.connection_deadline {
-                    Some(deadline) => sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                Some(self.disconnect(anyhow!("Connection exceeded the maximum age")))
-            },
-            message = self.outgoing_receiver.recv() => {
-                Some(self.send_message(connection, message.ok()?).await)
-            },
-            connection = self.incoming_connections.recv() => {
-                info!(target: LOG_NET_PEER, "Connected to peer");
+        // Sending and receiving have to make progress independently of each
+        // other. Both QUIC and TCP stop accepting bytes once the peer's flow
+        // control window is full and only release it when the peer's
+        // *application* reads; a peer that stops reading while it writes
+        // therefore deadlocks against a peer doing the same, permanently and
+        // silently. The connection stays open, keep-alives keep flowing and no
+        // idle timeout ever fires.
+        let mut send = pin!(Self::send_messages(
+            connection.clone(),
+            self.outgoing_receiver.clone(),
+            self.our_id_str.clone(),
+            self.peer_id_str.clone(),
+        ));
 
-                self.connection_deadline = self.max_connection_age.map(|age| Instant::now() + age);
+        let mut receive = pin!(Self::receive_messages(
+            connection.clone(),
+            self.incoming_sender.clone(),
+            self.our_id_str.clone(),
+            self.peer_id_str.clone(),
+        ));
 
-                Some(P2PConnectionSMState::Connected(connection.ok()?))
-            },
-            message = connection.receive() => {
-                let mut message = match message {
-                    Ok(message) => message,
-                    Err(e) => return Some(self.disconnect(e)),
-                };
+        loop {
+            tokio::select! {
+                update = async {
+                    match status_updates.as_mut() {
+                        Some(status_updates) => status_updates.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match update {
+                        Some(()) => self.publish_connected_status(&connection),
+                        // A stream that has ended must not be polled again.
+                        None => status_updates = None,
+                    }
+                },
+                // The connection metadata shown on the dashboard is no longer
+                // refreshed by message traffic, so refresh it on a timer.
+                () = sleep(P2P_STATUS_REFRESH_INTERVAL) => {
+                    self.publish_connected_status(&connection);
+                },
+                () = async {
+                    match self.connection_deadline {
+                        Some(deadline) => sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    return Some(self.disconnect(anyhow!("Connection exceeded the maximum age")));
+                },
+                error = &mut send => return Some(self.disconnect(error?)),
+                error = &mut receive => return Some(self.disconnect(error)),
+                connection = self.incoming_connections.recv() => {
+                    info!(target: LOG_NET_PEER, "Connected to peer");
 
-                match message.read_to_end().await {
-                    Ok(message) => {
-                        PEER_MESSAGES_COUNT
-                            .with_label_values(&[self.our_id_str.as_str(), self.peer_id_str.as_str(), "incoming"])
-                            .inc();
+                    self.connection_deadline = self.max_connection_age.map(|age| Instant::now() + age);
 
-                        if self.incoming_sender.try_send(message).is_err() {
-                            debug!(target: LOG_NET_PEER, "Incoming message channel is full");
-                        }
-                    },
-                    Err(e) => return Some(self.disconnect(e)),
-                }
-
-                Some(P2PConnectionSMState::Connected(connection))
-            },
+                    return Some(P2PConnectionSMState::Connected(connection.ok()?));
+                },
+            }
         }
+    }
+
+    /// Drive the outgoing half of a connection until it fails.
+    ///
+    /// Returns the error that ended the connection, or `None` if the state
+    /// machine should shut down because the outgoing channel is closed.
+    async fn send_messages(
+        connection: DynP2PConnection<M>,
+        outgoing_receiver: Receiver<M>,
+        our_id_str: String,
+        peer_id_str: String,
+    ) -> Option<anyhow::Error> {
+        loop {
+            let message = outgoing_receiver.recv().await.ok()?;
+
+            PEER_MESSAGES_COUNT
+                .with_label_values(&[our_id_str.as_str(), peer_id_str.as_str(), "outgoing"])
+                .inc();
+
+            if let Err(e) = connection.send(message).await {
+                return Some(e);
+            }
+        }
+    }
+
+    /// Drive the incoming half of a connection until it fails.
+    ///
+    /// The incoming channel drops messages instead of blocking when it is full,
+    /// so this only ever parks on the transport and always drains the peer.
+    async fn receive_messages(
+        connection: DynP2PConnection<M>,
+        incoming_sender: Sender<M>,
+        our_id_str: String,
+        peer_id_str: String,
+    ) -> anyhow::Error {
+        loop {
+            let mut frame = match connection.receive().await {
+                Ok(frame) => frame,
+                Err(e) => return e,
+            };
+
+            let message = match frame.read_to_end().await {
+                Ok(message) => message,
+                Err(e) => return e,
+            };
+
+            PEER_MESSAGES_COUNT
+                .with_label_values(&[our_id_str.as_str(), peer_id_str.as_str(), "incoming"])
+                .inc();
+
+            if incoming_sender.try_send(message).is_err() {
+                debug!(target: LOG_NET_PEER, "Incoming message channel is full");
+            }
+        }
+    }
+
+    fn publish_connected_status(&self, connection: &DynP2PConnection<M>) {
+        let status = P2PConnectionStatus {
+            conn_type: connection
+                .connection_type()
+                .or_else(|| self.connector.connection_type(self.peer_id)),
+            rtt: connection.rtt(),
+        };
+
+        self.status_sender.send_replace(P2PConnectionState {
+            connected: Some(status),
+            last_error: None,
+        });
     }
 
     fn disconnect(&self, error: anyhow::Error) -> P2PConnectionSMState<M> {
@@ -386,26 +460,6 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
             backoff: api_networking_backoff(),
             last_error: Some(last_error),
         }
-    }
-
-    async fn send_message(
-        &mut self,
-        mut connection: DynP2PConnection<M>,
-        peer_message: M,
-    ) -> P2PConnectionSMState<M> {
-        PEER_MESSAGES_COUNT
-            .with_label_values(&[
-                self.our_id_str.as_str(),
-                self.peer_id_str.as_str(),
-                "outgoing",
-            ])
-            .inc();
-
-        if let Err(e) = connection.send(peer_message).await {
-            return self.disconnect(e);
-        }
-
-        P2PConnectionSMState::Connected(connection)
     }
 
     async fn transition_disconnected(

@@ -3,6 +3,7 @@ mod tests;
 
 use std::io::Cursor;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -11,11 +12,13 @@ use bytes::{Bytes, BytesMut};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_server_core::dashboard_ui::ConnectionType;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, Stream, StreamExt};
 use iroh_next::endpoint::{Connection as IrohV1Connection, RecvStream as IrohV1RecvStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_rustls::TlsStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -23,7 +26,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 /// receive is a signed session outcome.
 const MAX_P2P_MESSAGE_SIZE: usize = 10_000_000;
 
-pub type DynP2PConnection<M> = Box<dyn IP2PConnection<M>>;
+/// A shared handle so that the connection state machine can drive the sending
+/// and the receiving half of a connection at the same time.
+pub type DynP2PConnection<M> = Arc<dyn IP2PConnection<M>>;
 
 pub type DynIP2PFrame<M> = Box<dyn IP2PFrame<M>>;
 
@@ -46,14 +51,19 @@ pub trait IP2PFrame<M>: Send + 'static {
 }
 
 #[async_trait]
-pub trait IP2PConnection<M>: Send + 'static {
+pub trait IP2PConnection<M>: Send + Sync + 'static {
     /// Send a message over the connection. This is *not* required to be
     /// cancel-safe.
-    async fn send(&mut self, message: M) -> anyhow::Result<()>;
+    ///
+    /// Takes `&self` because the connection state machine drives a send and a
+    /// receive at the same time: a send that parks on transport flow control
+    /// is only released by the peer reading, so we have to keep draining the
+    /// peer while we write.
+    async fn send(&self, message: M) -> anyhow::Result<()>;
 
     /// Receive a p2p frame from the connection. This is *required* to be
     /// cancel-safe.
-    async fn receive(&mut self) -> anyhow::Result<DynIP2PFrame<M>>;
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<M>>;
 
     /// Get the round-trip time of the connection.
     fn rtt(&self) -> Option<Duration>;
@@ -78,7 +88,7 @@ pub trait IP2PConnection<M>: Send + 'static {
     where
         Self: Sized,
     {
-        Box::new(self)
+        Arc::new(self)
     }
 }
 
@@ -98,23 +108,52 @@ where
     }
 }
 
+type TlsFramed = Framed<TlsStream<TcpStream>, LengthDelimitedCodec>;
+
+/// A length delimited TLS connection whose sending and receiving halves can be
+/// driven independently.
+///
+/// The halves have to be independent because a single TCP connection carries
+/// both directions: a write parks once the peer's socket buffers are full and
+/// is only released by the peer reading. Sharing one mutable handle would force
+/// the connection state machine to finish a write before it can read again, and
+/// two peers doing that at the same time never release each other.
+pub struct TlsP2PConnection {
+    sink: Mutex<SplitSink<TlsFramed, Bytes>>,
+    stream: Mutex<SplitStream<TlsFramed>>,
+}
+
+impl TlsP2PConnection {
+    pub fn new(framed: TlsFramed) -> Self {
+        let (sink, stream) = framed.split();
+
+        Self {
+            sink: Mutex::new(sink),
+            stream: Mutex::new(stream),
+        }
+    }
+}
+
 #[async_trait]
-impl<M> IP2PConnection<M> for Framed<TlsStream<TcpStream>, LengthDelimitedCodec>
+impl<M> IP2PConnection<M> for TlsP2PConnection
 where
     M: Encodable + Decodable + Serialize + DeserializeOwned + Send + 'static,
 {
-    async fn send(&mut self, message: M) -> anyhow::Result<()> {
+    async fn send(&self, message: M) -> anyhow::Result<()> {
         let mut bytes = Vec::new();
 
         bincode::serialize_into(&mut bytes, &message)?;
 
-        SinkExt::send(self, Bytes::from_owner(bytes)).await?;
+        SinkExt::send(&mut *self.sink.lock().await, Bytes::from_owner(bytes)).await?;
 
         Ok(())
     }
 
-    async fn receive(&mut self) -> anyhow::Result<DynIP2PFrame<M>> {
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<M>> {
         let message = self
+            .stream
+            .lock()
+            .await
             .next()
             .await
             .context("Framed stream is closed")??
@@ -155,7 +194,7 @@ impl<M> IP2PConnection<M> for iroh::endpoint::Connection
 where
     M: Encodable + Decodable + Serialize + DeserializeOwned + Send + 'static,
 {
-    async fn send(&mut self, message: M) -> anyhow::Result<()> {
+    async fn send(&self, message: M) -> anyhow::Result<()> {
         let mut bytes = Vec::new();
 
         bincode::serialize_into(&mut bytes, &message)?;
@@ -168,7 +207,7 @@ where
         Ok(())
     }
 
-    async fn receive(&mut self) -> anyhow::Result<DynIP2PFrame<M>> {
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<M>> {
         Ok(self.accept_uni().await?.into_dyn())
     }
 
@@ -200,7 +239,7 @@ impl<M> IP2PConnection<M> for IrohV1Connection
 where
     M: Encodable + Decodable + Serialize + DeserializeOwned + Send + 'static,
 {
-    async fn send(&mut self, message: M) -> anyhow::Result<()> {
+    async fn send(&self, message: M) -> anyhow::Result<()> {
         let mut bytes = Vec::new();
 
         bincode::serialize_into(&mut bytes, &message)?;
@@ -214,7 +253,7 @@ where
         Ok(())
     }
 
-    async fn receive(&mut self) -> anyhow::Result<DynIP2PFrame<M>> {
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<M>> {
         Ok(self.accept_uni().await?.into_dyn())
     }
 
