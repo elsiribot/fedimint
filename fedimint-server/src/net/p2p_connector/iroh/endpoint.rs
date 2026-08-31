@@ -22,6 +22,36 @@ use iroh_next::endpoint::{Builder, QuicTransportConfig};
 use iroh_next::{Endpoint, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use tracing::{debug, info, warn};
 
+use crate::net::p2p_connection::MAX_P2P_MESSAGE_SIZE;
+
+/// Number of unidirectional QUIC streams a peer may have open against us at
+/// once. Every p2p message is sent on its own uni stream.
+const IROH_MAX_CONCURRENT_UNI_STREAMS: u32 = 32;
+
+/// Per stream QUIC flow control window.
+///
+/// `quinn` defaults this to 1.25 MB, which is *smaller than a single legal p2p
+/// message*. A message above the window parks in `SendStream::write_all` until
+/// the receiving application drains the stream, so the transport refuses to
+/// carry payloads the application considers legal and the two constants
+/// disagree.
+///
+/// Sizing the window off [`MAX_P2P_MESSAGE_SIZE`] restores the invariant that
+/// sending any legal message can complete without the peer reading
+/// concurrently.
+pub(super) const IROH_STREAM_RECEIVE_WINDOW: u32 = MAX_P2P_MESSAGE_SIZE as u32;
+
+/// Connection wide QUIC flow control window.
+///
+/// The outgoing message queue per peer is `bounded(5)`, so at most a handful of
+/// messages can be in flight on one connection; 8x [`MAX_P2P_MESSAGE_SIZE`]
+/// keeps the connection window from becoming the new blocking point.
+///
+/// Setting this explicitly *lowers* our worst case buffering: `quinn` defaults
+/// `receive_window` to `VarInt::MAX`, capped only by
+/// `max_concurrent_uni_streams` (100) times `stream_receive_window`.
+pub(super) const IROH_RECEIVE_WINDOW: u32 = 8 * IROH_STREAM_RECEIVE_WINDOW;
+
 /// Build and bind an Iroh 1.0 endpoint using guardian P2P policy.
 pub(super) async fn build_iroh_endpoint(
     secret_key: SecretKey,
@@ -78,6 +108,12 @@ pub(super) async fn build_iroh_endpoint(
                 .expect("idle timeout fits in IdleTimeout"),
         ))
         .keep_alive_interval(IROH_KEEP_ALIVE_INTERVAL)
+        // A single p2p message must always fit into the flow control window,
+        // see the docs on IROH_STREAM_RECEIVE_WINDOW.
+        .stream_receive_window(IROH_STREAM_RECEIVE_WINDOW.into())
+        .receive_window(IROH_RECEIVE_WINDOW.into())
+        .send_window(u64::from(IROH_RECEIVE_WINDOW))
+        .max_concurrent_uni_streams(IROH_MAX_CONCURRENT_UNI_STREAMS.into())
         .build();
 
     let endpoint = Box::pin(

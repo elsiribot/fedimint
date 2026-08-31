@@ -21,7 +21,11 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 /// Maximum size of a p2p message in bytes. The largest message we expect to
 /// receive is a signed session outcome.
-const MAX_P2P_MESSAGE_SIZE: usize = 10_000_000;
+///
+/// Any transport we run p2p over has to admit a whole message of this size
+/// into its flow control window, see
+/// [`crate::net::p2p_connector::iroh::endpoint`].
+pub(crate) const MAX_P2P_MESSAGE_SIZE: usize = 10_000_000;
 
 pub type DynP2PConnection<M> = Box<dyn IP2PConnection<M>>;
 

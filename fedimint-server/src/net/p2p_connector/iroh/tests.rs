@@ -6,8 +6,11 @@ use fedimint_server_core::dashboard_ui::ConnectionType;
 use iroh::{NodeAddr, SecretKey};
 use iroh_next::{RelayUrl, TransportAddr};
 
-use super::endpoint::guardian_pkarr_addr_filter;
+use super::endpoint::{
+    IROH_RECEIVE_WINDOW, IROH_STREAM_RECEIVE_WINDOW, guardian_pkarr_addr_filter,
+};
 use super::{IP2PConnector, IrohConnector, endpoint_id_stable_to_next, secret_key_stable_to_next};
+use crate::net::p2p_connection::MAX_P2P_MESSAGE_SIZE;
 
 #[test]
 fn stable_identity_converts_to_same_iroh_v1_identity() {
@@ -91,4 +94,23 @@ async fn production_connectors_exchange_messages_over_direct_override() -> anyho
     assert_eq!(outgoing.connection_type(), Some(ConnectionType::Direct));
 
     Ok(())
+}
+
+/// A single p2p message must always fit into one QUIC stream's flow control
+/// window, and several must fit into the connection's.
+///
+/// Without this, `SendStream::write_all` parks until the peer's *application*
+/// reads, which the p2p state machine cannot promise while it is itself
+/// sending. `quinn`'s 1.25 MB default window is below `MAX_P2P_MESSAGE_SIZE`
+/// and stalled 7 guardian federations whose DKG round payload was ~1.26 MB.
+#[test]
+fn quic_windows_admit_a_whole_p2p_message() {
+    assert!(
+        u64::from(IROH_STREAM_RECEIVE_WINDOW) >= MAX_P2P_MESSAGE_SIZE as u64,
+        "stream_receive_window must admit a whole p2p message"
+    );
+    assert!(
+        u64::from(IROH_RECEIVE_WINDOW) >= MAX_P2P_MESSAGE_SIZE as u64,
+        "receive_window must admit a whole p2p message"
+    );
 }
