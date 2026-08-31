@@ -189,11 +189,11 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
     async fn get_block_number(&self) -> anyhow::Result<u64>;
 
     /// The canonical block hash of `block` (security findings 04/12): used by
-    /// the deposit scanner to bind a
-    /// [`fedimint_usdt_common::DepositObservation`] to a specific fork, so
+    /// the block-hash observer to bind a
+    /// [`fedimint_usdt_common::BlockHashObservation`] to a specific fork, so
     /// observations read on different forks at the same height cannot
-    /// aggregate toward a threshold credit. `Err` if `block` is unknown to
-    /// the node (e.g. beyond its head) or the node is unreachable.
+    /// aggregate toward a threshold ring anchor. `Err` if `block` is unknown
+    /// to the node (e.g. beyond its head) or the node is unreachable.
     async fn get_block_hash(&self, block: u64) -> anyhow::Result<[u8; 32]>;
 
     /// The ERC-20 `balanceOf(holder)` for `token`, evaluated *as of*
@@ -205,6 +205,22 @@ pub trait IServerEvmRpc: std::fmt::Debug + Send + Sync + 'static {
         holder: EvmAddress,
         at_block: u64,
     ) -> anyhow::Result<UsdtAmount>;
+
+    /// The raw 32-byte EVM storage word at `key` of contract `addr`,
+    /// evaluated *as of* `at_block` (`eth_getStorageAt`). Used by the
+    /// guardian-local balances-slot consistency check
+    /// (`Usdt::spawn_balances_slot_checker`) to verify that the configured
+    /// token really keeps its balances mapping at
+    /// `fedimint_usdt_common::USDT_BALANCES_SLOT` -- the slot every
+    /// deposit-proof storage key is derived from -- by comparing this raw
+    /// read against the same block's `balanceOf`. Never part of a consensus
+    /// decision.
+    async fn get_storage_at(
+        &self,
+        addr: EvmAddress,
+        key: [u8; 32],
+        at_block: u64,
+    ) -> anyhow::Result<[u8; 32]>;
 
     /// The token's Tether-style `basisPointsRate` transfer-fee parameter, used
     /// by the startup solvency check ([`crate::UsdtInit::init`]). Returns `Err`
@@ -641,6 +657,21 @@ impl IServerEvmRpc for AlloyEvmRpc {
         Ok(UsdtAmount(balance))
     }
 
+    async fn get_storage_at(
+        &self,
+        addr: EvmAddress,
+        key: [u8; 32],
+        at_block: u64,
+    ) -> anyhow::Result<[u8; 32]> {
+        let word: U256 = self
+            .provider
+            .get_storage_at(Address::from(addr.0), U256::from_be_bytes(key))
+            .block_id(BlockId::number(at_block))
+            .await
+            .with_context(|| format!("eth_getStorageAt on {addr} at block {at_block}"))?;
+        Ok(word.to_be_bytes())
+    }
+
     async fn get_erc20_basis_points_rate(&self, token: EvmAddress) -> anyhow::Result<u64> {
         let contract = IERC20::new(Address::from(token.0), &self.provider);
         // On a standard ERC-20 (no `basisPointsRate`) this call reverts, which
@@ -1037,7 +1068,6 @@ impl IServerEvmRpc for AlloyEvmRpc {
         let Some(hint) = resp else {
             return Ok(None);
         };
-        let actual_gas_cost = u64::try_from(hint.actual_gas_cost).unwrap_or(u64::MAX);
         let hint_block = u64::try_from(hint.receipt.block_number)
             .context("UserOp receipt blockNumber overflows u64")?;
 
@@ -1046,9 +1076,11 @@ impl IServerEvmRpc for AlloyEvmRpc {
         // `UserOperationEvent` log, read with a SINGLE-block `eth_getLogs`
         // (fromBlock == toBlock == the bundler-hinted block, so the free-tier
         // range/archive limits do not bite) filtered on the EntryPoint address
-        // and the event's indexed `userOpHash` topic. `{success, block,
-        // block_hash}` all come from this log -- never from the bundler hint --
-        // so a lying/compromised bundler cannot fabricate a settlement.
+        // and the event's indexed `userOpHash` topic. EVERY receipt field --
+        // `{success, block, block_hash, actual_gas_cost_wei}` -- comes from
+        // this log, never from the bundler hint (see
+        // [`receipt_from_entrypoint_logs`]), so a lying/compromised bundler
+        // cannot fabricate a settlement or its gas cost.
         let entry_point = self.entry_point.context(
             "AlloyEvmRpc::get_user_op_receipt requires an EntryPoint address (see \
              Self::with_entry_point)",
@@ -1066,30 +1098,8 @@ impl IServerEvmRpc for AlloyEvmRpc {
             .await
             .context("eth_getLogs UserOperationEvent cross-check failed")?;
 
-        for log in logs {
-            // Belt-and-suspenders: the filter already constrains address +
-            // topic0 + topic1, but re-verify the EntryPoint address and the
-            // decoded indexed `userOpHash` before trusting the event.
-            if log.inner.address != entry_point_addr {
-                continue;
-            }
-            let Ok(decoded) = UserOperationEvent::decode_log(&log.inner) else {
-                continue;
-            };
-            if decoded.data.userOpHash != B256::from(user_op_hash) {
-                continue;
-            }
-            let (Some(block_hash), Some(block)) = (log.block_hash, log.block_number) else {
-                // A pending/uncled log with no block identity: cannot bind to
-                // a fork, so treat as not-yet-confirmed.
-                continue;
-            };
-            return Ok(Some(UserOpReceipt {
-                success: decoded.data.success,
-                block,
-                block_hash: block_hash.0,
-                actual_gas_cost_wei: UsdtAmount(actual_gas_cost),
-            }));
+        if let Some(receipt) = receipt_from_entrypoint_logs(&logs, entry_point_addr, user_op_hash) {
+            return Ok(Some(receipt));
         }
 
         // The bundler claimed inclusion but the authoritative EntryPoint log is
@@ -1124,16 +1134,70 @@ impl IServerEvmRpc for AlloyEvmRpc {
     }
 }
 
+/// Builds the authoritative [`UserOpReceipt`] for `user_op_hash` from the
+/// configured `EntryPoint`'s own `UserOperationEvent` logs, or `None` when no
+/// log confirms the op (mismatch/absent/pending -> do not confirm).
+///
+/// Every receipt field comes from the decoded log itself: `success`, the
+/// inclusion `block`/`block_hash`, AND `actual_gas_cost_wei` (the event's own
+/// `actualGasCost`). The last one matters just as much as the others: it
+/// feeds the refund deduction for failed withdrawal batches, so taking it
+/// from the bundler's untrusted `eth_getUserOperationReceipt` response (as
+/// this code once did, while already cross-checking the other fields against
+/// the log) would let a lying/compromised bundler inflate the gas cost
+/// deducted from users' refunds. The bundler response is used ONLY to locate
+/// the inclusion block for the single-block `eth_getLogs` query.
+///
+/// Pure over its inputs (no RPC), so the field-provenance contract is
+/// unit-testable below. This is guardian-LOCAL observation code: its output
+/// only becomes consensus once threshold-many guardians vote the identical
+/// `UserOpConfirmed` observation.
+fn receipt_from_entrypoint_logs(
+    logs: &[alloy::rpc::types::Log],
+    entry_point_addr: Address,
+    user_op_hash: [u8; 32],
+) -> Option<UserOpReceipt> {
+    for log in logs {
+        // Belt-and-suspenders: the caller's filter already constrains
+        // address + topic0 + topic1, but re-verify the EntryPoint address
+        // and the decoded indexed `userOpHash` before trusting the event.
+        if log.inner.address != entry_point_addr {
+            continue;
+        }
+        let Ok(decoded) = UserOperationEvent::decode_log(&log.inner) else {
+            continue;
+        };
+        if decoded.data.userOpHash != B256::from(user_op_hash) {
+            continue;
+        }
+        let (Some(block_hash), Some(block)) = (log.block_hash, log.block_number) else {
+            // A pending/uncled log with no block identity: cannot bind to
+            // a fork, so treat as not-yet-confirmed.
+            continue;
+        };
+        // Saturating: a gas cost that overflows u64 (impossible for any real
+        // op; ~18.4 ETH of wei) still yields a deterministic, maximal
+        // deduction rather than a decode failure.
+        let actual_gas_cost = u64::try_from(decoded.data.actualGasCost).unwrap_or(u64::MAX);
+        return Some(UserOpReceipt {
+            success: decoded.data.success,
+            block,
+            block_hash: block_hash.0,
+            actual_gas_cost_wei: UsdtAmount(actual_gas_cost),
+        });
+    }
+    None
+}
+
 /// Subset of an ERC-4337 `eth_getUserOperationReceipt` response the module
 /// needs as a HINT to locate the inclusion block (see
-/// [`AlloyEvmRpc::get_user_op_receipt`]); the authoritative `success`/block/
-/// block-hash come from the `EntryPoint` log cross-check, so the bundler's own
-/// `success` flag is deliberately NOT deserialized/trusted here. Hex-string
-/// numbers decode via `alloy`'s `U256` serde.
+/// [`AlloyEvmRpc::get_user_op_receipt`]); ALL authoritative receipt fields --
+/// `success`, block, block-hash, and `actualGasCost` -- come from the
+/// `EntryPoint` log cross-check ([`receipt_from_entrypoint_logs`]), so
+/// nothing beyond the locating block number is deserialized/trusted here.
+/// Hex-string numbers decode via `alloy`'s `U256` serde.
 #[derive(Debug, serde::Deserialize)]
 struct BundlerUserOpReceipt {
-    #[serde(rename = "actualGasCost")]
-    actual_gas_cost: U256,
     receipt: BundlerInnerReceipt,
 }
 
@@ -1285,6 +1349,90 @@ mod tests {
     #[test]
     fn https_ok() {
         AlloyEvmRpc::new("https://eth-mainnet.g.alchemy.com/v2/key").expect("https is allowed");
+    }
+
+    /// Builds an `alloy` RPC [`alloy::rpc::types::Log`] carrying a real
+    /// ABI-encoded `UserOperationEvent`, as `eth_getLogs` would return it.
+    fn entrypoint_event_log(
+        entry_point: Address,
+        user_op_hash: [u8; 32],
+        success: bool,
+        actual_gas_cost: u64,
+        block: Option<u64>,
+        block_hash: Option<[u8; 32]>,
+    ) -> alloy::rpc::types::Log {
+        let event = UserOperationEvent {
+            userOpHash: B256::from(user_op_hash),
+            sender: Address::from([0x11; 20]),
+            paymaster: Address::ZERO,
+            nonce: U256::ZERO,
+            success,
+            actualGasCost: U256::from(actual_gas_cost),
+            actualGasUsed: U256::from(21_000u64),
+        };
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: entry_point,
+                data: alloy::sol_types::SolEvent::encode_log_data(&event),
+            },
+            block_hash: block_hash.map(B256::from),
+            block_number: block,
+            ..Default::default()
+        }
+    }
+
+    /// The receipt's `actual_gas_cost_wei` must come from the `EntryPoint`
+    /// log's own `actualGasCost` field (this fix), alongside the
+    /// already-log-sourced `success`/`block`/`block_hash` -- the untrusted
+    /// bundler hint contributes nothing to any receipt field.
+    #[test]
+    fn receipt_fields_including_gas_cost_come_from_the_entrypoint_log() {
+        let entry_point = Address::from([0xEE; 20]);
+        let op_hash = [0x42; 32];
+        let log = entrypoint_event_log(
+            entry_point,
+            op_hash,
+            false,
+            1_234_567,
+            Some(99),
+            Some([0xBB; 32]),
+        );
+
+        let receipt = receipt_from_entrypoint_logs(&[log], entry_point, op_hash)
+            .expect("a matching, block-bound log must confirm");
+
+        assert_eq!(receipt.actual_gas_cost_wei, UsdtAmount(1_234_567));
+        assert!(!receipt.success);
+        assert_eq!(receipt.block, 99);
+        assert_eq!(receipt.block_hash, [0xBB; 32]);
+    }
+
+    /// A log for a different op hash, from a different address, or without a
+    /// block identity must not confirm anything.
+    #[test]
+    fn receipt_rejects_mismatched_or_unbound_logs() {
+        let entry_point = Address::from([0xEE; 20]);
+        let op_hash = [0x42; 32];
+
+        let wrong_hash =
+            entrypoint_event_log(entry_point, [0x43; 32], true, 1, Some(99), Some([0xBB; 32]));
+        assert!(receipt_from_entrypoint_logs(&[wrong_hash], entry_point, op_hash).is_none());
+
+        let wrong_address = entrypoint_event_log(
+            Address::from([0xEF; 20]),
+            op_hash,
+            true,
+            1,
+            Some(99),
+            Some([0xBB; 32]),
+        );
+        assert!(receipt_from_entrypoint_logs(&[wrong_address], entry_point, op_hash).is_none());
+
+        let no_block = entrypoint_event_log(entry_point, op_hash, true, 1, None, Some([0xBB; 32]));
+        assert!(receipt_from_entrypoint_logs(&[no_block], entry_point, op_hash).is_none());
+
+        let no_block_hash = entrypoint_event_log(entry_point, op_hash, true, 1, Some(99), None);
+        assert!(receipt_from_entrypoint_logs(&[no_block_hash], entry_point, op_hash).is_none());
     }
 
     #[test]

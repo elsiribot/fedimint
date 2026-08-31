@@ -321,7 +321,6 @@ pub(crate) async fn distributed_gen(
             entry_point: params.entry_point,
             account_factory: params.account_factory,
             simple_account_impl: params.simple_account_impl,
-            check_ttl_blocks: params.check_ttl_blocks,
             broadcaster_min_balance_wei: params.broadcaster_min_balance_wei,
             eth_usd_price_feed: params.eth_usd_price_feed,
             price_feed_max_staleness_secs: params.price_feed_max_staleness_secs,

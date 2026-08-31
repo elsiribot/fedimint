@@ -86,6 +86,16 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     let usdt_contract = EvmAddress([0u8; 20]);
     mock.set_chain_id(31337);
     mock.set_block_number(100);
+    // Script the fee estimate explicitly so the deposit fee the proof path
+    // charges is a deterministic value this test can compute the expected
+    // net-minted balance from.
+    let scripted_fee = fedimint_usdt_common::FeeVote {
+        max_fee_per_gas_wei: 100_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
+    let deposit_fee = fedimint_usdt_common::deposit_fee_quote(&scripted_fee)
+        .expect("scripted fee must produce a quote");
 
     let fed = dual_mint_fixtures(mock.clone())
         .new_fed_builder(0)
@@ -125,13 +135,15 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
 
     let (claim_keypair, account) = usdt1.allocate_deposit().await?;
 
-    // Deposit-by-proof credits AND mints the full proven balance in one no-fee
-    // transaction (unlike the legacy observe-then-claim path), so the deposit
-    // is a plain 512-msat multiple (mintv2's smallest client denomination, so
-    // it is exactly representable as e-cash with no rounding dust). Client 1
-    // deliberately does NOT submit a proof -- it models a depositor who funded
-    // the account on-chain but lost its DB BEFORE crediting.
-    let deposit_amount = UsdtAmount(2_560_000);
+    // Deposit-by-proof credits the full proven balance and mints it net of
+    // the deposit fee in one transaction, so the deposit is chosen as a
+    // 512-msat-multiple NET (mintv2's smallest client denomination, exactly
+    // representable as e-cash with no rounding dust) padded by the
+    // deterministic fee. Client 1 deliberately does NOT submit a proof -- it
+    // models a depositor who funded the account on-chain but lost its DB
+    // BEFORE crediting.
+    let net_amount = UsdtAmount(2_560_000);
+    let deposit_amount = UsdtAmount(net_amount.0 + deposit_fee.0);
 
     // --- Client 2: SAME seed, FRESH empty DB (simulating total client-DB
     //     loss). It has no ClaimKey/NextDepositIndex entries at all. ---
@@ -180,20 +192,20 @@ async fn deposit_is_recoverable_from_seed_after_db_loss() -> anyhow::Result<()> 
     )
     .await?;
 
-    // The FULL deposited amount (no fee on the proof path) lands in the
-    // seed-only client's `USDT_UNIT` balance. Issuance is asynchronous even
-    // after the proof tx is accepted, so poll with a timeout.
+    // The deposited amount NET of the deposit fee lands in the seed-only
+    // client's `USDT_UNIT` balance. Issuance is asynchronous even after the
+    // proof tx is accepted, so poll with a timeout.
     let poll_deadline = Instant::now() + Duration::from_secs(30);
     let balance = loop {
         let balance = client2.get_balance_for_unit(USDT_UNIT).await?;
-        if balance == Amount::from_msats(deposit_amount.0) || Instant::now() >= poll_deadline {
+        if balance == Amount::from_msats(net_amount.0) || Instant::now() >= poll_deadline {
             break balance;
         }
         sleep(Duration::from_millis(200)).await;
     };
     assert_eq!(
         balance,
-        Amount::from_msats(deposit_amount.0),
+        Amount::from_msats(net_amount.0),
         "the recovered deposit must be creditable+claimable into USDT_UNIT e-cash on the \
          seed-only client"
     );

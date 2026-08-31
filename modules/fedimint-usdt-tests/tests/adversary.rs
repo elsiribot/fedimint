@@ -35,7 +35,7 @@ use fedimint_testing::federation::FederationTest;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_usdt_client::api::UsdtFederationApi as _;
 use fedimint_usdt_client::{CraftedInputOutcome, UsdtClientInit, UsdtClientModule};
-use fedimint_usdt_common::{EvmAddress, USDT_UNIT, UsdtAmount};
+use fedimint_usdt_common::{EvmAddress, FeeVote, USDT_UNIT, UsdtAmount, deposit_fee_quote};
 use fedimint_usdt_server::UsdtInit;
 use fedimint_usdt_tests::attacks::{self, Attack};
 
@@ -43,10 +43,25 @@ use fedimint_usdt_tests::attacks::{self, Attack};
 /// module's default `UsdtGenParams::usdt_contract` placeholder).
 const USDT_CONTRACT: EvmAddress = EvmAddress([0u8; 20]);
 
-/// 512-msat-aligned so a credit's minted e-cash is exactly representable by the
-/// `mintv2` primary module with no rounding dust (lets the baseline assert
-/// EXACT equality).
-const DEPOSIT_AMOUNT: UsdtAmount = UsdtAmount(2_560_000);
+/// The NET e-cash the honest baseline expects to mint: 512-msat-aligned so a
+/// credit's minted e-cash is exactly representable by the `mintv2` primary
+/// module with no rounding dust (lets the baseline assert EXACT equality).
+const NET_AMOUNT: UsdtAmount = UsdtAmount(2_560_000);
+
+/// The `FeeVote` every guardian's mock scripts (see [`boot_ready`]): a low,
+/// sane estimate whose `deposit_fee_quote` stays small relative to
+/// [`NET_AMOUNT`], so the fee-gated proof path accepts the honest credit.
+const SCRIPTED_FEE: FeeVote = FeeVote {
+    max_fee_per_gas_wei: 100_000_000,
+    usdt_per_eth_e6: 3_000_000_000,
+};
+
+/// The GROSS on-chain deposit: [`NET_AMOUNT`] padded by the deterministic
+/// deposit fee the proof path charges, so exactly `NET_AMOUNT` is minted.
+fn deposit_amount() -> UsdtAmount {
+    let fee = deposit_fee_quote(&SCRIPTED_FEE).expect("scripted fee must produce a quote");
+    UsdtAmount(NET_AMOUNT.0 + fee.0)
+}
 
 /// A federation with the USDT-denominated `mintv2` primary plus the usdt module
 /// wired to `mock` as every guardian's EVM RPC (mirrors `tests/tests.rs`'s
@@ -71,6 +86,7 @@ async fn boot_ready() -> anyhow::Result<(FederationTest, ClientHandleArc, Arc<Mo
     let mock = Arc::new(MockEvmRpc::new());
     mock.set_chain_id(31337);
     mock.set_block_number(100);
+    mock.set_fee_estimate(SCRIPTED_FEE);
 
     let fed = dual_mint_fixtures(mock.clone())
         .new_fed_builder(0)
@@ -188,8 +204,9 @@ async fn assert_attack_rejected(
 }
 
 /// #1 HONEST BASELINE (control): a legit proof of a genuinely-derived deposit
-/// account credits AND mints exactly the deposited amount. Proves the flow
-/// works and that the matrix's "reject" outcomes are not false negatives.
+/// account credits the deposited amount and mints exactly the NET (gross
+/// minus the deposit fee). Proves the flow works and that the matrix's
+/// "reject" outcomes are not false negatives.
 #[tokio::test(flavor = "multi_thread")]
 async fn attack_01_honest_baseline_credits_and_mints() -> anyhow::Result<()> {
     let (fed, client, mock) = boot_ready().await?;
@@ -202,21 +219,22 @@ async fn attack_01_honest_baseline_credits_and_mints() -> anyhow::Result<()> {
         USDT_CONTRACT,
         &claim_keypair,
         account,
-        DEPOSIT_AMOUNT,
+        deposit_amount(),
         Duration::from_secs(120),
     )
     .await?;
 
     // Poll: issuance is async even after the deposit-proof tx is accepted.
+    // Exactly the NET (gross minus the deposit fee) is minted.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let balance = usdt_balance(&client).await?;
-        if balance == Amount::from_msats(DEPOSIT_AMOUNT.0) {
+        if balance == Amount::from_msats(NET_AMOUNT.0) {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "honest deposit-by-proof did not mint {DEPOSIT_AMOUNT} (last balance {balance})"
+            "honest deposit-by-proof did not mint {NET_AMOUNT} net (last balance {balance})"
         );
         sleep(Duration::from_millis(200)).await;
     }
@@ -337,7 +355,7 @@ async fn attack_06_replay_rejected() -> anyhow::Result<()> {
         USDT_CONTRACT,
         &claim_keypair,
         account,
-        DEPOSIT_AMOUNT,
+        deposit_amount(),
         Duration::from_secs(120),
     )
     .await?;
@@ -347,39 +365,9 @@ async fn attack_06_replay_rejected() -> anyhow::Result<()> {
     // and is rejected on the zero delta (not the anchor).
     let block = latest_anchored(&usdt).await?;
     let (proof, hash) =
-        attacks::synthetic_deposit_proof(USDT_CONTRACT, account, DEPOSIT_AMOUNT.0, block);
+        attacks::synthetic_deposit_proof(USDT_CONTRACT, account, deposit_amount().0, block);
     mock.set_block_hash(block, hash);
-    let attack = attacks::attack_replay(claim_keypair.public_key(), proof, DEPOSIT_AMOUNT);
-    assert_attack_rejected(&usdt, &client, &mock, vec![claim_keypair], attack).await?;
-
-    drop(fed);
-    Ok(())
-}
-
-/// #7 OVER-MINT: after a legit deposit-by-proof credit (which advances both
-/// `credited` and `claimed`), a legacy `V0` claim tries to re-mint the value.
-/// `available == 0` -> `InsufficientCredit`.
-#[tokio::test(flavor = "multi_thread")]
-async fn attack_07_over_mint_via_v0_rejected() -> anyhow::Result<()> {
-    let (fed, client, mock) = boot_ready().await?;
-    let usdt = client.get_first_module::<UsdtClientModule>()?;
-
-    let (claim_keypair, account) = usdt.allocate_deposit().await?;
-    common::credit_deposit_via_proof(
-        &usdt,
-        &mock,
-        USDT_CONTRACT,
-        &claim_keypair,
-        account,
-        DEPOSIT_AMOUNT,
-        Duration::from_secs(120),
-    )
-    .await?;
-
-    // Try to re-claim the already-minted delta via the legacy V0 path. The V0
-    // input's pub_key is the account's stored claim_pk, so it must be signed by
-    // the same claim keypair.
-    let attack = attacks::attack_over_mint_v0(account, DEPOSIT_AMOUNT);
+    let attack = attacks::attack_replay(claim_keypair.public_key(), proof, deposit_amount());
     assert_attack_rejected(&usdt, &client, &mock, vec![claim_keypair], attack).await?;
 
     drop(fed);
@@ -424,7 +412,7 @@ async fn attack_09_stale_growth_rejected() -> anyhow::Result<()> {
         USDT_CONTRACT,
         &claim_keypair,
         account,
-        DEPOSIT_AMOUNT,
+        deposit_amount(),
         Duration::from_secs(120),
     )
     .await?;
@@ -443,7 +431,7 @@ async fn attack_09_stale_growth_rejected() -> anyhow::Result<()> {
         claim_keypair.public_key(),
         account,
         other_block,
-        UsdtAmount(DEPOSIT_AMOUNT.0 / 2),
+        UsdtAmount(deposit_amount().0 / 2),
     );
     assert_attack_rejected(&usdt, &client, &mock, vec![claim_keypair], attack).await?;
 

@@ -41,6 +41,8 @@ fn test_secret_key(byte: u8) -> secp256k1::SecretKey {
     secp256k1::SecretKey::from_slice(&[byte; 32]).expect("nonzero byte is a valid secp256k1 scalar")
 }
 
+#[ignore = "needs an ERC-4337 bundler; anvil answers eth_getUserOperationReceipt \
+            with -32601. See deploy_and_sweep_e2e.rs for the shared analysis"]
 #[tokio::test]
 async fn hand_signed_withdrawal_batch_deploys_pool_and_pays_recipients() -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {

@@ -9,8 +9,8 @@ use std::ffi;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context as _, bail};
-use api::{FediSweepStatusResponse, UsdtFederationApi};
+use anyhow::bail;
+use api::UsdtFederationApi;
 use db::{
     ClaimKeyKey, ClaimKeyPrefixAll, DbKeyPrefix, EvmRpcUrlKey, EvmRpcUrlPrefixAll,
     NextDepositIndexKey, NextDepositIndexPrefixAll, NextRefundIndexKey, NextRefundIndexPrefixAll,
@@ -45,7 +45,7 @@ use fedimint_usdt_common::config::UsdtClientConfig;
 use fedimint_usdt_common::{
     BootstrapState, DepositFeeQuoteResponse, DepositProof, DepositStatusResponse, EvmAddress, KIND,
     PoolStateResponse, RefundStatusResponse, StatusResponse, USDT_UNIT, UsdtAmount, UsdtCommonInit,
-    UsdtInput, UsdtInputV0, UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse,
+    UsdtInput, UsdtModuleTypes, UsdtOutput, UsdtOutputV0, UserOpStatusResponse,
     WithdrawFeeQuoteResponse, WithdrawalStatus, WithdrawalStatusResponse, usdt_amount,
 };
 use futures::StreamExt;
@@ -60,13 +60,9 @@ pub mod db;
 pub mod evm;
 pub mod states;
 
-/// Cap on the exponential backoff [`UsdtClientModule::check_and_claim`] waits
-/// between `deposit_status` polls.
-const CHECK_AND_CLAIM_MAX_BACKOFF: Duration = Duration::from_secs(5);
-
 /// Cap on the exponential backoff
 /// [`UsdtClientModule::await_withdrawal_confirmed`] waits between
-/// `withdrawal_status` polls, mirroring [`CHECK_AND_CLAIM_MAX_BACKOFF`].
+/// `withdrawal_status` polls.
 const AWAIT_WITHDRAWAL_CONFIRMED_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Namespaces deposit claim keys under the module root secret: every deposit
@@ -135,34 +131,6 @@ const FEE_SANITY_PERCENT: u64 = 25;
 /// BEFORE any irreversible submit -- burning e-cash for a withdrawal or
 /// minting e-cash net of a deposit fee for a claim -- so a rejection never
 /// leaves a signed/submitted transaction behind.
-/// Computes the all-time total balance a deposit proof attests for an
-/// account, mirroring the server's sweep-aware high-water rule (LOCAL fedi
-/// extension; see `submit_prebuilt_deposit_proof`): a proof anchored at a
-/// block strictly LATER than the account's last confirmed sweep proves the
-/// POST-sweep balance, so the all-time total is `swept + proven`; a proof
-/// anchored at or before the last sweep, a never-swept account, or an
-/// unavailable `fedi_sweep_status` endpoint (`sweep: None` -- e.g. an
-/// upstream server build that does not serve the LOCAL endpoint) keeps
-/// upstream's raw-`proven` rule.
-///
-/// Pure and synchronous (no network/DB/wall-clock access, wasm-safe) so it
-/// is unit-testable without a live federation.
-fn sweep_aware_all_time_total(
-    sweep: Option<&FediSweepStatusResponse>,
-    proof_block: u64,
-    proven: UsdtAmount,
-) -> UsdtAmount {
-    match sweep {
-        Some(sweep) => match sweep.last_sweep_block {
-            Some(sweep_block) if proof_block > sweep_block => {
-                UsdtAmount(sweep.swept.0.saturating_add(proven.0))
-            }
-            _ => proven,
-        },
-        None => proven,
-    }
-}
-
 fn check_fee_cap(
     quote_fee: UsdtAmount,
     amount: UsdtAmount,
@@ -242,19 +210,6 @@ pub struct RecoverySummary {
     /// each `claim_pk` to follow up. Empty when `check_uncredited` was
     /// `false`.
     pub checked: Vec<CheckedAccount>,
-}
-
-/// Result of a single [`UsdtClientModule::claim`] call: the gross
-/// (on-chain-credited) amount claimed and the deposit fee actually charged
-/// against it (per [`UsdtClientModule::deposit_fee_quote`] at submission
-/// time), so callers can report the real e-cash issued (`claimed - fee`)
-/// without re-fetching a possibly-since-changed quote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ClaimResult {
-    /// The gross (on-chain-credited) amount claimed.
-    pub claimed: UsdtAmount,
-    /// The deposit fee charged against `claimed` (see [`UsdtInputV0::fee`]).
-    pub fee: UsdtAmount,
 }
 
 /// Outcome of [`UsdtClientModule::submit_crafted_input_for_test`]: whether the
@@ -349,11 +304,6 @@ pub enum UsdtOperationMeta {
         recipient: EvmAddress,
         amount: UsdtAmount,
         max_fee: UsdtAmount,
-        /// Txid of the fedimint transaction that enqueued the withdrawal;
-        /// its `OutPoint { txid, out_idx: 0 }` keys `withdrawal_status`.
-        /// `None` only for entries logged before this field existed.
-        #[serde(default)]
-        txid: Option<fedimint_core::TransactionId>,
     },
 }
 
@@ -372,23 +322,25 @@ impl ClientModule for UsdtClientModule {
         }
     }
 
-    // A claim input DOES charge a real deposit fee (see `Self::submit_claim`),
-    // but it is never reported through this trait method: unlike
+    // A deposit input DOES charge a real deposit fee (see
+    // `Self::submit_deposit_proof_input`), but it is
+    // never reported through this trait method: unlike
     // `output_fee` below, whose `max_fee` must be ADDED on top of the
     // withdrawal output's own `amounts` for the transaction-balancing
-    // framework to fund it correctly, a claim input's fee is baked directly
-    // into its own `ClientInput.amounts`, which `submit_claim` already sets
-    // to the NET `amount - fee` (mirroring the server's `process_input`,
-    // which declares the input GROSS -- `amounts: amount, fees: fee` -- so
-    // the two sides balance in `USDT_UNIT`: `amount >= (amount - fee) +
-    // fee`). Reporting `fee` again here would double-count it and starve the
-    // primary module's minted change by `fee`. The transaction-balancing
-    // framework calls this for every input in a transaction being built
+    // framework to fund it correctly, a deposit input's fee is baked directly
+    // into its own `ClientInput.amounts`, which `claim_input`/
+    // `deposit_proof_input` already set to the NET `amount - fee` (mirroring
+    // the server's `process_input`, which declares the input GROSS --
+    // `amounts: amount, fees: fee` -- so the two sides balance in
+    // `USDT_UNIT`: `amount >= (amount - fee) + fee`). Reporting `fee` again
+    // here would double-count it and starve the primary module's minted
+    // change by `fee`. The transaction-balancing framework calls this for
+    // every input in a transaction being built
     // (`Client::finalize_and_submit_transaction` sums `input_fee`/
     // `output_fee` across all modules involved to compute the primary
     // module's balancing output), not only when this module happens to be
-    // the primary one, so it must return `Some` for the only real input
-    // variant (`UsdtInput::V0`) rather than `unreachable!()`.
+    // the primary one, so it must return `Some` for the real input variants
+    // rather than `unreachable!()`.
     fn input_fee(
         &self,
         _amount: &Amounts,
@@ -536,7 +488,7 @@ impl UsdtClientModule {
 
     /// Derives the next seed-indexed claim keypair, persists it keyed by its
     /// derived deposit address, and returns both so the caller can hand the
-    /// address out and later drive [`Self::check_and_claim`] with the keypair.
+    /// address out and later drive [`Self::submit_deposit_proof`] against it.
     ///
     /// The claim key is deterministic from the module root secret and a
     /// monotonically-increasing per-deposit index (persisted as
@@ -548,8 +500,8 @@ impl UsdtClientModule {
         // unless the federation reports `Ready`, so a user is never told to
         // deposit into a federation that cannot yet honor the full
         // deposit->claim->sweep->withdraw lifecycle. Only the ADVERTISEMENT of
-        // new addresses is gated -- claim/withdraw/pool-state stay ungated (a
-        // credited deposit is already backed in its own account).
+        // new addresses is gated -- proof-submit/withdraw/pool-state stay
+        // ungated (a credited deposit is already backed in its own account).
         let status = self.module_api.status().await?;
         if status.state != BootstrapState::Ready {
             bail!(
@@ -604,72 +556,10 @@ impl UsdtClientModule {
             })
     }
 
-    /// Returns the most recently allocated deposit address if it has never
-    /// received a deposit, otherwise allocates a fresh one -- so a caller
-    /// that repeatedly shows "the" deposit address (e.g. a wallet's receive
-    /// screen) reuses the same unused address instead of burning a new
-    /// derivation index on every view. The returned `bool` is
-    /// `newly_allocated`: `false` on the reuse path, `true` when this call
-    /// fell through to [`Self::allocate_deposit`].
-    ///
-    /// Reuse path: if [`NextDepositIndexKey`] is past `0`, the keypair for
-    /// the last-handed-out index is re-derived (deterministically, see
-    /// [`Self::claim_keypair_for_index`]) and the federation's
-    /// `deposit_status` is consulted; `credited == 0` means the address has
-    /// never been credited a deposit, so it is returned as-is (with its
-    /// [`ClaimKeyKey`] idempotently re-stored, mirroring
-    /// [`Self::recover_deposits`]' key-restoring discipline, so a client DB
-    /// that lost the key still ends up with it). A `deposit_status` failure
-    /// is propagated rather than silently falling through to a fresh
-    /// allocation (the caller is interactive and can retry; silently
-    /// allocating on every transient API error would defeat the reuse).
-    ///
-    /// The reuse path deliberately does NOT apply [`Self::allocate_deposit`]'s
-    /// `BootstrapState::Ready` readiness gate: only the ADVERTISEMENT of NEW
-    /// deposit addresses is gated (see that method's doc comment), and a
-    /// reused address already exists -- the federation watches it regardless.
-    ///
-    /// Otherwise (nothing allocated yet, or the last address was already
-    /// credited -- reusing a credited address would mislead depositors into
-    /// paying an address whose earlier deposit may already be claimed), this
-    /// falls through to [`Self::allocate_deposit`], gate included.
-    pub async fn current_or_allocate_deposit(&self) -> anyhow::Result<(Keypair, EvmAddress, bool)> {
-        let next_index = self
-            .db
-            .begin_transaction_nc()
-            .await
-            .get_value(&NextDepositIndexKey)
-            .await
-            .unwrap_or(0);
-
-        if next_index > 0 {
-            let claim_keypair = self.claim_keypair_for_index(next_index - 1);
-            let claim_pk = claim_keypair.public_key();
-            let account = self.deposit_address(&claim_pk);
-
-            let status = self.module_api.deposit_status(claim_pk).await?;
-            if status.credited.0 == 0 {
-                // Idempotently ensure the claim key is stored (it normally
-                // already is, from the `allocate_deposit` that handed this
-                // index out, but re-storing the deterministically re-derived
-                // key is harmless and heals a lost entry).
-                let mut dbtx = self.db.begin_transaction().await;
-                dbtx.insert_entry(&ClaimKeyKey(account), &claim_keypair)
-                    .await;
-                dbtx.commit_tx().await;
-
-                return Ok((claim_keypair, account, false));
-            }
-        }
-
-        let (claim_keypair, account) = self.allocate_deposit().await?;
-        Ok((claim_keypair, account, true))
-    }
-
     /// Rescans the federation from the seed alone to rediscover deposits whose
-    /// client-DB state was lost, re-storing each rediscovered claim key so the
-    /// existing [`Self::claim`]/[`Self::check_and_claim`] path can then be run
-    /// per account.
+    /// client-DB state was lost, re-storing each rediscovered claim key (so a
+    /// later [`Self::submit_deposit_proof`] for its index can credit + mint
+    /// against it).
     ///
     /// Gap-limit scan: walks seed-derivation indices from `0`, deriving
     /// [`Self::claim_keypair_for_index`] and querying the federation's
@@ -694,9 +584,9 @@ impl UsdtClientModule {
     /// [`Self::allocate_deposit`] calls do not collide with recovered
     /// deposits (left untouched if none were found).
     ///
-    /// This does NOT auto-claim: recovery is deliberately read-mostly plus
-    /// key-restoring, so the caller decides when to run [`Self::claim`] per
-    /// account with a nonzero `claimable`. This explicit rescan (plus its CLI
+    /// This does NOT auto-credit: recovery is deliberately read-mostly plus
+    /// key-restoring, so the caller decides when to submit a deposit proof
+    /// per rediscovered index. This explicit rescan (plus its CLI
     /// `recover` subcommand) is the module's recovery path; the module uses
     /// [`NoModuleBackup`], so it is not wired into the client's global
     /// `recover()` flow -- doing so is a possible follow-up.
@@ -777,13 +667,12 @@ impl UsdtClientModule {
                 // distinguish a truly unused index from one that was funded
                 // on-chain but not yet credited -- both report `credited == 0`
                 // here. Rather than silently discarding the index, persist its
-                // claim key (so `claim`/`check_and_claim` can use it the moment
-                // the deposit IS credited via a `UsdtInput::DepositProofV0`
-                // proof submission) when `check_uncredited` is set -- this does
-                // NOT auto-claim (the caller still decides when to run
-                // `claim`), it only ensures the funds are not practically
-                // stranded. The miss counter still advances so the scan
-                // terminates at `gap_limit`.
+                // claim key when `check_uncredited` is set (so a follow-up
+                // `UsdtInput::DepositProofV0` proof submission can credit +
+                // mint it) -- this does NOT auto-credit (the caller still
+                // decides when to submit the proof), it only ensures the
+                // funds are not practically stranded. The miss counter still
+                // advances so the scan terminates at `gap_limit`.
                 if check_uncredited {
                     let mut dbtx = db.begin_transaction().await;
                     dbtx.insert_entry(&ClaimKeyKey(status.account), &claim_keypair)
@@ -943,22 +832,31 @@ impl UsdtClientModule {
     ///    and assert `keccak256(header_rlp) == B.hash` locally before
     ///    submitting.
     /// 4. Submit a transaction pairing the `DepositProofV0` input (funding the
-    ///    newly-proven delta in [`USDT_UNIT`]) with the primary
-    ///    (USDT-denominated `mintv2`) module's mint output -- deposit + claim
-    ///    atomic, no fee (see [`UsdtInput::DepositProofV0`]).
+    ///    newly-proven delta GROSS, with the federation's deposit fee quote as
+    ///    its `fee`) with the primary (USDT-denominated `mintv2`) module's mint
+    ///    output for the NET `delta - fee` -- deposit + claim atomic (see
+    ///    [`UsdtInput::DepositProofV0`]).
     ///
     /// `evm_rpc_url` overrides the endpoint for this call only; see
     /// [`Self::resolve_evm_rpc_urls`] for the precedence.
+    ///
+    /// `max_deposit_fee`/`accept_high_fee` are the security finding 07 fee
+    /// cap applied to the freshly fetched deposit fee quote (see
+    /// [`check_fee_cap`]).
     ///
     /// # Errors
     ///
     /// Returns an `Err` if the ring has anchored no block yet, the RPC calls
     /// fail, the header reconstruction does not hash to the block's own hash,
-    /// or the proof proves nothing new over what is already credited.
+    /// the proof proves nothing new over what is already credited, the fee
+    /// quote is unavailable or fails the [`check_fee_cap`] guard, or the fee
+    /// would consume the whole newly-proven delta.
     pub async fn submit_deposit_proof(
         &self,
         index: u64,
         evm_rpc_url: Option<String>,
+        max_deposit_fee: Option<UsdtAmount>,
+        accept_high_fee: bool,
     ) -> anyhow::Result<OperationId> {
         let claim_keypair = self.claim_keypair_for_index(index);
         let account = self.deposit_address(&claim_keypair.public_key());
@@ -975,14 +873,20 @@ impl UsdtClientModule {
             .fetch_deposit_proof(self.cfg.usdt_contract, account, block)
             .await?;
 
-        self.submit_prebuilt_deposit_proof(&claim_keypair, proof, proven)
-            .await
+        self.submit_prebuilt_deposit_proof(
+            &claim_keypair,
+            proof,
+            proven,
+            max_deposit_fee,
+            accept_high_fee,
+        )
+        .await
     }
 
     /// Submits an already-built [`DepositProof`] of `claim_keypair`'s derived
     /// deposit account as a [`UsdtInput::DepositProofV0`], crediting AND
-    /// minting the newly-proven delta as USDT e-cash in one transaction (no
-    /// fee).
+    /// minting the newly-proven delta (net of the federation's deposit fee
+    /// quote) as USDT e-cash in one transaction.
     ///
     /// This is the transport-agnostic core of [`Self::submit_deposit_proof`]:
     /// the latter obtains `(proof, proven)` via the client's own WASM-safe
@@ -992,6 +896,14 @@ impl UsdtClientModule {
     /// the federation's current `credited`; the authoritative balance is what
     /// the guardians independently re-derive from the trie).
     ///
+    /// Fetches the federation's current deposit fee quote
+    /// ([`Self::deposit_fee_quote`]), applies the security finding 07
+    /// [`check_fee_cap`] guard against it (`max_deposit_fee`/
+    /// `accept_high_fee`) BEFORE submitting
+    /// anything, and supplies it as the input's `fee` -- the server validates
+    /// it against its own fresh quote (client-supplies-server-validates, see
+    /// [`UsdtInput::DepositProofV0`]).
+    ///
     /// Persists `claim_keypair` under [`ClaimKeyKey`] (idempotent) so the
     /// deposit is claimable/recoverable exactly as [`Self::allocate_deposit`]
     /// leaves it.
@@ -999,12 +911,15 @@ impl UsdtClientModule {
     /// # Errors
     ///
     /// Returns an `Err` if the proof proves nothing new over what is already
-    /// credited, or the submission is rejected.
+    /// credited, the fee quote is unavailable or fails the fee-cap guard, the
+    /// fee would consume the whole delta, or the submission is rejected.
     pub async fn submit_prebuilt_deposit_proof(
         &self,
         claim_keypair: &Keypair,
         proof: DepositProof,
         proven: UsdtAmount,
+        max_deposit_fee: Option<UsdtAmount>,
+        accept_high_fee: bool,
     ) -> anyhow::Result<OperationId> {
         let claim_pk = claim_keypair.public_key();
         let account = self.deposit_address(&claim_pk);
@@ -1020,56 +935,39 @@ impl UsdtClientModule {
         // new, mintable value -- mirror the server's `process_deposit_proof`
         // high-water logic so the `ClientInput.amounts` we declare matches the
         // `InputMeta.amount` the server will return (or the transaction would
-        // not balance). LOCAL fedi extension (sweep-aware, mirroring our
-        // fork's server rule): a proof anchored at a block strictly LATER
-        // than the account's last confirmed sweep proves the POST-sweep
-        // balance, so the all-time total the server credits is
-        // `swept + proven`; a proof anchored at or before the last sweep (or
-        // for a never-swept account) keeps upstream's raw-`proven` rule.
+        // not balance).
         let status = self.module_api.deposit_status(claim_pk).await?;
-        // `fedi_sweep_status` is a LOCAL fedi extension endpoint: an upstream
-        // `fedimint-usdt-server` build does not serve it, and
-        // `request_current_consensus` then errors once a threshold of peers
-        // report the method as unknown. Degrade gracefully to upstream's
-        // raw-`proven` rule (never-swept semantics) instead of hard-failing
-        // the whole deposit-proof submission: against an upstream server the
-        // raw rule is exactly what the guardians apply, and against OUR
-        // (sweep-aware) server a fallback can at worst mis-declare the delta,
-        // which the guardians reject as an unbalanced transaction -- it can
-        // never over-credit.
-        let sweep = match self.module_api.fedi_sweep_status(claim_pk).await {
-            Ok(sweep) => Some(sweep),
-            Err(err) => {
-                tracing::debug!(
-                    %account,
-                    err = %err,
-                    "fedi_sweep_status unavailable (upstream server build?); \
-                     falling back to raw-proven deposit-credit semantics"
-                );
-                None
-            }
-        };
-        let all_time_total = sweep_aware_all_time_total(sweep.as_ref(), proof.block_number, proven);
-        let delta = all_time_total.0.saturating_sub(status.credited.0);
+        let delta = proven.0.saturating_sub(status.credited.0);
         if delta == 0 {
             bail!(
-                "deposit proof proves {proven} (all-time total {all_time_total}) but {} is \
-                 already credited for {account}; nothing new to credit",
+                "deposit proof proves {proven} but {} is already credited for {account}; nothing \
+                 new to credit",
                 status.credited,
             );
         }
 
-        self.submit_deposit_proof_input(claim_keypair, account, proof, UsdtAmount(delta))
+        // Security finding 07: the fee-cap guard runs against the freshly
+        // fetched quote BEFORE any transaction is built or submitted.
+        let fee = self.deposit_fee_quote().await?.fee;
+        check_fee_cap(
+            fee,
+            UsdtAmount(delta),
+            max_deposit_fee,
+            accept_high_fee,
+            "--max-deposit-fee",
+        )?;
+
+        self.submit_deposit_proof_input(claim_keypair, account, proof, UsdtAmount(delta), fee)
             .await
     }
 
     /// Builds the [`UsdtInput::DepositProofV0`] client input funding `delta`
-    /// (in [`USDT_UNIT`]) with `claim_keypair`, submits it paired with the
-    /// primary (USDT-denominated `mintv2`) module's mint output, and awaits the
-    /// e-cash issuance -- the deposit-by-proof analogue of
-    /// [`Self::submit_claim`] (implicit-funding pattern), but crediting AND
-    /// minting atomically with no fee. Factored out of
-    /// [`Self::submit_deposit_proof`] so a hermetic test can drive it with
+    /// (in [`USDT_UNIT`]) with `claim_keypair`, charging `fee`, submits it
+    /// paired with the primary (USDT-denominated `mintv2`) module's mint
+    /// output, and awaits the e-cash issuance -- the deposit-by-proof
+    /// implicit-funding submission path,
+    /// crediting AND minting atomically net of the deposit fee. Factored out
+    /// of [`Self::submit_deposit_proof`] so a hermetic test can drive it with
     /// a pre-built [`DepositProof`] + delta without a live EVM RPC.
     async fn submit_deposit_proof_input(
         &self,
@@ -1077,8 +975,9 @@ impl UsdtClientModule {
         account: EvmAddress,
         proof: DepositProof,
         delta: UsdtAmount,
+        fee: UsdtAmount,
     ) -> anyhow::Result<OperationId> {
-        let input = Self::deposit_proof_input(claim_keypair, proof, delta);
+        let input = Self::deposit_proof_input(claim_keypair, proof, delta, fee)?;
 
         let operation_id = OperationId::new_random();
         let tx = TransactionBuilder::new().with_inputs(
@@ -1091,21 +990,21 @@ impl UsdtClientModule {
             .finalize_and_submit_transaction(
                 operation_id,
                 KIND.as_str(),
-                // No fee on the deposit-by-proof path (see
-                // `UsdtInput::DepositProofV0`); the full delta is minted.
+                // The REAL deposit fee charged (per `Self::deposit_fee_quote`
+                // at submission time); the e-cash minted is `delta - fee`.
                 move |_range| UsdtOperationMeta::Claim {
                     account,
                     amount: delta,
-                    fee: UsdtAmount(0),
+                    fee,
                 },
                 tx,
             )
             .await?;
 
         // Await the USDT-denominated `mintv2` primary module's e-cash issuance,
-        // mirroring `submit_claim`: the deposit's e-cash is minted 1:1 with the
-        // input's `delta` funding, and issuance completes strictly after the
-        // transaction is submitted.
+        // the deposit's e-cash is minted for the
+        // input's NET `delta - fee` funding, and issuance completes strictly
+        // after the transaction is submitted.
         self.client_ctx
             .await_primary_module_outputs_for_unit(
                 operation_id,
@@ -1118,34 +1017,47 @@ impl UsdtClientModule {
     }
 
     /// Builds the [`UsdtInput::DepositProofV0`] `ClientInput` claiming a
-    /// newly-proven `delta` for `claim_keypair`'s derived deposit account.
+    /// newly-proven `delta` for `claim_keypair`'s derived deposit account,
+    /// charging `fee` via NET issuance (mirroring [`Self::claim_input`]
+    /// exactly): the input's own `fee` field carries the fee the server
+    /// verifies against its own quote, while `amounts` is set to
+    /// `delta - fee` so the USDT-`mintv2` primary module mints exactly that
+    /// much e-cash. The server's `process_deposit_proof` declares the input
+    /// GROSS (`amounts: delta, fees: fee`), so the two sides balance in
+    /// [`USDT_UNIT`]. A pure, synchronous helper (no network/DB access) so
+    /// the input construction is unit-testable.
     ///
-    /// Unlike [`Self::claim_input`], no fee: the server's
-    /// `process_deposit_proof` returns `InputMeta { amounts: delta, fees:
-    /// ZERO, pub_key: claim_pk }`, so `ClientInput.amounts` is the full `delta`
-    /// (which the USDT-`mintv2` primary module mints) and the transaction
-    /// balances in [`USDT_UNIT`]. A pure, synchronous helper (no network/DB
-    /// access) so the input construction is unit-testable.
+    /// # Errors
+    ///
+    /// Returns an `Err` if `fee` would consume all or more of `delta`
+    /// (mirroring the server's `UsdtInputError::FeeExceedsAmount` rejection,
+    /// but caught locally before ever building/submitting the transaction).
     fn deposit_proof_input(
         claim_keypair: &Keypair,
         proof: DepositProof,
         delta: UsdtAmount,
-    ) -> ClientInput<UsdtInput> {
-        ClientInput {
+        fee: UsdtAmount,
+    ) -> anyhow::Result<ClientInput<UsdtInput>> {
+        if delta.0 <= fee.0 {
+            bail!("newly-proven deposit delta {delta} does not cover the {fee} deposit fee");
+        }
+
+        Ok(ClientInput {
             input: UsdtInput::DepositProofV0 {
                 claim_pk: claim_keypair.public_key(),
                 proof,
+                fee,
             },
             keys: vec![*claim_keypair],
-            amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(delta)),
-        }
+            amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(UsdtAmount(delta.0 - fee.0))),
+        })
     }
 
     /// Adversarial/test-only: submit an ARBITRARY, hand-crafted [`UsdtInput`]
     /// (paired 1:1 with a USDT-`mintv2` mint output funding `declared`)
     /// directly through the client transaction API, bypassing every honest
-    /// builder (`submit_deposit_proof`/`submit_prebuilt_deposit_proof`/
-    /// `submit_claim`) and their client-side gates
+    /// builder (`submit_deposit_proof`/`submit_prebuilt_deposit_proof`)
+    /// and their client-side gates
     /// (delta/`claimable`/fee-cap). This is the raw submission primitive
     /// the `fedimint-usdt-tests` security harness uses to play a malicious
     /// client against the deposit-by-proof flow: it replicates exactly what
@@ -1231,85 +1143,8 @@ impl UsdtClientModule {
         Ok(CraftedInputOutcome::Accepted { minted: declared })
     }
 
-    /// Looks up the claim keypair persisted by [`Self::allocate_deposit`] for
-    /// `claim_pk`'s derived deposit account.
-    async fn load_claim_keypair(
-        &self,
-        claim_pk: &secp256k1::PublicKey,
-    ) -> anyhow::Result<(EvmAddress, Keypair)> {
-        let account = self.deposit_address(claim_pk);
-
-        let mut dbtx = self.db.begin_transaction_nc().await;
-        let claim_keypair = dbtx
-            .get_value(&ClaimKeyKey(account))
-            .await
-            .context("No claim key found for this deposit address; run `deposit-address` first")?;
-
-        Ok((account, claim_keypair))
-    }
-
-    /// One-shot claim for `claim_pk`'s deposit account: reads the current
-    /// [`Self::deposit_status`] (no polling, unlike [`Self::check_and_claim`])
-    /// and, if there is a nonzero claimable balance, submits the claim
-    /// transaction using the keypair [`Self::allocate_deposit`] persisted for
-    /// `claim_pk`. Returns a [`ClaimResult`] carrying both the claimed
-    /// (gross, on-chain-credited) amount and the deposit fee actually
-    /// charged against it -- the e-cash issued is `claimed - fee`.
-    ///
-    /// Callers should have already funded the derived deposit account and had
-    /// its balance credited via a `UsdtInput::DepositProofV0` proof submission
-    /// (see Task 9's proof-submit flow); use [`Self::deposit_status`] to poll
-    /// for the resulting credit.
-    ///
-    /// `max_deposit_fee`/`accept_high_fee` are the security finding 07 fee
-    /// cap: `max_deposit_fee` is an explicit hard ceiling on the federation's
-    /// deposit fee quote (checked in [`Self::submit_claim`] via
-    /// [`check_fee_cap`]); if `None`, the default `FEE_SANITY_PERCENT` sanity
-    /// guard applies instead unless `accept_high_fee` is set. See
-    /// [`check_fee_cap`] for the exact semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `Err` -- BEFORE any e-cash is minted -- if the federation's
-    /// deposit fee quote exceeds `max_deposit_fee`, or (when
-    /// `max_deposit_fee` is `None` and `accept_high_fee` is `false`) exceeds
-    /// the default sanity threshold.
-    pub async fn claim(
-        &self,
-        claim_pk: secp256k1::PublicKey,
-        max_deposit_fee: Option<UsdtAmount>,
-        accept_high_fee: bool,
-    ) -> anyhow::Result<ClaimResult> {
-        let (account, claim_keypair) = self.load_claim_keypair(&claim_pk).await?;
-        let status = self.module_api.deposit_status(claim_pk).await?;
-
-        if status.claimable.0 == 0 {
-            bail!(
-                "Nothing claimable yet for {account} (credited={}, claimed={}); \
-                 run `check-deposit` and wait for the deposit checker, or poll `deposit-status`",
-                status.credited.0,
-                status.claimed.0,
-            );
-        }
-
-        let fee = self
-            .submit_claim(
-                &claim_keypair,
-                account,
-                status.claimable,
-                max_deposit_fee,
-                accept_high_fee,
-            )
-            .await?;
-
-        Ok(ClaimResult {
-            claimed: status.claimable,
-            fee,
-        })
-    }
-
     /// Reports the federation's current deposit fee quote: the minimum `fee`
-    /// a `UsdtInput::V0` claiming a credited deposit must offer right now
+    /// a deposit claim must offer right now
     /// (mirroring [`Self::withdraw_fee_quote`]). Thin wrapper around
     /// [`UsdtFederationApi::deposit_fee_quote`] (threshold-agreement --
     /// every guardian answers identically, since the quote is derived from
@@ -1322,7 +1157,8 @@ impl UsdtClientModule {
     /// `FeeVote` median yet (or the quote overflowed), so the response's
     /// `fee` is a non-authoritative `UsdtAmount(0)` placeholder that MUST
     /// NOT be submitted against. Every caller of this wrapper (`claim` via
-    /// [`Self::submit_claim`], `fedimint-cli`'s `deposit-fee-quote`/`claim`)
+    /// [`Self::submit_prebuilt_deposit_proof`], `fedimint-cli`'s
+    /// `deposit-fee-quote`/`submit-deposit-proof`)
     /// therefore inherits this bail rather than silently claiming for `0`
     /// fee and hitting `process_input`'s `NoFeeQuoteAvailable` rejection
     /// later.
@@ -1330,176 +1166,6 @@ impl UsdtClientModule {
         let quote = self.module_api.deposit_fee_quote().await?;
         let available = quote.available;
         ensure_fee_quote_available(quote, available)
-    }
-
-    /// Polls [`Self::deposit_status`] until a credited deposit becomes
-    /// claimable (or `deadline` elapses), then submits a fedimint transaction
-    /// claiming it.
-    ///
-    /// Crediting is proof-driven (see the crate-level docs / Task 9's
-    /// proof-submit flow): the depositor funds the derived deposit account and
-    /// a [`fedimint_usdt_common::DepositProof`] is submitted as a
-    /// `UsdtInput::DepositProofV0` to credit it. This method only WAITS for the
-    /// resulting credit and then claims it; it no longer enqueues any
-    /// guardian-local polling (the removed guardian-poll deposit path).
-    pub async fn check_and_claim(
-        &self,
-        claim_keypair: &Keypair,
-        deadline: Duration,
-    ) -> anyhow::Result<()> {
-        let claim_pk = claim_keypair.public_key();
-
-        let deadline_at = Instant::now() + deadline;
-        let mut backoff = Duration::from_millis(250);
-
-        let (account, claimable) = loop {
-            let status = self.module_api.deposit_status(claim_pk).await?;
-
-            if status.claimable.0 > 0 {
-                break (status.account, status.claimable);
-            }
-
-            if Instant::now() >= deadline_at {
-                bail!(
-                    "Deposit to {} was not claimable before the deadline",
-                    status.account,
-                );
-            }
-
-            sleep(backoff).await;
-            backoff = (backoff * 2).min(CHECK_AND_CLAIM_MAX_BACKOFF);
-        };
-
-        // No caller-facing cap flags on this polling convenience method (it
-        // predates the CLI's `--max-deposit-fee`/`--accept-high-fee` and is
-        // only used by [`Self::claim`]'s callers indirectly via tests) --
-        // `accept_high_fee: true` preserves its prior unrestricted-quote
-        // behavior rather than silently starting to enforce the finding-07
-        // default sanity guard here.
-        self.submit_claim(claim_keypair, account, claimable, None, true)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Builds and submits the transaction claiming `amount` from `account`,
-    /// funding it with `claim_keypair`. Shared by [`Self::check_and_claim`]
-    /// (which polls until an amount is claimable) and [`Self::claim`] (which
-    /// takes a single already-known claimable amount). Returns the deposit
-    /// fee charged (per [`Self::deposit_fee_quote`]).
-    ///
-    /// The claimed funds are absorbed directly into the transaction's
-    /// implicit funding, which the USDT-`mintv2` primary module (routed to by
-    /// `USDT_UNIT`) balances by minting e-cash notes; no explicit output is
-    /// added here. The e-cash minted is the NET `amount - fee` (see
-    /// [`Self::claim_input`]).
-    ///
-    /// Applies the security finding 07 [`check_fee_cap`] guard against the
-    /// freshly fetched quote BEFORE building the claim input or submitting
-    /// anything -- see `max_deposit_fee`/`accept_high_fee` on [`Self::claim`]
-    /// for the semantics.
-    async fn submit_claim(
-        &self,
-        claim_keypair: &Keypair,
-        account: EvmAddress,
-        amount: UsdtAmount,
-        max_deposit_fee: Option<UsdtAmount>,
-        accept_high_fee: bool,
-    ) -> anyhow::Result<UsdtAmount> {
-        let quote = self.deposit_fee_quote().await?;
-        let fee = quote.fee;
-
-        check_fee_cap(
-            fee,
-            amount,
-            max_deposit_fee,
-            accept_high_fee,
-            "--max-deposit-fee",
-        )?;
-
-        let input = Self::claim_input(claim_keypair, account, amount, fee)?;
-
-        let operation_id = OperationId::new_random();
-        let tx = TransactionBuilder::new().with_inputs(
-            self.client_ctx
-                .make_client_inputs(ClientInputBundle::new_no_sm(vec![input])),
-        );
-
-        let range = self
-            .client_ctx
-            .finalize_and_submit_transaction(
-                operation_id,
-                KIND.as_str(),
-                move |_range| UsdtOperationMeta::Claim {
-                    account,
-                    amount,
-                    fee,
-                },
-                tx,
-            )
-            .await?;
-
-        // Await the primary-module (USDT-denominated `mintv2`) e-cash issuance
-        // so `claim` returns only once the e-cash is actually in hand -- the
-        // issuance is a blind-signature round-trip driven by the output state
-        // machine, which completes strictly AFTER
-        // `finalize_and_submit_transaction` returns (that only submits the tx).
-        // The unit-aware await (`..._for_unit(USDT_UNIT)`) is required because
-        // this module's e-cash is USDT-, not Bitcoin-denominated: the default
-        // `await_primary_module_outputs` resolves the primary module for
-        // `AmountUnit::BITCOIN` and would not cover our USDT-denominated
-        // `mintv2` primary module.
-        self.client_ctx
-            .await_primary_module_outputs_for_unit(
-                operation_id,
-                range.into_iter().collect(),
-                USDT_UNIT,
-            )
-            .await?;
-
-        Ok(fee)
-    }
-
-    /// Builds the `ClientInput` claiming `amount` from `account` with
-    /// `claim_keypair`, charging `fee` (per [`Self::deposit_fee_quote`]) via
-    /// NET issuance rather than an explicit [`ClientModule::input_fee`] (see
-    /// that trait method's doc comment on this module's impl for why): the
-    /// input's own [`UsdtInputV0::fee`] carries the fee the server verifies
-    /// against its own quote, while `amounts` is set to `amount - fee` so
-    /// the USDT-`mintv2` primary module mints exactly that much e-cash. The
-    /// server's `process_input` declares the input GROSS (`amounts: amount,
-    /// fees: fee`), so the two sides balance in `USDT_UNIT`.
-    ///
-    /// A pure, synchronous helper (no network/DB access) so the guard and
-    /// the resulting `ClientInput` are unit-testable without a live
-    /// federation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `Err` if `fee` would consume all or more of `amount`
-    /// (mirroring the server's `UsdtInputError::FeeExceedsAmount`
-    /// rejection, but caught locally before ever building/submitting the
-    /// transaction, mirroring how `fedimint-wallet-client` skips
-    /// uneconomical peg-ins below the deposit fee).
-    fn claim_input(
-        claim_keypair: &Keypair,
-        account: EvmAddress,
-        amount: UsdtAmount,
-        fee: UsdtAmount,
-    ) -> anyhow::Result<ClientInput<UsdtInput>> {
-        if amount.0 <= fee.0 {
-            bail!("deposit {amount} does not cover the {fee} deposit fee");
-        }
-
-        Ok(ClientInput {
-            input: UsdtInput::V0(UsdtInputV0 {
-                account,
-                amount,
-                fee,
-            }),
-            keys: vec![*claim_keypair],
-            amounts: Amounts::new_custom(USDT_UNIT, usdt_amount(UsdtAmount(amount.0 - fee.0))),
-        })
     }
 
     /// Reports the federation's current withdrawal fee quote: the minimum
@@ -1550,7 +1216,7 @@ impl UsdtClientModule {
 
     /// Polls [`Self::withdrawal_status`] until `out_point` reaches a
     /// terminal state (`Confirmed`/`Failed`) or `deadline` elapses,
-    /// mirroring [`Self::check_and_claim`]'s exponential-backoff polling
+    /// with an exponential-backoff polling
     /// loop. Returns the confirmed block on success; `Err` on `Failed`, an
     /// elapsed deadline, or an API error.
     pub async fn await_withdrawal_confirmed(
@@ -1584,7 +1250,7 @@ impl UsdtClientModule {
 
     /// Submits a withdrawal output transaction, burning `amount + max_fee`
     /// of `USDT_UNIT`-denominated e-cash (auto-funded from the USDT-`mintv2`
-    /// primary module's existing notes, mirroring [`Self::submit_claim`]'s
+    /// primary module's existing notes, mirroring the deposit-proof path's
     /// implicit-funding pattern but on the output side) and enqueueing an
     /// on-chain payout of `amount` to `recipient` (Phase 8, Task 1's
     /// DEBIT/QUEUE half; Task 2 batches queued withdrawals into an
@@ -1623,9 +1289,9 @@ impl UsdtClientModule {
     /// implicit funding sees the reissued change (the USDT-`mintv2` primary
     /// module funds each withdrawal by spending notes and reissuing change
     /// asynchronously). This mirrors this module's own claim path
-    /// (`submit_claim`), which likewise submits and lets the caller poll for
-    /// the effect rather than blocking on the primary module's output state
-    /// machines here.
+    /// (`submit_deposit_proof_input`), which likewise submits and lets the
+    /// caller poll for the effect rather than blocking on the primary
+    /// module's output state machines here.
     ///
     /// Returns the `OutPointRange` of the transaction's mint-change outputs
     /// (empty if the funding was exact). The withdrawal output itself is
@@ -1694,11 +1360,10 @@ impl UsdtClientModule {
             .finalize_and_submit_transaction(
                 operation_id,
                 KIND.as_str(),
-                move |range| UsdtOperationMeta::Withdraw {
+                move |_range| UsdtOperationMeta::Withdraw {
                     recipient,
                     amount,
                     max_fee,
-                    txid: Some(range.txid()),
                 },
                 tx,
             )
@@ -1921,9 +1586,8 @@ mod tests {
         OutPoint, PeerId, PoolStateResponse, RefundStatusResponse, SECP256K1, StatusResponse,
         USDT_UNIT, UsdtAmount, UsdtClientModule, UsdtFederationApi, UsdtInput,
         UserOpStatusResponse, WithdrawFeeQuoteResponse, WithdrawalStatusResponse, check_fee_cap,
-        ensure_fee_quote_available, secp256k1, sweep_aware_all_time_total,
+        ensure_fee_quote_available, secp256k1,
     };
-    use crate::api::FediSweepStatusResponse;
     use crate::db::{ClaimKeyKey, NextDepositIndexKey};
 
     /// Deterministic test keypair (mirrors
@@ -1932,94 +1596,6 @@ mod tests {
     /// particular one).
     fn test_keypair() -> Keypair {
         DerivableSecret::new_root(b"usdt-claim-input-test-seed", b"salt").to_secp_key(SECP256K1)
-    }
-
-    /// [`sweep_aware_all_time_total`] mirrors the server's sweep-aware
-    /// high-water rule: post-sweep proofs prove the post-sweep balance
-    /// (`swept + proven`), everything else -- pre-sweep proofs, never-swept
-    /// accounts, and an unavailable `fedi_sweep_status` endpoint (upstream
-    /// server build) -- keeps upstream's raw-`proven` rule.
-    #[test]
-    fn sweep_aware_total_follows_server_high_water_rule() {
-        let account = EvmAddress([0x22; 20]);
-        let sweep = |swept: u64, last_sweep_block: Option<u64>| FediSweepStatusResponse {
-            account,
-            swept: UsdtAmount(swept),
-            last_sweep_block,
-        };
-        let proven = UsdtAmount(1_000_000);
-
-        // Proof anchored strictly after the last sweep: all-time total is
-        // swept + proven.
-        assert_eq!(
-            sweep_aware_all_time_total(Some(&sweep(5_000_000, Some(100))), 101, proven),
-            UsdtAmount(6_000_000),
-        );
-        // Proof anchored AT the last sweep block: raw proven (the proof may
-        // predate the sweep within the block).
-        assert_eq!(
-            sweep_aware_all_time_total(Some(&sweep(5_000_000, Some(100))), 100, proven),
-            proven,
-        );
-        // Proof anchored before the last sweep: raw proven.
-        assert_eq!(
-            sweep_aware_all_time_total(Some(&sweep(5_000_000, Some(100))), 99, proven),
-            proven,
-        );
-        // Never-swept account: raw proven.
-        assert_eq!(
-            sweep_aware_all_time_total(Some(&sweep(0, None)), 101, proven),
-            proven,
-        );
-        // Endpoint unavailable (upstream server build without the LOCAL
-        // `fedi_sweep_status` endpoint): must degrade to raw proven, not
-        // fail.
-        assert_eq!(sweep_aware_all_time_total(None, 101, proven), proven);
-        // Saturating add on pathological totals.
-        assert_eq!(
-            sweep_aware_all_time_total(
-                Some(&sweep(u64::MAX, Some(100))),
-                101,
-                UsdtAmount(u64::MAX)
-            ),
-            UsdtAmount(u64::MAX),
-        );
-    }
-
-    /// [`UsdtClientModule::claim_input`] must set the input's own `fee`
-    /// field from the quote, and declare the NET `amount - fee` as its
-    /// `ClientInput.amounts` -- not the gross `amount` -- so the
-    /// USDT-`mintv2` primary module mints exactly `amount - fee` and the
-    /// transaction balances against the server's GROSS `process_input`
-    /// declaration (`amounts: amount, fees: fee`).
-    #[test]
-    fn claim_input_sets_fee_and_net_amounts() {
-        let keypair = test_keypair();
-        let account = EvmAddress([0x11; 20]);
-        let amount = UsdtAmount(1_000_000);
-        let fee = UsdtAmount(100_000);
-
-        let input = UsdtClientModule::claim_input(&keypair, account, amount, fee)
-            .expect("amount comfortably exceeds fee");
-
-        match input.input {
-            UsdtInput::V0(v0) => {
-                assert_eq!(v0.account, account);
-                assert_eq!(v0.amount, amount);
-                assert_eq!(v0.fee, fee);
-            }
-            UsdtInput::RefundV0 { .. }
-            | UsdtInput::DepositProofV0 { .. }
-            | UsdtInput::Default { .. } => {
-                panic!("claim_input must build a V0 input")
-            }
-        }
-        assert_eq!(input.keys, vec![keypair]);
-        assert_eq!(
-            input.amounts,
-            Amounts::new_custom(USDT_UNIT, Amount::from_msats(amount.0 - fee.0)),
-            "ClientInput.amounts must be the NET amount, not the gross claimed amount"
-        );
     }
 
     /// (misc #4, finding 06's client-confusion facet.)
@@ -2044,37 +1620,19 @@ mod tests {
         assert_eq!(passed, quote);
     }
 
-    /// An uneconomical deposit (the fee would consume all or more of the
-    /// claimed amount) must be rejected locally, before ever building or
-    /// submitting a transaction -- mirroring the server's
-    /// `UsdtInputError::FeeExceedsAmount` rejection and
-    /// `fedimint-wallet-client`'s uneconomical-peg-in guard.
-    #[test]
-    fn claim_input_rejects_uneconomical_deposit() {
-        let keypair = test_keypair();
-        let account = EvmAddress([0x22; 20]);
-
-        // fee == amount.
-        let err =
-            UsdtClientModule::claim_input(&keypair, account, UsdtAmount(500), UsdtAmount(500))
-                .expect_err("fee equal to amount must be rejected");
-        assert!(err.to_string().contains("deposit fee"));
-
-        // fee > amount.
-        UsdtClientModule::claim_input(&keypair, account, UsdtAmount(500), UsdtAmount(600))
-            .expect_err("fee exceeding amount must be rejected");
-    }
-
     /// [`UsdtClientModule::deposit_proof_input`] must build a `DepositProofV0`
-    /// input signed by the claim key, funding the FULL newly-proven `delta`
-    /// (no fee, unlike the `V0` claim path) as its `ClientInput.amounts`, so
-    /// the transaction balances against the server's `process_deposit_proof`
-    /// declaration (`amounts: delta, fees: ZERO, pub_key: claim_pk`) and the
-    /// USDT-`mintv2` primary module mints exactly `delta`.
+    /// input signed by the claim key, carrying the quote-derived `fee` in the
+    /// input itself, and funding the NET `delta - fee` as its
+    /// `ClientInput.amounts` (mirroring [`UsdtClientModule::claim_input`]'s
+    /// net-issuance pattern), so the transaction balances against the
+    /// server's `process_deposit_proof` GROSS declaration (`amounts: delta,
+    /// fees: fee, pub_key: claim_pk`) and the USDT-`mintv2` primary module
+    /// mints exactly `delta - fee`.
     #[test]
-    fn deposit_proof_input_binds_claim_key_and_full_delta() {
+    fn deposit_proof_input_binds_claim_key_fee_and_net_delta() {
         let keypair = test_keypair();
         let delta = UsdtAmount(500_000_000);
+        let fee = UsdtAmount(2_880_000);
         let proof = DepositProof {
             block_number: 100,
             header_rlp: vec![0x01, 0x02, 0x03],
@@ -2082,12 +1640,14 @@ mod tests {
             storage_proof: vec![vec![0xbb]],
         };
 
-        let input = UsdtClientModule::deposit_proof_input(&keypair, proof.clone(), delta);
+        let input = UsdtClientModule::deposit_proof_input(&keypair, proof.clone(), delta, fee)
+            .expect("delta comfortably exceeds fee");
 
         match input.input {
             UsdtInput::DepositProofV0 {
                 claim_pk,
                 proof: input_proof,
+                fee: input_fee,
             } => {
                 assert_eq!(
                     claim_pk,
@@ -2095,8 +1655,12 @@ mod tests {
                     "the input must carry the claim key the server derives the account from"
                 );
                 assert_eq!(input_proof, proof, "the proof must be carried verbatim");
+                assert_eq!(
+                    input_fee, fee,
+                    "the input must carry the quote-derived fee for the server to validate"
+                );
             }
-            UsdtInput::V0(_) | UsdtInput::RefundV0 { .. } | UsdtInput::Default { .. } => {
+            UsdtInput::RefundV0 { .. } | UsdtInput::Default { .. } => {
                 panic!("deposit_proof_input must build a DepositProofV0 input")
             }
         }
@@ -2107,9 +1671,39 @@ mod tests {
         );
         assert_eq!(
             input.amounts,
-            Amounts::new_custom(USDT_UNIT, Amount::from_msats(delta.0)),
-            "ClientInput.amounts must fund the FULL delta (deposit-by-proof charges no fee)"
+            Amounts::new_custom(USDT_UNIT, Amount::from_msats(delta.0 - fee.0)),
+            "ClientInput.amounts must be the NET delta - fee, not the gross delta"
         );
+    }
+
+    /// An uneconomical deposit proof (the fee would consume all or more of
+    /// the newly-proven delta) must be rejected locally, before ever building
+    /// or submitting a transaction -- mirroring the server's
+    /// `UsdtInputError::FeeExceedsAmount` rejection and
+    /// [`UsdtClientModule::claim_input`]'s identical local guard.
+    #[test]
+    fn deposit_proof_input_rejects_uneconomical_delta() {
+        let keypair = test_keypair();
+        let proof = DepositProof {
+            block_number: 100,
+            header_rlp: vec![0x01],
+            account_proof: vec![],
+            storage_proof: vec![],
+        };
+
+        // fee == delta.
+        let err = UsdtClientModule::deposit_proof_input(
+            &keypair,
+            proof.clone(),
+            UsdtAmount(500),
+            UsdtAmount(500),
+        )
+        .expect_err("fee equal to delta must be rejected");
+        assert!(err.to_string().contains("deposit fee"));
+
+        // fee > delta.
+        UsdtClientModule::deposit_proof_input(&keypair, proof, UsdtAmount(500), UsdtAmount(600))
+            .expect_err("fee exceeding delta must be rejected");
     }
 
     /// The deposit claim-key derivation must be deterministic from the seed:
@@ -2408,13 +2002,6 @@ mod tests {
         ) -> FederationResult<()> {
             unimplemented!("recover_deposits_scan never calls withdraw_fees")
         }
-
-        async fn fedi_sweep_status(
-            &self,
-            _claim_pk: secp256k1::PublicKey,
-        ) -> FederationResult<crate::api::FediSweepStatusResponse> {
-            unimplemented!("recover_deposits_scan never calls fedi_sweep_status")
-        }
     }
 
     /// The crux of security finding 08's fix: a funded-but-uncredited deposit
@@ -2458,7 +2045,7 @@ mod tests {
         assert_eq!(checked0.account, account0);
         assert_eq!(checked0.claim_pk, claim_pk0);
 
-        // The claim key was persisted, so a later `claim`/`check_and_claim`
+        // The claim key was persisted, so a later deposit-proof submission
         // can use it the moment the deposit becomes credited -- this is the
         // crux of the fix: seed-only recovery no longer discards uncredited
         // indices.

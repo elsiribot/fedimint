@@ -154,9 +154,6 @@ pub struct UsdtConfigConsensus {
     /// CREATE2 `initCodeHash`). Placeholder; real deployments/tests must
     /// override.
     pub simple_account_impl: EvmAddress,
-    /// Guardian-side: how many blocks a claimed-but-unconfirmed deposit
-    /// check remains valid for before it must be re-issued.
-    pub check_ttl_blocks: u64,
     /// The minimum ETH balance (in wei) a guardian's broadcaster EOA must
     /// hold to count as "funded" for the Part C readiness state machine (see
     /// `fedimint_usdt_common::BootstrapObservation::broadcaster_funded`).

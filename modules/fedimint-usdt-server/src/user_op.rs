@@ -679,7 +679,6 @@ pub fn assemble_eth_signature(
 
 #[cfg(test)]
 mod tests {
-    use alloy::sol_types::SolCall as _;
     use fedimint_core::secp256k1;
     use fedimint_usdt_common::user_op::eth_signed_message_hash;
 

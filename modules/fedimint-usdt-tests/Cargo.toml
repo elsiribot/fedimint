@@ -27,6 +27,16 @@ path = "bin/usdt_adversary.rs"
 name = "capture-deposit-proof-fixtures"
 path = "bin/capture_deposit_proof_fixtures.rs"
 
+# Read-only mainnet audit of the addresses a mainnet deployment would be
+# configured with: proves the module's offline CREATE2 deposit-account
+# derivation against the deployed `SimpleAccountFactory.getAddress`, and the
+# `USDT_BALANCES_SLOT` assumption against a live `eth_getProof`. Needs the
+# public internet, so like `capture-deposit-proof-fixtures` it is not part of
+# any CI lane -- see the file's module doc.
+[[bin]]
+name = "verify-mainnet-config"
+path = "bin/verify_mainnet_config.rs"
+
 [lib]
 name = "fedimint_usdt_tests"
 path = "src/lib.rs"

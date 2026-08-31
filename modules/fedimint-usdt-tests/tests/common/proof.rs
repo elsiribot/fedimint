@@ -12,10 +12,12 @@
 //! votes it in), and submits the proof through the real client path
 //! ([`UsdtClientModule::submit_prebuilt_deposit_proof`]).
 //!
-//! Because deposit-by-proof credits AND mints the full proven balance in one
-//! transaction with NO fee (unlike the legacy observe-then-claim path), the
-//! federation credits -- and the submitting client's USDT e-cash balance grows
-//! by -- exactly the proven `balance`.
+//! Deposit-by-proof credits AND mints the proven balance in one transaction,
+//! net of the federation's deposit fee quote: the federation credits the full
+//! proven `balance`, and the submitting client's USDT e-cash balance grows by
+//! `balance - fee` (where `fee` is `deposit_fee_quote` at submission time --
+//! deterministic in hermetic tests, since the mock's scripted `FeeVote` fixes
+//! the median).
 
 use std::time::Duration;
 
@@ -102,10 +104,14 @@ pub fn synthetic_deposit_proof(
 ///    ([`UsdtClientModule::submit_prebuilt_deposit_proof`]), retrying until the
 ///    ring has converged to the scripted hash and the proof verifies.
 ///
-/// Deposit-by-proof charges no fee, so the submitting client's `USDT_UNIT`
-/// e-cash balance grows by exactly `balance` (`balance` must be a 512-msat
-/// multiple to avoid mintv2 denomination-rounding dust if the caller asserts
-/// exact equality).
+/// Deposit-by-proof charges the federation's deposit fee quote, so the
+/// submitting client's `USDT_UNIT` e-cash balance grows by `balance - fee`
+/// (`balance - fee` must be a 512-msat multiple to avoid mintv2
+/// denomination-rounding dust if the caller asserts exact equality; compute
+/// `fee` deterministically via `deposit_fee_quote(&scripted_vote)`). The
+/// finding-07 client fee-cap sanity guard is bypassed (`accept_high_fee`)
+/// because hermetic tests script arbitrary fee medians; the guard itself is
+/// unit-tested in `fedimint-usdt-client`.
 pub async fn credit_deposit_via_proof(
     usdt: &UsdtClientModule,
     mock: &MockEvmRpc,
@@ -140,7 +146,7 @@ pub async fn credit_deposit_via_proof(
     // verifies server-side (the observer + consensus need a few 1s ticks).
     loop {
         match usdt
-            .submit_prebuilt_deposit_proof(claim_keypair, proof.clone(), balance)
+            .submit_prebuilt_deposit_proof(claim_keypair, proof.clone(), balance, None, true)
             .await
         {
             Ok(_) => return Ok(()),
@@ -159,7 +165,10 @@ pub async fn credit_deposit_via_proof(
 /// Live-chain (`anvil`) analogue of [`credit_deposit_via_proof`]: drives the
 /// REAL client `eth_getProof` submit flow
 /// ([`UsdtClientModule::submit_deposit_proof`]) against the e2e `anvil` node,
-/// crediting AND minting the deposit at seed-derivation `index` with NO fee.
+/// crediting AND minting the deposit at seed-derivation `index` net of the
+/// federation's live deposit fee quote (the finding-07 sanity guard is
+/// bypassed here, like the hermetic helper, since a live anvil node's gas
+/// price is not under the test's control).
 ///
 /// Unlike the hermetic helper (which scripts a `MockEvmRpc`'s block hash and
 /// hands the server a synthetic proof), this points the client at `anvil`'s own
@@ -202,7 +211,7 @@ pub async fn credit_deposit_via_anvil_proof(
         }
 
         match usdt
-            .submit_deposit_proof(index, Some(anvil.url().to_string()))
+            .submit_deposit_proof(index, Some(anvil.url().to_string()), None, true)
             .await
         {
             Ok(_) => return Ok(()),

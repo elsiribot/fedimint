@@ -23,7 +23,8 @@ use fedimint_usdt_client::api::UsdtFederationApi;
 use fedimint_usdt_client::{UsdtClientInit, UsdtClientModule};
 use fedimint_usdt_common::user_op::UserOpReceipt;
 use fedimint_usdt_common::{
-    EvmAddress, FeeVote, USDT_UNIT, UsdtAmount, UserOpStatus, withdrawal_fee_quote,
+    EvmAddress, FeeVote, USDT_UNIT, UsdtAmount, UserOpStatus, deposit_fee_quote,
+    withdrawal_fee_quote,
 };
 use fedimint_usdt_server::UsdtInit;
 use fedimint_usdt_server::db::{
@@ -168,12 +169,23 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     // Well past `confirmation_depth: 1` so the checker's read block is never
     // ahead of this guardian's cached head.
     mock.set_block_number(100);
+    // Script the fee estimate explicitly (the same value as `MockEvmRpc`'s
+    // sane default, but named here) so the deposit fee the proof path charges
+    // is a deterministic pure function this test can compute expected
+    // balances from.
+    let scripted_fee = FeeVote {
+        max_fee_per_gas_wei: 1_000_000_000,
+        usdt_per_eth_e6: 3_000_000_000,
+    };
+    mock.set_fee_estimate(scripted_fee);
+    let deposit_fee = deposit_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
 
     // Mint fees disabled: this test asserts the USDT-denominated e-cash
-    // balance is *exactly* the deposited amount, which would otherwise be
-    // reduced by the USDT-`mintv2` instance's (`mintv2` fee schedule,
-    // irrelevant to what this test is verifying: deposit-detection consensus
-    // and claim correctness, not fee accounting).
+    // balance is *exactly* the deposited amount net of the deposit fee, which
+    // would otherwise be further reduced by the USDT-`mintv2` instance's
+    // (`mintv2` fee schedule, irrelevant to what this test is verifying:
+    // deposit-detection consensus and claim correctness, not mint fee
+    // accounting).
     let fed = dual_mint_fixtures(mock.clone())
         .new_fed_builder(0)
         .disable_mint_fees()
@@ -214,16 +226,17 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     //    (deposit-by-proof, Task 9): the client builds a
     //    `UsdtInput::DepositProofV0` for a synthetic proof of `deposit_amount` at
     //    the federation's newest anchored confirmation-deep block, and the
-    //    federation credits AND mints the full proven balance atomically. No
-    //    deposit fee is charged on this path (unlike the legacy observe-then-claim
-    //    path), so the minted e-cash equals the deposited amount exactly.
-    //    `deposit_amount` (`2_560_000`) is a multiple of 512 msat (mintv2's
-    //    smallest client denomination) so it is exactly representable as e-cash
-    //    notes with no rounding dust, letting step 3 assert *exact* equality. The
-    //    helper anchors the proof's block hash in the ring via the shared mock's
-    //    block-hash observer, so all guardians verify the proof against the same
-    //    consensus anchor.
-    let deposit_amount = UsdtAmount(2_560_000);
+    //    federation credits the full proven balance and mints it NET of the deposit
+    //    fee (the proof path is fee-gated exactly like withdrawals are),
+    //    atomically. `net_amount` (`2_560_000`, i.e. `deposit_amount -
+    //    deposit_fee`) is a multiple of 512 msat (mintv2's smallest client
+    //    denomination) so the minted e-cash is exactly representable with no
+    //    rounding dust, letting step 3 assert *exact* equality. The helper anchors
+    //    the proof's block hash in the ring via the shared mock's block-hash
+    //    observer, so all guardians verify the proof against the same consensus
+    //    anchor.
+    let net_amount = UsdtAmount(2_560_000);
+    let deposit_amount = UsdtAmount(net_amount.0 + deposit_fee.0);
     common::credit_deposit_via_proof(
         &usdt,
         &mock,
@@ -235,13 +248,14 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     )
     .await?;
 
-    // 3. The USDT-denominated e-cash balance equals the full deposited amount.
-    //    Issuance is asynchronous even after the deposit-proof transaction is
-    //    accepted, so poll with a timeout rather than asserting on the first read.
+    // 3. The USDT-denominated e-cash balance equals the deposited amount net of the
+    //    deposit fee. Issuance is asynchronous even after the deposit-proof
+    //    transaction is accepted, so poll with a timeout rather than asserting on
+    //    the first read.
     let poll_deadline = fedimint_core::runtime::Instant::now() + Duration::from_secs(30);
     let balance = loop {
         let balance = client.get_balance_for_unit(USDT_UNIT).await?;
-        if balance == Amount::from_msats(deposit_amount.0)
+        if balance == Amount::from_msats(net_amount.0)
             || fedimint_core::runtime::Instant::now() >= poll_deadline
         {
             break balance;
@@ -250,8 +264,8 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     };
     assert_eq!(
         balance,
-        Amount::from_msats(deposit_amount.0),
-        "deposit-by-proof mints the full deposited amount as USDT e-cash"
+        Amount::from_msats(net_amount.0),
+        "deposit-by-proof mints the deposited amount net of the deposit fee as USDT e-cash"
     );
 
     // 4. Replay of the same proof credits nothing new: the account's high-water
@@ -273,7 +287,7 @@ async fn deposit_becomes_claimable_usdt_ecash() -> anyhow::Result<()> {
     );
     assert_eq!(
         client.get_balance_for_unit(USDT_UNIT).await?,
-        Amount::from_msats(deposit_amount.0),
+        Amount::from_msats(net_amount.0),
         "a rejected replay must not change the USDT-denominated balance"
     );
 
@@ -432,13 +446,14 @@ async fn deposit_sweep_pipeline_is_deterministic_and_confirms_pool_balance() -> 
     //    (deposit-by-proof, Task 9): the client's `DepositProofV0` credits the
     //    account, which deterministically fires the SAME `maybe_trigger_sweep`
     //    bookkeeping the legacy observation path did, so the deploy-and-sweep
-    //    pipeline below is exercised unchanged. `deposit_amount` is
-    //    512-msat-aligned so the credit's minted e-cash is exactly representable
-    //    (the deposit-proof transaction must balance against the mintv2 primary
-    //    module). The sweep pulls the full credited balance, so `PoolState.balance`
-    //    converges to `deposit_amount`.
+    //    pipeline below is exercised unchanged. The credit mints `deposit_amount -
+    //    deposit_fee` (the proof path charges the fee-vote-median-derived deposit
+    //    fee), so `deposit_amount` is chosen so the NET is 512-msat-aligned/exactly
+    //    representable. The sweep pulls the full credited balance (fee included),
+    //    so `PoolState.balance` converges to `deposit_amount`.
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
-    let deposit_amount = UsdtAmount(2_560_000);
+    let deposit_fee = deposit_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
+    let deposit_amount = UsdtAmount(2_560_000 + deposit_fee.0);
     common::credit_deposit_via_proof(
         &usdt,
         &mock,
@@ -663,10 +678,11 @@ async fn withdrawal_status_reports_unknown_then_queued() -> anyhow::Result<()> {
         sleep(Duration::from_millis(300)).await;
     }
 
-    // Fund the withdrawal via deposit-by-proof (Task 9): the credit mints the
-    // full `net_deposit_amount` (`51_200_000`, a 512-msat multiple that avoids
-    // mintv2 denomination dust and comfortably covers `amount + max_fee` below)
-    // as USDT e-cash in one transaction, with no deposit fee.
+    // Fund the withdrawal via deposit-by-proof (Task 9): the credit mints
+    // exactly `net_deposit_amount` (`51_200_000`, a 512-msat multiple that
+    // avoids mintv2 denomination dust and comfortably covers `amount +
+    // max_fee` below) as USDT e-cash in one transaction -- the on-chain
+    // deposit is padded by the deterministic deposit fee.
     // This does NOT wait for the Phase-7 background sweep pipeline the
     // credited deposit auto-triggers -- unlike the Task-1/Task-2 tests
     // above, this test never reads pool/sweep state, so there is nothing to
@@ -683,9 +699,13 @@ async fn withdrawal_status_reports_unknown_then_queued() -> anyhow::Result<()> {
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let net_deposit_amount = UsdtAmount(51_200_000);
+    let deposit_fee = deposit_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
+    let deposit_amount = UsdtAmount(net_deposit_amount.0 + deposit_fee.0);
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
-    // Deposit-by-proof (Task 9): credit + mint the full proven balance as
-    // USDT e-cash in one transaction (no fee), funding the withdrawal below.
+    // Deposit-by-proof (Task 9): credit the full proven balance and mint it
+    // NET of the deposit fee as USDT e-cash in one transaction, funding the
+    // withdrawal below. The on-chain deposit is padded by the (deterministic,
+    // scripted-median-derived) fee so exactly `net_deposit_amount` is minted.
     // The helper anchors the synthetic proof's block hash in the ring via the
     // shared mock's block-hash observer, so every guardian verifies it.
     common::credit_deposit_via_proof(
@@ -694,7 +714,7 @@ async fn withdrawal_status_reports_unknown_then_queued() -> anyhow::Result<()> {
         usdt_contract,
         &claim_keypair,
         account,
-        net_deposit_amount,
+        deposit_amount,
         Duration::from_secs(120),
     )
     .await?;
@@ -808,15 +828,15 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
     let quote = usdt.withdraw_fee_quote(UsdtAmount(1_000_000)).await?;
     assert_eq!(quote.max_fee, expected_quote);
 
-    // 2. Fund the withdrawal via deposit-by-proof (Task 9): the credit mints the
-    //    full `net_deposit_amount` as USDT e-cash in one transaction, with no
-    //    deposit fee. `61_440_000` is a 512-msat multiple (no mintv2 denomination
-    //    dust) chosen to EXCEED the deploy+sweep gas threshold
-    //    (`deposit_fee_quote`, ~`57_600_000` at this scripted fee) so the credit is
-    //    not treated as un-sweepable dust -- the deposit-by-proof credit fires the
-    //    same `maybe_trigger_sweep`, and the sweep must actually run for the
-    //    pool/audit assertions below. It also comfortably covers `amount +
-    //    max_fee`.
+    // 2. Fund the withdrawal via deposit-by-proof (Task 9): the credit mints
+    //    exactly `net_deposit_amount` (a 512-msat multiple, no mintv2 denomination
+    //    dust) as USDT e-cash in one transaction, with the on-chain deposit padded
+    //    by the deposit fee (`deposit_fee_quote`, `57_600_000` at this scripted
+    //    fee). The padded gross deposit trivially exceeds the fee, so the credit is
+    //    accepted and is not treated as un-sweepable dust -- the deposit-by-proof
+    //    credit fires the same `maybe_trigger_sweep`, and the sweep must actually
+    //    run for the pool/audit assertions below. The net comfortably covers
+    //    `amount + max_fee`.
     //
     // Part C: drive the module to Ready before allocating a deposit.
     let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
@@ -829,9 +849,13 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let net_deposit_amount = UsdtAmount(61_440_000);
+    let deposit_fee = deposit_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
+    let deposit_amount = UsdtAmount(net_deposit_amount.0 + deposit_fee.0);
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
-    // Deposit-by-proof (Task 9): credit + mint the full proven balance as
-    // USDT e-cash in one transaction (no fee), funding the withdrawal below.
+    // Deposit-by-proof (Task 9): credit the full proven balance and mint it
+    // NET of the deposit fee as USDT e-cash in one transaction, funding the
+    // withdrawal below. The on-chain deposit is padded by the (deterministic,
+    // scripted-median-derived) fee so exactly `net_deposit_amount` is minted.
     // The helper anchors the synthetic proof's block hash in the ring via the
     // shared mock's block-hash observer, so every guardian verifies it.
     common::credit_deposit_via_proof(
@@ -840,7 +864,7 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
         usdt_contract,
         &claim_keypair,
         account,
-        net_deposit_amount,
+        deposit_amount,
         Duration::from_secs(120),
     )
     .await?;
@@ -858,7 +882,7 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
     assert_eq!(
         client.get_balance_for_unit(USDT_UNIT).await?,
         Amount::from_msats(net_deposit_amount.0),
-        "deposit-by-proof mints the full deposited amount as USDT e-cash (no fee)"
+        "deposit-by-proof mints the deposited amount net of the deposit fee as USDT e-cash"
     );
 
     // 2b. Crediting a deposit auto-triggers the Phase-7 deploy-and-sweep MPC
@@ -906,7 +930,7 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
     for &peer in &peers {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            if usdt.pool_state(peer).await?.balance == net_deposit_amount {
+            if usdt.pool_state(peer).await?.balance == deposit_amount {
                 break;
             }
             if Instant::now() >= deadline {
@@ -916,23 +940,25 @@ async fn withdrawal_output_debits_queues_and_fee_median_is_deterministic() -> an
         }
     }
 
-    // 2c. **Solvency gate.** After the sweep, the pool holds `net_deposit_amount`
-    //     of on-chain USDT while the `USDT_UNIT`-denominated mintv2 instance has
-    //     issued exactly `net_deposit_amount` of e-cash -- deposit-by-proof
-    //     charges no fee, so the federation's global audited net assets are zero
-    //     (solvent, never negative). No other module in this fixture
-    //     holds/issues any Bitcoin-denominated value, so the global `net_assets`
-    //     figure reduces to exactly this module pair.
+    // 2c. **Solvency gate.** After the sweep, the pool holds the GROSS
+    //     `deposit_amount` of on-chain USDT while the `USDT_UNIT`-denominated
+    //     mintv2 instance has issued only the NET `net_deposit_amount` of
+    //     e-cash -- the difference is exactly the deposit fee the proof path
+    //     charged, which is federation fee revenue (a surplus, never a
+    //     deficit). No other module in this fixture holds/issues any
+    //     Bitcoin-denominated value, so the global `net_assets` figure
+    //     reduces to exactly this module pair.
     let audit = fed
         .new_admin_api(peers[0])
         .await?
         .audit(fedimint_core::module::ApiAuth::new("pass".to_string()))
         .await?;
     assert_eq!(
-        audit.net_assets, 0,
-        "deposit-by-proof charges no deposit fee, so after a sweep with no withdrawals yet the \
-         pool USDT (net_deposit_amount) exactly backs the issued e-cash (net_deposit_amount) -- \
-         the federation's global net assets are zero"
+        audit.net_assets,
+        i64::try_from(deposit_fee.0).expect("deposit_fee fits an i64"),
+        "after a sweep with no withdrawals yet, the pool USDT (gross deposit) exceeds the issued \
+         e-cash (net) by exactly the collected deposit fee -- the federation's global net assets \
+         equal that fee revenue"
     );
     assert!(
         audit.net_assets >= 0,
@@ -1146,9 +1172,10 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
     // 1. Fund + sweep: deposit-by-proof -> pool funded (Task 9). All e-cash amounts
     //    are 512-msat-aligned to avoid mintv2 denomination dust: the
     //    deposit-by-proof credit mints exactly `net_deposit_amount` (a 512
-    //    multiple, no deposit fee), and each withdrawal burns `amount_i + quote`
-    //    (also 512-aligned -- `quote` is itself 512-aligned post-Task-1's 360k gas
-    //    units, so each `amount_i` is chosen as a 512 multiple directly).
+    //    multiple; the on-chain deposit is padded by the deterministic deposit
+    //    fee), and each withdrawal burns `amount_i + quote` (also 512-aligned --
+    //    `quote` is itself 512-aligned post-Task-1's 360k gas units, so each
+    //    `amount_i` is chosen as a 512 multiple directly).
     // Part C: drive the module to Ready before allocating a deposit.
     let group_public_key = client.api().with_module(usdt.id).group_public_key().await?;
     common::mock_ready_stack(
@@ -1160,9 +1187,13 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let net_deposit_amount = UsdtAmount(61_440_000);
+    let deposit_fee = deposit_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
+    let deposit_amount = UsdtAmount(net_deposit_amount.0 + deposit_fee.0);
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
-    // Deposit-by-proof (Task 9): credit + mint the full proven balance as
-    // USDT e-cash in one transaction (no fee), funding the withdrawal below.
+    // Deposit-by-proof (Task 9): credit the full proven balance and mint it
+    // NET of the deposit fee as USDT e-cash in one transaction, funding the
+    // withdrawal below. The on-chain deposit is padded by the (deterministic,
+    // scripted-median-derived) fee so exactly `net_deposit_amount` is minted.
     // The helper anchors the synthetic proof's block hash in the ring via the
     // shared mock's block-hash observer, so every guardian verifies it.
     common::credit_deposit_via_proof(
@@ -1171,7 +1202,7 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
         usdt_contract,
         &claim_keypair,
         account,
-        net_deposit_amount,
+        deposit_amount,
         Duration::from_secs(120),
     )
     .await?;
@@ -1221,7 +1252,7 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
     for &peer in &peers {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            if usdt.pool_state(peer).await?.balance == net_deposit_amount {
+            if usdt.pool_state(peer).await?.balance == deposit_amount {
                 break;
             }
             if Instant::now() >= deadline {
@@ -1233,21 +1264,23 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
         }
     }
 
-    // 1b. **Solvency gate.** After the sweep, the pool holds `net_deposit_amount`
-    //     of on-chain USDT while the `USDT_UNIT`-denominated mintv2 instance has
-    //     issued exactly `net_deposit_amount` of e-cash -- deposit-by-proof
-    //     charges no fee, so the federation's global audited net assets are zero
-    //     (solvent, non-negative). No Bitcoin-denominated value exists in this
-    //     fixture, so the global figure reduces to this module pair alone.
+    // 1b. **Solvency gate.** After the sweep, the pool holds the GROSS
+    //     `deposit_amount` of on-chain USDT while the `USDT_UNIT`-denominated
+    //     mintv2 instance has issued only the NET `net_deposit_amount` of
+    //     e-cash -- the difference is exactly the deposit fee the proof path
+    //     charged (federation fee revenue, a surplus). No Bitcoin-denominated
+    //     value exists in this fixture, so the global figure reduces to this
+    //     module pair alone.
     let audit_after_sweep = fed
         .new_admin_api(peers[0])
         .await?
         .audit(fedimint_core::module::ApiAuth::new("pass".to_string()))
         .await?;
     assert_eq!(
-        audit_after_sweep.net_assets, 0,
-        "deposit-by-proof charges no deposit fee, so after the sweep (before any withdrawal) the \
-         pool USDT exactly backs the issued e-cash -- global net assets are zero"
+        audit_after_sweep.net_assets,
+        i64::try_from(deposit_fee.0).expect("deposit_fee fits an i64"),
+        "after the sweep (before any withdrawal) the pool USDT exceeds the issued e-cash by \
+         exactly the collected deposit fee"
     );
 
     // 2. Queue TWO withdrawals. `withdraw` awaits each transaction's acceptance
@@ -1379,7 +1412,7 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
     // 4. Pool debited by exactly amount_1 + amount_2 (NOT the fees, which were
     //    already burned from e-cash and accrue to the federation) and both
     //    withdrawals Confirmed -- poll to convergence on EVERY guardian.
-    let expected_pool_balance = UsdtAmount(net_deposit_amount.0 - amount_1.0 - amount_2.0);
+    let expected_pool_balance = UsdtAmount(deposit_amount.0 - amount_1.0 - amount_2.0);
     for &peer in &peers {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
@@ -1482,10 +1515,10 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
 
     // 6. **Round-trip solvency gate.** After a FULL deposit-by-proof -> sweep ->
     //    withdraw -> confirm round trip, the federation's global net assets equal
-    //    exactly the SUM of every fee collected -- deposit-by-proof charges no
-    //    deposit fee, so that is just both withdrawals' `max_fee`s. Per `audit`'s
-    //    own doc comment this figure stays CONSTANT across the withdrawal queue ->
-    //    batch -> confirm lifecycle (it is zero at the `audit_after_sweep`
+    //    exactly the SUM of every fee collected -- the deposit fee the proof path
+    //    charged plus both withdrawals' `max_fee`s. Per `audit`'s own doc comment
+    //    this figure stays CONSTANT across the withdrawal queue -> batch -> confirm
+    //    lifecycle (it equals the deposit fee at the `audit_after_sweep`
     //    checkpoint, then rises by each withdrawal's burned fee) -- and it is never
     //    negative, so the federation remains solvent throughout.
     let audit_after_round_trip = fed
@@ -1493,10 +1526,10 @@ async fn withdrawal_batch_confirms_and_debits_pool_for_two_queued_withdrawals() 
         .await?
         .audit(fedimint_core::module::ApiAuth::new("pass".to_string()))
         .await?;
-    // Deposit-by-proof charges no deposit fee, so the only fee revenue is the
-    // two withdrawals' `max_fee`s.
-    let expected_fee_revenue =
-        2 * i64::try_from(expected_quote.0).expect("expected_quote fits an i64");
+    // The collected fee revenue is the proof path's deposit fee plus the two
+    // withdrawals' `max_fee`s.
+    let expected_fee_revenue = i64::try_from(deposit_fee.0).expect("deposit_fee fits an i64")
+        + 2 * i64::try_from(expected_quote.0).expect("expected_quote fits an i64");
     assert_eq!(
         audit_after_round_trip.net_assets, expected_fee_revenue,
         "the federation's global net assets after a full deposit->claim->sweep->withdraw->confirm \
@@ -1569,9 +1602,13 @@ async fn client_claims_refund_on_terminal_failure() -> anyhow::Result<()> {
     );
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
     let net_deposit_amount = UsdtAmount(61_440_000);
+    let deposit_fee = deposit_fee_quote(&scripted_fee).expect("scripted fee must produce a quote");
+    let deposit_amount = UsdtAmount(net_deposit_amount.0 + deposit_fee.0);
     let (claim_keypair, account) = usdt.allocate_deposit().await?;
-    // Deposit-by-proof (Task 9): credit + mint the full proven balance as
-    // USDT e-cash in one transaction (no fee), funding the withdrawal below.
+    // Deposit-by-proof (Task 9): credit the full proven balance and mint it
+    // NET of the deposit fee as USDT e-cash in one transaction, funding the
+    // withdrawal below. The on-chain deposit is padded by the (deterministic,
+    // scripted-median-derived) fee so exactly `net_deposit_amount` is minted.
     // The helper anchors the synthetic proof's block hash in the ring via the
     // shared mock's block-hash observer, so every guardian verifies it.
     common::credit_deposit_via_proof(
@@ -1580,7 +1617,7 @@ async fn client_claims_refund_on_terminal_failure() -> anyhow::Result<()> {
         usdt_contract,
         &claim_keypair,
         account,
-        net_deposit_amount,
+        deposit_amount,
         Duration::from_secs(120),
     )
     .await?;
@@ -1628,7 +1665,7 @@ async fn client_claims_refund_on_terminal_failure() -> anyhow::Result<()> {
     for &peer in &peers {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            if usdt.pool_state(peer).await?.balance == net_deposit_amount {
+            if usdt.pool_state(peer).await?.balance == deposit_amount {
                 break;
             }
             if Instant::now() >= deadline {
@@ -1777,14 +1814,13 @@ mod fedimint_migration_tests {
     use fedimint_testing::db::{snapshot_db_migrations, validate_migrations_server};
     use fedimint_usdt_common::user_op::{SignedUserOp, UnsignedUserOp};
     use fedimint_usdt_common::{
-        BootstrapObservation, DepositObservation, EvmAddress, FeeVote, UsdtAmount, UsdtCommonInit,
-        signing_session_id,
+        BootstrapObservation, EvmAddress, FeeVote, UsdtAmount, UsdtCommonInit, signing_session_id,
     };
     use fedimint_usdt_server::db::{
-        BlockCountVoteKey, BootstrapVoteKey, DbKeyPrefix, DepositObservationVoteKey, DepositRecord,
-        DepositRecordKey, FeeVoteKey, FeeVotePrefix, HasEverBeenReadyKey, MpcRoundChunk,
-        MpcRoundChunkKey, PendingUserOp, PendingUserOpKey, PoolState, PoolStateKey, SessionState,
-        SigningPurpose, SigningSession, SigningSessionKey, StoredFeeVote, SubmittedUserOpKey,
+        BlockCountVoteKey, BootstrapVoteKey, DbKeyPrefix, DepositRecord, DepositRecordKey,
+        FeeVoteKey, FeeVotePrefix, HasEverBeenReadyKey, MpcRoundChunk, MpcRoundChunkKey,
+        PendingUserOp, PendingUserOpKey, PoolState, PoolStateKey, SessionState, SigningPurpose,
+        SigningSession, SigningSessionKey, StoredFeeVote, SubmittedUserOpKey,
         UserOpConfirmedObservation, UserOpConfirmedVoteKey, UserOpPurpose, WithdrawalState,
         WithdrawalStateKey,
     };
@@ -1875,17 +1911,21 @@ mod fedimint_migration_tests {
             },
         )
         .await;
-        // The pre-`migrate_db_v1` `DepositObservationVoteKey -> DepositObservation`
-        // shape (findings 04/12/15), written at the raw byte level because the
-        // current `DepositObservation` type now carries a `block_hash` the old
-        // on-disk rows did not (mirrors the raw `FeeVote` write above). A
-        // derived struct encodes as the concatenation of its fields in order,
-        // so this is exactly the old four-field layout `migrate_db_v1` must
-        // drop.
-        let mut old_deposit_vote_key_bytes = vec![DbKeyPrefix::DepositObservationVote as u8];
-        old_deposit_vote_key_bytes.extend_from_slice(
-            &DepositObservationVoteKey(account, PeerId::from(0)).consensus_encode_to_vec(),
-        );
+        // The pre-`migrate_db_v1` `DepositObservationVote` row shape
+        // (findings 04/12/15), written ENTIRELY at the raw byte level: the
+        // whole table (prefix `0x04`,
+        // `fedimint_usdt_server::REMOVED_DEPOSIT_OBSERVATION_VOTE_PREFIX`)
+        // was later removed along with the legacy guardian-poll deposit
+        // path, so neither the key nor the value type exists any more. The
+        // key was `(EvmAddress, PeerId)` and the old value the four-field
+        // pre-`block_hash` observation; a derived struct/tuple encodes as
+        // the concatenation of its fields in order, so these raw bytes are
+        // exactly what the deleted code wrote and what `migrate_db_v1` must
+        // drop -- byte-identical to what this writer produced before the
+        // removal, keeping the frozen snapshot stable.
+        let mut old_deposit_vote_key_bytes = vec![0x04u8];
+        old_deposit_vote_key_bytes.extend_from_slice(&account.consensus_encode_to_vec());
+        old_deposit_vote_key_bytes.extend_from_slice(&PeerId::from(0).consensus_encode_to_vec());
         let mut old_deposit_vote_value_bytes = Vec::new();
         old_deposit_vote_value_bytes.extend_from_slice(&account.consensus_encode_to_vec());
         old_deposit_vote_value_bytes
@@ -2148,6 +2188,29 @@ mod fedimint_migration_tests {
         validate_migrations_server(module, "usdt-server", |db| async move {
             let mut dbtx = db.begin_transaction_nc().await;
 
+            // The retired prefixes -- `0x04` (`DepositObservationVote`,
+            // dropped by `migrate_db_v1`; the snapshot carries a raw
+            // old-shape row) and `0x05` (`PendingCheck`, dropped by
+            // `migrate_db_v4`) -- are permanent gaps in `DbKeyPrefix`, so
+            // the exhaustive per-variant loop below can no longer visit
+            // them; assert their raw keyspaces read back EMPTY here instead,
+            // preserving what the deleted `DepositObservationVote` arm used
+            // to check.
+            for removed_prefix in [0x04u8, 0x05u8] {
+                let residual: Vec<_> = dbtx
+                    .raw_find_by_prefix(&[removed_prefix])
+                    .await
+                    .expect("DB error")
+                    .collect()
+                    .await;
+                ensure!(
+                    residual.is_empty(),
+                    "the migration chain must drop every row under retired prefix \
+                     {removed_prefix:#04x}"
+                );
+                info!("Validated retired prefix {removed_prefix:#04x} (empty)");
+            }
+
             for prefix in DbKeyPrefix::iter() {
                 match prefix {
                     DbKeyPrefix::BlockCountVote => {
@@ -2186,24 +2249,6 @@ mod fedimint_migration_tests {
                             .await;
                         ensure!(!records.is_empty(), "no DepositRecords read back");
                         info!("Validated DepositRecord");
-                    }
-                    DbKeyPrefix::DepositObservationVote => {
-                        // Findings 04/12/15: `migrate_db_v1` DROPS pre-migration
-                        // `DepositObservationVote` rows (they carry no
-                        // `block_hash` and are re-proposed every scan tick --
-                        // see that function's doc comment), so the table must
-                        // read back cleanly in the NEW shape as EMPTY.
-                        let votes = dbtx
-                            .find_by_prefix(&fedimint_usdt_server::db::DepositObservationVotePrefix)
-                            .await
-                            .collect::<Vec<(DepositObservationVoteKey, DepositObservation)>>()
-                            .await;
-                        ensure!(
-                            votes.is_empty(),
-                            "pre-migration DepositObservationVote rows must be dropped by \
-                             migrate_db_v1, not rewritten"
-                        );
-                        info!("Validated DepositObservationVote (dropped, not rewritten)");
                     }
                     DbKeyPrefix::SigningSession => {
                         let sessions = dbtx
@@ -2415,11 +2460,19 @@ mod fedimint_migration_tests {
                         info!("Validated RecoverResidualVote (new prefix, empty)");
                     }
                     DbKeyPrefix::WithdrawFeesVote => {
-                        // Consensus 0.12 (guardian fee withdrawal): a
-                        // brand-new prefix that starts empty and fills at
-                        // runtime -- the v0 snapshot fixture predates it and
+                        // Another brand-new per-peer vote prefix (0x16), same
+                        // case as `RecoverResidualVote` and `BlockHashVote`
+                        // above: the pre-migration v0 snapshot predates it and
                         // no migration writes to it, so it must read back
-                        // cleanly as EMPTY (never populated pre-migration).
+                        // cleanly as EMPTY.
+                        //
+                        // This arm did not exist on the source branch, where
+                        // `WithdrawFeesVote` was added to the server's
+                        // `DbKeyPrefix` without updating this exhaustive match
+                        // — so this test did not compile there. Adding the arm
+                        // (rather than a `_ =>` wildcard) keeps the match
+                        // exhaustive, so the next prefix added is a compile
+                        // error here too instead of silently unvalidated.
                         let votes = dbtx
                             .find_by_prefix(&fedimint_usdt_server::db::WithdrawFeesVotePrefix)
                             .await
@@ -2431,24 +2484,6 @@ mod fedimint_migration_tests {
                              snapshot must not contain any rows for it"
                         );
                         info!("Validated WithdrawFeesVote (new prefix, empty)");
-                    }
-                    DbKeyPrefix::LastSweepBlock => {
-                        // LOCAL fedi extension (sweep-aware credit rule): a
-                        // brand-new prefix holding only new `u64` data -- the
-                        // v0 snapshot fixture predates it and no migration
-                        // writes to it, so it must read back cleanly as EMPTY
-                        // (never populated pre-migration).
-                        let blocks = dbtx
-                            .find_by_prefix(&fedimint_usdt_server::db::LastSweepBlockPrefix)
-                            .await
-                            .collect::<Vec<_>>()
-                            .await;
-                        ensure!(
-                            blocks.is_empty(),
-                            "LastSweepBlock is a brand-new prefix; the pre-migration v0 \
-                             snapshot must not contain any rows for it"
-                        );
-                        info!("Validated LastSweepBlock (new prefix, empty)");
                     }
                 }
             }

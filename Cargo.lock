@@ -6123,6 +6123,7 @@ dependencies = [
  "hex_lit",
  "secp256k1 0.29.1",
  "serde",
+ "serde_json",
  "sha3",
  "thiserror 2.0.18",
 ]

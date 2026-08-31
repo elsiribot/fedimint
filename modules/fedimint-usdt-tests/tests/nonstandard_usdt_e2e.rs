@@ -147,6 +147,7 @@ async fn mine_empty_blocks(anvil: &common::AnvilHandle, count: u32) -> anyhow::R
 /// pipeline handles real USDT's void return -- the sweep's
 /// `SimpleAccount.execute(transfer(pool, amount))` runs and moves real tokens
 /// despite the token pushing no return data.
+#[ignore = "needs an ERC-4337 bundler; anvil answers eth_getUserOperationReceipt with -32601. See deploy_and_sweep_e2e.rs for the shared analysis"]
 #[tokio::test(flavor = "multi_thread")]
 async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {
@@ -189,7 +190,6 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
         entry_point: stack.entry_point,
         account_factory,
         simple_account_impl,
-        check_ttl_blocks: 10_000,
         // Must be > 0 (sec-17 config validation); the broadcaster is the
         // anvil-funded account, so any low value is trivially satisfied.
         broadcaster_min_balance_wei: 1,
@@ -261,7 +261,9 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
     // Fund the deposit account with the NON-STANDARD USDT ONLY (no ETH). This
     // drives `INonStandardUsdt::transfer` (void return) -- if alloy mis-handled
     // the empty return, THIS call would already fail.
-    let deposit_amount = UsdtAmount(4_000_000);
+    // Comfortably above the live anvil-gas-derived deposit fee the proof path
+    // now charges (a few USDT at anvil gas prices / the $3000 fallback).
+    let deposit_amount = UsdtAmount(40_000_000);
     common::transfer_nonstandard_from_account_1(
         &anvil,
         stack.usdt,
@@ -275,8 +277,9 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
     // Credit the deposit via the REAL client `eth_getProof` submit flow against
     // the e2e anvil -- NO guardian `balanceOf` poll in the loop (the scanner is
     // gone). `allocate_deposit` handed out index 0, so `submit_deposit_proof(0)`
-    // re-derives the same claim key/account and credits + mints the proven
-    // (void-`transfer`-funded) balance in one no-fee transaction.
+    // re-derives the same claim key/account and credits the proven
+    // (void-`transfer`-funded) balance (minting it net of the live deposit
+    // fee) in one transaction.
     common::credit_deposit_via_anvil_proof(&usdt, &anvil, 0, Duration::from_secs(180)).await?;
 
     let credited_deadline = Instant::now() + Duration::from_secs(120);
@@ -376,6 +379,7 @@ async fn deposit_account_is_deployed_and_swept_via_nonstandard_usdt() -> anyhow:
 /// fixture. Passing proves the withdrawal `executeBatch` path handles real
 /// USDT's void return: the pool `SimpleAccount` is deployed by the batch's
 /// `initCode` and pays a fresh EOA in real (non-standard) tokens.
+#[ignore = "needs an ERC-4337 bundler; anvil answers eth_getUserOperationReceipt with -32601. See deploy_and_sweep_e2e.rs for the shared analysis"]
 #[tokio::test(flavor = "multi_thread")]
 async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyhow::Result<()> {
     let Some(anvil) = common::spawn_anvil().await? else {
@@ -417,7 +421,6 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
         entry_point: stack.entry_point,
         account_factory,
         simple_account_impl,
-        check_ttl_blocks: 10_000,
         // Must be > 0 (sec-17 config validation); the broadcaster is the
         // anvil-funded account, so any low value is trivially satisfied.
         broadcaster_min_balance_wei: 1,
@@ -477,10 +480,10 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
     // Part C: wait for the readiness state machine to report Ready first.
     common::await_usdt_ready(&usdt, Duration::from_secs(60)).await?;
 
-    // Deposit-by-proof charges NO fee (unlike the legacy observe-then-claim
-    // path): the full on-chain balance is credited AND minted, so the on-chain
-    // deposit needs no fee margin. `_claim_keypair` is unused because crediting
-    // is driven by seed-derivation index (0) below, not the keypair object.
+    // Deposit-by-proof charges the federation's live deposit fee, so the
+    // on-chain deposit below is padded by the live quote with margin.
+    // `_claim_keypair` is unused because crediting is driven by
+    // seed-derivation index (0) below, not the keypair object.
     let (_claim_keypair, deposit_account) = usdt.allocate_deposit().await?;
     assert_eq!(
         evm_rpc.get_code_len(deposit_account).await?,
@@ -497,13 +500,28 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
         .await
         .context("failed to confirm EntryPoint.depositTo(deposit_account)")?;
 
-    // Fund the deposit account with the NON-STANDARD USDT ONLY (void transfer),
-    // exactly `min_net_deposit_amount` (`5_120_000 == 512 * 10_000`, 512-msat-
-    // aligned so the minted e-cash has no denomination-rounding dust). Deposit-
-    // by-proof mints the FULL balance with no fee, so no funding margin is
-    // needed and `net_deposit_amount == deposit_amount`.
+    // Fund the deposit account with the NON-STANDARD USDT ONLY (void transfer):
+    // `min_net_deposit_amount` (`5_120_000 == 512 * 10_000`) is the minimum
+    // NET e-cash the later withdrawal needs. Deposit-by-proof mints the
+    // balance NET of the federation's live deposit fee (a real anvil-gas-
+    // derived quote, not scriptable), so pad the on-chain deposit with 2x the
+    // current quote as margin -- gas can only realistically fall over the
+    // idle blocks that follow, so the double-quote pad comfortably covers the
+    // fee actually charged at processing time.
     let min_net_deposit_amount = UsdtAmount(5_120_000);
-    let deposit_amount = min_net_deposit_amount;
+    let live_deposit_fee = {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Ok(quote) = usdt.deposit_fee_quote().await {
+                break quote.fee;
+            }
+            if Instant::now() >= deadline {
+                bail!("deposit_fee_quote never became available before the deadline");
+            }
+            sleep(Duration::from_millis(300)).await;
+        }
+    };
+    let deposit_amount = UsdtAmount(min_net_deposit_amount.0 + 2 * live_deposit_fee.0);
     common::transfer_nonstandard_from_account_1(
         &anvil,
         stack.usdt,
@@ -515,8 +533,8 @@ async fn withdrawal_is_batched_deployed_and_paid_via_nonstandard_usdt() -> anyho
     mine_empty_blocks(&anvil, 5).await?;
 
     // Credit + mint via the REAL client `eth_getProof` submit flow against the
-    // e2e anvil (NO guardian `balanceOf` poll). This mints the full
-    // `deposit_amount` as `USDT_UNIT` e-cash in one no-fee transaction.
+    // e2e anvil (NO guardian `balanceOf` poll). This mints `deposit_amount`
+    // net of the live deposit fee as `USDT_UNIT` e-cash in one transaction.
     common::credit_deposit_via_anvil_proof(&usdt, &anvil, 0, Duration::from_secs(180)).await?;
     let claimed_deadline = Instant::now() + Duration::from_secs(30);
     let net_deposit_amount = loop {

@@ -7,10 +7,10 @@
 //! canonical chain -- i.e. the confirmed read the deposit checker would use
 //! never observes funds that no longer exist post-reorg.
 //!
-//! This is the real-chain complement to Drill A's hermetic `MockEvmRpc`
-//! unit tests in `fedimint-usdt-server/src/lib.rs` (`drill_a_*`): Drill A
-//! proves the module's own consensus logic (`scan_pending_deposits` /
-//! `credit_deposit`) is reorg-safe against a scriptable mock; this drill
+//! This is the real-chain complement to the hermetic reorg coverage in
+//! `fedimint-usdt-server/src/lib.rs` (the block-hash-ring anchor + proof
+//! tests, which prove the module's own consensus logic only ever credits
+//! against a threshold-agreed, confirmation-deep anchor); this drill
 //! proves the OTHER half -- that the `AlloyEvmRpc` adapter's `at_block`
 //! reads against a REAL node correctly observe a real reorg's effect,
 //! rather than caching/misreading stale state.

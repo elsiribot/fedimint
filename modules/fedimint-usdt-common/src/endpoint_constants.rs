@@ -24,8 +24,8 @@ pub const USEROP_STATUS_ENDPOINT: &str = "userop_status";
 /// single-guardian estimate).
 pub const WITHDRAW_FEE_QUOTE_ENDPOINT: &str = "withdraw_fee_quote";
 
-/// Reports the current deposit fee quote: the minimum `fee` a
-/// `UsdtInput::V0` claiming a credited deposit must offer, derived from the
+/// Reports the current deposit fee quote: the minimum `fee` a deposit claim
+/// (`UsdtInput::DepositProofV0`) must offer, derived from the
 /// federation's consensus-agreed `FeeVote` median (see
 /// `fedimint_usdt_common::deposit_fee_quote`). Read from consensus DB, so
 /// any guardian answers identically (threshold-agreement, not just a

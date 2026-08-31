@@ -51,6 +51,14 @@ struct State {
     /// hash (see [`mock_block_hash`]) so every guardian agrees on a stable,
     /// distinct-per-height value out of the box (security finding 12).
     block_hashes: HashMap<u64, [u8; 32]>,
+    /// Scripted `get_storage_at` overrides, keyed by `(addr, key)`. An
+    /// unscripted `(token, balances_storage_key(holder))` pair falls back to
+    /// the scripted ERC-20 balance for `(token, holder)` (canonical
+    /// slot-2-layout behavior, so the balances-slot consistency check
+    /// passes against the mock by default); anything else reads as the
+    /// all-zero word. Overriding lets a test model a token whose balances
+    /// mapping is NOT at `USDT_BALANCES_SLOT`.
+    storage_overrides: HashMap<(EvmAddress, [u8; 32]), [u8; 32]>,
 }
 
 /// Deterministic, block-number-derived stand-in for a canonical block hash
@@ -98,6 +106,7 @@ impl Default for State {
             user_op_receipts: HashMap::new(),
             block_hashes: HashMap::new(),
             entrypoint_deposits: HashMap::new(),
+            storage_overrides: HashMap::new(),
         }
     }
 }
@@ -241,6 +250,15 @@ impl MockEvmRpc {
         self.lock().entrypoint_deposits.insert(account, deposit_wei);
     }
 
+    /// Scripts the raw word [`IServerEvmRpc::get_storage_at`] returns for
+    /// `(addr, key)`, overriding the default derive-from-scripted-balances
+    /// behavior (see [`State::storage_overrides`]) -- e.g. to model a token
+    /// whose balances mapping is NOT at the canonical slot.
+    #[allow(dead_code)]
+    pub fn set_storage_word(&self, addr: EvmAddress, key: [u8; 32], word: [u8; 32]) {
+        self.lock().storage_overrides.insert((addr, key), word);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -286,6 +304,36 @@ impl IServerEvmRpc for MockEvmRpc {
     async fn get_erc20_basis_points_rate(&self, _token: EvmAddress) -> anyhow::Result<u64> {
         // Mock: a standard (fee-less) token.
         Ok(0)
+    }
+
+    async fn get_storage_at(
+        &self,
+        addr: EvmAddress,
+        key: [u8; 32],
+        at_block: u64,
+    ) -> anyhow::Result<[u8; 32]> {
+        let state = self.lock();
+        anyhow::ensure!(at_block <= state.block_number, "header not found");
+        if let Some(word) = state.storage_overrides.get(&(addr, key)) {
+            return Ok(*word);
+        }
+        // Default: behave like a canonical slot-2-layout token -- the word at
+        // `balances_storage_key(holder)` is the scripted balance for
+        // `(addr, holder)` as of `at_block`, so the guardian-local
+        // balances-slot consistency check agrees with `get_erc20_balance`
+        // out of the box.
+        for ((token, holder), by_block) in &state.balances {
+            if *token == addr && fedimint_usdt_common::balances_storage_key(holder) == key {
+                let balance = by_block
+                    .range(..=at_block)
+                    .next_back()
+                    .map_or(0, |(_, v)| v.0);
+                let mut word = [0u8; 32];
+                word[24..].copy_from_slice(&balance.to_be_bytes());
+                return Ok(word);
+            }
+        }
+        Ok([0u8; 32])
     }
 
     async fn get_fee_estimate(&self) -> anyhow::Result<FeeVote> {

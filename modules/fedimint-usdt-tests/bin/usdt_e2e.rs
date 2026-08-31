@@ -204,13 +204,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Wait for a live `FeeVote` median to exist (the guardians' 1s poller
-        // reads the real anvil gas price): `process_input` rejects a claim
-        // with `DepositFeeInsufficient` before any median exists (the quote
-        // endpoint reports a `0` sentinel until then), mirroring
-        // `withdraw_e2e.rs`'s identical wait.
-        // Deposit-by-proof charges NO fee, but the later withdrawal leg needs a
-        // live `FeeVote` median to exist; poll `deposit-fee-quote` purely as
-        // that warmup gate (its value no longer sizes the deposit).
+        // reads the real anvil gas price): `process_input` rejects a
+        // deposit-proof credit with `NoFeeQuoteAvailable` before any median
+        // exists (the quote endpoint reports a `0` sentinel until then), and
+        // the live quote is what sizes the deposit's fee pad below --
+        // mirroring `withdraw_e2e.rs`'s identical wait.
         info!("Polling deposit-fee-quote until a nonzero quote is available (FeeVote warmup)...");
         let fee_deadline = fedimint_core::time::now() + Duration::from_secs(60);
         loop {
@@ -244,13 +242,31 @@ async fn main() -> anyhow::Result<()> {
         // the automatic deploy-and-sweep UserOp sent FROM this account.
 
         info!(%account, "Transferring USDT to the deposit address on-chain...");
-        // Deposit-by-proof mints the FULL on-chain balance with NO fee, so the
-        // on-chain transfer is exactly `min_net_transfer_amount` (2_048_000 =
-        // 4000 * 512, a multiple of the `mintv2` denomination granularity so
-        // the minted e-cash has no sub-denomination dust remainder). No fee
-        // margin is needed any more (unlike the legacy observe-then-claim path).
+        // Deposit-by-proof mints the on-chain balance NET of the federation's
+        // live deposit fee, so the on-chain transfer is
+        // `min_net_transfer_amount` (2_048_000 = 4000 * 512, a multiple of the
+        // `mintv2` denomination granularity) padded by 2x the live quote as
+        // margin (real anvil gas is not scriptable and can only realistically
+        // fall over the idle blocks that follow, so the double-quote pad
+        // covers the fee actually charged at processing time).
         let min_net_transfer_amount = UsdtAmount(2_048_000);
-        let transfer_amount = min_net_transfer_amount;
+        let quote_deadline = fedimint_core::time::now() + Duration::from_secs(60);
+        let live_deposit_fee = loop {
+            let quote = cmd!(client, "module", "usdt", "deposit-fee-quote")
+                .out_json()
+                .await;
+            if let Ok(quote) = quote
+                && let Some(fee) = quote["fee"].as_u64()
+            {
+                break UsdtAmount(fee);
+            }
+            ensure!(
+                fedimint_core::time::now() < quote_deadline,
+                "deposit-fee-quote never became available before the deadline"
+            );
+            fedimint_core::runtime::sleep(Duration::from_secs(1)).await;
+        };
+        let transfer_amount = UsdtAmount(min_net_transfer_amount.0 + 2 * live_deposit_fee.0);
         transfer_erc20_from_account_1(&anvil, token, account, transfer_amount).await?;
 
         info!("Mining past confirmation_depth...");
@@ -275,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
                 "submit-deposit-proof",
                 "--index",
                 "0",
+                "--accept-high-fee",
                 "--evm-rpc-url",
                 anvil.rpc_url()
             )
@@ -294,12 +311,14 @@ async fn main() -> anyhow::Result<()> {
             fedimint_core::runtime::sleep(Duration::from_secs(2)).await;
         }
 
-        // Deposit-by-proof credited AND minted the full transfer in one no-fee
-        // transaction (the client's `submit-deposit-proof` awaits the
-        // USDT-denominated `mintv2` issuance before returning), so the
-        // USDT-denominated e-cash balance equals the transferred amount exactly.
-        // A short poll only absorbs any per-process client-load latency.
-        info!("Verifying the USDT-denominated e-cash balance equals the deposit...");
+        // Deposit-by-proof credited the full transfer and minted it net of the
+        // live deposit fee in one transaction (the client's
+        // `submit-deposit-proof` awaits the USDT-denominated `mintv2` issuance
+        // before returning), so the USDT-denominated e-cash balance is the
+        // transfer minus the fee actually charged -- read (not predicted, the
+        // live quote can move) and bounds-checked. A short poll only absorbs
+        // any per-process client-load latency.
+        info!("Verifying the USDT-denominated e-cash balance covers the net deposit...");
         let balance_deadline = fedimint_core::time::now() + Duration::from_secs(30);
         let net_transfer_amount = loop {
             let balance = usdt_ecash_balance_msats(&client).await?;
@@ -313,9 +332,14 @@ async fn main() -> anyhow::Result<()> {
             fedimint_core::runtime::sleep(Duration::from_secs(1)).await;
         };
         ensure!(
-            net_transfer_amount == transfer_amount,
-            "USDT e-cash balance ({net_transfer_amount}) must equal the deposited amount \
-             ({transfer_amount}) -- deposit-by-proof mints the full balance with no fee"
+            net_transfer_amount.0 >= min_net_transfer_amount.0,
+            "USDT e-cash balance ({net_transfer_amount}) must cover the minimum net deposit \
+             ({min_net_transfer_amount})"
+        );
+        ensure!(
+            net_transfer_amount.0 < transfer_amount.0,
+            "USDT e-cash balance ({net_transfer_amount}) must be NET of a nonzero deposit fee \
+             (gross {transfer_amount})"
         );
 
         info!("Verifying a second proof of the same (already-credited) deposit fails...");
@@ -326,6 +350,7 @@ async fn main() -> anyhow::Result<()> {
             "submit-deposit-proof",
             "--index",
             "0",
+            "--accept-high-fee",
             "--evm-rpc-url",
             anvil.rpc_url()
         )
