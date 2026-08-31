@@ -24,12 +24,20 @@ use fedimint_server_core::dashboard_ui::P2PConnectionStatus;
 use futures::future::select_all;
 use futures::{FutureExt, StreamExt};
 use tokio::sync::watch;
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::metrics::{PEER_CONNECT_COUNT, PEER_DISCONNECT_COUNT, PEER_MESSAGES_COUNT};
 use crate::net::p2p_connection::{DynConnectionStatusUpdates, DynP2PConnection};
 use crate::net::p2p_connector::DynP2PConnector;
+
+/// Bound on how long sending a single p2p message may take before the
+/// connection is considered stuck and torn down.
+///
+/// Generous on purpose: it only has to be shorter than "forever". A guardian
+/// on a relayed path still has to be able to push a whole
+/// `MAX_P2P_MESSAGE_SIZE` message through within it.
+const P2P_SEND_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct P2PConnectionState {
@@ -401,11 +409,19 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
             ])
             .inc();
 
-        if let Err(e) = connection.send(peer_message).await {
-            return self.disconnect(e);
+        // A send parks indefinitely once the peer's flow control window is full
+        // and only the peer's application reading releases it. Since this task
+        // is also the one that reads, a peer running the same state machine can
+        // never release us and we can never release it. Nothing errors, the
+        // connection stays healthy and keep-alives keep flowing, so without a
+        // bound here the guardian just stops making progress in silence.
+        match timeout(P2P_SEND_TIMEOUT, connection.send(peer_message)).await {
+            Ok(Ok(())) => P2PConnectionSMState::Connected(connection),
+            Ok(Err(e)) => self.disconnect(e),
+            Err(_) => self.disconnect(anyhow!(
+                "Sending a message to the peer did not complete within {P2P_SEND_TIMEOUT:?}"
+            )),
         }
-
-        P2PConnectionSMState::Connected(connection)
     }
 
     async fn transition_disconnected(

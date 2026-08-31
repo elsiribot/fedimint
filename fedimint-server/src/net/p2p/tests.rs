@@ -157,6 +157,29 @@ impl IP2PConnection<u64> for FakeConnection {
     }
 }
 
+/// A connection whose send never completes, the way a send parked on transport
+/// flow control against a peer that is itself parked never completes.
+struct ParkedConnection;
+
+#[async_trait]
+impl IP2PConnection<u64> for ParkedConnection {
+    async fn send(&mut self, _message: u64) -> anyhow::Result<()> {
+        future::pending().await
+    }
+
+    async fn receive(&mut self) -> anyhow::Result<DynIP2PFrame<u64>> {
+        future::pending().await
+    }
+
+    fn rtt(&self) -> Option<Duration> {
+        None
+    }
+
+    fn connection_type(&self) -> Option<ConnectionType> {
+        Some(ConnectionType::Direct)
+    }
+}
+
 struct PendingConnector {
     fallback: Option<ConnectionType>,
 }
@@ -183,7 +206,7 @@ impl IP2PConnector<u64> for PendingConnector {
 struct StatusMachineHarness {
     connection_sender: async_channel::Sender<DynP2PConnection<u64>>,
     status_receiver: watch::Receiver<P2PConnectionState>,
-    _outgoing_sender: async_channel::Sender<u64>,
+    outgoing_sender: async_channel::Sender<u64>,
     _incoming_receiver: async_channel::Receiver<u64>,
     task: JoinHandle<()>,
 }
@@ -199,7 +222,10 @@ impl StatusMachineHarness {
         Self::spawn_with_fallback(connection, None)
     }
 
-    fn spawn_with_fallback(connection: FakeConnection, fallback: Option<ConnectionType>) -> Self {
+    fn spawn_with_fallback(
+        connection: impl IP2PConnection<u64>,
+        fallback: Option<ConnectionType>,
+    ) -> Self {
         let (connection_sender, incoming_connections) = async_channel::bounded(4);
         let (outgoing_sender, outgoing_receiver) = async_channel::bounded(5);
         let (incoming_sender, incoming_receiver) = async_channel::bounded(5);
@@ -233,7 +259,7 @@ impl StatusMachineHarness {
         Self {
             connection_sender,
             status_receiver,
-            _outgoing_sender: outgoing_sender,
+            outgoing_sender,
             _incoming_receiver: incoming_receiver,
             task,
         }
@@ -268,12 +294,56 @@ impl StatusMachineHarness {
     fn current_status(&mut self) -> Option<P2PConnectionStatus> {
         self.status_receiver.borrow_and_update().connected.clone()
     }
+
+    /// Like [`Self::wait_for_status`] but without a deadline of its own, so it
+    /// can be used under `start_paused` without competing for the clock.
+    async fn wait_for_disconnect(&mut self) {
+        while self.current_status().is_none() {
+            self.status_receiver
+                .changed()
+                .await
+                .expect("status sender remains alive");
+        }
+
+        while self.current_status().is_some() {
+            self.status_receiver
+                .changed()
+                .await
+                .expect("status sender remains alive");
+        }
+    }
 }
 
 impl Drop for StatusMachineHarness {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// A send that parks forever must end the connection rather than the state
+/// machine, so the stall becomes a logged disconnect and a reconnect attempt
+/// instead of silence.
+#[tokio::test(start_paused = true)]
+async fn a_send_that_never_completes_disconnects_the_peer() {
+    let mut harness = StatusMachineHarness::spawn_with_fallback(ParkedConnection, None);
+
+    harness
+        .outgoing_sender
+        .send(7)
+        .await
+        .expect("state machine accepts outgoing messages");
+
+    harness.wait_for_disconnect().await;
+
+    assert!(
+        harness
+            .status_receiver
+            .borrow_and_update()
+            .last_error
+            .as_ref()
+            .expect("disconnect records an error")
+            .contains("did not complete")
+    );
 }
 
 #[tokio::test]
