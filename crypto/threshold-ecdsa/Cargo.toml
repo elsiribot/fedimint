@@ -1,0 +1,42 @@
+[package]
+authors = { workspace = true }
+description = "Threshold ECDSA (CGGMP21) wrapper for Fedimint federations"
+edition = { workspace = true }
+license = { workspace = true }
+name = "fedimint-threshold-ecdsa"
+publish = false
+readme = { workspace = true }
+repository = { workspace = true }
+version = { workspace = true }
+
+[lib]
+name = "fedimint_threshold_ecdsa"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bincode = { workspace = true }
+cggmp21 = { workspace = true }
+fedimint-aead = { workspace = true }
+hd-wallet = { workspace = true }
+hkdf = { workspace = true }
+rand = { workspace = true }
+ring = { workspace = true }
+round-based = { workspace = true, features = ["state-machine"] }
+secp256k1 = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["derive"] }
+serde-big-array = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+cggmp21 = { workspace = true, features = ["spof"] }
+hex = { workspace = true }
+round-based = { workspace = true, features = ["sim"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

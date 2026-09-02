@@ -9,7 +9,7 @@ use fedimint_client_module::AdminCreds;
 use fedimint_client_module::secret::{PlainRootSecretStrategy, RootSecretStrategy};
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::PeerId;
-use fedimint_core::config::{ClientConfig, FederationId};
+use fedimint_core::config::{ClientConfig, ConfigGenModuleParams, FederationId};
 use fedimint_core::core::ModuleKind;
 use fedimint_core::db::Database;
 use fedimint_core::db::mem_impl::MemDatabase;
@@ -43,6 +43,13 @@ pub struct FederationTest {
     num_peers: u16,
     num_offline: u16,
     connectors: ConnectorRegistry,
+    /// Each online guardian's server-side [`Database`] (the same handle
+    /// `consensus::run` was spawned with in [`FederationTestBuilder::build`]),
+    /// so a test can inspect a guardian's raw consensus state directly (e.g.
+    /// to assert every guardian's module DB ended up byte-identical) rather
+    /// than only through the wire API. `Database` is a cheap `Arc`-backed
+    /// clone, so stashing one here does not duplicate any storage.
+    databases: BTreeMap<PeerId, Database>,
 }
 
 impl FederationTest {
@@ -236,6 +243,20 @@ impl FederationTest {
     pub fn is_degraded(&self) -> bool {
         self.num_offline > 0
     }
+
+    /// Returns `peer`'s server-side [`Database`] (the SAME handle its
+    /// `consensus::run` instance was spawned with), for tests that need to
+    /// inspect a guardian's raw consensus DB directly -- e.g. asserting that
+    /// every guardian's module state ended up byte-identical after some
+    /// consensus flow. Only online peers have an entry (see
+    /// [`Self::online_peer_ids`]); panics if `peer` is offline or unknown.
+    #[must_use]
+    pub fn server_db(&self, peer: PeerId) -> Database {
+        self.databases
+            .get(&peer)
+            .expect("server_db called for an offline or unknown peer")
+            .clone()
+    }
 }
 
 /// Builder struct for creating a `FederationTest`.
@@ -250,6 +271,7 @@ pub struct FederationTestBuilder {
     client_init: ClientModuleInitRegistry,
     bitcoin_rpc_connection: DynServerBitcoinRpc,
     enable_mint_fees: bool,
+    extra_module_instances: Vec<(ModuleKind, ConfigGenModuleParams)>,
 }
 
 impl FederationTestBuilder {
@@ -272,6 +294,7 @@ impl FederationTestBuilder {
             client_init,
             bitcoin_rpc_connection,
             enable_mint_fees: true,
+            extra_module_instances: Vec::new(),
         }
     }
 
@@ -305,6 +328,19 @@ impl FederationTestBuilder {
         self
     }
 
+    /// Attach an extra instance of an already-registered module kind, with
+    /// its own config-gen params (already serialized to JSON). Appended after
+    /// the default one-instance-per-kind set built from `server_init`, so its
+    /// instance id is assigned last.
+    pub fn with_extra_module_instance(
+        mut self,
+        kind: ModuleKind,
+        params: ConfigGenModuleParams,
+    ) -> FederationTestBuilder {
+        self.extra_module_instances.push((kind, params));
+        self
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> FederationTest {
         install_crypto_provider().await;
@@ -319,6 +355,7 @@ impl FederationTestBuilder {
             self.base_port,
             self.enable_mint_fees,
             &self.server_init,
+            &self.extra_module_instances,
         )
         .expect("Generates local config");
 
@@ -326,6 +363,7 @@ impl FederationTestBuilder {
             ServerConfig::trusted_dealer_gen(&params, &self.server_init, &self.version_hash);
 
         let task_group = TaskGroup::new();
+        let mut databases = BTreeMap::new();
         for (peer_id, cfg) in configs.clone() {
             let peer_port = self.base_port + u16::from(peer_id) * 3;
 
@@ -340,6 +378,7 @@ impl FederationTestBuilder {
             let instances = cfg.consensus.iter_module_instances();
             let decoders = self.server_init.available_decoders(instances).unwrap();
             let db = Database::new(MemDatabase::new(), decoders);
+            databases.insert(peer_id, db.clone());
             let module_init_registry = self.server_init.clone();
             let subgroup = task_group.make_subgroup();
             let checkpoint_dir = tempfile::Builder::new().tempdir().unwrap().keep();
@@ -441,6 +480,7 @@ impl FederationTestBuilder {
                 .bind()
                 .await
                 .expect("Failed to initialize endpoints for testing"),
+            databases,
         }
     }
 }

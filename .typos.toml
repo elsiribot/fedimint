@@ -21,6 +21,12 @@ tpe = "tpe"
 # appears in bitcoin test addresses
 nd = "nd"
 
+# deliberate spelling in a log string (devimint/src/federation.rs)
+unparseable = "unparseable"
+
+# hyphenated prefix in "mis-decodes" / "mis-handled" (usdt tests, plan docs)
+mis = "mis"
+
 [files]
 extend-exclude = [
   "db/**",

@@ -18,8 +18,9 @@ use fedimint_connectors::{
 };
 use fedimint_core::admin_client::{GuardianConfigBackup, ServerStatusLegacy, SetupStatus};
 use fedimint_core::backup::{BackupStatistics, ClientBackupSnapshot};
+use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
 use fedimint_core::core::backup::SignedBackupRequest;
-use fedimint_core::core::{Decoder, DynOutputOutcome, ModuleInstanceId, ModuleKind, OutputOutcome};
+use fedimint_core::core::{Decoder, DynOutputOutcome, ModuleInstanceId, OutputOutcome};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::audit::AuditSummary;
@@ -505,7 +506,7 @@ pub trait IGlobalFederationApi: IRawFederationApi {
         name: String,
         federation_name: Option<String>,
         disable_base_fees: Option<bool>,
-        enabled_modules: Option<BTreeSet<ModuleKind>>,
+        module_params: Option<ServerModuleConfigGenParamsRegistry>,
         federation_size: Option<u32>,
         auth: ApiAuth,
     ) -> FederationResult<String>;

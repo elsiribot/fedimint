@@ -17,6 +17,9 @@ use fedimint_lnv2_common::endpoint_constants::{
 };
 use rand::seq::SliceRandom;
 
+// `add_gateway`/`remove_gateway` are admin-only endpoints, currently
+// unreferenced on this v0.11 branch; kept for API completeness.
+#[allow(dead_code)]
 #[apply(async_trait_maybe_send!)]
 pub trait LightningFederationApi {
     async fn consensus_block_count(&self) -> FederationResult<u64>;

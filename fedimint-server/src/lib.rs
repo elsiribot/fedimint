@@ -310,7 +310,7 @@ pub async fn run_driven(
     db_checkpoint_retention: u64,
     iroh_api_limits: ConnectionLimits,
 ) -> anyhow::Result<()> {
-    let mut control = inherited_control_socket().await?;
+    let mut control = inherited_control_socket()?;
 
     let existing_config = if data_dir.exists() {
         match get_config_if_present_strict(&data_dir) {
@@ -567,7 +567,7 @@ fn bounded_reason(reason: &str) -> String {
 }
 
 #[cfg(unix)]
-async fn inherited_control_socket() -> anyhow::Result<tokio::net::UnixStream> {
+fn inherited_control_socket() -> anyhow::Result<tokio::net::UnixStream> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
     anyhow::ensure!(

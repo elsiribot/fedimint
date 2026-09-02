@@ -1182,7 +1182,7 @@ impl ClientModule for MintClientModule {
                     yield serde_json::to_value(note_counts)?;
                 }
                 _ => {
-                    Err(anyhow::format_err!("Unknown method: {}", method))?;
+                    Err(anyhow::format_err!("Unknown method: {method}"))?;
                     unreachable!()
                 },
             }

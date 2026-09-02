@@ -1008,17 +1008,33 @@ impl Client {
             .is_some()
     }
 
-    /// Waits for an output from the primary module to reach its final
-    /// state.
+    /// Waits for an output from the primary module for `unit` to reach its
+    /// final state.
+    pub async fn await_primary_module_output_for_unit(
+        &self,
+        operation_id: OperationId,
+        out_point: OutPoint,
+        unit: AmountUnit,
+    ) -> anyhow::Result<()> {
+        self.primary_module_for_unit(unit)
+            .ok_or_else(|| anyhow!("No primary module available for unit {unit:?}"))?
+            .1
+            .await_primary_module_output(operation_id, out_point)
+            .await
+    }
+
+    /// Waits for an output from the Bitcoin primary module to reach its final
+    /// state. A specialization of
+    /// [`Self::await_primary_module_output_for_unit`] for
+    /// [`AmountUnit::BITCOIN`] (the common case); callers whose e-cash is
+    /// denominated in another unit (e.g. the usdt module's USDT-denominated
+    /// `mintv2`) use the unit-aware method directly.
     pub async fn await_primary_bitcoin_module_output(
         &self,
         operation_id: OperationId,
         out_point: OutPoint,
     ) -> anyhow::Result<()> {
-        self.primary_module_for_unit(AmountUnit::BITCOIN)
-            .ok_or_else(|| anyhow!("No primary module available"))?
-            .1
-            .await_primary_module_output(operation_id, out_point)
+        self.await_primary_module_output_for_unit(operation_id, out_point, AmountUnit::BITCOIN)
             .await
     }
 
@@ -1041,6 +1057,45 @@ impl Client {
             id,
             db,
             api: self.api().with_module(id),
+            module,
+        })
+    }
+
+    /// Returns a reference to a typed module client instance for a specific
+    /// `instance` id.
+    ///
+    /// Unlike [`Self::get_first_module`], which picks an arbitrary instance
+    /// of the given module kind, this looks up the exact instance
+    /// requested. Useful when a federation runs multiple instances of the
+    /// same module kind (e.g. two `mintv2` instances for different amount
+    /// units) and the caller needs a specific one.
+    pub fn get_module_by_instance<M: ClientModule>(
+        &'_ self,
+        instance: ModuleInstanceId,
+    ) -> anyhow::Result<ClientModuleInstance<'_, M>> {
+        let module_kind = M::kind();
+        let actual_kind = self
+            .modules
+            .iter_modules()
+            .find(|(id, _, _)| *id == instance)
+            .map(|(_, kind, _)| kind.clone())
+            .ok_or_else(|| format_err!("Unknown module instance {instance}"))?;
+        if actual_kind != module_kind {
+            bail!(
+                "Module kind mismatch for instance {instance}: expected {module_kind}, found {actual_kind}"
+            );
+        }
+        let module: &M = self
+            .try_get_module(instance)
+            .ok_or_else(|| format_err!("Unknown module instance {instance}"))?
+            .as_any()
+            .downcast_ref::<M>()
+            .ok_or_else(|| format_err!("Module is not of type {}", std::any::type_name::<M>()))?;
+        let (db, _) = self.db().with_prefix_module_id(instance);
+        Ok(ClientModuleInstance {
+            id: instance,
+            db,
+            api: self.api().with_module(instance),
             module,
         })
     }
@@ -1083,19 +1138,33 @@ impl Client {
         get_decoded_client_secret::<T>(self.db()).await
     }
 
-    /// Waits for outputs from the primary module to reach its final
-    /// state.
+    /// Waits for outputs from the primary module for `unit` to reach their
+    /// final state.
+    pub async fn await_primary_module_outputs_for_unit(
+        &self,
+        operation_id: OperationId,
+        outputs: Vec<OutPoint>,
+        unit: AmountUnit,
+    ) -> anyhow::Result<()> {
+        for out_point in outputs {
+            self.await_primary_module_output_for_unit(operation_id, out_point, unit)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Waits for outputs from the Bitcoin primary module to reach their final
+    /// state. A specialization of
+    /// [`Self::await_primary_module_outputs_for_unit`] for
+    /// [`AmountUnit::BITCOIN`].
     pub async fn await_primary_bitcoin_module_outputs(
         &self,
         operation_id: OperationId,
         outputs: Vec<OutPoint>,
     ) -> anyhow::Result<()> {
-        for out_point in outputs {
-            self.await_primary_bitcoin_module_output(operation_id, out_point)
-                .await?;
-        }
-
-        Ok(())
+        self.await_primary_module_outputs_for_unit(operation_id, outputs, AmountUnit::BITCOIN)
+            .await
     }
 
     /// Returns the config of the client in JSON format.
@@ -2418,6 +2487,15 @@ impl ClientContextIface for Client {
         outputs: Vec<OutPoint>,
     ) -> anyhow::Result<()> {
         Client::await_primary_bitcoin_module_outputs(self, operation_id, outputs).await
+    }
+
+    async fn await_primary_module_outputs_for_unit(
+        &self,
+        operation_id: OperationId,
+        outputs: Vec<OutPoint>,
+        unit: AmountUnit,
+    ) -> anyhow::Result<()> {
+        Client::await_primary_module_outputs_for_unit(self, operation_id, outputs, unit).await
     }
 
     fn operation_log(&self) -> &dyn IOperationLog {

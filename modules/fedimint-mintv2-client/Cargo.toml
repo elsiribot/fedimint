@@ -15,17 +15,13 @@ rustc-args = ["--cfg", "tokio_unstable"]
 # cargo udeps can't detect that one
 normal = ["aquamarine"]
 
-[features]
-cli = ["dep:clap"]
-default = []
-
 [lib]
 name = "fedimint_mintv2_client"
 path = "src/lib.rs"
 
-[[bench]]
-harness = false
-name = "recovery"
+[features]
+cli = ["dep:clap"]
+default = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -63,3 +59,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 divan = "0.1.21"
+
+[[bench]]
+harness = false
+name = "recovery"

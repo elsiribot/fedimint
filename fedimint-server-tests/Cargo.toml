@@ -11,10 +11,6 @@ readme = { workspace = true }
 repository = { workspace = true }
 version = { workspace = true }
 
-[[test]]
-name = "fedimint_server_migration"
-path = "tests/migration.rs"
-
 [dev-dependencies]
 bitcoin = { workspace = true }
 fedimint-api-client = { workspace = true }
@@ -30,6 +26,10 @@ rand = { workspace = true }
 strum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[[test]]
+name = "fedimint_server_migration"
+path = "tests/migration.rs"
 
 [lints]
 workspace = true

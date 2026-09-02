@@ -333,8 +333,10 @@ where
                     api_url,
                 }
             }
-            (ParentPhase::ConfigPersisted, ChildMessage::ConsensusStarted {})
-            | (ParentPhase::AwaitingConsensus, ChildMessage::ConsensusStarted {}) => {
+            (
+                ParentPhase::ConfigPersisted | ParentPhase::AwaitingConsensus,
+                ChildMessage::ConsensusStarted {},
+            ) => {
                 self.phase = ParentPhase::AwaitingRetirement;
                 DrivenDkgEvent::ConsensusStarted
             }
@@ -528,10 +530,10 @@ pub(crate) fn validate_run_dkg(
     ensure!(
         decoded
             .iter()
-            .filter(|code| code.enabled_modules.is_some())
+            .filter(|code| code.module_params.is_some())
             .count()
             <= 1,
-        "Enabled modules are configured by more than one setup code"
+        "The module instance list is configured by more than one setup code"
     );
     ensure!(
         decoded
@@ -635,10 +637,18 @@ pub(crate) fn validate_run_dkg(
         .iter()
         .find_map(|code| code.disable_base_fees)
         .unwrap_or(is_env_var_set(FM_DISABLE_BASE_FEES_ENV));
-    let enabled_modules = decoded
+    // The module instance list is the source of truth for which module
+    // instances the federation runs. If no setup code configured it, fall
+    // back to the default instance list (one instance of each
+    // default-enabled module kind, in canonical order).
+    let module_params = decoded
         .iter()
-        .find_map(|code| code.enabled_modules.clone())
-        .unwrap_or_else(|| settings.default_modules.clone());
+        .find_map(|code| code.module_params.clone())
+        .unwrap_or_else(|| {
+            settings
+                .available_module_params
+                .select_kinds(&settings.default_modules)
+        });
     let network = bitcoin::Network::from_str(&network).context("Invalid Bitcoin network")?;
     ensure!(
         network == settings.network,
@@ -658,7 +668,7 @@ pub(crate) fn validate_run_dkg(
             .collect(),
         meta: BTreeMap::from([(META_FEDERATION_NAME_KEY.to_string(), federation_name)]),
         disable_base_fees,
-        enabled_modules,
+        module_params,
         network,
     })
 }
@@ -793,6 +803,8 @@ mod tests {
             network: bitcoin::Network::Regtest,
             available_modules: BTreeSet::new(),
             default_modules: BTreeSet::new(),
+            available_module_params:
+                fedimint_core::config::ServerModuleConfigGenParamsRegistry::default(),
         }
     }
 
@@ -816,7 +828,7 @@ mod tests {
                 },
                 federation_name: (index == 0).then(|| "test-fed".to_string()),
                 disable_base_fees: None,
-                enabled_modules: None,
+                module_params: None,
                 federation_size: (index == 0).then_some(4),
             })
             .collect();

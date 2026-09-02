@@ -16,12 +16,12 @@ normal = ["aquamarine"]
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "tokio_unstable"]
 
-[features]
-tor = ["fedimint-api-client/tor"]
-
 [lib]
 name = "fedimint_client_module"
 path = "src/lib.rs"
+
+[features]
+tor = ["fedimint-api-client/tor"]
 
 [dependencies]
 anyhow = { workspace = true }

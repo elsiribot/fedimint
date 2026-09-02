@@ -95,6 +95,9 @@ pub const FM_LND_BASE_EXECUTABLE_ENV: &str = "FM_LND_BASE_EXECUTABLE";
 // Env variable to override esplora binary set:
 pub const FM_ESPLORA_BASE_EXECUTABLE_ENV: &str = "FM_ESPLORA_BASE_EXECUTABLE";
 
+// Env variable to override anvil binary set:
+pub const FM_ANVIL_BASE_EXECUTABLE_ENV: &str = "FM_ANVIL_BASE_EXECUTABLE";
+
 // Env variable to override esplora binary set:
 pub const FM_RECOVERYTOOL_BASE_EXECUTABLE_ENV: &str = "FM_RECOVERYTOOL_BASE_EXECUTABLE";
 
@@ -121,6 +124,13 @@ pub const FM_DEVIMINT_CMD_INHERIT_STDERR_ENV: &str = "FM_DEVIMINT_CMD_INHERIT_ST
 
 /// Force devimint to run a test with a deprecated configuration
 pub const FM_DEVIMINT_RUN_DEPRECATED_TESTS_ENV: &str = "FM_DEVIMINT_RUN_DEPRECATED_TESTS";
+
+/// Override (in seconds) how long devimint waits for config-gen (DKG) to
+/// produce each guardian's invite code before timing out. Defaults to 60s;
+/// raised by tests with heavy key ceremonies (e.g. the usdt module's
+/// threshold-ECDSA DKG). Only raises the ceiling -- the wait returns the
+/// instant the invite code appears.
+pub const FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS_ENV: &str = "FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS";
 
 /// Devimint's "data dir" (think `/usr/devimint/`).
 ///

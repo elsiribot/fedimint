@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail, format_err};
 use bitcoin::hashes::sha256;
+use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
 pub use fedimint_core::config::{
     ClientConfig, FederationId, GlobalClientConfig, JsonWithKind, ModuleInitRegistry, P2PMessage,
     PeerUrl, ServerModuleConfig, ServerModuleConsensusConfig, TypedServerModuleConfig,
@@ -45,6 +46,9 @@ pub mod driven;
 pub mod io;
 pub mod peer_handle;
 pub mod setup;
+
+#[cfg(test)]
+mod tests;
 
 /// The default maximum open connections the API can handle
 pub const DEFAULT_MAX_CLIENT_CONNECTIONS: u32 = 1000;
@@ -223,6 +227,10 @@ pub struct ConfigGenSettings {
     pub available_modules: BTreeSet<ModuleKind>,
     /// Modules that should be enabled by default in the setup UI
     pub default_modules: BTreeSet<ModuleKind>,
+    /// Default config-gen params for every available module, keyed by instance
+    /// id in the canonical instance order. Used to materialize the module
+    /// instance list from a set of selected module kinds during setup.
+    pub available_module_params: ServerModuleConfigGenParamsRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -247,8 +255,9 @@ pub struct ConfigGenParams {
     pub meta: BTreeMap<String, String>,
     /// Whether to disable base fees for this federation
     pub disable_base_fees: bool,
-    /// Modules enabled by the leader during setup
-    pub enabled_modules: BTreeSet<ModuleKind>,
+    /// The module instance list to generate configs for. This is the single
+    /// source of truth for which module instances the federation runs.
+    pub module_params: ServerModuleConfigGenParamsRegistry,
     /// Bitcoin network for this federation
     pub network: bitcoin::Network,
 }
@@ -500,22 +509,17 @@ impl ServerConfig {
             disable_base_fees: peer0.disable_base_fees,
         };
 
-        // Use legacy module ordering for backwards compatibility tests
-        let use_legacy_order = is_env_var_set("FM_BACKWARDS_COMPATIBILITY_TEST");
-        let module_iter: Vec<_> = if use_legacy_order {
-            registry.iter_legacy_order()
-        } else {
-            registry.iter().collect()
-        };
-
-        let module_configs: BTreeMap<_, _> = module_iter
-            .into_iter()
-            .filter(|(kind, _)| peer0.enabled_modules.contains(kind))
-            .enumerate()
-            .map(|(module_id, (_kind, module_init))| {
+        let module_configs: BTreeMap<_, _> = peer0
+            .module_params
+            .iter_modules()
+            .map(|(module_id, kind, params)| {
+                let module_init = registry.get(kind).expect(
+                    "Module kinds in module_params are validated against the \
+                     available-modules registry before config gen starts",
+                );
                 (
-                    module_id as ModuleInstanceId,
-                    module_init.trusted_dealer_gen(&peer0.peer_ids(), &args),
+                    module_id,
+                    module_init.trusted_dealer_gen(&peer0.peer_ids(), &args, params),
                 )
             })
             .collect();
@@ -730,21 +734,9 @@ impl ServerConfig {
             disable_base_fees: params.disable_base_fees,
         };
 
-        // Use legacy module ordering for backwards compatibility tests
-        let use_legacy_order = is_env_var_set("FM_BACKWARDS_COMPATIBILITY_TEST");
-        let module_iter: Vec<_> = if use_legacy_order {
-            registry.iter_legacy_order()
-        } else {
-            registry.iter().collect()
-        };
-
         let mut module_cfgs = BTreeMap::new();
 
-        for (module_id, (kind, module_init)) in module_iter
-            .into_iter()
-            .filter(|(kind, _)| params.enabled_modules.contains(kind))
-            .enumerate()
-        {
+        for (module_id, kind, module_config_gen_params) in params.module_params.iter_modules() {
             info!(
                 target: LOG_NET_PEER_DKG,
                 "Running config generation for module of kind {kind}..."
@@ -758,8 +750,12 @@ impl ServerConfig {
                 "Module config generation started"
             );
 
+            let module_init = registry
+                .get(kind)
+                .with_context(|| format!("Module of kind {kind} not found"))?;
+
             let cfg = module_init
-                .distributed_gen(&handle, &args)
+                .distributed_gen(&handle, &args, module_config_gen_params)
                 .await
                 .map_err(|err| {
                     error!(
@@ -788,7 +784,7 @@ impl ServerConfig {
                 "Module config generation completed"
             );
 
-            module_cfgs.insert(module_id as ModuleInstanceId, cfg);
+            module_cfgs.insert(module_id, cfg);
         }
 
         let cfg = ServerConfig::from(
@@ -871,6 +867,41 @@ impl ServerConfig {
 
         Ok(cfg)
     }
+}
+
+/// Build a module instance list holding one instance of each module in
+/// `enabled_modules`, each carrying that module's default config gen params.
+///
+/// This materializes the instance list at the setup boundaries (the default
+/// `available_module_params` in [`ConfigGenSettings`] and the test config gen
+/// params), where a set of module kinds needs to be turned into the instance
+/// list that is the source of truth for config generation.
+///
+/// Modules are iterated in the canonical instance order (legacy insertion order
+/// under `FM_BACKWARDS_COMPATIBILITY_TEST`, otherwise the registry's
+/// kind-sorted order), and each module contributes its own default config gen
+/// params via
+/// [`fedimint_server_core::IServerModuleInit::default_config_gen_params`].
+/// Instance ids are assigned by position.
+pub fn build_module_params_registry(
+    registry: &ServerModuleInitRegistry,
+    enabled_modules: &BTreeSet<ModuleKind>,
+) -> ServerModuleConfigGenParamsRegistry {
+    let use_legacy_order = is_env_var_set("FM_BACKWARDS_COMPATIBILITY_TEST");
+    let module_iter: Vec<_> = if use_legacy_order {
+        registry.iter_legacy_order()
+    } else {
+        registry.iter().collect()
+    };
+
+    let mut module_params = ServerModuleConfigGenParamsRegistry::default();
+    for (kind, module_init) in module_iter
+        .into_iter()
+        .filter(|(kind, _)| enabled_modules.contains(kind))
+    {
+        module_params.append_module(kind.clone(), module_init.default_config_gen_params());
+    }
+    module_params
 }
 
 impl ServerConfig {

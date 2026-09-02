@@ -4,6 +4,13 @@ failure-output = "immediate"
 # no matter the profile, we want to kill tests that hanged on something
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+# Real cggmp21 threshold-ECDSA keygen/aux-gen/signing is CPU-bound and takes
+# well over the default 2min cap on slower dev machines (it passes in CI on
+# faster hardware). Give the MPC-heavy packages 10min before termination.
+[[profile.default.overrides]]
+filter = 'package(fedimint-threshold-ecdsa)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 # define `dev` to allow running cargo and nextest with the same profile name
 # inherits default profile config
 [profile.dev]

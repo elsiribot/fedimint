@@ -11,12 +11,12 @@ version = { workspace = true }
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "tokio_unstable"]
 
-[features]
-default = []
-
 [lib]
 name = "fedimint_server"
 path = "src/lib.rs"
+
+[features]
+default = []
 
 [dependencies]
 aleph-bft = { workspace = true }
@@ -75,12 +75,14 @@ tracing = { workspace = true }
 url = { workspace = true }
 z32 = { workspace = true }
 
-[dev-dependencies]
-test-log = { workspace = true }
-tempfile = { workspace = true }
-
 [build-dependencies]
 fedimint-build = { workspace = true }
+
+[dev-dependencies]
+fedimint-mint-common = { workspace = true }
+fedimint-mint-server = { workspace = true }
+tempfile = { workspace = true }
+test-log = { workspace = true }
 
 [lints]
 workspace = true

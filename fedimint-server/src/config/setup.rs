@@ -8,7 +8,7 @@ use anyhow::{Context, ensure};
 use async_trait::async_trait;
 use fedimint_core::admin_client::{SetLocalParamsRequest, SetupStatus};
 use fedimint_core::base32::FEDIMINT_PREFIX;
-use fedimint_core::config::META_FEDERATION_NAME_KEY;
+use fedimint_core::config::{META_FEDERATION_NAME_KEY, ServerModuleConfigGenParamsRegistry};
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::db::Database;
 use fedimint_core::endpoint_constants::{
@@ -65,9 +65,9 @@ pub struct LocalParams {
     federation_name: Option<String>,
     /// Whether to disable base fees, set by the leader
     disable_base_fees: Option<bool>,
-    /// Modules enabled by the leader (if None, all available modules are
-    /// enabled)
-    enabled_modules: Option<BTreeSet<ModuleKind>>,
+    /// The module instance list configured by the leader (if `None`, the
+    /// default set of module instances is used)
+    module_params: Option<ServerModuleConfigGenParamsRegistry>,
     /// Total number of guardians (including the one who sets this), set by the
     /// leader
     federation_size: Option<u32>,
@@ -80,7 +80,7 @@ impl LocalParams {
             endpoints: self.endpoints.clone(),
             federation_name: self.federation_name.clone(),
             disable_base_fees: self.disable_base_fees,
-            enabled_modules: self.enabled_modules.clone(),
+            module_params: self.module_params.clone(),
             federation_size: self.federation_size,
         }
     }
@@ -165,6 +165,10 @@ impl ISetupApi for SetupApi {
         self.settings.default_modules.clone()
     }
 
+    fn available_module_params(&self) -> ServerModuleConfigGenParamsRegistry {
+        self.settings.available_module_params.clone()
+    }
+
     async fn reset_setup_codes(&self) {
         self.state.lock().await.setup_codes.clear();
     }
@@ -175,7 +179,7 @@ impl ISetupApi for SetupApi {
         name: String,
         federation_name: Option<String>,
         disable_base_fees: Option<bool>,
-        enabled_modules: Option<BTreeSet<ModuleKind>>,
+        module_params: Option<ServerModuleConfigGenParamsRegistry>,
         federation_size: Option<u32>,
     ) -> anyhow::Result<String> {
         if let Some(existing_local_parameters) = self.state.lock().await.local_params.clone()
@@ -183,7 +187,7 @@ impl ISetupApi for SetupApi {
             && existing_local_parameters.name == name
             && existing_local_parameters.federation_name == federation_name
             && existing_local_parameters.disable_base_fees == disable_base_fees
-            && existing_local_parameters.enabled_modules == enabled_modules
+            && existing_local_parameters.module_params == module_params
             && existing_local_parameters.federation_size == federation_size
         {
             return Ok(base32::encode_prefixed(
@@ -253,7 +257,7 @@ impl ISetupApi for SetupApi {
                 name,
                 federation_name,
                 disable_base_fees,
-                enabled_modules,
+                module_params,
                 federation_size,
             }
         } else {
@@ -282,7 +286,7 @@ impl ISetupApi for SetupApi {
                 name,
                 federation_name,
                 disable_base_fees,
-                enabled_modules,
+                module_params,
                 federation_size,
             }
         };
@@ -344,10 +348,10 @@ impl ISetupApi for SetupApi {
             .setup_codes
             .iter()
             .chain(once(&local_params.setup_code()))
-            .any(|info| info.enabled_modules.is_some())
+            .any(|info| info.module_params.is_some())
         {
             ensure!(
-                info.enabled_modules.is_none(),
+                info.module_params.is_none(),
                 "Enabled modules have already been configured by another guardian"
             );
         }
@@ -410,11 +414,30 @@ impl ISetupApi for SetupApi {
             .find_map(|info| info.disable_base_fees)
             .unwrap_or(is_env_var_set(FM_DISABLE_BASE_FEES_ENV));
 
-        let enabled_modules = state
+        // The module instance list is the source of truth for which module
+        // instances the federation runs. If no guardian configured it, fall
+        // back to the default instance list (one instance of each
+        // default-enabled module kind, in canonical order).
+        let module_params = state
             .setup_codes
             .iter()
-            .find_map(|info| info.enabled_modules.clone())
-            .unwrap_or_else(|| self.settings.default_modules.clone());
+            .find_map(|info| info.module_params.clone())
+            .unwrap_or_else(|| {
+                self.settings
+                    .available_module_params
+                    .select_kinds(&self.settings.default_modules)
+            });
+
+        // A leader-supplied module instance list could reference a module kind
+        // this build doesn't know about. Reject it here, before it reaches
+        // config generation, where an unregistered kind would otherwise be
+        // reachable as an unrecoverable panic in the trusted-dealer path.
+        for (_, kind, _) in module_params.iter_modules() {
+            ensure!(
+                self.settings.available_modules.contains(kind),
+                "Module of kind {kind} is not available in this build"
+            );
+        }
 
         let our_id = state
             .setup_codes
@@ -430,14 +453,14 @@ impl ISetupApi for SetupApi {
             api_auth: local_params.auth,
             peers: (0..)
                 .map(|i| PeerId::from(i as u16))
-                .zip(state.setup_codes.clone().into_iter())
+                .zip(state.setup_codes.clone())
                 .collect(),
             meta: BTreeMap::from_iter(vec![(
                 META_FEDERATION_NAME_KEY.to_string(),
                 federation_name,
             )]),
             disable_base_fees,
-            enabled_modules,
+            module_params,
             network: self.settings.network,
         };
 
@@ -479,14 +502,14 @@ impl ISetupApi for SetupApi {
             .find_map(|info| info.disable_base_fees)
     }
 
-    async fn cfg_enabled_modules(&self) -> Option<BTreeSet<ModuleKind>> {
+    async fn cfg_module_params(&self) -> Option<ServerModuleConfigGenParamsRegistry> {
         let state = self.state.lock().await;
         let local_setup_code = state.local_params.as_ref().map(LocalParams::setup_code);
         state
             .setup_codes
             .iter()
             .chain(local_setup_code.iter())
-            .find_map(|info| info.enabled_modules.clone())
+            .find_map(|info| info.module_params.clone())
     }
 }
 
@@ -558,7 +581,7 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<SetupApi>> {
                         .request_auth()
                         .ok_or(ApiError::bad_request("Missing password".to_string()))?;
 
-                    config.set_local_parameters(auth, request.name, request.federation_name, request.disable_base_fees, request.enabled_modules, request.federation_size)
+                    config.set_local_parameters(auth, request.name, request.federation_name, request.disable_base_fees, request.module_params, request.federation_size)
                         .await
                         .map_err(|e| ApiError::bad_request(e.to_string()))
                 }

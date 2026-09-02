@@ -353,6 +353,7 @@ pub struct MintClientContext {
     tbs_agg_pks: BTreeMap<Denomination, AggregatePublicKey>,
     tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, tbs::PublicKeyShare>>,
     pub balance_update_sender: tokio::sync::watch::Sender<()>,
+    pub amount_unit: AmountUnit,
 }
 
 impl Context for MintClientContext {
@@ -373,6 +374,7 @@ impl ClientModule for MintClientModule {
             tbs_agg_pks: self.cfg.tbs_agg_pks.clone(),
             tbs_pks: self.cfg.tbs_pks.clone(),
             balance_update_sender: self.balance_update_sender.clone(),
+            amount_unit: self.cfg.amount_unit,
         }
     }
 
@@ -527,6 +529,13 @@ impl ClientModule for MintClientModule {
 }
 
 impl MintClientModule {
+    /// The [`AmountUnit`] this mint instance is denominated in (e.g.
+    /// Bitcoin, or the usdt module's USDT unit for a USDT-denominated
+    /// instance).
+    pub fn amount_unit(&self) -> AmountUnit {
+        self.cfg.amount_unit
+    }
+
     async fn select_funding_input(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,

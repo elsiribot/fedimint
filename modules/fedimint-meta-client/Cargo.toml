@@ -11,13 +11,13 @@ version = { workspace = true }
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "tokio_unstable"]
 
-[features]
-cli = ["dep:clap"]
-default = []
-
 [lib]
 name = "fedimint_meta_client"
 path = "src/lib.rs"
+
+[features]
+cli = ["dep:clap"]
+default = []
 
 [dependencies]
 anyhow = { workspace = true }

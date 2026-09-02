@@ -8,24 +8,20 @@ readme = { workspace = true }
 repository = { workspace = true }
 version = { workspace = true }
 
+[lib]
+name = "fedimint_gateway_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gatewayd"
+path = "src/bin/gatewayd.rs"
+
 [features]
 tor = [
     "fedimint-client/tor",
     "fedimint-api-client/tor",
     "fedimint-gateway-common/tor",
 ]
-
-[[bin]]
-name = "gatewayd"
-path = "src/bin/gatewayd.rs"
-
-[lib]
-name = "fedimint_gateway_server"
-path = "src/lib.rs"
-
-[[test]]
-name = "gatewayd-tests"
-path = "tests/tests.rs"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -98,6 +94,9 @@ url = { workspace = true, features = ["serde"] }
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]
 tikv-jemallocator = { workspace = true }
 
+[build-dependencies]
+fedimint-build = { workspace = true }
+
 [dev-dependencies]
 assert_matches = { workspace = true }
 fedimint-dummy-client = { workspace = true }
@@ -111,8 +110,9 @@ fedimint-unknown-server = { workspace = true }
 itertools = { workspace = true }
 tpe = { workspace = true }
 
-[build-dependencies]
-fedimint-build = { workspace = true }
+[[test]]
+name = "gatewayd-tests"
+path = "tests/tests.rs"
 
 [lints]
 workspace = true

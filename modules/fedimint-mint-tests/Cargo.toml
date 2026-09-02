@@ -7,10 +7,6 @@ name = "fedimint-mint-tests"
 publish = false
 version = { workspace = true }
 
-[[test]]
-name = "fedimint_mint_tests"
-path = "tests/tests.rs"
-
 [dependencies]
 anyhow = { workspace = true }
 bitcoin_hashes = { workspace = true }
@@ -42,6 +38,10 @@ assert_matches = { workspace = true }
 fedimint-dummy-client = { workspace = true }
 fedimint-dummy-common = { workspace = true }
 fedimint-dummy-server = { workspace = true }
+
+[[test]]
+name = "fedimint_mint_tests"
+path = "tests/tests.rs"
 
 [lints]
 workspace = true

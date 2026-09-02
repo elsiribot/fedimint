@@ -11,10 +11,6 @@ version = { workspace = true }
 name = "wallet-module-tests"
 path = "src/bin/wallet-module-tests.rs"
 
-[[test]]
-name = "fedimint_wallet_tests"
-path = "tests/tests.rs"
-
 [dependencies]
 anyhow = { workspace = true }
 bitcoin = { workspace = true }
@@ -45,6 +41,10 @@ assert_matches = { workspace = true }
 fedimint-dummy-client = { workspace = true }
 fedimint-dummy-common = { workspace = true }
 fedimint-dummy-server = { workspace = true }
+
+[[test]]
+name = "fedimint_wallet_tests"
+path = "tests/tests.rs"
 
 [lints]
 workspace = true

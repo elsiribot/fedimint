@@ -69,6 +69,7 @@ pub const LOG_CLIENT_MODULE_WALLET: &str = "fm::client::module::wallet";
 pub const LOG_CLIENT_MODULE_WALLETV2: &str = "fm::client::module::walletv2";
 pub const LOG_CLIENT_MODULE_GW: &str = "fm::client::module::gw";
 pub const LOG_CLIENT_MODULE_GWV2: &str = "fm::client::module::gwv2";
+pub const LOG_CLIENT_MODULE_USDT: &str = "fm::client::module::usdt";
 pub const LOG_GATEWAY: &str = "fm::gw";
 pub const LOG_GATEWAY_UI: &str = "fm::gw::ui";
 pub const LOG_LIGHTNING: &str = "fm::gw::lightning";

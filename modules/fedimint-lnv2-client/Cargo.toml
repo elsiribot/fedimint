@@ -10,13 +10,13 @@ version = { workspace = true }
 # cargo udeps can't detect that one
 normal = ["aquamarine"]
 
-[features]
-cli = ["dep:clap"]
-default = []
-
 [lib]
 name = "fedimint_lnv2_client"
 path = "src/lib.rs"
+
+[features]
+cli = ["dep:clap"]
+default = []
 
 [dependencies]
 anyhow = { workspace = true }

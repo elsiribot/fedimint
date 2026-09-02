@@ -19,7 +19,7 @@ use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::runtime::block_in_place;
 use fedimint_core::task::block_on;
 use fedimint_core::task::jit::JitTryAnyhow;
-use fedimint_core::util::SafeUrl;
+use fedimint_core::util::{FmtCompact as _, SafeUrl};
 use fedimint_core::{Amount, NumPeers, PeerId};
 use fedimint_gateway_common::WithdrawResponse;
 use fedimint_logging::LOG_DEVIMINT;
@@ -31,13 +31,13 @@ use fs_lock::FileLock;
 use futures::future::{join_all, try_join_all};
 use tokio::task::{JoinSet, spawn_blocking};
 use tokio::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::external::Bitcoind;
 use super::util::{Command, ProcessHandle, ProcessManager, cmd};
 use super::vars::utf8;
-use crate::envs::{FM_CLIENT_DIR_ENV, FM_DATA_DIR_ENV};
-use crate::util::{FedimintdCmd, poll, poll_simple, poll_with_timeout};
+use crate::envs::{FM_CLIENT_DIR_ENV, FM_DATA_DIR_ENV, FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS_ENV};
+use crate::util::{FedimintdCmd, poll, poll_with_timeout};
 use crate::version_constants::{VERSION_0_10_0_ALPHA, VERSION_0_11_0_ALPHA};
 use crate::{poll_almost_equal, poll_eq, poll_lte, vars};
 
@@ -385,14 +385,44 @@ impl Federation {
             for peer_env_vars in peer_to_env_vars_map.values() {
                 let peer_data_dir = utf8(&peer_env_vars.FM_DATA_DIR);
 
-                let invite_code = poll_simple("awaiting-invite-code", || async {
-                    let path = format!("{peer_data_dir}/{invite_code_filename_original}");
-                    tokio::fs::read_to_string(&path)
-                        .await
-                        .with_context(|| format!("Awaiting invite code file: {path}"))
-                })
-                .await
-                .context("Awaiting invite code file")?;
+                // Config-gen (DKG) can run for well over the default 60s poll
+                // timeout for modules with heavy key ceremonies -- notably the
+                // usdt module, whose threshold-ECDSA distributed key generation
+                // does a per-guardian Paillier aux-gen (safe-prime search) that
+                // alone takes a minute or more. Let the invite-code wait be
+                // extended via `FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS` (default:
+                // the usual 60s), so such federations get enough time without
+                // changing the fast path for every other test (this poll
+                // returns the instant the invite code appears, so a larger
+                // timeout only raises the ceiling, never the happy-path wait).
+                let config_gen_timeout = match std::env::var(
+                    FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS_ENV,
+                ) {
+                    Ok(raw) => match raw.parse::<u64>() {
+                        Ok(secs) => Duration::from_secs(secs),
+                        Err(err) => {
+                            warn!(
+                                target: "devimint",
+                                %raw,
+                                err = %err.fmt_compact(),
+                                env = FM_DEVIMINT_CONFIG_GEN_TIMEOUT_SECS_ENV,
+                                "Ignoring unparsable config-gen timeout override; falling back to 60s"
+                            );
+                            Duration::from_secs(60)
+                        }
+                    },
+                    Err(_) => Duration::from_secs(60),
+                };
+                let invite_code =
+                    poll_with_timeout("awaiting-invite-code", config_gen_timeout, || async {
+                        let path = format!("{peer_data_dir}/{invite_code_filename_original}");
+                        tokio::fs::read_to_string(&path)
+                            .await
+                            .with_context(|| format!("Awaiting invite code file: {path}"))
+                            .map_err(std::ops::ControlFlow::Continue)
+                    })
+                    .await
+                    .context("Awaiting invite code file")?;
 
                 download_from_invite_code(&connectors, &InviteCode::from_str(&invite_code)?)
                     .await?;
@@ -909,8 +939,7 @@ impl Federation {
             )
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "new balance did not equal prev balance minus withdraw_amount minus fees: {}",
-                    e
+                    "new balance did not equal prev balance minus withdraw_amount minus fees: {e}"
                 )
             })?;
         }

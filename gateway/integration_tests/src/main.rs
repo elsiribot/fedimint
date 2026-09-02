@@ -332,12 +332,12 @@ async fn config_test(gw_type: LightningNodeType) -> anyhow::Result<()> {
                 let fed_info = gw.client().connect_fed(new_invite_code).await?;
                 assert_eq!(second_fed_balance_msat, Amount::from_msats(fed_info["balance_msat"].as_u64().expect("Balance should be present")));
 
-                if is_env_var_set_opt("FEDI_ENABLE_IROH_TESTS").unwrap_or(false) {
-                    if gw.gatewayd_version >= *VERSION_0_10_0_ALPHA {
-                        // Try to get the info over iroh
-                        info!(target: LOG_TEST, gatewayd_version = %gw.gatewayd_version, "Getting info over iroh");
-                        gw.client().with_iroh().get_info().await?;
-                    }
+                if is_env_var_set_opt("FEDI_ENABLE_IROH_TESTS").unwrap_or(false)
+                    && gw.gatewayd_version >= *VERSION_0_10_0_ALPHA
+                {
+                    // Try to get the info over iroh
+                    info!(target: LOG_TEST, gatewayd_version = %gw.gatewayd_version, "Getting info over iroh");
+                    gw.client().with_iroh().get_info().await?;
                 }
 
                 info!(target: LOG_TEST, "Gateway configuration test successful");

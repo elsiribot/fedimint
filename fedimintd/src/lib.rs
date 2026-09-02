@@ -385,6 +385,10 @@ async fn run_inner(
         network: server_opts.bitcoin_network,
         available_modules: module_init_registry.kinds(),
         default_modules: module_init_registry.default_modules(),
+        available_module_params: fedimint_server::config::build_module_params_registry(
+            &module_init_registry,
+            &module_init_registry.kinds(),
+        ),
     };
 
     let driven_dkg = is_env_var_set(FM_DKG_CTRL_ENV);

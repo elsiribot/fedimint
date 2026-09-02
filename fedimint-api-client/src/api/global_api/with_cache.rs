@@ -8,8 +8,9 @@ use bitcoin::secp256k1;
 use fedimint_connectors::{DynGuaridianConnection, ServerResult};
 use fedimint_core::admin_client::{GuardianConfigBackup, SetLocalParamsRequest, SetupStatus};
 use fedimint_core::backup::{BackupStatistics, ClientBackupSnapshot};
+use fedimint_core::config::ServerModuleConfigGenParamsRegistry;
+use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::core::backup::SignedBackupRequest;
-use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::endpoint_constants::{
     ADD_PEER_SETUP_CODE_ENDPOINT, API_ANNOUNCEMENTS_ENDPOINT, AUDIT_ENDPOINT, AUTH_ENDPOINT,
     AWAIT_SESSION_OUTCOME_ENDPOINT, AWAIT_TRANSACTION_ENDPOINT, BACKUP_ENDPOINT,
@@ -286,6 +287,12 @@ where
         core_api_version: ApiVersion,
         broadcast_public_keys: Option<&BTreeMap<PeerId, secp256k1::PublicKey>>,
     ) -> anyhow::Result<SessionStatus> {
+        enum NoCacheErr {
+            Initial,
+            Pending(Vec<AcceptedItem>),
+            Err(anyhow::Error),
+        }
+
         let mut lru_lock = self.get_session_status_lru.lock().await;
 
         let entry_arc = lru_lock
@@ -295,11 +302,6 @@ where
         // we drop the lru lock so requests for other `session_idx` can work in parallel
         drop(lru_lock);
 
-        enum NoCacheErr {
-            Initial,
-            Pending(Vec<AcceptedItem>),
-            Err(anyhow::Error),
-        }
         match entry_arc
             .get_or_try_init(|| async {
                 let session_status =
@@ -388,7 +390,7 @@ where
         name: String,
         federation_name: Option<String>,
         disable_base_fees: Option<bool>,
-        enabled_modules: Option<BTreeSet<ModuleKind>>,
+        module_params: Option<ServerModuleConfigGenParamsRegistry>,
         federation_size: Option<u32>,
         auth: ApiAuth,
     ) -> FederationResult<String> {
@@ -398,7 +400,7 @@ where
                 name,
                 federation_name,
                 disable_base_fees,
-                enabled_modules,
+                module_params,
                 federation_size,
             }),
             auth,

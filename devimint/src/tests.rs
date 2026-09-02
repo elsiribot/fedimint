@@ -2722,6 +2722,10 @@ pub enum TestCmd {
         #[arg(long)]
         lnv2: String,
     },
+    /// Standalone smoke test for the `anvil` EVM devnet daemon: starts anvil
+    /// (without spinning up a full dev federation) and checks it responds
+    /// with the expected chain id and a block number.
+    AnvilSmokeTest,
 }
 
 pub async fn handle_command(cmd: TestCmd, common_args: CommonArgs) -> Result<()> {
@@ -2861,6 +2865,44 @@ pub async fn handle_command(cmd: TestCmd, common_args: CommonArgs) -> Result<()>
             let (process_mgr, _) = setup(common_args).await?;
             Box::pin(upgrade_tests(&process_mgr, binary)).await?;
         }
+        TestCmd::AnvilSmokeTest => {
+            let (process_mgr, _) = setup(common_args).await?;
+            anvil_smoke_test(&process_mgr).await?;
+        }
     }
+    Ok(())
+}
+
+/// Standalone smoke test for the `anvil` EVM devnet daemon (see
+/// [`crate::external::Anvil`]): starts anvil directly (no full dev
+/// federation needed) and checks it responds over JSON-RPC with the expected
+/// chain id and a block number.
+pub async fn anvil_smoke_test(process_mgr: &ProcessManager) -> Result<()> {
+    info!(target: LOG_DEVIMINT, "Testing anvil EVM devnet smoke test");
+
+    let anvil = crate::external::Anvil::new(process_mgr).await?;
+
+    let url = anvil.rpc_url().parse().context("invalid anvil rpc url")?;
+    let provider = alloy::providers::ProviderBuilder::new().connect_http(url);
+
+    let chain_id = alloy::providers::Provider::get_chain_id(&provider)
+        .await
+        .context("anvil eth_chainId request failed")?;
+    anyhow::ensure!(
+        chain_id == 31337,
+        "anvil reported unexpected chain id: {chain_id}"
+    );
+
+    let block_number = alloy::providers::Provider::get_block_number(&provider)
+        .await
+        .context("anvil eth_blockNumber request failed")?;
+
+    info!(
+        target: LOG_DEVIMINT,
+        chain_id,
+        block_number,
+        "fm success: anvil-smoke-test"
+    );
+
     Ok(())
 }
