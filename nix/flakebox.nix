@@ -258,7 +258,6 @@ let
         moreutils-ts
         cmake
         rust-bindgen
-        m4 # needed by gmp-mpfr-sys (pulled in transitively via cggmp21 -> rug)
 
         # tests
         (lib.hiPrio pkgs.bashInteractive)
