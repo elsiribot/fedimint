@@ -2088,7 +2088,7 @@ mod module_instances_tests {
             "swap",
         ]
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
         let registry = parse_module_instances(&specs).expect("valid specs must parse");
@@ -2154,7 +2154,7 @@ mod module_instances_tests {
 
     #[test]
     fn rejects_malformed_json() {
-        let err = parse_module_instances(&[r#"mintv2={not json}"#.to_string()])
+        let err = parse_module_instances(&[r"mintv2={not json}".to_string()])
             .expect_err("malformed JSON must error");
         assert!(
             err.to_string().contains("mintv2"),
