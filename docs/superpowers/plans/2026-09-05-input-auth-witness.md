@@ -172,12 +172,17 @@ pub fn verify_key_witness(
         .verify_schnorr(&sig, msg, &pub_key.x_only_public_key().0)
         .map_err(|_| TransactionError::InvalidSignature {
             tx: String::new(),
-            hash: msg.as_ref().consensus_encode_to_hex(),
+            hash: msg.as_ref().to_lower_hex_string(),
             sig: sig.consensus_encode_to_hex(),
             key: pub_key.consensus_encode_to_hex(),
         })
 }
 ```
+
+`to_lower_hex_string` comes from `bitcoin::hex::DisplayHex`, already imported at
+the top of this file as `use bitcoin::hex::DisplayHex as _;`. Do not reach for
+`consensus_encode_to_hex` on the message — `secp256k1::Message` is not
+`Encodable`, only `AsRef<[u8]>`.
 
 Note `InvalidSignature.tx` is left empty: this associated function has no access to the transaction. The caller in Task 4 has it and fills it in. Do not change the error variant's shape — the comment on `UnbalancedTransaction` explains that these types cannot change.
 
@@ -285,32 +290,52 @@ pub enum InputAuth {
     SelfVerified,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct InputMeta {
     pub amount: TransactionItemAmounts,
     pub auth: InputAuth,
 }
 ```
 
-Keep whatever derives `InputMeta` already carries; add none.
+`InputMeta`'s existing `#[derive(Debug, PartialEq, Eq)]` must be preserved
+exactly — `modules/fedimint-ln-server/src/lib.rs:1513` does
+`assert_eq!(processed_input_meta, expected_input_meta)`. That is also why
+`InputAuth` derives `PartialEq` and `Eq` above.
 
 - [ ] **Step 4: Update all seven producers plus the two `ln` test fixtures**
 
-In each, the field `pub_key: <expr>` becomes `auth: InputAuth::Key(<expr>)`, and `InputAuth` joins the existing `fedimint_core::module::{...}` import. The expressions, verbatim from each site:
+`InputAuth` joins the existing `fedimint_core::module::{...}` import in each
+file. Every substitution, verbatim — note that three sites use field shorthand
+for a local also named `pub_key`:
 
-- `modules/fedimint-dummy-server/src/lib.rs:229` — `pub_key: input.pub_key`
-- `modules/fedimint-mint-server/src/lib.rs` — read the site; it is the note's spend key
-- `modules/fedimint-mintv2-server/src/lib.rs`
-- `modules/fedimint-wallet-server/src/lib.rs`
-- `modules/fedimint-walletv2-server/src/lib.rs`
-- `modules/fedimint-ln-server/src/lib.rs` (:612, plus :1504 and :1575 in tests)
-- `modules/fedimint-lnv2-server/src/lib.rs`
+| File | Line | From | To |
+| --- | --- | --- | --- |
+| `modules/fedimint-mint-server/src/lib.rs` | 622 | `pub_key: *input.note.spend_key(),` | `auth: InputAuth::Key(*input.note.spend_key()),` |
+| `modules/fedimint-mintv2-server/src/lib.rs` | 487 | `pub_key: input.note.nonce,` | `auth: InputAuth::Key(input.note.nonce),` |
+| `modules/fedimint-wallet-server/src/lib.rs` | 836 | `pub_key,` | `auth: InputAuth::Key(pub_key),` |
+| `modules/fedimint-walletv2-server/src/lib.rs` | 660 | `pub_key: input.tweak,` | `auth: InputAuth::Key(input.tweak),` |
+| `modules/fedimint-ln-server/src/lib.rs` | 618 | `pub_key,` | `auth: InputAuth::Key(pub_key),` |
+| `modules/fedimint-lnv2-server/src/lib.rs` | 544 | `pub_key,` | `auth: InputAuth::Key(pub_key),` |
+| `modules/fedimint-dummy-server/src/lib.rs` | 229 | `pub_key: input.pub_key,` | `auth: InputAuth::Key(input.pub_key),` |
 
-Find them all with:
+Plus the two `ln` test fixtures. At `modules/fedimint-ln-server/src/lib.rs:1509`
+the expression spans three lines:
+
+```rust
+            auth: InputAuth::Key(
+                preimage
+                    .to_public_key()
+                    .expect("should create Schnorr pubkey from preimage"),
+            ),
+```
+
+and at `:1580`, `pub_key: gateway_key,` becomes
+`auth: InputAuth::Key(gateway_key),`.
+
+Confirm none were missed — this must print nothing when you are done:
 
 ```bash
-grep -rn "pub_key:" --include=*.rs modules/ | grep -B2 -A2 "InputMeta" 
-grep -rn "InputMeta {" -A 12 --include=*.rs modules/
+grep -rn "InputMeta {" -A 14 --include=*.rs modules/ fedimint-core/ | grep "pub_key"
 ```
 
 - [ ] **Step 5: Update the single consumer**
