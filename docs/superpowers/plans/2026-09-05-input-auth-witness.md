@@ -23,6 +23,7 @@
 
   ```bash
   nix develop -c cargo check --workspace --all-targets
+  nix develop -c cargo clippy --workspace --all-targets -- -D warnings
   nix develop -c cargo test -p fedimint-core
   nix develop -c cargo test -p fedimint-server
   nix develop -c cargo test -p fedimint-server-tests
@@ -373,6 +374,7 @@ Run the gate:
 
 ```bash
 nix develop -c cargo check --workspace --all-targets
+nix develop -c cargo clippy --workspace --all-targets -- -D warnings
 nix develop -c cargo test -p fedimint-core
 nix develop -c cargo test -p fedimint-server
 nix develop -c cargo test -p fedimint-server-tests
@@ -585,6 +587,7 @@ Run the gate:
 
 ```bash
 nix develop -c cargo check --workspace --all-targets
+nix develop -c cargo clippy --workspace --all-targets -- -D warnings
 nix develop -c cargo test -p fedimint-core
 nix develop -c cargo test -p fedimint-server
 nix develop -c cargo test -p fedimint-server-tests
@@ -675,6 +678,7 @@ Run the gate:
 
 ```bash
 nix develop -c cargo check --workspace --all-targets
+nix develop -c cargo clippy --workspace --all-targets -- -D warnings
 nix develop -c cargo test -p fedimint-core
 nix develop -c cargo test -p fedimint-server
 nix develop -c cargo test -p fedimint-server-tests
@@ -975,6 +979,7 @@ Run the gate:
 
 ```bash
 nix develop -c cargo check --workspace --all-targets
+nix develop -c cargo clippy --workspace --all-targets -- -D warnings
 nix develop -c cargo test -p fedimint-core
 nix develop -c cargo test -p fedimint-server
 nix develop -c cargo test -p fedimint-server-tests
@@ -1004,3 +1009,29 @@ The builder now emits TransactionSignature::Witnessed."
 - **No witness size cap in core.** Listed as an open question in the spec; deferred until there is a real consumer to size it against.
 - **No upstream issue filed.** The draft lives at `/tmp/claude-1000/-home-user-projects-experimint/60422aec-83d1-46ca-b80e-4a0321d8c590/scratchpad/fedimint-issue-input-auth.md` and its symbol names were verified against this fork, not against upstream master, which is a different API generation.
 - **Witness malleability is unconfirmed.** The spec flags it: two submissions of one txid with different valid witnesses become possible, and the claim that consensus dedup makes this benign has not been checked against the submission path. Worth resolving before this leaves the branch.
+
+---
+
+## Deviations from this plan, as executed
+
+Recorded after the fact so the plan and the branch agree.
+
+- **Task 6: `ClientInputAuth::Keys` wraps one `Keypair`, not a `Vec`.** The plan
+  mandated `Keys(Vec<Keypair>)` plus a runtime `assert_eq!(keys.len(), 1, ..)`
+  in `build()`. The Task 6 review flagged that as a panic in library code with
+  no error channel to route a module bug into, and the plan's justification for
+  it rested on a survey of construction sites that turned out to be wrong —
+  there are 27 sites, not 18, and two of them passed *zero* keys, so the
+  assertion would in fact have fired. The human overruled the plan: the type now
+  makes "exactly one key per input" a compile-time fact and the assertion is
+  gone.
+- **The gate gained `cargo clippy -- -D warnings`.** The repo's own `justfile`
+  runs it, and the plan's gate did not, so a `clippy::clone_on_copy` error
+  reached review unnoticed.
+- **The gate gained `cargo test -p fedimint-mint-tests`.** See the Global
+  Constraints note: nothing else in the workspace calls
+  `process_transaction_with_dbtx`, so without it the branch's central claim was
+  verified by nothing that runs.
+- **Task 1 additionally added a `Witnessed` arm to `validate_signatures`.** Not
+  in the plan, but forced: adding a third enum variant made the existing match
+  non-exhaustive. Task 4 deleted `validate_signatures` entirely, retiring it.
