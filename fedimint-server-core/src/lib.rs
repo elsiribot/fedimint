@@ -24,8 +24,8 @@ use fedimint_core::db::DatabaseTransaction;
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::registry::{ModuleDecoderRegistry, ModuleRegistry};
 use fedimint_core::module::{
-    ApiEndpoint, ApiEndpointContext, ApiRequestErased, CommonModuleInit, InputMeta, ModuleCommon,
-    ModuleInit, TransactionItemAmounts,
+    ApiEndpoint, ApiEndpointContext, ApiRequestErased, CommonModuleInit, InputAuthCtx, InputMeta,
+    ModuleCommon, ModuleInit, TransactionItemAmounts,
 };
 use fedimint_core::{InPoint, OutPoint, PeerId, apply, async_trait_maybe_send, dyn_newtype_define};
 pub use init::*;
@@ -93,6 +93,7 @@ pub trait ServerModule: Debug + Sized {
     fn verify_input(
         &self,
         _input: &<Self::Common as ModuleCommon>::Input,
+        _ctx: &InputAuthCtx<'_>,
     ) -> Result<(), <Self::Common as ModuleCommon>::InputError> {
         Ok(())
     }
@@ -227,7 +228,7 @@ pub trait IServerModule: Debug {
     // Use this function to parallelise stateless cryptographic verification of
     // inputs across a transaction. All inputs of a transaction are verified
     // before any input is processed.
-    fn verify_input(&self, input: &DynInput) -> Result<(), DynInputError>;
+    fn verify_input(&self, input: &DynInput, ctx: &InputAuthCtx<'_>) -> Result<(), DynInputError>;
 
     /// Try to spend a transaction input. On success all necessary updates will
     /// be part of the database transaction. On failure (e.g. double spend)
@@ -360,13 +361,14 @@ where
     // Use this function to parallelise stateless cryptographic verification of
     // inputs across a transaction. All inputs of a transaction are verified
     // before any input is processed.
-    fn verify_input(&self, input: &DynInput) -> Result<(), DynInputError> {
+    fn verify_input(&self, input: &DynInput, ctx: &InputAuthCtx<'_>) -> Result<(), DynInputError> {
         <Self as ServerModule>::verify_input(
             self,
             input
                 .as_any()
                 .downcast_ref::<<<Self as ServerModule>::Common as ModuleCommon>::Input>()
                 .expect("incorrect input type passed to module plugin"),
+            ctx,
         )
         .map_err(|v| DynInputError::from_typed(input.module_instance_id(), v))
     }

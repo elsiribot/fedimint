@@ -25,8 +25,8 @@ use fedimint_core::envs::{FM_ENABLE_MODULE_MINT_ENV, is_env_var_set_opt};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
     Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion,
-    InputAuth, InputMeta, ModuleConsensusVersion, ModuleInit, SerdeModuleEncodingBase64,
-    SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
+    InputAuth, InputAuthCtx, InputMeta, ModuleConsensusVersion, ModuleInit,
+    SerdeModuleEncodingBase64, SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
 };
 use fedimint_core::{
     Amount, InPoint, NumPeersExt, OutPoint, PeerId, Tiered, TieredMulti, apply,
@@ -561,7 +561,11 @@ impl ServerModule for Mint {
         bail!("Mint does not process consensus items");
     }
 
-    fn verify_input(&self, input: &MintInput) -> Result<(), MintInputError> {
+    fn verify_input(
+        &self,
+        input: &MintInput,
+        _ctx: &InputAuthCtx<'_>,
+    ) -> Result<(), MintInputError> {
         let input = input.ensure_v0_ref()?;
 
         let amount_key = self

@@ -50,7 +50,9 @@ use crate::encoding::{Decodable, DecodeError, Encodable};
 use crate::fmt_utils::AbbreviateHexBytes;
 use crate::task::MaybeSend;
 use crate::util::FmtCompact;
-use crate::{Amount, apply, async_trait_maybe_send, maybe_add_send, maybe_add_send_sync};
+use crate::{
+    Amount, TransactionId, apply, async_trait_maybe_send, maybe_add_send, maybe_add_send_sync,
+};
 
 /// How an input proves it is allowed to be spent.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -67,6 +69,53 @@ pub enum InputAuth {
     /// an attacker detach this input and reattach it to a transaction with
     /// different outputs.
     SelfVerified,
+}
+
+/// What a module needs to verify its own input authorization.
+///
+/// Deliberately exposes no raw txid bytes. The only message reachable from
+/// here is the one an input must bind to, so the ergonomic thing to write is
+/// also the correct thing to write.
+pub struct InputAuthCtx<'a> {
+    txid: TransactionId,
+    in_idx: u64,
+    witness: &'a [u8],
+}
+
+impl<'a> InputAuthCtx<'a> {
+    pub fn new(txid: TransactionId, in_idx: u64, witness: &'a [u8]) -> Self {
+        Self {
+            txid,
+            in_idx,
+            witness,
+        }
+    }
+
+    /// The message every self-verified input must bind its signatures to.
+    pub fn txid_message(&self) -> secp256k1::Message {
+        secp256k1::Message::from_digest(*self.txid.as_ref())
+    }
+
+    /// This input's witness, meaning whatever the module decides.
+    pub fn witness(&self) -> &'a [u8] {
+        self.witness
+    }
+
+    pub fn in_idx(&self) -> u64 {
+        self.in_idx
+    }
+
+    /// Prefer this over `txid_message`: it cannot be pointed at the wrong
+    /// message.
+    pub fn verify_schnorr(
+        &self,
+        pub_key: &secp256k1::PublicKey,
+        sig: &secp256k1::schnorr::Signature,
+    ) -> bool {
+        secp256k1::global::SECP256K1
+            .verify_schnorr(sig, &self.txid_message(), &pub_key.x_only_public_key().0)
+            .is_ok()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

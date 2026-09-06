@@ -1,5 +1,7 @@
 use fedimint_core::db::DatabaseTransaction;
-use fedimint_core::module::{Amounts, CoreConsensusVersion, InputAuth, TransactionItemAmounts};
+use fedimint_core::module::{
+    Amounts, CoreConsensusVersion, InputAuth, InputAuthCtx, TransactionItemAmounts,
+};
 use fedimint_core::transaction::{TRANSACTION_OVERFLOW_ERROR, Transaction, TransactionError};
 use fedimint_core::{InPoint, OutPoint};
 use fedimint_server_core::ServerModuleRegistry;
@@ -28,25 +30,27 @@ pub async fn process_transaction_with_dbtx(
         CONSENSUS_TX_PROCESSED_OUTPUTS.observe(out_count as f64);
     });
 
+    let txid = transaction.tx_hash();
+    let witnesses = transaction.input_witnesses()?;
+
     // We can not return the error here as errors are not returned in a specified
     // order and the client still expects consensus on the error. Since the
     // error is not extensible at the moment we need to incorrectly return the
     // InvalidWitnessLength variant.
-    transaction
-        .inputs
-        .clone()
+    (0..transaction.inputs.len())
         .into_par_iter()
-        .try_for_each(|input| {
+        .try_for_each(|in_idx| {
+            let input = &transaction.inputs[in_idx];
+            let ctx = InputAuthCtx::new(txid, in_idx as u64, witnesses[in_idx]);
+
             modules
                 .get_expect(input.module_instance_id())
-                .verify_input(&input)
+                .verify_input(input, &ctx)
         })
         .map_err(|_| TransactionError::InvalidWitnessLength)?;
 
     let mut funding_verifier = FundingVerifier::default();
     let mut public_keys = Vec::new();
-
-    let txid = transaction.tx_hash();
 
     for (input, in_idx) in transaction.inputs.iter().zip(0u64..) {
         // somewhat unfortunately, we need to do the extra checks berofe `process_x`

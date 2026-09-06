@@ -322,4 +322,38 @@ mod tests {
             InputAuth::SelfVerified => panic!("expected Key"),
         }
     }
+
+    #[test]
+    fn auth_ctx_message_is_derived_from_the_txid() {
+        use fedimint_core::module::InputAuthCtx;
+
+        let txid = TransactionId::from_byte_array([3u8; 32]);
+        let ctx = InputAuthCtx::new(txid, 0, &[]);
+
+        assert_eq!(ctx.txid_message(), Message::from_digest([3u8; 32]));
+        assert_eq!(ctx.in_idx(), 0);
+        assert!(ctx.witness().is_empty());
+    }
+
+    #[test]
+    fn auth_ctx_verify_schnorr_binds_to_the_txid() {
+        use fedimint_core::module::InputAuthCtx;
+
+        let secp = Secp256k1::new();
+        let kp = Keypair::new(&secp, &mut OsRng);
+
+        let txid = TransactionId::from_byte_array([3u8; 32]);
+        let other = TransactionId::from_byte_array([4u8; 32]);
+
+        let ctx = InputAuthCtx::new(txid, 0, &[]);
+        let sig = secp.sign_schnorr(&ctx.txid_message(), &kp);
+
+        assert!(ctx.verify_schnorr(&kp.public_key(), &sig));
+
+        let wrong = InputAuthCtx::new(other, 0, &[]);
+        assert!(
+            !wrong.verify_schnorr(&kp.public_key(), &sig),
+            "a signature over a different txid must not verify"
+        );
+    }
 }
