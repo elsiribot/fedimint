@@ -2,8 +2,9 @@ use core::fmt;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
-use bitcoin::key::Secp256k1;
+use bitcoin::key::{Keypair, Secp256k1};
 use fedimint_core::core::{Input, IntoDynInstance, ModuleKind, Output};
+use fedimint_core::secp256k1::rand::rngs::OsRng;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::Amounts;
 use fedimint_core::transaction::TransactionSignature;
@@ -223,4 +224,69 @@ fn tx_builder_witness_positional_alignment() {
         witnesses[1], witness_b,
         "witness at index 1 must match the second input"
     );
+}
+
+#[test]
+/// A transaction whose inputs are all `ClientInputAuth::Key` must encode as
+/// `TransactionSignature::NaiveMultisig`, byte-identical to what an unpatched
+/// client would have produced. Emitting `Witnessed` here instead would make a
+/// patched client wire-incompatible with any unpatched guardian, since an
+/// unpatched decoder does not know that variant and rejects it outright.
+fn tx_builder_all_keys_uses_naive_multisig_encoding() {
+    let secp = Secp256k1::new();
+    let kp = Keypair::new(&secp, &mut OsRng);
+
+    let (transaction, _states) = TransactionBuilder::new()
+        .with_inputs(
+            ClientInputBundle::<NoopInput, super::NeverClientStateMachine>::new_no_sm(vec![
+                ClientInput {
+                    input: NoopInput,
+                    auth: ClientInputAuth::Key(kp),
+                    amounts: Amounts::new_bitcoin_msats(1),
+                },
+            ])
+            .into_instanceless()
+            .into_dyn(0),
+        )
+        .build(&secp, rand::thread_rng());
+
+    match transaction.signatures {
+        TransactionSignature::NaiveMultisig(sigs) => assert_eq!(sigs.len(), 1),
+        TransactionSignature::Witnessed(_) => {
+            panic!("an all-Key transaction must not use the Witnessed encoding")
+        }
+        TransactionSignature::Default { .. } => panic!("unexpected default encoding"),
+    }
+}
+
+#[test]
+/// A transaction with a mix of `Key` and `Witness` inputs must still use
+/// `Witnessed`, since it cannot be represented in `NaiveMultisig`.
+fn tx_builder_mixed_auth_uses_witnessed_encoding() {
+    let secp = Secp256k1::new();
+    let kp = Keypair::new(&secp, &mut OsRng);
+
+    let (transaction, _states) = TransactionBuilder::new()
+        .with_inputs(
+            ClientInputBundle::<NoopInput, super::NeverClientStateMachine>::new_no_sm(vec![
+                ClientInput {
+                    input: NoopInput,
+                    auth: ClientInputAuth::Key(kp),
+                    amounts: Amounts::new_bitcoin_msats(1),
+                },
+                ClientInput {
+                    input: NoopInput,
+                    auth: ClientInputAuth::Witness(vec![0x42]),
+                    amounts: Amounts::new_bitcoin_msats(1),
+                },
+            ])
+            .into_instanceless()
+            .into_dyn(0),
+        )
+        .build(&secp, rand::thread_rng());
+
+    assert!(matches!(
+        transaction.signatures,
+        TransactionSignature::Witnessed(_)
+    ));
 }

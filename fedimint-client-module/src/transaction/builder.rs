@@ -30,7 +30,7 @@ use crate::{
 pub enum ClientInputAuth {
     /// Sign the txid with this key. Produces this input's single witness: a
     /// schnorr signature over the txid.
-    Keys(Keypair),
+    Key(Keypair),
     /// Use these witness bytes verbatim. For inputs whose module verifies
     /// its own authorization, where the signatures may have been produced by
     /// other people entirely.
@@ -555,19 +555,46 @@ impl TransactionBuilder {
         let txid = Transaction::tx_hash_from_parts(&inputs, &outputs, nonce);
         let msg = secp256k1::Message::from_digest_slice(&txid[..]).expect("txid has right length");
 
-        let witnesses: Vec<Vec<u8>> = input_auths
+        // Only reach for the new `Witnessed` encoding when at least one input
+        // actually needs it. An all-`Key` transaction is representable in the
+        // pre-witness `NaiveMultisig` encoding, and an *unpatched* guardian's
+        // decoder does not know the `Witnessed` variant at all: it resolves to
+        // `Default { variant: 1, .. }` and the transaction is rejected outright
+        // with `UnsupportedSignatureScheme`. Since minor consensus versions are
+        // not negotiated, that would make a patched client wire-incompatible
+        // with an unpatched federation (or with itself mid-rolling-upgrade) for
+        // every module, not just the one that needed witnesses. Do not
+        // "simplify" this back to always emitting `Witnessed` — the server
+        // treats both encodings identically, so this branch costs nothing
+        // server-side and buys back compatibility for the common case.
+        let signatures = if input_auths
             .iter()
-            .map(|auth| match auth {
-                ClientInputAuth::Keys(kp) => secp_ctx.sign_schnorr(&msg, kp).as_ref().to_vec(),
-                ClientInputAuth::Witness(bytes) => bytes.clone(),
-            })
-            .collect();
+            .all(|auth| matches!(auth, ClientInputAuth::Key(_)))
+        {
+            let sigs = input_auths
+                .iter()
+                .filter_map(|auth| match auth {
+                    ClientInputAuth::Key(kp) => Some(secp_ctx.sign_schnorr(&msg, kp)),
+                    ClientInputAuth::Witness(_) => None,
+                })
+                .collect();
+            TransactionSignature::NaiveMultisig(sigs)
+        } else {
+            let witnesses: Vec<Vec<u8>> = input_auths
+                .iter()
+                .map(|auth| match auth {
+                    ClientInputAuth::Key(kp) => secp_ctx.sign_schnorr(&msg, kp).as_ref().to_vec(),
+                    ClientInputAuth::Witness(bytes) => bytes.clone(),
+                })
+                .collect();
+            TransactionSignature::Witnessed(witnesses)
+        };
 
         let transaction = Transaction {
             inputs,
             outputs,
             nonce,
-            signatures: TransactionSignature::Witnessed(witnesses),
+            signatures,
         };
 
         let input_states = self

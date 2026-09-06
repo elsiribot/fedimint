@@ -1,3 +1,4 @@
+use fedimint_core::core::DynInputError;
 use fedimint_core::db::DatabaseTransaction;
 use fedimint_core::encoding::Encodable;
 use fedimint_core::module::{
@@ -32,16 +33,32 @@ pub async fn process_transaction_with_dbtx(
     });
 
     let txid = transaction.tx_hash();
+    // Hoisting this ahead of the per-module `verify_input` pass below changed
+    // *error precedence*, not the accept/reject set: a transaction that is
+    // invalid for more than one reason now reports `InvalidWitnessLength` or
+    // `UnsupportedSignatureScheme` ahead of a module's own `Input(..)` error,
+    // where previously the module error could win the race. The choice of
+    // which error wins is deterministic (this check runs strictly before the
+    // per-input pass, for every peer), so consensus on the error is preserved.
     let witnesses = transaction.input_witnesses()?;
     let msg = secp256k1::Message::from_digest(*txid.as_ref());
 
-    // We can not return the error here as errors are not returned in a specified
-    // order and the client still expects consensus on the error. Since the
-    // error is not extensible at the moment we need to incorrectly return the
-    // InvalidWitnessLength variant.
-    (0..transaction.inputs.len())
+    // `try_for_each` would surface whichever input's error rayon's work
+    // stealing happens to observe first, which is nondeterministic across
+    // guardians even though every guardian evaluates the same set of inputs.
+    // Since guardians must agree on *which* error a transaction produces (not
+    // just on the fact that it is rejected), collect every input's result
+    // instead, preserving the by-index order `ParallelIterator::collect`
+    // guarantees for an indexed source, and then deterministically take the
+    // first `Err` by index. This costs verifying every input even once one
+    // has already failed (no early exit), which is bounded by transaction
+    // size and is worth paying: `TransactionError::Input` is no longer
+    // collapsed into `InvalidWitnessLength`, so a `SelfVerified` module's
+    // rejection is diagnosable instead of indistinguishable from a witness
+    // count mismatch.
+    let verify_results: Vec<Result<(), DynInputError>> = (0..transaction.inputs.len())
         .into_par_iter()
-        .try_for_each(|in_idx| {
+        .map(|in_idx| {
             let input = &transaction.inputs[in_idx];
             let ctx = InputAuthCtx::new(txid, in_idx as u64, witnesses[in_idx]);
 
@@ -49,7 +66,11 @@ pub async fn process_transaction_with_dbtx(
                 .get_expect(input.module_instance_id())
                 .verify_input(input, &ctx)
         })
-        .map_err(|_| TransactionError::InvalidWitnessLength)?;
+        .collect();
+
+    if let Some(err) = verify_results.into_iter().find_map(Result::err) {
+        return Err(TransactionError::Input(err));
+    }
 
     let mut funding_verifier = FundingVerifier::default();
 

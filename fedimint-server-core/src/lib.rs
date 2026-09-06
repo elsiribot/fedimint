@@ -90,6 +90,36 @@ pub trait ServerModule: Debug + Sized {
     // Use this function to parallelise stateless cryptographic verification of
     // inputs across a transaction. All inputs of a transaction are verified
     // before any input is processed.
+    //
+    // The default `Ok(())` is only safe for a module whose `process_input`
+    // returns `InputAuth::Key`: for that auth, core itself checks a schnorr
+    // signature over the txid after `process_input` runs, so leaving this
+    // default alone does not skip authorization.
+    //
+    // A module that ever returns `InputAuth::SelfVerified` from
+    // `process_input` **must** override this method, or that input gets zero
+    // authorization checking: nothing else in core checks it, and nothing
+    // catches the omission at compile time or otherwise.
+    //
+    // This method has no database access (it runs before any input is
+    // processed, in parallel, across all inputs of the transaction), so a
+    // self-verifying module cannot check its witness against keys it looks up
+    // by state. The obligation this creates is two-sided, and both halves are
+    // required:
+    //   1. Here, verify the witness against key material carried *inside the
+    //      input itself* (e.g. keys embedded in the input, or committed to by
+    //      a hash embedded in the input), bound to `InputAuthCtx::txid_message`
+    //      (see `InputAuth::SelfVerified` for why that binding matters).
+    //   2. In `process_input`, with database access, check that the key
+    //      material verified here is actually the authorized one for whatever
+    //      is being spent (e.g. it matches what was committed to on chain or
+    //      in the database), and reject the input if it is not.
+    // Doing only the first half lets an attacker supply *their own* keys
+    // inside the input, satisfy the signature check here, and still have
+    // `process_input` treat the input as authorized: the check would be
+    // internally consistent but would not be a check on the right thing. Do
+    // not split this into "verify signature" and "verify permission" and then
+    // forget the second half.
     fn verify_input(
         &self,
         _input: &<Self::Common as ModuleCommon>::Input,

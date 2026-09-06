@@ -68,6 +68,14 @@ pub enum InputAuth {
     /// `InputAuthCtx::txid_message()`. Verifying against anything else lets
     /// an attacker detach this input and reattach it to a transaction with
     /// different outputs.
+    ///
+    /// It must also have done so against key material carried *inside the
+    /// input*, and separately confirmed in `process_input` (where the
+    /// database is available) that that key material is the one actually
+    /// authorized to spend. See the doc comment on
+    /// `ServerModule::verify_input` for why both halves are required — an
+    /// attacker who can supply their own keys inside the input defeats a
+    /// check that only does the first half.
     SelfVerified,
 }
 
@@ -96,7 +104,14 @@ impl<'a> InputAuthCtx<'a> {
         secp256k1::Message::from_digest(*self.txid.as_ref())
     }
 
-    /// This input's witness, meaning whatever the module decides.
+    /// This input's witness bytes.
+    ///
+    /// These are unauthenticated, attacker-controlled input: whatever the
+    /// transaction's author put there, verified by nobody yet. They only
+    /// become meaningful once a self-verifying module checks them (e.g. as a
+    /// signature, or as key material to check a signature against) bound to
+    /// [`Self::txid_message`]. Never trust these bytes, or anything derived
+    /// from them, without performing that check first.
     pub fn witness(&self) -> &'a [u8] {
         self.witness
     }
@@ -107,6 +122,7 @@ impl<'a> InputAuthCtx<'a> {
 
     /// Prefer this over `txid_message`: it cannot be pointed at the wrong
     /// message.
+    #[must_use]
     pub fn verify_schnorr(
         &self,
         pub_key: &secp256k1::PublicKey,
