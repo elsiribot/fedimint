@@ -26,9 +26,14 @@
   nix develop -c cargo test -p fedimint-core
   nix develop -c cargo test -p fedimint-server
   nix develop -c cargo test -p fedimint-server-tests
+  nix develop -c cargo test -p fedimint-mint-tests
   ```
 
-  The compile gate is what catches the nine `InputMeta` sites and the eighteen `ClientInput` sites. The heavy integration suites (devimint, wasm-tests, lnv2-tests, mint-tests) need bitcoind/lnd/electrs and are left to CI. Baseline at `a50619eafc6` is clean.
+  The compile gate is what catches the nine `InputMeta` sites and the eighteen `ClientInput` sites.
+
+  `fedimint-mint-tests` is the load-bearing one. It is the cheapest crate in the tree that actually drives real transactions through `process_transaction_with_dbtx` — about 60s, no external daemons — and **nothing else in the workspace calls that function at all**. `fedimint-server`'s own tests are `FundingVerifier` arithmetic; `fedimint-server-tests` is migration-only. Without it, this branch's central claim — that the existing single-key path is unchanged — is verified by nothing that runs. The Task 4 review caught this; it is not optional.
+
+  The remaining heavy suites (devimint, wasm-tests, lnv2-tests) need bitcoind/lnd/electrs and are left to CI. Baseline at `a50619eafc6` is clean, and `fedimint-mint-tests` was 21 passed / 1 ignored at the Task 4 head.
 - Commit at the end of every task. Do not squash tasks together.
 
 ---
@@ -371,6 +376,7 @@ nix develop -c cargo check --workspace --all-targets
 nix develop -c cargo test -p fedimint-core
 nix develop -c cargo test -p fedimint-server
 nix develop -c cargo test -p fedimint-server-tests
+nix develop -c cargo test -p fedimint-mint-tests
 ```
 
 Expected: PASS. Every existing test is now a regression check that the `Key` path is untouched.
@@ -582,6 +588,7 @@ nix develop -c cargo check --workspace --all-targets
 nix develop -c cargo test -p fedimint-core
 nix develop -c cargo test -p fedimint-server
 nix develop -c cargo test -p fedimint-server-tests
+nix develop -c cargo test -p fedimint-mint-tests
 ```
 
 Expected: PASS. `input_witnesses()` now runs on every transaction, so a regression here means the length check disagrees with the old `pub_keys.len() != signatures.len()`.
@@ -671,6 +678,7 @@ nix develop -c cargo check --workspace --all-targets
 nix develop -c cargo test -p fedimint-core
 nix develop -c cargo test -p fedimint-server
 nix develop -c cargo test -p fedimint-server-tests
+nix develop -c cargo test -p fedimint-mint-tests
 ```
 
 Expected: PASS. This is the load-bearing regression check for the whole plan: every existing transaction test now flows through `input_witnesses` and `verify_key_witness` instead of `validate_signatures`.
@@ -970,6 +978,7 @@ nix develop -c cargo check --workspace --all-targets
 nix develop -c cargo test -p fedimint-core
 nix develop -c cargo test -p fedimint-server
 nix develop -c cargo test -p fedimint-server-tests
+nix develop -c cargo test -p fedimint-mint-tests
 ```
 
 Expected: PASS.
