@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 use assert_matches::assert_matches;
 use fedimint_client_module::DynGlobalClientContext;
 use fedimint_client_module::sm::{ClientSMDatabaseTransaction, State, StateTransition};
-use fedimint_client_module::transaction::{ClientInput, ClientInputBundle};
+use fedimint_client_module::transaction::{ClientInput, ClientInputAuth, ClientInputBundle};
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{Amounts, ModuleConsensusVersion};
@@ -301,7 +301,7 @@ pub(crate) async fn transition_btc_tx_confirmed(
 
     let client_input = ClientInput::<WalletInput> {
         input: wallet_input,
-        keys: vec![awaiting_confirmation_state.tweak_key],
+        auth: ClientInputAuth::Keys(vec![awaiting_confirmation_state.tweak_key]),
         amounts: amount,
     };
 

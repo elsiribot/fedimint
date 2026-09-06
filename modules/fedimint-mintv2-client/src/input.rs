@@ -1,5 +1,5 @@
 use fedimint_client::DynGlobalClientContext;
-use fedimint_client::transaction::{ClientInput, ClientInputBundle};
+use fedimint_client::transaction::{ClientInput, ClientInputAuth, ClientInputBundle};
 use fedimint_client_module::module::OutPointRange;
 use fedimint_client_module::sm::{ClientSMDatabaseTransaction, State, StateTransition};
 use fedimint_core::TransactionId;
@@ -141,7 +141,7 @@ fn refund_client_inputs(
         .iter()
         .map(|spendable_note| ClientInput::<MintInput> {
             input: MintInput::new_v0(spendable_note.note()),
-            keys: vec![spendable_note.keypair],
+            auth: ClientInputAuth::Keys(vec![spendable_note.keypair]),
             amounts: Amounts::new_custom(amount_unit, spendable_note.amount()),
         })
         .collect()

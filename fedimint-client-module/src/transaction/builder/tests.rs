@@ -2,7 +2,7 @@ use core::fmt;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
-use bitcoin::key::Secp256k1;
+use bitcoin::key::{Keypair, Secp256k1};
 use fedimint_core::core::{Input, IntoDynInstance, ModuleKind, Output};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::Amounts;
@@ -11,7 +11,7 @@ use super::{
     ClientInputBundle, ClientOutput, ClientOutputBundle, ClientOutputSM, TransactionBuilder,
 };
 use crate::module::OutPointRange;
-use crate::transaction::{ClientInput, ClientInputSM};
+use crate::transaction::{ClientInput, ClientInputAuth, ClientInputSM};
 
 #[derive(Encodable, Decodable, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct NoopInput;
@@ -65,6 +65,10 @@ fn tx_builder_empty_bundles() {
     // We'll collect ranges sms were called into this thing to compare at the end
     let sm_called = Arc::new(Mutex::new(String::new()));
 
+    // The builder requires exactly one auth per input; these inputs don't
+    // exercise signing, so any keypair will do.
+    let keypair = Keypair::new(&Secp256k1::new(), &mut rand::thread_rng());
+
     let no_call_input_sm = ClientInputSM {
         state_machines: Arc::new(move |_out_point_range: OutPointRange| {
             panic!("Don't call me maybe");
@@ -117,7 +121,7 @@ fn tx_builder_empty_bundles() {
             ClientInputBundle::<NoopInput>::new(
                 vec![ClientInput {
                     input: NoopInput,
-                    keys: vec![],
+                    auth: ClientInputAuth::Keys(vec![keypair.clone()]),
                     amounts: Amounts::new_bitcoin_msats(1),
                 }],
                 vec![yes_call_input_sm.clone()],
@@ -134,7 +138,7 @@ fn tx_builder_empty_bundles() {
             ClientInputBundle::<NoopInput>::new(
                 vec![ClientInput {
                     input: NoopInput,
-                    keys: vec![],
+                    auth: ClientInputAuth::Keys(vec![keypair]),
                     amounts: Amounts::new_bitcoin_msats(1),
                 }],
                 vec![yes_call_input_sm],

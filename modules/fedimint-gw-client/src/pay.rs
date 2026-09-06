@@ -4,7 +4,7 @@ use fedimint_client::ClientHandleArc;
 use fedimint_client_module::DynGlobalClientContext;
 use fedimint_client_module::sm::{ClientSMDatabaseTransaction, State, StateTransition};
 use fedimint_client_module::transaction::{
-    ClientInput, ClientInputBundle, ClientOutput, ClientOutputBundle,
+    ClientInput, ClientInputAuth, ClientInputBundle, ClientOutput, ClientOutputBundle,
 };
 use fedimint_core::config::FederationId;
 use fedimint_core::core::OperationId;
@@ -732,7 +732,7 @@ impl GatewayPayClaimOutgoingContract {
         let client_input = ClientInput::<LightningInput> {
             input: claim_input,
             amounts: Amounts::new_bitcoin(contract.amount),
-            keys: vec![context.redeem_key],
+            auth: ClientInputAuth::Keys(vec![context.redeem_key]),
         };
 
         let out_points = global_context

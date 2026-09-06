@@ -6,7 +6,7 @@ use fedimint_api_client::api::{FederationApiExt, ServerError};
 use fedimint_api_client::query::FilterMapThreshold;
 use fedimint_client_module::DynGlobalClientContext;
 use fedimint_client_module::sm::{ClientSMDatabaseTransaction, State, StateTransition};
-use fedimint_client_module::transaction::{ClientInput, ClientInputBundle};
+use fedimint_client_module::transaction::{ClientInput, ClientInputAuth, ClientInputBundle};
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{Amounts, ApiRequestErased};
@@ -256,7 +256,7 @@ impl ReceiveStateMachine {
                 agg_decryption_key,
             )),
             amounts: Amounts::new_bitcoin(old_state.common.contract.commitment.amount),
-            keys: vec![old_state.common.refund_keypair],
+            auth: ClientInputAuth::Keys(vec![old_state.common.refund_keypair]),
         };
 
         let outpoints = global_context

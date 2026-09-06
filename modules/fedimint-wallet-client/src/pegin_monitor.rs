@@ -6,7 +6,7 @@ use bitcoin::ScriptBuf;
 use fedimint_api_client::api::DynModuleApi;
 use fedimint_bitcoind::DynBitcoindRpc;
 use fedimint_client_module::module::{ClientContext, OutPointRange};
-use fedimint_client_module::transaction::{ClientInput, ClientInputBundle};
+use fedimint_client_module::transaction::{ClientInput, ClientInputAuth, ClientInputBundle};
 use fedimint_core::core::OperationId;
 use fedimint_core::db::{
     AutocommitError, Database, DatabaseTransaction, IDatabaseTransactionOpsCoreTyped as _,
@@ -487,7 +487,7 @@ async fn claim_peg_in(
 
         let client_input = ClientInput::<WalletInput> {
             input: wallet_input,
-            keys: vec![tweak_key],
+            auth: ClientInputAuth::Keys(vec![tweak_key]),
             amounts: Amounts::new_bitcoin(amount),
         };
 

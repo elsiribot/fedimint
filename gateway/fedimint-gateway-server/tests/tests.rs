@@ -9,7 +9,8 @@ use assert_matches::assert_matches;
 use bitcoin::hashes::{Hash, sha256};
 use fedimint_client::ClientHandleArc;
 use fedimint_client::transaction::{
-    ClientInput, ClientInputBundle, ClientOutput, ClientOutputBundle, TransactionBuilder,
+    ClientInput, ClientInputAuth, ClientInputBundle, ClientOutput, ClientOutputBundle,
+    TransactionBuilder,
 };
 use fedimint_client_module::module::OutPointRange;
 use fedimint_core::config::FederationId;
@@ -403,7 +404,7 @@ async fn test_gateway_cannot_claim_invalid_preimage() -> anyhow::Result<()> {
             let client_input = ClientInput::<LightningInput> {
                 input: claim_input,
                 amounts: Amounts::new_bitcoin(outgoing_contract.amount),
-                keys: vec![gateway_module.redeem_key],
+                auth: ClientInputAuth::Keys(vec![gateway_module.redeem_key]),
             };
 
             let tx = TransactionBuilder::new().with_inputs(

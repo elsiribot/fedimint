@@ -14,7 +14,7 @@ use assert_matches::assert_matches;
 use bitcoin::hashes::sha256;
 use fedimint_client_module::DynGlobalClientContext;
 use fedimint_client_module::sm::{ClientSMDatabaseTransaction, State, StateTransition};
-use fedimint_client_module::transaction::{ClientInput, ClientInputBundle};
+use fedimint_client_module::transaction::{ClientInput, ClientInputAuth, ClientInputBundle};
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::Amounts;
@@ -332,7 +332,7 @@ impl DecryptingPreimageState {
         let client_input = ClientInput::<LightningInput> {
             input: claim_input,
             amounts: Amounts::new_bitcoin(contract.amount),
-            keys: vec![context.redeem_key],
+            auth: ClientInputAuth::Keys(vec![context.redeem_key]),
         };
 
         let change_range = global_context

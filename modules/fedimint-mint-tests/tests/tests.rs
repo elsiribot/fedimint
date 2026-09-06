@@ -4,7 +4,9 @@ use assert_matches::assert_matches;
 use bls12_381::G1Affine;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::backup::{ClientBackup, Metadata};
-use fedimint_client::transaction::{ClientInput, ClientInputBundle, TransactionBuilder};
+use fedimint_client::transaction::{
+    ClientInput, ClientInputAuth, ClientInputBundle, TransactionBuilder,
+};
 use fedimint_client_module::ClientModule;
 use fedimint_core::core::OperationId;
 use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
@@ -86,7 +88,7 @@ async fn transaction_with_invalid_signature_is_rejected() -> anyhow::Result<()> 
             },
         }),
         amounts: Amounts::new_bitcoin_msats(1024),
-        keys: vec![keypair],
+        auth: ClientInputAuth::Keys(vec![keypair]),
     };
 
     let operation_id = OperationId::new_random();

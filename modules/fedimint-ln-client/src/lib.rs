@@ -42,8 +42,8 @@ use fedimint_client_module::module::{ClientContext, ClientModule, IClientModule,
 use fedimint_client_module::oplog::UpdateStreamOrOutcome;
 use fedimint_client_module::sm::{DynState, ModuleNotifier, State, StateTransition};
 use fedimint_client_module::transaction::{
-    ClientInput, ClientInputBundle, ClientOutput, ClientOutputBundle, ClientOutputSM, FeeQuote,
-    FeeQuoteRequest, TransactionBuilder,
+    ClientInput, ClientInputAuth, ClientInputBundle, ClientOutput, ClientOutputBundle,
+    ClientOutputSM, FeeQuote, FeeQuoteRequest, TransactionBuilder,
 };
 use fedimint_client_module::{DynGlobalClientContext, sm_enum_variant_translation};
 use fedimint_core::config::FederationId;
@@ -1738,7 +1738,7 @@ impl LightningClientModule {
         let client_input = ClientInput::<LightningInput> {
             input,
             amounts: Amounts::new_bitcoin(incoming_contract_account.amount),
-            keys: vec![key_pair],
+            auth: ClientInputAuth::Keys(vec![key_pair]),
         };
 
         let tx = TransactionBuilder::new().with_inputs(

@@ -25,10 +25,22 @@ use crate::{
     states_add_instance, states_to_instanceless_dyn,
 };
 
+/// How a client authorizes an input it is contributing.
+#[derive(Clone, Debug)]
+pub enum ClientInputAuth {
+    /// Sign the txid with each of these keys. One signature per keypair,
+    /// flattened across inputs, exactly as before witnesses existed.
+    Keys(Vec<Keypair>),
+    /// Use these witness bytes verbatim. For inputs whose module verifies
+    /// its own authorization, where the signatures may have been produced by
+    /// other people entirely.
+    Witness(Vec<u8>),
+}
+
 #[derive(Clone, Debug)]
 pub struct ClientInput<I = DynInput> {
     pub input: I,
-    pub keys: Vec<Keypair>,
+    pub auth: ClientInputAuth,
     pub amounts: Amounts,
 }
 
@@ -127,7 +139,7 @@ where
                 .into_iter()
                 .map(|input| InstancelessDynClientInput {
                     input: Box::new(input.input),
-                    keys: input.keys,
+                    auth: input.auth,
                     amounts: input.amounts,
                 })
                 .collect(),
@@ -162,7 +174,7 @@ where
     fn into_dyn(self, module_instance_id: ModuleInstanceId) -> ClientInput {
         ClientInput {
             input: self.input.into_dyn(module_instance_id),
-            keys: self.keys,
+            auth: self.auth,
             amounts: self.amounts,
         }
     }
@@ -215,7 +227,7 @@ impl IntoDynInstance for InstancelessDynClientInputBundle {
                 .into_iter()
                 .map(|input| ClientInput {
                     input: DynInput::from_parts(module_instance_id, input.input),
-                    keys: input.keys,
+                    auth: input.auth,
                     amounts: input.amounts,
                 })
                 .collect::<Vec<ClientInput>>(),
@@ -514,7 +526,7 @@ impl TransactionBuilder {
         // at `input_idx` comes from, so we can call state machines of the
         // corresponding bundle for every input bundle. It is always
         // monotonically increasing, e.g. `[0, 0, 1, 2, 2, 2, 4]`
-        let (input_idx_to_bundle_idx, inputs, input_keys): (Vec<_>, Vec<_>, Vec<_>) = multiunzip(
+        let (input_idx_to_bundle_idx, inputs, input_auths): (Vec<_>, Vec<_>, Vec<_>) = multiunzip(
             self.inputs
                 .iter()
                 .enumerate()
@@ -522,7 +534,7 @@ impl TransactionBuilder {
                     bundle
                         .inputs
                         .iter()
-                        .map(move |input| (bundle_idx, input.input.clone(), input.keys.clone()))
+                        .map(move |input| (bundle_idx, input.input.clone(), input.auth.clone()))
                 }),
         );
         // `output_idx_to_bundle` works exactly like `input_idx_to_bundle_idx` above,
@@ -543,17 +555,25 @@ impl TransactionBuilder {
         let txid = Transaction::tx_hash_from_parts(&inputs, &outputs, nonce);
         let msg = secp256k1::Message::from_digest_slice(&txid[..]).expect("txid has right length");
 
-        let signatures = input_keys
+        let witnesses: Vec<Vec<u8>> = input_auths
             .iter()
-            .flatten()
-            .map(|keypair| secp_ctx.sign_schnorr(&msg, keypair))
+            .map(|auth| match auth {
+                ClientInputAuth::Keys(keys) => {
+                    // A Key input's witness is its single signature. More than one
+                    // key per input can no longer be expressed, and never had a
+                    // server-side meaning: core returned one pub_key per input.
+                    assert_eq!(keys.len(), 1, "an input contributes exactly one witness");
+                    secp_ctx.sign_schnorr(&msg, &keys[0]).as_ref().to_vec()
+                }
+                ClientInputAuth::Witness(bytes) => bytes.clone(),
+            })
             .collect();
 
         let transaction = Transaction {
             inputs,
             outputs,
             nonce,
-            signatures: TransactionSignature::NaiveMultisig(signatures),
+            signatures: TransactionSignature::Witnessed(witnesses),
         };
 
         let input_states = self

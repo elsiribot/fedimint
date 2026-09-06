@@ -2,7 +2,7 @@ use anyhow::ensure;
 use bitcoin::hashes::sha256;
 use fedimint_client_module::DynGlobalClientContext;
 use fedimint_client_module::sm::{ClientSMDatabaseTransaction, State, StateTransition};
-use fedimint_client_module::transaction::{ClientInput, ClientInputBundle};
+use fedimint_client_module::transaction::{ClientInput, ClientInputAuth, ClientInputBundle};
 use fedimint_core::config::FederationId;
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -242,7 +242,7 @@ impl SendStateMachine {
                         OutgoingWitness::Cancel(signature),
                     )),
                     amounts: Amounts::new_bitcoin(old_state.common.contract.amount),
-                    keys: vec![old_state.common.refund_keypair],
+                    auth: ClientInputAuth::Keys(vec![old_state.common.refund_keypair]),
                 };
 
                 let change_range = global_context
@@ -312,7 +312,7 @@ impl SendStateMachine {
                 OutgoingWitness::Refund,
             )),
             amounts: Amounts::new_bitcoin(old_state.common.contract.amount),
-            keys: vec![old_state.common.refund_keypair],
+            auth: ClientInputAuth::Keys(vec![old_state.common.refund_keypair]),
         };
 
         let change_range = global_context

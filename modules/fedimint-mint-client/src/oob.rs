@@ -4,7 +4,9 @@ use std::time::SystemTime;
 use fedimint_client_module::DynGlobalClientContext;
 use fedimint_client_module::module::OutPointRange;
 use fedimint_client_module::sm::{ClientSMDatabaseTransaction, State, StateTransition};
-use fedimint_client_module::transaction::{ClientInput, ClientInputBundle, ClientInputSM};
+use fedimint_client_module::transaction::{
+    ClientInput, ClientInputAuth, ClientInputBundle, ClientInputSM,
+};
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::Amounts;
@@ -382,7 +384,7 @@ async fn try_cancel_oob_spend_multi(
         .into_iter()
         .map(|(amount, spendable_note)| ClientInput {
             input: MintInput::new_v0(amount, spendable_note.note()),
-            keys: vec![spendable_note.spend_key],
+            auth: ClientInputAuth::Keys(vec![spendable_note.spend_key]),
             amounts: Amounts::new_bitcoin(amount),
         })
         .collect();

@@ -32,8 +32,8 @@ pub use events::*;
 use fedimint_api_client::api::DynModuleApi;
 use fedimint_client::module::ClientModule;
 use fedimint_client::transaction::{
-    ClientInput, ClientInputBundle, ClientInputSM, ClientOutput, ClientOutputBundle,
-    ClientOutputSM, FeeQuote, FeeQuoteRequest, TransactionBuilder,
+    ClientInput, ClientInputAuth, ClientInputBundle, ClientInputSM, ClientOutput,
+    ClientOutputBundle, ClientOutputSM, FeeQuote, FeeQuoteRequest, TransactionBuilder,
 };
 use fedimint_client_module::db::ClientModuleMigrationFn;
 use fedimint_client_module::module::init::{
@@ -643,7 +643,7 @@ impl MintClientModule {
             .iter()
             .map(|spendable_note| ClientInput {
                 input: MintInput::new_v0(spendable_note.note()),
-                keys: vec![spendable_note.keypair],
+                auth: ClientInputAuth::Keys(vec![spendable_note.keypair]),
                 amounts: Amounts::new_custom(amount_unit, spendable_note.amount()),
             })
             .collect();

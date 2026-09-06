@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use fedimint_client::ClientHandleArc;
-use fedimint_client::transaction::{ClientInput, ClientInputBundle, TransactionBuilder};
+use fedimint_client::transaction::{
+    ClientInput, ClientInputAuth, ClientInputBundle, TransactionBuilder,
+};
 use fedimint_client_module::module::ClientModule;
 use fedimint_core::core::{IntoDynInstance, OperationId};
 use fedimint_core::module::{AmountUnit, Amounts};
@@ -330,7 +332,7 @@ async fn claiming_outgoing_contract_triggers_success() -> anyhow::Result<()> {
             OutgoingWitness::Claim(MOCK_INVOICE_PREIMAGE),
         )),
         amounts: Amounts::new_bitcoin(contract.amount),
-        keys: vec![mock::gateway_keypair()],
+        auth: ClientInputAuth::Keys(vec![mock::gateway_keypair()]),
     };
 
     let lnv2_module_id = client

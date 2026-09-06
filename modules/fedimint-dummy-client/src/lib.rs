@@ -17,7 +17,8 @@ use fedimint_client_module::module::{
 };
 use fedimint_client_module::sm::{Context, DynState, ModuleNotifier, State, StateTransition};
 use fedimint_client_module::transaction::{
-    ClientInput, ClientInputBundle, ClientInputSM, ClientOutput, ClientOutputBundle, ClientOutputSM,
+    ClientInput, ClientInputAuth, ClientInputBundle, ClientInputSM, ClientOutput,
+    ClientOutputBundle, ClientOutputSM,
 };
 use fedimint_client_module::{DynGlobalClientContext, sm_enum_variant_translation};
 use fedimint_core::core::{IntoDynInstance, ModuleInstanceId, ModuleKind, OperationId};
@@ -197,7 +198,7 @@ impl ClientModule for DummyClientModule {
                         pub_key: self.key.public_key(),
                     },
                     amounts: Amounts::new_custom(unit, missing_input_amount),
-                    keys: vec![self.key],
+                    auth: ClientInputAuth::Keys(vec![self.key]),
                 };
 
                 let input_sm = ClientInputSM {
@@ -334,7 +335,7 @@ impl DummyClientModule {
                 pub_key: keypair.public_key(),
             },
             amounts: Amounts::new_custom(unit, amount),
-            keys: vec![keypair],
+            auth: ClientInputAuth::Keys(vec![keypair]),
         };
 
         self.client_ctx

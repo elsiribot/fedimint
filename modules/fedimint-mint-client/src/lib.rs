@@ -62,8 +62,8 @@ use fedimint_client_module::module::{
 use fedimint_client_module::oplog::{OperationLogEntry, UpdateStreamOrOutcome};
 use fedimint_client_module::sm::{Context, DynState, ModuleNotifier, State, StateTransition};
 use fedimint_client_module::transaction::{
-    ClientInput, ClientInputBundle, ClientInputSM, ClientOutput, ClientOutputBundle,
-    ClientOutputSM, FeeQuote, FeeQuoteRequest, TransactionBuilder,
+    ClientInput, ClientInputAuth, ClientInputBundle, ClientInputSM, ClientOutput,
+    ClientOutputBundle, ClientOutputSM, FeeQuote, FeeQuoteRequest, TransactionBuilder,
 };
 use fedimint_client_module::{DynGlobalClientContext, sm_enum_variant_translation};
 use fedimint_core::base32::{FEDIMINT_PREFIX, encode_prefixed};
@@ -1631,7 +1631,7 @@ impl MintClientModule {
             inputs_and_notes.push((
                 ClientInput {
                     input: MintInput::new_v0(amount, note),
-                    keys: vec![spendable_note.spend_key],
+                    auth: ClientInputAuth::Keys(vec![spendable_note.spend_key]),
                     amounts: Amounts::new_bitcoin(amount),
                 },
                 spendable_note,

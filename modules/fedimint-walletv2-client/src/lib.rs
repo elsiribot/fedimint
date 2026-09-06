@@ -27,8 +27,8 @@ use events::{ReceivePaymentEvent, SendPaymentEvent};
 use fedimint_api_client::api::{DynModuleApi, FederationResult};
 use fedimint_client::DynGlobalClientContext;
 use fedimint_client::transaction::{
-    ClientInput, ClientInputBundle, ClientInputSM, ClientOutput, ClientOutputBundle,
-    ClientOutputSM, FeeQuote, FeeQuoteRequest, TransactionBuilder,
+    ClientInput, ClientInputAuth, ClientInputBundle, ClientInputSM, ClientOutput,
+    ClientOutputBundle, ClientOutputSM, FeeQuote, FeeQuoteRequest, TransactionBuilder,
 };
 use fedimint_client_module::db::ClientModuleMigrationFn;
 use fedimint_client_module::module::init::{ClientModuleInit, ClientModuleInitArgs};
@@ -670,7 +670,7 @@ impl WalletClientModule {
                 fee,
                 tweak: self.derive_tweak(address_index).public_key(),
             }),
-            keys: vec![self.derive_tweak(address_index)],
+            auth: ClientInputAuth::Keys(vec![self.derive_tweak(address_index)]),
             amounts: Amounts::new_bitcoin(Amount::from_sats((value - fee).to_sat())),
         };
 
