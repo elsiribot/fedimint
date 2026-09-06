@@ -97,6 +97,12 @@ impl Transaction {
     ) -> Result<(), TransactionError> {
         let signatures = match &self.signatures {
             TransactionSignature::NaiveMultisig(sigs) => sigs,
+            // Not produced anywhere yet (see `Self::input_witnesses`); later tasks
+            // teach the caller of `validate_signatures` to go through
+            // `input_witnesses`/`verify_key_witness` instead, which understand it.
+            TransactionSignature::Witnessed(_) => {
+                return Err(TransactionError::UnsupportedSignatureScheme { variant: 1 });
+            }
             TransactionSignature::Default { variant, .. } => {
                 return Err(TransactionError::UnsupportedSignatureScheme { variant: *variant });
             }
@@ -125,11 +131,64 @@ impl Transaction {
 
         Ok(())
     }
+
+    /// One witness per input, whichever encoding this transaction uses.
+    ///
+    /// Errors if the count does not match the input count, which is the check
+    /// [`Self::validate_signatures`] used to perform against the collected
+    /// public keys.
+    pub fn input_witnesses(&self) -> Result<Vec<&[u8]>, TransactionError> {
+        match &self.signatures {
+            TransactionSignature::NaiveMultisig(sigs) => {
+                if sigs.len() != self.inputs.len() {
+                    return Err(TransactionError::InvalidWitnessLength);
+                }
+                Ok(sigs.iter().map(|sig| sig.as_ref() as &[u8]).collect())
+            }
+            TransactionSignature::Witnessed(witnesses) => {
+                if witnesses.len() != self.inputs.len() {
+                    return Err(TransactionError::InvalidWitnessLength);
+                }
+                Ok(witnesses.iter().map(Vec::as_slice).collect())
+            }
+            TransactionSignature::Default { variant, .. } => {
+                Err(TransactionError::UnsupportedSignatureScheme { variant: *variant })
+            }
+        }
+    }
+
+    /// Verify a witness belonging to an `InputAuth::Key` input: exactly one
+    /// 64-byte schnorr signature over the txid.
+    pub fn verify_key_witness(
+        witness: &[u8],
+        msg: &secp256k1::Message,
+        pub_key: &secp256k1::PublicKey,
+    ) -> Result<(), TransactionError> {
+        let sig = secp256k1::schnorr::Signature::from_slice(witness)
+            .map_err(|_| TransactionError::InvalidWitnessLength)?;
+
+        secp256k1::global::SECP256K1
+            .verify_schnorr(&sig, msg, &pub_key.x_only_public_key().0)
+            .map_err(|_| TransactionError::InvalidSignature {
+                tx: String::new(),
+                hash: msg.as_ref().to_lower_hex_string(),
+                sig: sig.consensus_encode_to_hex(),
+                key: pub_key.consensus_encode_to_hex(),
+            })
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Encodable, Decodable)]
 pub enum TransactionSignature {
     NaiveMultisig(Vec<fedimint_core::secp256k1::schnorr::Signature>),
+    /// One opaque witness per input, positionally aligned with
+    /// [`Transaction::inputs`].
+    ///
+    /// For an input whose module returns `InputAuth::Key`, the witness is
+    /// exactly the 64 bytes of its schnorr signature over the txid. For an
+    /// input whose module returns `InputAuth::SelfVerified`, the bytes mean
+    /// whatever that module decides they mean.
+    Witnessed(Vec<Vec<u8>>),
     #[encodable_default]
     Default {
         variant: u64,
@@ -143,6 +202,11 @@ impl fmt::Debug for TransactionSignature {
             Self::NaiveMultisig(multi) => {
                 f.debug_struct("NaiveMultisig")
                     .field("len", &multi.len())
+                    .finish()?;
+            }
+            Self::Witnessed(witnesses) => {
+                f.debug_struct("Witnessed")
+                    .field("len", &witnesses.len())
                     .finish()?;
             }
             Self::Default { variant, bytes } => {
@@ -199,3 +263,49 @@ pub const TRANSACTION_OVERFLOW_ERROR: TransactionError = TransactionError::Unbal
 
 #[derive(Debug, Encodable, Decodable, Clone, Eq, PartialEq)]
 pub struct TransactionSubmissionOutcome(pub Result<TransactionId, TransactionError>);
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::secp256k1::rand::rngs::OsRng;
+    use secp256k1::{Keypair, Message, Secp256k1};
+
+    use super::*;
+
+    fn dummy_msg() -> Message {
+        Message::from_digest([7u8; 32])
+    }
+
+    #[test]
+    fn key_witness_roundtrips() {
+        let secp = Secp256k1::new();
+        let kp = Keypair::new(&secp, &mut OsRng);
+        let sig = secp.sign_schnorr(&dummy_msg(), &kp);
+
+        Transaction::verify_key_witness(sig.as_ref(), &dummy_msg(), &kp.public_key())
+            .expect("a fresh signature over this message must verify");
+    }
+
+    #[test]
+    fn key_witness_rejects_wrong_message() {
+        let secp = Secp256k1::new();
+        let kp = Keypair::new(&secp, &mut OsRng);
+        let sig = secp.sign_schnorr(&dummy_msg(), &kp);
+
+        let other = Message::from_digest([9u8; 32]);
+        assert!(matches!(
+            Transaction::verify_key_witness(sig.as_ref(), &other, &kp.public_key()),
+            Err(TransactionError::InvalidSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn key_witness_rejects_wrong_length() {
+        let secp = Secp256k1::new();
+        let kp = Keypair::new(&secp, &mut OsRng);
+
+        assert!(matches!(
+            Transaction::verify_key_witness(&[0u8; 63], &dummy_msg(), &kp.public_key()),
+            Err(TransactionError::InvalidWitnessLength)
+        ));
+    }
+}

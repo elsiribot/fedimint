@@ -230,6 +230,10 @@ fn format_item_details(item: &AcceptedItem) -> Markup {
                                     div { "Type: NaiveMultisig" }
                                     div { "Signatures: " (sigs.len()) }
                                 }
+                                TransactionSignature::Witnessed(witnesses) => {
+                                    div { "Type: Witnessed" }
+                                    div { "Witnesses: " (witnesses.len()) }
+                                }
                                 TransactionSignature::Default { variant, bytes } => {
                                     div { "Type: Unknown (variant " (variant) ")" }
                                     div { "Size: " (bytes.len()) " bytes" }
