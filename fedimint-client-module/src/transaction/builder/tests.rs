@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use bitcoin::key::{Keypair, Secp256k1};
 use fedimint_core::core::{Input, IntoDynInstance, ModuleKind, Output};
-use fedimint_core::secp256k1::rand::rngs::OsRng;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::Amounts;
+use fedimint_core::secp256k1::rand::rngs::OsRng;
 use fedimint_core::transaction::TransactionSignature;
 
 use super::{

@@ -573,9 +573,11 @@ impl TransactionBuilder {
         {
             let sigs = input_auths
                 .iter()
-                .filter_map(|auth| match auth {
-                    ClientInputAuth::Key(kp) => Some(secp_ctx.sign_schnorr(&msg, kp)),
-                    ClientInputAuth::Witness(_) => None,
+                .map(|auth| match auth {
+                    ClientInputAuth::Key(kp) => secp_ctx.sign_schnorr(&msg, kp),
+                    ClientInputAuth::Witness(_) => unreachable!(
+                        "the enclosing branch established that all `input_auths` are `Key`"
+                    ),
                 })
                 .collect();
             TransactionSignature::NaiveMultisig(sigs)

@@ -39,7 +39,17 @@ pub async fn process_transaction_with_dbtx(
     // `UnsupportedSignatureScheme` ahead of a module's own `Input(..)` error,
     // where previously the module error could win the race. The choice of
     // which error wins is deterministic (this check runs strictly before the
-    // per-input pass, for every peer), so consensus on the error is preserved.
+    // per-input pass, for every peer), so consensus on the error is preserved
+    // among equally-versioned guardians. This branch also changes what error
+    // an existing module's `verify_input` failure produces (e.g. a bad mint
+    // note now yields `Input(MintInputError::InvalidSignature)` where it
+    // previously yielded `InvalidWitnessLength`), so during a rolling
+    // upgrade a client submitting an *invalid* transaction can hit guardians
+    // on both sides of the upgrade and get no threshold-identical error via
+    // `request_current_consensus_retry`, retrying until the upgrade
+    // completes. Impact is low: it only affects invalid transactions, is
+    // self-healing once the upgrade finishes, and does not cause database or
+    // consensus divergence, since the engine only discards the error.
     let witnesses = transaction.input_witnesses()?;
     let msg = secp256k1::Message::from_digest(*txid.as_ref());
 
