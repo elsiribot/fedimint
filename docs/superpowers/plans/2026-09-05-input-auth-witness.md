@@ -18,7 +18,17 @@
 - **`TransactionSignature::NaiveMultisig` must keep working.** A transaction whose inputs are all `InputAuth::Key` must remain valid in its existing encoding. This is what keeps the whole existing test suite meaningful as a regression check.
 - **New enum variants go before `#[encodable_default] Default { variant, bytes }`,** never after, and never renumber existing variants.
 - **`n <= 210`** is the DoS bound on self-verified signature counts. Core does not enforce it; consumers do. Do not add a core-side cap in this plan.
-- Existing `cargo test --workspace` must stay green at the end of every task. If a task leaves it red, the task is not done.
+- **This repo has no Rust toolchain outside its nix devshell.** Every command must be wrapped: `nix develop -c cargo ...`. A bare `cargo` will fail with "command not found".
+- **The verification gate**, run at the end of every task, must be green before the task is done:
+
+  ```bash
+  nix develop -c cargo check --workspace --all-targets
+  nix develop -c cargo test -p fedimint-core
+  nix develop -c cargo test -p fedimint-server
+  nix develop -c cargo test -p fedimint-server-tests
+  ```
+
+  The compile gate is what catches the nine `InputMeta` sites and the eighteen `ClientInput` sites. The heavy integration suites (devimint, wasm-tests, lnv2-tests, mint-tests) need bitcoind/lnd/electrs and are left to CI. Baseline at `a50619eafc6` is clean.
 - Commit at the end of every task. Do not squash tasks together.
 
 ---
@@ -93,7 +103,7 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd /home/user/projects/fedimint-witness && cargo test -p fedimint-core transaction::tests -- --nocapture`
+Run: `cd /home/user/projects/fedimint-witness && nix develop -c cargo test -p fedimint-core transaction::tests -- --nocapture`
 
 Expected: FAIL to compile, `no function or associated item named 'verify_key_witness' found`.
 
@@ -201,13 +211,13 @@ Read the existing `NaiveMultisig` arm first and match its markup style exactly; 
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p fedimint-core transaction::tests`
+Run: `nix develop -c cargo test -p fedimint-core transaction::tests`
 
 Expected: PASS, 3 tests.
 
 - [ ] **Step 6: Verify the workspace still builds**
 
-Run: `cargo check --workspace --all-targets`
+Run: `nix develop -c cargo check --workspace --all-targets`
 
 Expected: no errors.
 
@@ -264,7 +274,7 @@ fn input_auth_key_carries_its_key() {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cargo test -p fedimint-core transaction::tests::input_auth_key_carries_its_key`
+Run: `nix develop -c cargo test -p fedimint-core transaction::tests::input_auth_key_carries_its_key`
 
 Expected: FAIL to compile, `unresolved import fedimint_core::module::InputAuth`.
 
@@ -354,7 +364,14 @@ Leave `transaction.validate_signatures(&public_keys)?;` exactly as it is. Behavi
 
 - [ ] **Step 6: Run the full suite**
 
-Run: `cargo test --workspace`
+Run the gate:
+
+```bash
+nix develop -c cargo check --workspace --all-targets
+nix develop -c cargo test -p fedimint-core
+nix develop -c cargo test -p fedimint-server
+nix develop -c cargo test -p fedimint-server-tests
+```
 
 Expected: PASS. Every existing test is now a regression check that the `Key` path is untouched.
 
@@ -430,7 +447,7 @@ fn auth_ctx_verify_schnorr_binds_to_the_txid() {
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cargo test -p fedimint-core transaction::tests`
+Run: `nix develop -c cargo test -p fedimint-core transaction::tests`
 
 Expected: FAIL to compile, `unresolved import fedimint_core::module::InputAuthCtx`.
 
@@ -558,7 +575,14 @@ Delete the now-duplicate `let txid = transaction.tx_hash();` further down.
 
 - [ ] **Step 6: Run the full suite**
 
-Run: `cargo test --workspace`
+Run the gate:
+
+```bash
+nix develop -c cargo check --workspace --all-targets
+nix develop -c cargo test -p fedimint-core
+nix develop -c cargo test -p fedimint-server
+nix develop -c cargo test -p fedimint-server-tests
+```
 
 Expected: PASS. `input_witnesses()` now runs on every transaction, so a regression here means the length check disagrees with the old `pub_keys.len() != signatures.len()`.
 
@@ -640,7 +664,14 @@ This changes which transactions are valid even though it changes no encoding, wh
 
 - [ ] **Step 4: Run the full suite**
 
-Run: `cargo test --workspace`
+Run the gate:
+
+```bash
+nix develop -c cargo check --workspace --all-targets
+nix develop -c cargo test -p fedimint-core
+nix develop -c cargo test -p fedimint-server
+nix develop -c cargo test -p fedimint-server-tests
+```
 
 Expected: PASS. This is the load-bearing regression check for the whole plan: every existing transaction test now flows through `input_witnesses` and `verify_key_witness` instead of `validate_signatures`.
 
@@ -834,7 +865,7 @@ async fn wrong_witness_count_rejected() {
 
 - [ ] **Step 3: Run them**
 
-Run: `cargo test -p fedimint-server-tests --test fedimint_server_transaction_auth`
+Run: `nix develop -c cargo test -p fedimint-server-tests --test fedimint_server_transaction_auth`
 
 Expected: PASS, 4 tests. If imports do not resolve, fix them against the real paths — `fedimint-server-tests/tests/migration.rs` imports `Dummy`, `DummyInput`, `DummyOutput` and `Transaction` and is the reference for what is public. `mem_database` may be named differently in `fedimint-testing-core`; check with `grep -rn "fn mem_database\|pub fn.*Database" fedimint-testing-core/src/db.rs`.
 
@@ -932,7 +963,14 @@ The assertion is the honest place to discover whether any existing module puts m
 
 - [ ] **Step 4: Run the full suite**
 
-Run: `cargo test --workspace`
+Run the gate:
+
+```bash
+nix develop -c cargo check --workspace --all-targets
+nix develop -c cargo test -p fedimint-core
+nix develop -c cargo test -p fedimint-server
+nix develop -c cargo test -p fedimint-server-tests
+```
 
 Expected: PASS.
 
