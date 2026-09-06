@@ -88,7 +88,7 @@ async fn transaction_with_invalid_signature_is_rejected() -> anyhow::Result<()> 
             },
         }),
         amounts: Amounts::new_bitcoin_msats(1024),
-        auth: ClientInputAuth::Keys(vec![keypair]),
+        auth: ClientInputAuth::Keys(keypair),
     };
 
     let operation_id = OperationId::new_random();

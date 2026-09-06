@@ -732,7 +732,7 @@ impl GatewayPayClaimOutgoingContract {
         let client_input = ClientInput::<LightningInput> {
             input: claim_input,
             amounts: Amounts::new_bitcoin(contract.amount),
-            auth: ClientInputAuth::Keys(vec![context.redeem_key]),
+            auth: ClientInputAuth::Keys(context.redeem_key),
         };
 
         let out_points = global_context

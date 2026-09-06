@@ -2,10 +2,11 @@ use core::fmt;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
-use bitcoin::key::{Keypair, Secp256k1};
+use bitcoin::key::Secp256k1;
 use fedimint_core::core::{Input, IntoDynInstance, ModuleKind, Output};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::Amounts;
+use fedimint_core::transaction::TransactionSignature;
 
 use super::{
     ClientInputBundle, ClientOutput, ClientOutputBundle, ClientOutputSM, TransactionBuilder,
@@ -65,10 +66,6 @@ fn tx_builder_empty_bundles() {
     // We'll collect ranges sms were called into this thing to compare at the end
     let sm_called = Arc::new(Mutex::new(String::new()));
 
-    // The builder requires exactly one auth per input; these inputs don't
-    // exercise signing, so any keypair will do.
-    let keypair = Keypair::new(&Secp256k1::new(), &mut rand::thread_rng());
-
     let no_call_input_sm = ClientInputSM {
         state_machines: Arc::new(move |_out_point_range: OutPointRange| {
             panic!("Don't call me maybe");
@@ -121,7 +118,7 @@ fn tx_builder_empty_bundles() {
             ClientInputBundle::<NoopInput>::new(
                 vec![ClientInput {
                     input: NoopInput,
-                    auth: ClientInputAuth::Keys(vec![keypair.clone()]),
+                    auth: ClientInputAuth::Witness(vec![]),
                     amounts: Amounts::new_bitcoin_msats(1),
                 }],
                 vec![yes_call_input_sm.clone()],
@@ -138,7 +135,7 @@ fn tx_builder_empty_bundles() {
             ClientInputBundle::<NoopInput>::new(
                 vec![ClientInput {
                     input: NoopInput,
-                    auth: ClientInputAuth::Keys(vec![keypair]),
+                    auth: ClientInputAuth::Witness(vec![]),
                     amounts: Amounts::new_bitcoin_msats(1),
                 }],
                 vec![yes_call_input_sm],
@@ -183,4 +180,47 @@ fn tx_builder_empty_bundles() {
     // This actually depends on how builder processes inputs and outputs,
     // but if it ever changes, just adjust the string.
     assert_eq!(*sm_called.lock().unwrap(), String::from("i-0,i-1,o-0,o-1,"));
+}
+
+#[test]
+/// Witness bytes attached via [`ClientInputAuth::Witness`] must end up in
+/// [`TransactionSignature::Witnessed`] at the same index as the input that
+/// carried them: this positional alignment is the contract every server-side
+/// witness-verification consumer relies on.
+fn tx_builder_witness_positional_alignment() {
+    let witness_a = vec![0xaa, 0xaa, 0xaa];
+    let witness_b = vec![0xbb, 0xbb];
+
+    let (transaction, _states) = TransactionBuilder::new()
+        .with_inputs(
+            ClientInputBundle::<NoopInput, super::NeverClientStateMachine>::new_no_sm(vec![
+                ClientInput {
+                    input: NoopInput,
+                    auth: ClientInputAuth::Witness(witness_a.clone()),
+                    amounts: Amounts::new_bitcoin_msats(1),
+                },
+                ClientInput {
+                    input: NoopInput,
+                    auth: ClientInputAuth::Witness(witness_b.clone()),
+                    amounts: Amounts::new_bitcoin_msats(1),
+                },
+            ])
+            .into_instanceless()
+            .into_dyn(0),
+        )
+        .build(&Secp256k1::new(), rand::thread_rng());
+
+    let TransactionSignature::Witnessed(witnesses) = transaction.signatures else {
+        panic!("expected TransactionSignature::Witnessed");
+    };
+
+    assert_eq!(witnesses.len(), 2);
+    assert_eq!(
+        witnesses[0], witness_a,
+        "witness at index 0 must match the first input"
+    );
+    assert_eq!(
+        witnesses[1], witness_b,
+        "witness at index 1 must match the second input"
+    );
 }

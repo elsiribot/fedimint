@@ -1631,7 +1631,7 @@ impl MintClientModule {
             inputs_and_notes.push((
                 ClientInput {
                     input: MintInput::new_v0(amount, note),
-                    auth: ClientInputAuth::Keys(vec![spendable_note.spend_key]),
+                    auth: ClientInputAuth::Keys(spendable_note.spend_key),
                     amounts: Amounts::new_bitcoin(amount),
                 },
                 spendable_note,

@@ -404,7 +404,7 @@ async fn test_gateway_cannot_claim_invalid_preimage() -> anyhow::Result<()> {
             let client_input = ClientInput::<LightningInput> {
                 input: claim_input,
                 amounts: Amounts::new_bitcoin(outgoing_contract.amount),
-                auth: ClientInputAuth::Keys(vec![gateway_module.redeem_key]),
+                auth: ClientInputAuth::Keys(gateway_module.redeem_key),
             };
 
             let tx = TransactionBuilder::new().with_inputs(

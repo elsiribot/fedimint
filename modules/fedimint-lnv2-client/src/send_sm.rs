@@ -242,7 +242,7 @@ impl SendStateMachine {
                         OutgoingWitness::Cancel(signature),
                     )),
                     amounts: Amounts::new_bitcoin(old_state.common.contract.amount),
-                    auth: ClientInputAuth::Keys(vec![old_state.common.refund_keypair]),
+                    auth: ClientInputAuth::Keys(old_state.common.refund_keypair),
                 };
 
                 let change_range = global_context
@@ -312,7 +312,7 @@ impl SendStateMachine {
                 OutgoingWitness::Refund,
             )),
             amounts: Amounts::new_bitcoin(old_state.common.contract.amount),
-            auth: ClientInputAuth::Keys(vec![old_state.common.refund_keypair]),
+            auth: ClientInputAuth::Keys(old_state.common.refund_keypair),
         };
 
         let change_range = global_context

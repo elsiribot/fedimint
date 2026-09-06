@@ -301,7 +301,7 @@ pub(crate) async fn transition_btc_tx_confirmed(
 
     let client_input = ClientInput::<WalletInput> {
         input: wallet_input,
-        auth: ClientInputAuth::Keys(vec![awaiting_confirmation_state.tweak_key]),
+        auth: ClientInputAuth::Keys(awaiting_confirmation_state.tweak_key),
         amounts: amount,
     };
 

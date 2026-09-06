@@ -28,9 +28,9 @@ use crate::{
 /// How a client authorizes an input it is contributing.
 #[derive(Clone, Debug)]
 pub enum ClientInputAuth {
-    /// Sign the txid with each of these keys. One signature per keypair,
-    /// flattened across inputs, exactly as before witnesses existed.
-    Keys(Vec<Keypair>),
+    /// Sign the txid with this key. Produces this input's single witness: a
+    /// schnorr signature over the txid.
+    Keys(Keypair),
     /// Use these witness bytes verbatim. For inputs whose module verifies
     /// its own authorization, where the signatures may have been produced by
     /// other people entirely.
@@ -558,13 +558,7 @@ impl TransactionBuilder {
         let witnesses: Vec<Vec<u8>> = input_auths
             .iter()
             .map(|auth| match auth {
-                ClientInputAuth::Keys(keys) => {
-                    // A Key input's witness is its single signature. More than one
-                    // key per input can no longer be expressed, and never had a
-                    // server-side meaning: core returned one pub_key per input.
-                    assert_eq!(keys.len(), 1, "an input contributes exactly one witness");
-                    secp_ctx.sign_schnorr(&msg, &keys[0]).as_ref().to_vec()
-                }
+                ClientInputAuth::Keys(kp) => secp_ctx.sign_schnorr(&msg, kp).as_ref().to_vec(),
                 ClientInputAuth::Witness(bytes) => bytes.clone(),
             })
             .collect();
