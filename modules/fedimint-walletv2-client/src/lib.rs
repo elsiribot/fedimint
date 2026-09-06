@@ -670,7 +670,7 @@ impl WalletClientModule {
                 fee,
                 tweak: self.derive_tweak(address_index).public_key(),
             }),
-            auth: ClientInputAuth::Keys(self.derive_tweak(address_index)),
+            auth: ClientInputAuth::Key(self.derive_tweak(address_index)),
             amounts: Amounts::new_bitcoin(Amount::from_sats((value - fee).to_sat())),
         };
 

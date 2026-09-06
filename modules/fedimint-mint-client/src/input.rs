@@ -249,7 +249,7 @@ impl MintInputStateCreated {
 
         let refund_input = ClientInput::<MintInput> {
             input: MintInput::new_v0(amount, spendable_note.note()),
-            auth: ClientInputAuth::Keys(spendable_note.spend_key),
+            auth: ClientInputAuth::Key(spendable_note.spend_key),
             amounts: Amounts::new_bitcoin(amount),
         };
 
@@ -344,7 +344,7 @@ impl MintInputStateCreatedBundle {
         for (amount, spendable_note) in spendable_notes.clone() {
             inputs.push(ClientInput::<MintInput> {
                 input: MintInput::new_v0(amount, spendable_note.note()),
-                auth: ClientInputAuth::Keys(spendable_note.spend_key),
+                auth: ClientInputAuth::Key(spendable_note.spend_key),
                 amounts: Amounts::new_bitcoin(amount),
             });
         }
@@ -446,7 +446,7 @@ impl MintInputStateRefundedBundle {
         for (amount, spendable_note) in spendable_notes {
             let refund_input = ClientInput::<MintInput> {
                 input: MintInput::new_v0(amount, spendable_note.note()),
-                auth: ClientInputAuth::Keys(spendable_note.spend_key),
+                auth: ClientInputAuth::Key(spendable_note.spend_key),
                 amounts: Amounts::new_bitcoin(amount),
             };
             match global_context

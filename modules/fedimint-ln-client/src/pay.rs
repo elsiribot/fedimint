@@ -543,7 +543,7 @@ async fn try_refund_outgoing_contract(
     let refund_client_input = ClientInput::<LightningInput> {
         input: refund_input,
         amounts: Amounts::new_bitcoin(contract_data.contract_account.amount),
-        auth: ClientInputAuth::Keys(refund_key),
+        auth: ClientInputAuth::Key(refund_key),
     };
 
     let change_range = global_context

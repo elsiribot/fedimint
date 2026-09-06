@@ -198,7 +198,7 @@ impl ClientModule for DummyClientModule {
                         pub_key: self.key.public_key(),
                     },
                     amounts: Amounts::new_custom(unit, missing_input_amount),
-                    auth: ClientInputAuth::Keys(self.key),
+                    auth: ClientInputAuth::Key(self.key),
                 };
 
                 let input_sm = ClientInputSM {
@@ -335,7 +335,7 @@ impl DummyClientModule {
                 pub_key: keypair.public_key(),
             },
             amounts: Amounts::new_custom(unit, amount),
-            auth: ClientInputAuth::Keys(keypair),
+            auth: ClientInputAuth::Key(keypair),
         };
 
         self.client_ctx

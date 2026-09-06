@@ -310,7 +310,7 @@ impl LightningReceiveConfirmedInvoice {
         let client_input = ClientInput::<LightningInput> {
             input,
             amounts: Amounts::new_bitcoin(contract.amount),
-            auth: ClientInputAuth::Keys(keypair),
+            auth: ClientInputAuth::Key(keypair),
         };
 
         global_context

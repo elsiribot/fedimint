@@ -487,7 +487,7 @@ async fn claim_peg_in(
 
         let client_input = ClientInput::<WalletInput> {
             input: wallet_input,
-            auth: ClientInputAuth::Keys(tweak_key),
+            auth: ClientInputAuth::Key(tweak_key),
             amounts: Amounts::new_bitcoin(amount),
         };
 

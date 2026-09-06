@@ -266,7 +266,7 @@ impl SendStateMachine {
                         OutgoingWitness::Claim(payment_response.preimage),
                     )),
                     amounts: Amounts::new_bitcoin(old_state.common.contract.amount),
-                    auth: ClientInputAuth::Keys(old_state.common.claim_keypair),
+                    auth: ClientInputAuth::Key(old_state.common.claim_keypair),
                 };
 
                 let outpoints = global_context

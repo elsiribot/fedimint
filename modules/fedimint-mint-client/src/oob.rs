@@ -384,7 +384,7 @@ async fn try_cancel_oob_spend_multi(
         .into_iter()
         .map(|(amount, spendable_note)| ClientInput {
             input: MintInput::new_v0(amount, spendable_note.note()),
-            auth: ClientInputAuth::Keys(spendable_note.spend_key),
+            auth: ClientInputAuth::Key(spendable_note.spend_key),
             amounts: Amounts::new_bitcoin(amount),
         })
         .collect();

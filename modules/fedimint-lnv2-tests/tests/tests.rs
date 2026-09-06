@@ -332,7 +332,7 @@ async fn claiming_outgoing_contract_triggers_success() -> anyhow::Result<()> {
             OutgoingWitness::Claim(MOCK_INVOICE_PREIMAGE),
         )),
         amounts: Amounts::new_bitcoin(contract.amount),
-        auth: ClientInputAuth::Keys(mock::gateway_keypair()),
+        auth: ClientInputAuth::Key(mock::gateway_keypair()),
     };
 
     let lnv2_module_id = client

@@ -332,7 +332,7 @@ impl DecryptingPreimageState {
         let client_input = ClientInput::<LightningInput> {
             input: claim_input,
             amounts: Amounts::new_bitcoin(contract.amount),
-            auth: ClientInputAuth::Keys(context.redeem_key),
+            auth: ClientInputAuth::Key(context.redeem_key),
         };
 
         let change_range = global_context

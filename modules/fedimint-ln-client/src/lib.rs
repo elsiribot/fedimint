@@ -1738,7 +1738,7 @@ impl LightningClientModule {
         let client_input = ClientInput::<LightningInput> {
             input,
             amounts: Amounts::new_bitcoin(incoming_contract_account.amount),
-            auth: ClientInputAuth::Keys(key_pair),
+            auth: ClientInputAuth::Key(key_pair),
         };
 
         let tx = TransactionBuilder::new().with_inputs(

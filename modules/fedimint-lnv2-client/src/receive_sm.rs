@@ -125,7 +125,7 @@ impl ReceiveStateMachine {
                 old_state.common.agg_decryption_key,
             )),
             amounts: Amounts::new_bitcoin(old_state.common.contract.commitment.amount),
-            auth: ClientInputAuth::Keys(old_state.common.claim_keypair),
+            auth: ClientInputAuth::Key(old_state.common.claim_keypair),
         };
 
         let change_range = global_context

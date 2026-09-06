@@ -256,7 +256,7 @@ impl ReceiveStateMachine {
                 agg_decryption_key,
             )),
             amounts: Amounts::new_bitcoin(old_state.common.contract.commitment.amount),
-            auth: ClientInputAuth::Keys(old_state.common.refund_keypair),
+            auth: ClientInputAuth::Key(old_state.common.refund_keypair),
         };
 
         let outpoints = global_context

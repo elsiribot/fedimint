@@ -141,7 +141,7 @@ fn refund_client_inputs(
         .iter()
         .map(|spendable_note| ClientInput::<MintInput> {
             input: MintInput::new_v0(spendable_note.note()),
-            auth: ClientInputAuth::Keys(spendable_note.keypair),
+            auth: ClientInputAuth::Key(spendable_note.keypair),
             amounts: Amounts::new_custom(amount_unit, spendable_note.amount()),
         })
         .collect()
