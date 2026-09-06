@@ -52,10 +52,27 @@ use crate::task::MaybeSend;
 use crate::util::FmtCompact;
 use crate::{Amount, apply, async_trait_maybe_send, maybe_add_send, maybe_add_send_sync};
 
+/// How an input proves it is allowed to be spent.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum InputAuth {
+    /// Core verifies a schnorr signature over the txid against this key,
+    /// taking the signature from this input's witness.
+    ///
+    /// This is what every module did implicitly before witnesses existed.
+    Key(secp256k1::PublicKey),
+    /// The module already verified authorization in `verify_input`.
+    ///
+    /// A module returning this **must** have bound its check to
+    /// `InputAuthCtx::txid_message()`. Verifying against anything else lets
+    /// an attacker detach this input and reattach it to a transaction with
+    /// different outputs.
+    SelfVerified,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct InputMeta {
     pub amount: TransactionItemAmounts,
-    pub pub_key: secp256k1::PublicKey,
+    pub auth: InputAuth,
 }
 
 /// Unit of account for a given amount.

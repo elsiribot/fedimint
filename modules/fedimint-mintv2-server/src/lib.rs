@@ -25,7 +25,7 @@ use fedimint_core::envs::{
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
     AmountUnit, Amounts, ApiEndpoint, ApiError, ApiVersion, CORE_CONSENSUS_VERSION,
-    CoreConsensusVersion, InputMeta, ModuleConsensusVersion, ModuleInit,
+    CoreConsensusVersion, InputAuth, InputMeta, ModuleConsensusVersion, ModuleInit,
     SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
 };
 use fedimint_core::{
@@ -484,7 +484,7 @@ impl ServerModule for Mint {
                 amounts: Amounts::new_custom(unit, amount),
                 fees: Amounts::new_custom(unit, self.cfg.consensus.fee_consensus.fee(amount)),
             },
-            pub_key: input.note.nonce,
+            auth: InputAuth::Key(input.note.nonce),
         })
     }
 

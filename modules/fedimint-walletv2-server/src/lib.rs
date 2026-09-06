@@ -46,7 +46,7 @@ use fedimint_core::envs::{
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
     AmountUnit, Amounts, ApiEndpoint, ApiVersion, Asset, CORE_CONSENSUS_VERSION,
-    CoreConsensusVersion, InputMeta, ModuleConsensusVersion, ModuleInit,
+    CoreConsensusVersion, InputAuth, InputMeta, ModuleConsensusVersion, ModuleInit,
     SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
 };
 #[cfg(not(target_family = "wasm"))]
@@ -657,7 +657,7 @@ impl ServerModule for Wallet {
                 amounts: Amounts::new_bitcoin(amount),
                 fees: Amounts::new_bitcoin(self.cfg.consensus.fee_consensus.fee(amount)),
             },
-            pub_key: input.tweak,
+            auth: InputAuth::Key(input.tweak),
         })
     }
 

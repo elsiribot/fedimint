@@ -14,7 +14,7 @@ use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    Amounts, ApiEndpoint, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
+    Amounts, ApiEndpoint, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputAuth, InputMeta,
     ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
 };
 use fedimint_core::{Amount, InPoint, OutPoint, PeerId, push_db_pair_items};
@@ -226,7 +226,7 @@ impl ServerModule for Dummy {
                 amounts: Amounts::new_custom(input.unit, input.amount),
                 fees: Amounts::ZERO,
             },
-            pub_key: input.pub_key,
+            auth: InputAuth::Key(input.pub_key),
         })
     }
 

@@ -22,7 +22,7 @@ use fedimint_core::envs::{FM_ENABLE_MODULE_LNV1_ENV, is_env_var_set_opt};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
     Amounts, ApiEndpoint, ApiEndpointContext, ApiVersion, CORE_CONSENSUS_VERSION,
-    CoreConsensusVersion, InputMeta, ModuleConsensusVersion, ModuleInit,
+    CoreConsensusVersion, InputAuth, InputMeta, ModuleConsensusVersion, ModuleInit,
     SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
 };
 use fedimint_core::secp256k1::{Message, PublicKey, SECP256K1};
@@ -614,7 +614,7 @@ impl ServerModule for Lightning {
                 amounts: Amounts::new_bitcoin(input.amount),
                 fees: Amounts::new_bitcoin(self.cfg.consensus.fee_consensus.contract_input),
             },
-            pub_key,
+            auth: InputAuth::Key(pub_key),
         })
     }
 
@@ -1268,7 +1268,7 @@ mod tests {
     use fedimint_core::encoding::Encodable;
     use fedimint_core::envs::BitcoinRpcConfig;
     use fedimint_core::module::registry::ModuleRegistry;
-    use fedimint_core::module::{Amounts, InputMeta, TransactionItemAmounts};
+    use fedimint_core::module::{Amounts, InputAuth, InputMeta, TransactionItemAmounts};
     use fedimint_core::secp256k1::{PublicKey, generate_keypair};
     use fedimint_core::task::TaskGroup;
     use fedimint_core::util::SafeUrl;
@@ -1506,9 +1506,11 @@ mod tests {
                 amounts: Amounts::new_bitcoin(amount),
                 fees: Amounts::ZERO,
             },
-            pub_key: preimage
-                .to_public_key()
-                .expect("should create Schnorr pubkey from preimage"),
+            auth: InputAuth::Key(
+                preimage
+                    .to_public_key()
+                    .expect("should create Schnorr pubkey from preimage"),
+            ),
         };
 
         assert_eq!(processed_input_meta, expected_input_meta);
@@ -1577,7 +1579,7 @@ mod tests {
                 amounts: Amounts::new_bitcoin(amount),
                 fees: Amounts::ZERO,
             },
-            pub_key: gateway_key,
+            auth: InputAuth::Key(gateway_key),
         };
 
         assert_eq!(processed_input_meta, expected_input_meta);

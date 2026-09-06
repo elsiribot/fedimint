@@ -308,4 +308,18 @@ mod tests {
             Err(TransactionError::InvalidWitnessLength)
         ));
     }
+
+    #[test]
+    fn input_auth_key_carries_its_key() {
+        use fedimint_core::module::InputAuth;
+
+        let secp = Secp256k1::new();
+        let kp = Keypair::new(&secp, &mut OsRng);
+
+        let auth = InputAuth::Key(kp.public_key());
+        match auth {
+            InputAuth::Key(pk) => assert_eq!(pk, kp.public_key()),
+            InputAuth::SelfVerified => panic!("expected Key"),
+        }
+    }
 }

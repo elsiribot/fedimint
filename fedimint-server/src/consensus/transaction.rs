@@ -1,5 +1,5 @@
 use fedimint_core::db::DatabaseTransaction;
-use fedimint_core::module::{Amounts, CoreConsensusVersion, TransactionItemAmounts};
+use fedimint_core::module::{Amounts, CoreConsensusVersion, InputAuth, TransactionItemAmounts};
 use fedimint_core::transaction::{TRANSACTION_OVERFLOW_ERROR, Transaction, TransactionError};
 use fedimint_core::{InPoint, OutPoint};
 use fedimint_server_core::ServerModuleRegistry;
@@ -76,7 +76,11 @@ pub async fn process_transaction_with_dbtx(
             .map_err(TransactionError::Input)?;
 
         funding_verifier.add_input(meta.amount)?;
-        public_keys.push(meta.pub_key);
+        match meta.auth {
+            InputAuth::Key(pub_key) => public_keys.push(pub_key),
+            // No module returns this yet; Task 4 wires it up.
+            InputAuth::SelfVerified => {}
+        }
     }
 
     transaction.validate_signatures(&public_keys)?;

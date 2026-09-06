@@ -61,7 +61,7 @@ use fedimint_core::envs::{
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
     Amounts, ApiEndpoint, ApiError, ApiRequestErased, ApiVersion, CORE_CONSENSUS_VERSION,
-    CoreConsensusVersion, InputMeta, ModuleConsensusVersion, ModuleInit,
+    CoreConsensusVersion, InputAuth, InputMeta, ModuleConsensusVersion, ModuleInit,
     SupportedModuleApiVersions, TransactionItemAmounts, api_endpoint,
 };
 use fedimint_core::net::auth::check_auth;
@@ -833,7 +833,7 @@ impl ServerModule for Wallet {
                 amounts: Amounts::new_bitcoin(amount),
                 fees: Amounts::new_bitcoin(fee),
             },
-            pub_key,
+            auth: InputAuth::Key(pub_key),
         })
     }
 
