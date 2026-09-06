@@ -90,53 +90,9 @@ impl Transaction {
         TransactionId::from_engine(engine)
     }
 
-    /// Validate the schnorr signatures signed over the `tx_hash`
-    pub fn validate_signatures(
-        &self,
-        pub_keys: &[secp256k1::PublicKey],
-    ) -> Result<(), TransactionError> {
-        let signatures = match &self.signatures {
-            TransactionSignature::NaiveMultisig(sigs) => sigs,
-            // Not produced anywhere yet (see `Self::input_witnesses`); later tasks
-            // teach the caller of `validate_signatures` to go through
-            // `input_witnesses`/`verify_key_witness` instead, which understand it.
-            TransactionSignature::Witnessed(_) => {
-                return Err(TransactionError::UnsupportedSignatureScheme { variant: 1 });
-            }
-            TransactionSignature::Default { variant, .. } => {
-                return Err(TransactionError::UnsupportedSignatureScheme { variant: *variant });
-            }
-        };
-
-        if pub_keys.len() != signatures.len() {
-            return Err(TransactionError::InvalidWitnessLength);
-        }
-
-        let txid = self.tx_hash();
-        let msg = secp256k1::Message::from_digest_slice(&txid[..]).expect("txid has right length");
-
-        for (pk, signature) in pub_keys.iter().zip(signatures) {
-            if secp256k1::global::SECP256K1
-                .verify_schnorr(signature, &msg, &pk.x_only_public_key().0)
-                .is_err()
-            {
-                return Err(TransactionError::InvalidSignature {
-                    tx: self.consensus_encode_to_hex(),
-                    hash: self.tx_hash().consensus_encode_to_hex(),
-                    sig: signature.consensus_encode_to_hex(),
-                    key: pk.consensus_encode_to_hex(),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
     /// One witness per input, whichever encoding this transaction uses.
     ///
-    /// Errors if the count does not match the input count, which is the check
-    /// [`Self::validate_signatures`] used to perform against the collected
-    /// public keys.
+    /// Errors if the count does not match the input count.
     pub fn input_witnesses(&self) -> Result<Vec<&[u8]>, TransactionError> {
         match &self.signatures {
             TransactionSignature::NaiveMultisig(sigs) => {

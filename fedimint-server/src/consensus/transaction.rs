@@ -1,9 +1,10 @@
 use fedimint_core::db::DatabaseTransaction;
+use fedimint_core::encoding::Encodable;
 use fedimint_core::module::{
     Amounts, CoreConsensusVersion, InputAuth, InputAuthCtx, TransactionItemAmounts,
 };
 use fedimint_core::transaction::{TRANSACTION_OVERFLOW_ERROR, Transaction, TransactionError};
-use fedimint_core::{InPoint, OutPoint};
+use fedimint_core::{InPoint, OutPoint, secp256k1};
 use fedimint_server_core::ServerModuleRegistry;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -32,6 +33,7 @@ pub async fn process_transaction_with_dbtx(
 
     let txid = transaction.tx_hash();
     let witnesses = transaction.input_witnesses()?;
+    let msg = secp256k1::Message::from_digest(*txid.as_ref());
 
     // We can not return the error here as errors are not returned in a specified
     // order and the client still expects consensus on the error. Since the
@@ -50,7 +52,6 @@ pub async fn process_transaction_with_dbtx(
         .map_err(|_| TransactionError::InvalidWitnessLength)?;
 
     let mut funding_verifier = FundingVerifier::default();
-    let mut public_keys = Vec::new();
 
     for (input, in_idx) in transaction.inputs.iter().zip(0u64..) {
         // somewhat unfortunately, we need to do the extra checks berofe `process_x`
@@ -81,13 +82,24 @@ pub async fn process_transaction_with_dbtx(
 
         funding_verifier.add_input(meta.amount)?;
         match meta.auth {
-            InputAuth::Key(pub_key) => public_keys.push(pub_key),
-            // No module returns this yet; Task 4 wires it up.
+            InputAuth::Key(pub_key) => {
+                Transaction::verify_key_witness(witnesses[in_idx as usize], &msg, &pub_key)
+                    .map_err(|err| match err {
+                        TransactionError::InvalidSignature { hash, sig, key, .. } => {
+                            TransactionError::InvalidSignature {
+                                tx: transaction.consensus_encode_to_hex(),
+                                hash,
+                                sig,
+                                key,
+                            }
+                        }
+                        other => other,
+                    })?;
+            }
+            // Already verified in the rayon pass above, bound to `txid`.
             InputAuth::SelfVerified => {}
         }
     }
-
-    transaction.validate_signatures(&public_keys)?;
 
     for (output, out_idx) in transaction.outputs.iter().zip(0u64..) {
         // somewhat unfortunately, we need to do the extra checks berofe `process_x`
