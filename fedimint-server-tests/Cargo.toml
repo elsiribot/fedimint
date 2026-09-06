@@ -15,6 +15,10 @@ version = { workspace = true }
 name = "fedimint_server_migration"
 path = "tests/migration.rs"
 
+[[test]]
+name = "fedimint_server_transaction_auth"
+path = "tests/transaction_auth.rs"
+
 [dev-dependencies]
 bitcoin = { workspace = true }
 fedimint-api-client = { workspace = true }
