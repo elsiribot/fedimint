@@ -78,7 +78,12 @@ fn try_parse_wallet_event(entry: &EventLogEntry) -> Option<WalletEvent> {
 }
 
 fn fixtures() -> Fixtures {
-    Fixtures::new_primary(DummyClientInit, DummyInit).with_module(WalletClientInit, WalletInit)
+    Fixtures::new_primary(DummyClientInit, DummyInit).with_module(
+        WalletClientInit {
+            shared_api: Some(Arc::default()),
+        },
+        WalletInit,
+    )
 }
 
 // We need the consensus block count to reach a non-zero value before we send in
@@ -708,7 +713,7 @@ mod db {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_client_db_migrations() -> anyhow::Result<()> {
         let _ = TracingSetup::default().init();
-        let module = DynClientModuleInit::from(WalletClientInit);
+        let module = DynClientModuleInit::from(WalletClientInit::default());
 
         validate_migrations_client::<_, _, WalletClientModule>(
             module,

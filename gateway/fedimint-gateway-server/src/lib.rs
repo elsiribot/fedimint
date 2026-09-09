@@ -653,7 +653,7 @@ impl Gateway {
         registry.attach(MintClientInit);
         registry.attach(MintV2ClientInit);
         registry.attach(WalletClientInit::new(dyn_bitcoin_rpc));
-        registry.attach(fedimint_walletv2_client::WalletClientInit);
+        registry.attach(fedimint_walletv2_client::WalletClientInit::default());
 
         let client_builder =
             GatewayClientBuilder::new(opts.data_dir.clone(), registry, opts.db_backend).await?;

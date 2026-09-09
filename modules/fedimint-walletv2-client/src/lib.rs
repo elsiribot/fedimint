@@ -13,6 +13,7 @@ pub mod db;
 pub mod events;
 mod receive_sm;
 mod send_sm;
+mod shared_api;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -59,6 +60,7 @@ use receive_sm::{ReceiveSMCommon, ReceiveSMState, ReceiveStateMachine};
 use secp256k1::Keypair;
 use send_sm::{SendSMCommon, SendSMState, SendStateMachine};
 use serde::{Deserialize, Serialize};
+pub use shared_api::WalletV2SharedApi;
 use strum::IntoEnumIterator as _;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -122,6 +124,7 @@ pub struct WalletClientModule {
     client_ctx: ClientContext<Self>,
     db: Database,
     module_api: DynModuleApi,
+    shared_api: Arc<WalletV2SharedApi>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,7 +180,11 @@ impl ClientModule for WalletClientModule {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct WalletClientInit;
+pub struct WalletClientInit {
+    /// Reuse this handle across accounts of the same federation/module
+    /// instance.
+    pub shared_api: Option<Arc<WalletV2SharedApi>>,
+}
 
 impl ModuleInit for WalletClientInit {
     type Common = WalletCommonInit;
@@ -201,6 +208,14 @@ impl ClientModuleInit for WalletClientInit {
     }
 
     async fn init(&self, args: &ClientModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
+        let shared_api = self.shared_api.clone().unwrap_or_default();
+        shared_api.scope.bind(
+            *args.federation_id(),
+            args.context().module_instance_id(),
+            *args.module_api_version(),
+            args.cfg(),
+            args.module_api().all_peers(),
+        )?;
         let module = WalletClientModule {
             root_secret: args.module_root_secret().clone(),
             cfg: args.cfg().clone(),
@@ -208,6 +223,7 @@ impl ClientModuleInit for WalletClientInit {
             client_ctx: args.context(),
             db: args.db().clone(),
             module_api: args.module_api().clone(),
+            shared_api,
         };
 
         module.spawn_output_scanner(args.task_group(), args.client_span());
@@ -857,14 +873,18 @@ impl WalletClientModule {
             .collect();
 
         let outputs = self
-            .module_api
-            .output_info_slice(next_output_index, next_output_index + SLICE_SIZE)
+            .shared_api
+            .output_info_slice(
+                &self.module_api,
+                next_output_index,
+                next_output_index + SLICE_SIZE,
+            )
             .await?;
 
         let returned_num = outputs.len();
         let mut matched_num: usize = 0;
 
-        for output in &outputs {
+        for output in outputs.iter() {
             if let Some(&address_index) = address_map.get(&output.script) {
                 matched_num += 1;
 

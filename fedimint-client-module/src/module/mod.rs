@@ -256,6 +256,12 @@ where
         }
     }
 
+    /// The module instance this context belongs to, available during
+    /// initialization.
+    pub fn module_instance_id(&self) -> ModuleInstanceId {
+        self.module_instance_id
+    }
+
     /// Get a reference back to client module from the [`Self`]
     ///
     /// It's often necessary for a client module to "move self"
