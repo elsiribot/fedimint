@@ -195,6 +195,15 @@ pub trait ILnRpcClient: Debug + Send + Sync {
         payment_hash: sha256::Hash,
     ) -> Result<bool, LightningRpcError>;
 
+    /// Returns true if invoices paying this gateway cannot be recognised by
+    /// their payee, because the backend's invoices are issued by a node shared
+    /// with unrelated users. The gateway then detects direct swaps by looking
+    /// up the invoice's payment hash among its registered incoming contracts
+    /// instead of comparing the payee to its node id.
+    fn detects_direct_swaps_by_payment_hash(&self) -> bool {
+        false
+    }
+
     /// Consumes the current client and returns a stream of intercepted HTLCs
     /// and a new client. `complete_htlc` must be called for all successfully
     /// intercepted HTLCs sent to the returned stream.
@@ -631,6 +640,10 @@ impl ILnRpcClient for LnRpcTracked {
             "outbound_payment_exists",
             self.inner.outbound_payment_exists(payment_hash).await
         )
+    }
+
+    fn detects_direct_swaps_by_payment_hash(&self) -> bool {
+        self.inner.detects_direct_swaps_by_payment_hash()
     }
 
     async fn route_htlcs<'a>(

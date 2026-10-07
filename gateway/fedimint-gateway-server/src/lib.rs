@@ -3797,6 +3797,45 @@ impl Gateway {
         Ok((registered_incoming_contract.contract, client))
     }
 
+    /// Detects a direct swap for backends whose invoices cannot be recognised
+    /// by their payee, see
+    /// [`ILnRpcClient::detects_direct_swaps_by_payment_hash`].
+    ///
+    /// An invoice whose payment hash matches a registered incoming contract
+    /// is swapped regardless of its payee. This pays the same party either
+    /// way: only the holder of the preimage can be paid for that hash, and the
+    /// incoming contract still has to match the invoice amount.
+    async fn direct_swap_by_payment_hash(
+        &self,
+        invoice: &Bolt11Invoice,
+    ) -> std::result::Result<Option<(IncomingContract, ClientHandleArc)>, GatewayClientV2Error>
+    {
+        let payment_image = PaymentImage::Hash(*invoice.payment_hash());
+
+        if self
+            .gateway_db
+            .begin_transaction_nc()
+            .await
+            .load_registered_incoming_contract(payment_image.clone())
+            .await
+            .is_none()
+        {
+            return Ok(None);
+        }
+
+        let (contract, client) = self
+            .get_registered_incoming_contract_and_client_v2(
+                payment_image,
+                invoice
+                    .amount_milli_satoshis()
+                    .expect("The amount invoice has been previously checked"),
+            )
+            .await
+            .map_err(GatewayClientV2Error::new)?;
+
+        Ok(Some((contract, client)))
+    }
+
     /// Completes (settles or cancels) an intercepted HTLC, retrying transient
     /// failures until Lightning reports a terminal outcome.
     ///
@@ -3887,6 +3926,13 @@ impl IGatewayClientV2 for Gateway {
         // machine turns the error into a cancellation -- forfeit a contract we
         // may already be committed to. Ask once we can actually answer.
         let lightning_context = self.await_lightning_context().await;
+        if lightning_context
+            .lnrpc
+            .detects_direct_swaps_by_payment_hash()
+        {
+            return self.direct_swap_by_payment_hash(invoice).await;
+        }
+
         if lightning_context.lightning_public_key == invoice.get_payee_pub_key() {
             let (contract, client) = self
                 .get_registered_incoming_contract_and_client_v2(
