@@ -9,8 +9,9 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Network, OutPoint};
 use clap::Subcommand;
 use envs::{
-    FM_LDK_ALIAS_ENV, FM_LND_MACAROON_ENV, FM_LND_PAYMENT_TIMEOUT_SECS_ENV, FM_LND_RPC_ADDR_ENV,
-    FM_LND_TIME_PREF_ENV, FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
+    FM_BARK_TOKEN_FILE_ENV, FM_BARK_URL_ENV, FM_LDK_ALIAS_ENV, FM_LND_MACAROON_ENV,
+    FM_LND_PAYMENT_TIMEOUT_SECS_ENV, FM_LND_RPC_ADDR_ENV, FM_LND_TIME_PREF_ENV,
+    FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
 };
 use fedimint_core::config::{FederationId, JsonClientConfig};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -768,6 +769,17 @@ pub enum LightningMode {
         /// LDK's Alias
         #[arg(long = "ldk-alias", env = FM_LDK_ALIAS_ENV)]
         alias: String,
+    },
+    /// Route LNv2 payments through a bark Ark wallet run by barkd
+    #[clap(name = "bark")]
+    Bark {
+        /// Base URL of barkd's REST API
+        #[arg(long = "bark-url", env = FM_BARK_URL_ENV)]
+        bark_url: SafeUrl,
+
+        /// Path of a file containing barkd's REST API auth token
+        #[arg(long = "bark-token-file", env = FM_BARK_TOKEN_FILE_ENV)]
+        bark_token_file: String,
     },
 }
 

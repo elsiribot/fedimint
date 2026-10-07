@@ -17,6 +17,14 @@ pub const FM_PORT_LDK: &str = "FM_PORT_LDK";
 /// The alias for the LDK Node
 pub const FM_LDK_ALIAS_ENV: &str = "FM_LDK_ALIAS";
 
+/// Environment variable that specifies the base URL of barkd's REST API.
+/// Necessary for bark configuration.
+pub const FM_BARK_URL_ENV: &str = "FM_BARK_URL";
+
+/// Environment variable that specifies the location of a file containing
+/// barkd's REST API auth token. Necessary for bark configuration.
+pub const FM_BARK_TOKEN_FILE_ENV: &str = "FM_BARK_TOKEN_FILE";
+
 /// Environment variable for overriding the iroh secret key
 pub const FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV: &str = "FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE";
 

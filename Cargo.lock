@@ -3917,6 +3917,7 @@ name = "fedimint-lightning"
 version = "0.13.0-alpha"
 dependencies = [
  "async-trait",
+ "axum 0.8.9",
  "bitcoin",
  "fedimint-bip39",
  "fedimint-core",
@@ -3931,7 +3932,9 @@ dependencies = [
  "lightning",
  "lightning-invoice",
  "lockable",
+ "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",

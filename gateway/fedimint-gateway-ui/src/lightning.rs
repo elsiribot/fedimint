@@ -267,6 +267,37 @@ where
                                     }
                                 }
                             }
+                            LightningMode::Bark { bark_url, .. } => {
+                                div id="node-type" class="alert alert-info" {
+                                    "Node Type: " strong { "External bark (Ark)" }
+                                }
+                                table class="table table-sm mb-0" {
+                                    tbody {
+                                        tr {
+                                            th { "barkd URL" }
+                                            td { (bark_url) }
+                                        }
+                                        tr {
+                                            th { "Network" }
+                                            td { (network) }
+                                        }
+                                        tr {
+                                            th { "Block Height" }
+                                            td { (block_height) }
+                                        }
+                                        tr {
+                                            th { "Status" }
+                                            td { (status_badge) }
+                                        }
+                                        @if let Some(pk) = pubkey {
+                                            tr {
+                                                th { "Gateway Node Id" }
+                                                td { (pk) }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         div class="mt-3 pt-3 border-top" {

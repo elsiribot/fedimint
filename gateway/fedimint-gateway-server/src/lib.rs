@@ -102,6 +102,7 @@ use fedimint_gwv2_client::{
     EXPIRATION_DELTA_MINIMUM_V2, FinalReceiveState, GatewayClientModuleV2, GatewayClientV2Error,
     IGatewayClientV2,
 };
+use fedimint_lightning::bark::GatewayBarkClient;
 use fedimint_lightning::lnd::GatewayLndClient;
 use fedimint_lightning::{
     CreateInvoiceRequest, ILnRpcClient, InterceptPaymentRequest, InterceptPaymentResponse,
@@ -180,6 +181,10 @@ const DB_FILE: &str = "gatewayd.db";
 /// Name of the folder that the gateway uses to store its node database when
 /// running in LDK mode.
 const LDK_NODE_DB_FOLDER: &str = "ldk_node";
+
+/// Tweak deriving the bark backend's synthetic node id from the gateway's root
+/// secret. Changing it changes the gateway's advertised `lightning_public_key`.
+const BARK_NODE_ID_TWEAK: &[u8] = b"fedimint-gateway-bark-node-id";
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// ```mermaid
@@ -2269,8 +2274,42 @@ impl Gateway {
                 .await
                 .expect("Could not create LDK Node")
             }
+            LightningMode::Bark {
+                bark_url,
+                bark_token_file,
+            } => {
+                let mnemonic = Self::load_mnemonic(&self.gateway_db)
+                    .await
+                    .expect("mnemonic should be set");
+                let bark_token = retry("read bark token", fibonacci_max_one_hour(), || async {
+                    tokio::fs::read_to_string(&bark_token_file)
+                        .await
+                        .map(|token| token.trim().to_string())
+                        .with_context(|| {
+                            format!("Failed to read bark token file {bark_token_file}")
+                        })
+                })
+                .await
+                .expect("Could not read bark token");
+
+                Box::new(GatewayBarkClient::new(
+                    bark_url,
+                    bark_token,
+                    bark_node_id(&mnemonic),
+                ))
+            }
         }
     }
+}
+
+/// Derives the node id advertised by a gateway whose lightning backend has no
+/// node of its own, see [`fedimint_lightning::bark`]. It only identifies the
+/// gateway to clients and never signs anything.
+fn bark_node_id(mnemonic: &Mnemonic) -> PublicKey {
+    Bip39RootSecretStrategy::<12>::to_root_secret(mnemonic)
+        .tweak(BARK_NODE_ID_TWEAK)
+        .to_secp_key(fedimint_core::secp256k1::SECP256K1)
+        .public_key()
 }
 
 #[async_trait]

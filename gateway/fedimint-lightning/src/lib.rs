@@ -1,3 +1,4 @@
+pub mod bark;
 pub mod ldk;
 pub mod lnd;
 pub mod metrics;
