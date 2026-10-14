@@ -1,5 +1,7 @@
 
 [workspace]
+# Vendored with a patch, see [patch.crates-io] below.
+exclude = ["patches/fedimint-ldk-node"]
 members = [
     "crypto/aead",
     "crypto/derive-secret",
@@ -424,3 +426,7 @@ lto = "thin"
 # Net effect on Linux: ~25 % smaller release binaries (e.g. gatewayd
 # 280 MB -> 216 MB) with no loss of backtrace quality.
 split-debuginfo = "packed"
+
+[patch.crates-io]
+# fedimint-ldk-node 0.6.1 with LDK_PAYMENT_RETRY_TIMEOUT raised from 10 s to 30 s.
+fedimint-ldk-node = { path = "patches/fedimint-ldk-node" }

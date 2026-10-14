@@ -3874,8 +3874,6 @@ dependencies = [
 [[package]]
 name = "fedimint-ldk-node"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24beb529810a0fc733e99319ac986b8d0c5e201473e3379eac3d17acd80c0f89"
 dependencies = [
  "base64 0.22.1",
  "bdk_chain",
