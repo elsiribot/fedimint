@@ -546,7 +546,8 @@ impl LightningClientModule {
             .amount_milli_satoshis()
             .ok_or(SendPaymentError::InvoiceMissingAmount)?;
 
-        if invoice.is_expired() {
+        // `Bolt11Invoice::is_expired` reads `SystemTime`, which panics on wasm
+        if invoice.would_expire(fedimint_core::time::duration_since_epoch()) {
             return Err(SendPaymentError::InvoiceExpired);
         }
 
