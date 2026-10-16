@@ -877,6 +877,72 @@ impl MintClientModule {
             return Ok((operation_id, ecash));
         }
 
+        self.reissue(represent_amount(amount), custom_meta.clone())
+            .await?;
+
+        Box::pin(self.send(amount, custom_meta, include_invite)).await
+    }
+
+    /// Send `ECash` consisting of exactly the given denominations and return
+    /// the send operation ID. Unlike [`Self::send`], which hands out any notes
+    /// summing to the amount, this fixes the note split, e.g. to bound the size
+    /// of the encoded ecash. Denominations missing from the client's database
+    /// are reissued first, with the same cancellation semantics as
+    /// [`Self::send`].
+    pub async fn send_denominations(
+        &self,
+        denominations: Vec<Denomination>,
+        custom_meta: Value,
+        include_invite: bool,
+    ) -> Result<(OperationId, ECash), SendECashError> {
+        if denominations
+            .iter()
+            .any(|d| !client_denominations().any(|supported| supported == *d))
+        {
+            return Err(SendECashError::UnsupportedDenomination);
+        }
+
+        if let Some((operation_id, ecash)) = self
+            .client_ctx
+            .module_db()
+            .autocommit(
+                |dbtx, _| {
+                    Box::pin(self.send_denominations_dbtx(
+                        dbtx,
+                        &denominations,
+                        custom_meta.clone(),
+                        include_invite,
+                    ))
+                },
+                Some(100),
+            )
+            .await
+            .expect("Failed to commit dbtx after 100 retries")
+        {
+            return Ok((operation_id, ecash));
+        }
+
+        let available = self.get_count_by_denomination().await;
+        let missing = count_denominations(&denominations)
+            .into_iter()
+            .flat_map(|(denomination, count)| {
+                let have = available.get(&denomination).copied().unwrap_or(0);
+                std::iter::repeat_n(denomination, count.saturating_sub(have) as usize)
+            })
+            .collect();
+
+        self.reissue(missing, custom_meta.clone()).await?;
+
+        Box::pin(self.send_denominations(denominations, custom_meta, include_invite)).await
+    }
+
+    /// Reissue notes of the given denominations to ourselves, funded and
+    /// balanced by the client's existing notes.
+    async fn reissue(
+        &self,
+        denominations: Vec<Denomination>,
+        custom_meta: Value,
+    ) -> Result<(), SendECashError> {
         self.client_ctx
             .global_api()
             .session_count()
@@ -884,12 +950,10 @@ impl MintClientModule {
             .map_err(|_| SendECashError::Offline)?;
 
         let operation_id = OperationId::new_random();
+        let amount = denominations.iter().map(|d| d.amount()).sum();
 
-        let output = self
-            .create_output_bundle(operation_id, represent_amount(amount))
-            .await;
+        let output = self.create_output_bundle(operation_id, denominations).await;
         let output = self.client_ctx.make_client_outputs(output);
-        let cm = custom_meta.clone();
 
         let range = self
             .client_ctx
@@ -899,7 +963,7 @@ impl MintClientModule {
                 move |change_outpoint_range| MintOperationMeta::Reissue {
                     change_outpoint_range,
                     amount,
-                    custom_meta: cm.clone(),
+                    custom_meta: custom_meta.clone(),
                 },
                 TransactionBuilder::new().with_outputs(output),
             )
@@ -912,7 +976,7 @@ impl MintClientModule {
                 .map_err(|_| SendECashError::Failure)?;
         }
 
-        Box::pin(self.send(amount, custom_meta, include_invite)).await
+        Ok(())
     }
 
     async fn send_ecash_dbtx(
@@ -927,6 +991,51 @@ impl MintClientModule {
             return Ok(None);
         };
 
+        Ok(Some(
+            self.send_notes_dbtx(dbtx, notes, custom_meta, include_invite)
+                .await,
+        ))
+    }
+
+    async fn send_denominations_dbtx(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        denominations: &[Denomination],
+        custom_meta: Value,
+        include_invite: bool,
+    ) -> Result<Option<(OperationId, ECash)>, Infallible> {
+        let mut notes = Vec::with_capacity(denominations.len());
+
+        for (denomination, count) in count_denominations(denominations) {
+            let available = dbtx
+                .find_by_prefix(&SpendableNoteAmountPrefix(denomination))
+                .await
+                .map(|entry| entry.0.0)
+                .take(count as usize)
+                .collect::<Vec<_>>()
+                .await;
+
+            if (available.len() as u64) < count {
+                return Ok(None);
+            }
+
+            notes.extend(available);
+        }
+
+        Ok(Some(
+            self.send_notes_dbtx(dbtx, notes, custom_meta, include_invite)
+                .await,
+        ))
+    }
+
+    /// Removes `notes` from the database and logs sending them as `ECash`.
+    async fn send_notes_dbtx(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        notes: Vec<SpendableNote>,
+        custom_meta: Value,
+        include_invite: bool,
+    ) -> (OperationId, ECash) {
         for spendable_note in &notes {
             self.remove_spendable_note(dbtx, spendable_note).await;
         }
@@ -966,7 +1075,7 @@ impl MintClientModule {
         let sender = self.balance_update_sender.clone();
         dbtx.on_commit(move || sender.send_replace(()));
 
-        Ok(Some((operation_id, ecash)))
+        (operation_id, ecash)
     }
 
     /// Receive the `ECash` by reissuing the notes and return the operation ID.
@@ -1309,6 +1418,8 @@ pub enum SendECashError {
     InsufficientBalance,
     #[error("A non-recoverable error has occurred")]
     Failure,
+    #[error("The requested denomination is not supported")]
+    UnsupportedDenomination,
 }
 
 #[derive(Error, Debug, Clone, Eq, PartialEq)]
@@ -1410,6 +1521,15 @@ fn represent_amount_with_fees(
     denominations.sort();
 
     denominations
+}
+
+fn count_denominations(denominations: &[Denomination]) -> BTreeMap<Denomination, u64> {
+    denominations
+        .iter()
+        .fold(BTreeMap::new(), |mut counts, denomination| {
+            *counts.entry(*denomination).or_insert(0) += 1;
+            counts
+        })
 }
 
 fn represent_amount(mut remaining_amount: Amount) -> Vec<Denomination> {

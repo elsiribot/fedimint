@@ -683,6 +683,61 @@ async fn send_without_funds_reports_insufficient_balance() -> anyhow::Result<()>
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn send_denominations_returns_exactly_the_requested_notes() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+
+    let client_send = fed
+        .join_client_with_db(MemDatabase::new().into(), root_secret(&SEND_SK))
+        .await;
+    let client_receive = fed
+        .join_client_with_db(MemDatabase::new().into(), root_secret(&RECEIVE_SK))
+        .await;
+
+    issue_ecash(&client_send, Amount::from_sats(11_000)).await?;
+
+    let mint = client_send.get_first_module::<MintClientModule>()?;
+
+    // Repeated denominations, and more notes of the largest one than the
+    // initial issuance holds, so the first send has to reissue
+    let requested = vec![Denomination(20), Denomination(20), Denomination(10)];
+
+    for _ in 0..3 {
+        let (_, ecash) = mint
+            .send_denominations(requested.clone(), Value::Null, true)
+            .await?;
+
+        let mut sent: Vec<Denomination> =
+            ecash.notes().iter().map(|note| note.denomination).collect();
+        sent.sort();
+        let mut expected = requested.clone();
+        expected.sort();
+        assert_eq!(sent, expected);
+
+        let operation_id = client_receive
+            .get_first_module::<MintClientModule>()?
+            .receive(ecash, Value::Null)
+            .await?;
+        assert_eq!(
+            client_receive
+                .get_first_module::<MintClientModule>()?
+                .await_final_receive_operation_state(operation_id)
+                .await?,
+            FinalReceiveOperationState::Success
+        );
+    }
+
+    assert_eq!(
+        mint.send_denominations(vec![Denomination(8)], Value::Null, false)
+            .await
+            .map(|(_, ecash)| ecash.amount()),
+        Err(SendECashError::UnsupportedDenomination),
+    );
+
+    Ok(())
+}
+
 mod db {
     use std::collections::{BTreeMap, BTreeSet};
 
