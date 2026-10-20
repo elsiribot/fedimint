@@ -168,6 +168,14 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub sending_parameters: Option<SendingParameters>,
+	/// Peers whose usable channel with the most inbound capacity is added to every BOLT 11
+	/// invoice as a route hint.
+	///
+	/// LDK leaves route hints out entirely once any of our channels is announced, expecting the
+	/// sender to find a path through the public graph. Senders with an incomplete graph then
+	/// cannot reach us. Listing well-connected peers here makes every invoice carry a hint
+	/// through the best online channel to one of them, whether announced or not.
+	pub route_hint_peers: Vec<PublicKey>,
 }
 
 impl Default for Config {
@@ -182,6 +190,7 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			sending_parameters: None,
 			node_alias: None,
+			route_hint_peers: Vec::new(),
 		}
 	}
 }

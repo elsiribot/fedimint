@@ -9,8 +9,9 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Network, OutPoint};
 use clap::Subcommand;
 use envs::{
-    FM_LDK_ALIAS_ENV, FM_LND_MACAROON_ENV, FM_LND_PAYMENT_TIMEOUT_SECS_ENV, FM_LND_RPC_ADDR_ENV,
-    FM_LND_TIME_PREF_ENV, FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
+    FM_LDK_ALIAS_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV, FM_LND_MACAROON_ENV,
+    FM_LND_PAYMENT_TIMEOUT_SECS_ENV, FM_LND_RPC_ADDR_ENV, FM_LND_TIME_PREF_ENV,
+    FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
 };
 use fedimint_core::config::{FederationId, JsonClientConfig};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -768,6 +769,18 @@ pub enum LightningMode {
         /// LDK's Alias
         #[arg(long = "ldk-alias", env = FM_LDK_ALIAS_ENV)]
         alias: String,
+
+        /// Peers whose usable channel with the most inbound capacity is
+        /// added to every invoice as a route hint. LDK omits route hints
+        /// once any channel is announced, which leaves senders with an
+        /// incomplete graph unable to reach us.
+        #[arg(
+            long = "ldk-route-hint-peers",
+            env = FM_LDK_ROUTE_HINT_PEERS_ENV,
+            value_delimiter = ','
+        )]
+        #[serde(default)]
+        route_hint_peers: Vec<PublicKey>,
     },
 }
 

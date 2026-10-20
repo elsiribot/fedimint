@@ -6,6 +6,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bitcoin::hashes::{Hash, sha256};
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::{FeeRate, Network, OutPoint};
 use fedimint_bip39::Mnemonic;
 use fedimint_core::envs::is_running_in_test_env;
@@ -166,12 +167,14 @@ impl GatewayLdkClient {
     /// [`LdkClientInitError::InvalidDataDir`] if the configuration cannot be
     /// used, with [`LdkClientInitError::Build`] if LDK cannot build the node,
     /// and with [`LdkClientInitError::Start`] if it cannot start it.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         data_dir: &Path,
         chain_source: ChainSource,
         network: Network,
         lightning_port: u16,
         alias: String,
+        route_hint_peers: Vec<PublicKey>,
         mnemonic: Mnemonic,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, LdkClientInitError> {
@@ -193,6 +196,7 @@ impl GatewayLdkClient {
                 port: lightning_port,
             }]),
             node_alias,
+            route_hint_peers,
             ..Default::default()
         });
 

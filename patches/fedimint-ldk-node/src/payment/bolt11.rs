@@ -21,18 +21,23 @@ use crate::payment::store::{
 };
 use crate::payment::SendingParameters;
 use crate::peer_store::{PeerInfo, PeerStore};
-use crate::types::{ChannelManager, PaymentStore};
+use crate::types::{ChannelManager, KeysManager, PaymentStore};
 
 use lightning::ln::bolt11_payment;
+use lightning::ln::channel_state::ChannelDetails;
 use lightning::ln::channelmanager::{
 	Bolt11InvoiceParameters, PaymentId, RecipientOnionFields, Retry, RetryableSendFailure,
 };
+use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{PaymentParameters, RouteParameters};
+use lightning::routing::router::{RouteHint, RouteHintHop};
+use lightning::sign::{NodeSigner, Recipient};
 
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
 use lightning_invoice::Bolt11Invoice as LdkBolt11Invoice;
 use lightning_invoice::Bolt11InvoiceDescription as LdkBolt11InvoiceDescription;
+use lightning_invoice::InvoiceBuilder;
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -94,6 +99,7 @@ pub struct Bolt11Payment {
 	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	config: Arc<Config>,
+	keys_manager: Arc<KeysManager>,
 	logger: Arc<Logger>,
 }
 
@@ -104,7 +110,7 @@ impl Bolt11Payment {
 		connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<Arc<Logger>>>,
-		config: Arc<Config>, logger: Arc<Logger>,
+		config: Arc<Config>, keys_manager: Arc<KeysManager>, logger: Arc<Logger>,
 	) -> Self {
 		Self {
 			runtime,
@@ -114,6 +120,7 @@ impl Bolt11Payment {
 			payment_store,
 			peer_store,
 			config,
+			keys_manager,
 			logger,
 		}
 	}
@@ -542,16 +549,16 @@ impl Bolt11Payment {
 				..Default::default()
 			};
 
-			match self.channel_manager.create_bolt11_invoice(invoice_params) {
-				Ok(inv) => {
-					log_info!(self.logger, "Invoice created: {}", inv);
-					inv
-				},
+			let invoice = match self.channel_manager.create_bolt11_invoice(invoice_params) {
+				Ok(inv) => inv,
 				Err(e) => {
 					log_error!(self.logger, "Failed to create invoice: {}", e);
 					return Err(Error::InvoiceCreationFailed);
 				},
-			}
+			};
+			let invoice = self.add_route_hint_peer_hint(invoice, invoice_description)?;
+			log_info!(self.logger, "Invoice created: {}", invoice);
+			invoice
 		};
 
 		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
@@ -584,6 +591,79 @@ impl Bolt11Payment {
 		);
 		self.payment_store.insert(payment)?;
 
+		Ok(invoice)
+	}
+
+	/// Re-issues `invoice` with an extra route hint through the best usable channel to one of the
+	/// [`Config::route_hint_peers`], or returns it unchanged if there is none.
+	///
+	/// The payment hash and secret are kept, so the inbound payment `ChannelManager` registered
+	/// for `invoice` still matches.
+	fn add_route_hint_peer_hint(
+		&self, invoice: LdkBolt11Invoice, invoice_description: &LdkBolt11InvoiceDescription,
+	) -> Result<LdkBolt11Invoice, Error> {
+		if self.config.route_hint_peers.is_empty() {
+			return Ok(invoice);
+		}
+
+		let Some((channel, hint)) = self
+			.channel_manager
+			.list_usable_channels()
+			.into_iter()
+			.filter(|c| self.config.route_hint_peers.contains(&c.counterparty.node_id))
+			.filter_map(|c| route_hint_for_channel(&c).map(|hint| (c, hint)))
+			.max_by_key(|(c, _)| c.inbound_capacity_msat)
+		else {
+			log_info!(self.logger, "No usable channel to a route hint peer, leaving invoice as is");
+			return Ok(invoice);
+		};
+
+		let existing_hints = invoice.route_hints();
+		if existing_hints
+			.iter()
+			.any(|h| h.0.iter().any(|hop| hop.short_channel_id == hint.0[0].short_channel_id))
+		{
+			return Ok(invoice);
+		}
+
+		let mut builder = InvoiceBuilder::new(invoice.currency())
+			.invoice_description(invoice_description.clone())
+			.duration_since_epoch(invoice.duration_since_epoch())
+			.payee_pub_key(self.channel_manager.get_our_node_id())
+			.payment_hash(*invoice.payment_hash())
+			.payment_secret(*invoice.payment_secret())
+			.basic_mpp()
+			.min_final_cltv_expiry_delta(invoice.min_final_cltv_expiry_delta())
+			.expiry_time(invoice.expiry_time());
+		if let Some(amount_msat) = invoice.amount_milli_satoshis() {
+			builder = builder.amount_milli_satoshis(amount_msat);
+		}
+		for existing_hint in existing_hints {
+			builder = builder.private_route(existing_hint);
+		}
+		builder = builder.private_route(hint);
+
+		let raw_invoice = builder.build_raw().map_err(|e| {
+			log_error!(self.logger, "Failed to rebuild invoice with route hint: {}", e);
+			Error::InvoiceCreationFailed
+		})?;
+		let signature = self.keys_manager.sign_invoice(&raw_invoice, Recipient::Node);
+		let signed_invoice = raw_invoice.sign(|_| signature).map_err(|()| {
+			log_error!(self.logger, "Failed to sign invoice with route hint");
+			Error::InvoiceCreationFailed
+		})?;
+		let invoice = LdkBolt11Invoice::from_signed(signed_invoice).map_err(|e| {
+			log_error!(self.logger, "Invoice with route hint is invalid: {}", e);
+			Error::InvoiceCreationFailed
+		})?;
+
+		log_info!(
+			self.logger,
+			"Added route hint via channel {} with {} ({} msat inbound)",
+			channel.channel_id,
+			channel.counterparty.node_id,
+			channel.inbound_capacity_msat
+		);
 		Ok(invoice)
 	}
 
@@ -813,4 +893,28 @@ impl Bolt11Payment {
 
 		Ok(())
 	}
+}
+
+/// Builds a single-hop route hint from the channel's counterparty to us, mirroring LDK's own
+/// invoice route hints. Announced channels use their real SCID, which the counterparty forwards on
+/// regardless of SCID alias support. Returns `None` while the counterparty has not sent us its
+/// forwarding parameters yet.
+fn route_hint_for_channel(channel: &ChannelDetails) -> Option<RouteHint> {
+	let forwarding_info = channel.counterparty.forwarding_info.as_ref()?;
+	let short_channel_id = if channel.is_announced {
+		channel.short_channel_id.or(channel.inbound_scid_alias)?
+	} else {
+		channel.get_inbound_payment_scid()?
+	};
+	Some(RouteHint(vec![RouteHintHop {
+		src_node_id: channel.counterparty.node_id,
+		short_channel_id,
+		fees: RoutingFees {
+			base_msat: forwarding_info.fee_base_msat,
+			proportional_millionths: forwarding_info.fee_proportional_millionths,
+		},
+		cltv_expiry_delta: forwarding_info.cltv_expiry_delta,
+		htlc_minimum_msat: channel.inbound_htlc_minimum_msat,
+		htlc_maximum_msat: channel.inbound_htlc_maximum_msat,
+	}]))
 }

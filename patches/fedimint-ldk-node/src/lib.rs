@@ -842,6 +842,7 @@ impl Node {
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
+			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.logger),
 		)
 	}
@@ -859,6 +860,7 @@ impl Node {
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
+			Arc::clone(&self.keys_manager),
 			Arc::clone(&self.logger),
 		))
 	}

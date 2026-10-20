@@ -17,6 +17,10 @@ pub const FM_PORT_LDK: &str = "FM_PORT_LDK";
 /// The alias for the LDK Node
 pub const FM_LDK_ALIAS_ENV: &str = "FM_LDK_ALIAS";
 
+/// Comma-separated node public keys of peers the LDK Node adds a route hint for
+/// to every invoice, through its usable channel with the most inbound capacity.
+pub const FM_LDK_ROUTE_HINT_PEERS_ENV: &str = "FM_LDK_ROUTE_HINT_PEERS";
+
 /// Environment variable for overriding the iroh secret key
 pub const FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV: &str = "FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE";
 

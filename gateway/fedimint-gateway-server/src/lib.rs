@@ -2256,6 +2256,7 @@ impl Gateway {
             LightningMode::Ldk {
                 lightning_port,
                 alias,
+                route_hint_peers,
             } => {
                 let mnemonic = Self::load_mnemonic(&self.gateway_db)
                     .await
@@ -2270,6 +2271,7 @@ impl Gateway {
                         self.network,
                         lightning_port,
                         alias.clone(),
+                        route_hint_peers.clone(),
                         mnemonic.clone(),
                         runtime.clone(),
                     )
