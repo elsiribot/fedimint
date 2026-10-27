@@ -47,8 +47,10 @@ pub(crate) const BDK_CLIENT_STOP_GAP: usize = 20;
 pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
 
 // The timeout after which we abandon retrying failed payments.
-// Patched from 10 s: give LDK more route attempts into congested recipient LSPs.
-pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+// Patched from 10 s: give LDK more route attempts into congested recipient LSPs,
+// and keep re-routing the missing parts of an MPP payment for as long as
+// recipients typically hold the parts that did arrive (60 s and more).
+pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
 
 // The interval (in block height) after which we retry archiving fully resolved channel monitors.
 pub(crate) const RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL: u32 = 6;
