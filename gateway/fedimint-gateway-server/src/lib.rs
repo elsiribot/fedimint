@@ -14,6 +14,7 @@
 #![allow(clippy::large_futures)]
 #![allow(clippy::struct_field_names)]
 
+mod auth;
 pub mod client;
 pub mod config;
 pub mod envs;
@@ -359,9 +360,9 @@ pub struct Gateway {
     /// The bcrypt password hash used to authenticate the gateway.
     bcrypt_password_hash: String,
 
-    /// The bcrypt password hash used to authenticate the gateway liquidity
-    /// manager.
-    bcrypt_liquidity_manager_password_hash: Option<String>,
+    /// Checks API tokens against the admin and liquidity manager hashes,
+    /// running bcrypt once per token.
+    password_verifier: Arc<auth::PasswordVerifier>,
 
     /// The number of route hints to include in LNv1 invoices.
     num_route_hints: u32,
@@ -767,9 +768,12 @@ impl Gateway {
             metrics_listen: gateway_parameters.metrics_listen,
             task_group,
             bcrypt_password_hash: gateway_parameters.bcrypt_password_hash.to_string(),
-            bcrypt_liquidity_manager_password_hash: gateway_parameters
-                .bcrypt_liquidity_manager_password_hash
-                .map(|h| h.to_string()),
+            password_verifier: Arc::new(auth::PasswordVerifier::new(
+                gateway_parameters.bcrypt_password_hash.to_string(),
+                gateway_parameters
+                    .bcrypt_liquidity_manager_password_hash
+                    .map(|h| h.to_string()),
+            )),
             num_route_hints,
             network,
             chain_source,

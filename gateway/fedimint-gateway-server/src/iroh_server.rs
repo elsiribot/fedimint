@@ -21,6 +21,7 @@ use serde_json::json;
 use tracing::{error, info, warn};
 use url::Url;
 
+use crate::auth::Role;
 use crate::error::{GatewayError, PublicGatewayError};
 use crate::rpc_server::verify_bolt11_preimage_v2_get;
 use crate::{Gateway, GatewayState};
@@ -289,7 +290,8 @@ pub(crate) async fn handle_request(
         return Ok(unknown_route(&request.route));
     }
 
-    if handlers.is_authenticated(&request.route) && iroh_verify_password(&gateway, request).is_err()
+    if handlers.is_authenticated(&request.route)
+        && iroh_verify_password(&gateway, request).await.is_err()
     {
         return Ok((StatusCode::UNAUTHORIZED, Json(json!(()))));
     }
@@ -401,12 +403,12 @@ fn parse_verify_route(
 
 /// Verifies if the supplied password in the Iroh request matches the gateway's
 /// password
-fn iroh_verify_password(
+async fn iroh_verify_password(
     gateway: &Arc<Gateway>,
     request: &IrohGatewayRequest,
 ) -> anyhow::Result<()> {
     if let Some(password) = request.password.as_ref()
-        && bcrypt::verify(password, &gateway.bcrypt_password_hash)?
+        && gateway.password_verifier.verify(password).await == Some(Role::Admin)
     {
         return Ok(());
     }
