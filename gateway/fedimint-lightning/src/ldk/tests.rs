@@ -10,7 +10,7 @@ use tokio::sync::{RwLock, oneshot};
 
 use super::{
     GatewayLdkClient, InboundRegistrationRefusal, LdkClientInitError, PendingPaymentWakeup,
-    check_inbound_registration, get_esplora_url, htlc_completion_error,
+    check_inbound_registration, get_esplora_url, htlc_completion_error, lightning_balance_sats,
 };
 use crate::LightningRpcError;
 
@@ -176,4 +176,44 @@ async fn registration_try_lock_is_refused_while_pay_holds_the_hash_lock() {
 
     drop(pay_guard);
     assert!(pool.try_lock(payment_id).is_some());
+}
+
+/// On 2026-10-30 a cooperative close of a 6M channel paid 5,387,948 sat into
+/// the on-chain wallet, which LDK's Lightning total also kept for ~6 blocks.
+#[test]
+fn lightning_balance_leaves_out_coop_closes_and_adds_unswept_outputs() {
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use ldk_node::lightning::chain::channelmonitor::BalanceSource;
+    use ldk_node::lightning::ln::types::ChannelId;
+    use ldk_node::{BalanceDetails, LightningBalance, PendingSweepBalance};
+
+    let peer = PublicKey::from_secret_key(
+        &Secp256k1::new(),
+        &SecretKey::from_slice(&[1; 32]).expect("valid key"),
+    );
+    let awaiting = |amount_satoshis, source| LightningBalance::ClaimableAwaitingConfirmations {
+        channel_id: ChannelId::from_bytes([2; 32]),
+        counterparty_node_id: peer,
+        amount_satoshis,
+        confirmation_height: 973_865,
+        source,
+    };
+    let balances = BalanceDetails {
+        total_onchain_balance_sats: 11_949_830,
+        spendable_onchain_balance_sats: 6_486_882,
+        total_anchor_channels_reserve_sats: 75_000,
+        // 4,726,078 in the open channels, the rest from the two closes below
+        total_lightning_balance_sats: 4_726_078 + 5_387_948 + 300_000,
+        lightning_balances: vec![
+            awaiting(5_387_948, BalanceSource::CoopClose),
+            awaiting(300_000, BalanceSource::HolderForceClosed),
+        ],
+        pending_balances_from_channel_closures: vec![PendingSweepBalance::PendingBroadcast {
+            channel_id: None,
+            amount_satoshis: 40_000,
+        }],
+    };
+    // The force close's 300k is not in the wallet yet and stays; the coop
+    // close is already on-chain and goes; the unswept 40k is added.
+    assert_eq!(lightning_balance_sats(&balances), 4_726_078 + 300_000 + 40_000);
 }

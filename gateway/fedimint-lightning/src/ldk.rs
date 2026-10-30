@@ -20,9 +20,11 @@ use fedimint_gateway_common::{
 use fedimint_ln_common::contracts::Preimage;
 use fedimint_logging::{LOG_LIGHTNING, LOG_LIGHTNING_LDK};
 use ldk_node::config::ChannelConfig;
+use ldk_node::lightning::chain::channelmonitor::BalanceSource;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::routing::gossip::{NodeAlias, NodeId};
 use ldk_node::logger::{LogLevel, LogRecord, LogWriter};
+use ldk_node::{BalanceDetails, LightningBalance, PendingSweepBalance};
 use ldk_node::payment::{
     PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus, SendingParameters,
 };
@@ -155,6 +157,41 @@ impl std::fmt::Debug for GatewayLdkClient {
     }
 }
 
+
+/// Funds in channels and in channel closes that the on-chain balance does not
+/// already count, so the two balances add up to what the node holds.
+///
+/// LDK's total Lightning balance overlaps the on-chain one: a cooperative
+/// close pays straight into the on-chain wallet, which counts it at once, while
+/// the channel monitor keeps reporting it for ~6 blocks (on 2026-10-30 a 6M
+/// close showed up twice, 5.39M, for an hour). Balances from force closes and
+/// HTLCs reach the wallet only once swept, and an output whose sweep is not
+/// broadcast yet is in neither total, so it is added.
+fn lightning_balance_sats(balances: &BalanceDetails) -> u64 {
+    let in_wallet_already: u64 = balances
+        .lightning_balances
+        .iter()
+        .map(|balance| match balance {
+            LightningBalance::ClaimableAwaitingConfirmations {
+                amount_satoshis,
+                source: BalanceSource::CoopClose,
+                ..
+            } => *amount_satoshis,
+            _ => 0,
+        })
+        .sum();
+    let awaiting_sweep: u64 = balances
+        .pending_balances_from_channel_closures
+        .iter()
+        .map(|balance| match balance {
+            PendingSweepBalance::PendingBroadcast {
+                amount_satoshis, ..
+            } => *amount_satoshis,
+            _ => 0,
+        })
+        .sum();
+    balances.total_lightning_balance_sats.saturating_sub(in_wallet_already) + awaiting_sweep
+}
 impl GatewayLdkClient {
     /// Creates a new `GatewayLdkClient` instance and starts the underlying
     /// lightning node. All resources, including the lightning node, will be
@@ -1173,7 +1210,7 @@ impl ILnRpcClient for GatewayLdkClient {
 
         Ok(GetBalancesResponse {
             onchain_balance_sats: balances.total_onchain_balance_sats,
-            lightning_balance_msats: balances.total_lightning_balance_sats * 1000,
+            lightning_balance_msats: lightning_balance_sats(&balances) * 1000,
             inbound_lightning_liquidity_msats: total_inbound_liquidity_balance_msat,
         })
     }
