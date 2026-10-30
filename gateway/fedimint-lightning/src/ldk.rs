@@ -992,6 +992,7 @@ impl ILnRpcClient for GatewayLdkClient {
             pubkey,
             force,
             sats_per_vbyte: _,
+            funding_outpoint,
         }: CloseChannelsWithPeerRequest,
     ) -> Result<CloseChannelsWithPeerResponse, LightningRpcError> {
         let mut num_channels_closed = 0;
@@ -1002,6 +1003,9 @@ impl ILnRpcClient for GatewayLdkClient {
             .list_channels()
             .iter()
             .filter(|channel| channel.counterparty_node_id == pubkey)
+            .filter(|channel| {
+                funding_outpoint.is_none_or(|outpoint| channel.funding_txo == Some(outpoint))
+            })
         {
             if force {
                 match self.node.force_close_channel(

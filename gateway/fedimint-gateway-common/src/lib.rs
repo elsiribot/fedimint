@@ -583,17 +583,25 @@ pub struct CloseChannelsWithPeerRequest {
     #[serde(default)]
     pub force: bool,
     pub sats_per_vbyte: Option<u64>,
+    /// Close only the channel funded by this outpoint instead of every channel
+    /// with the peer
+    #[serde(default)]
+    pub funding_outpoint: Option<OutPoint>,
 }
 
 impl fmt::Display for CloseChannelsWithPeerRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CloseChannelsWithPeerRequest {{ pubkey: {}, force: {}, sats_per_vbyte: {} }}",
+            "CloseChannelsWithPeerRequest {{ pubkey: {}, force: {}, sats_per_vbyte: {}, funding_outpoint: {} }}",
             self.pubkey,
             self.force,
             match self.sats_per_vbyte {
                 Some(sats) => sats.to_string(),
+                None => "None".to_string(),
+            },
+            match self.funding_outpoint {
+                Some(outpoint) => outpoint.to_string(),
                 None => "None".to_string(),
             }
         )

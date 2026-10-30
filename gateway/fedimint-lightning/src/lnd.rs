@@ -1727,6 +1727,7 @@ impl ILnRpcClient for GatewayLndClient {
             pubkey,
             force,
             sats_per_vbyte,
+            funding_outpoint,
         }: CloseChannelsWithPeerRequest,
     ) -> Result<CloseChannelsWithPeerResponse, LightningRpcError> {
         let mut client = self.connect().await?;
@@ -1747,6 +1748,13 @@ impl ILnRpcClient for GatewayLndClient {
             })?
             .into_inner()
             .channels;
+        // LND formats channel points as `<txid>:<vout>`, like `OutPoint`'s Display
+        let channels_with_peer: Vec<_> = channels_with_peer
+            .into_iter()
+            .filter(|channel| {
+                funding_outpoint.is_none_or(|outpoint| channel.channel_point == outpoint.to_string())
+            })
+            .collect();
 
         for channel in &channels_with_peer {
             let channel_point =

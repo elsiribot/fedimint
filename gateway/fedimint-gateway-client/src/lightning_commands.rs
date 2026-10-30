@@ -87,6 +87,11 @@ pub enum LightningCommands {
         /// set)
         #[clap(long, required_unless_present = "force")]
         sats_per_vbyte: Option<u64>,
+
+        /// Close only the channel with this funding outpoint, in
+        /// `<txid>:<vout>` form
+        #[clap(long)]
+        funding_outpoint: Option<bitcoin::OutPoint>,
     },
     /// List channels.
     ListChannels,
@@ -216,6 +221,7 @@ impl LightningCommands {
                 pubkey,
                 force,
                 sats_per_vbyte,
+                funding_outpoint,
             } => {
                 let response = close_channels_with_peer(
                     client,
@@ -224,6 +230,7 @@ impl LightningCommands {
                         pubkey,
                         force,
                         sats_per_vbyte,
+                        funding_outpoint,
                     },
                 )
                 .await?;
