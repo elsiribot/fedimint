@@ -320,6 +320,12 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.manually_accept_inbound_channels = true;
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
+	// LDK's default lets a peer have only 10% of the channel in flight towards us, which caps
+	// a single received payment at a tenth of the channel (a 720k receive over a 6.27M channel
+	// failed). Allow the whole channel, as ldk-node already does for unannounced channels. This
+	// is negotiated at channel open, so it only applies to channels opened after this change.
+	user_config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel =
+		100;
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;
