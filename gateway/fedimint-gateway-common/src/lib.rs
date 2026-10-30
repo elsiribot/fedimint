@@ -770,8 +770,8 @@ pub enum LightningMode {
         #[arg(long = "ldk-alias", env = FM_LDK_ALIAS_ENV)]
         alias: String,
 
-        /// Peers whose usable channel with the most inbound capacity is
-        /// added to every invoice as a route hint. LDK omits route hints
+        /// Peers whose two usable channels with the most inbound capacity
+        /// are added to every invoice as route hints. LDK omits route hints
         /// once any channel is announced, which leaves senders with an
         /// incomplete graph unable to reach us.
         #[arg(

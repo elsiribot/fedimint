@@ -44,6 +44,9 @@ use bitcoin::hashes::Hash;
 
 use std::sync::{Arc, RwLock};
 
+/// How many channels to route hint peers an invoice gets a hint for, best inbound first.
+const ROUTE_HINT_PEER_HINTS: usize = 2;
+
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
 #[cfg(feature = "uniffi")]
@@ -594,8 +597,12 @@ impl Bolt11Payment {
 		Ok(invoice)
 	}
 
-	/// Re-issues `invoice` with an extra route hint through the best usable channel to one of the
-	/// [`Config::route_hint_peers`], or returns it unchanged if there is none.
+	/// Re-issues `invoice` with extra route hints through the [`ROUTE_HINT_PEER_HINTS`] usable
+	/// channels to [`Config::route_hint_peers`] with the most inbound capacity, or returns it
+	/// unchanged if there is none.
+	///
+	/// More than one hint lets a payer split a payment across channels, so a receive can be larger
+	/// than any single channel's inbound capacity.
 	///
 	/// The payment hash and secret are kept, so the inbound payment `ChannelManager` registered
 	/// for `invoice` still matches.
@@ -606,23 +613,23 @@ impl Bolt11Payment {
 			return Ok(invoice);
 		}
 
-		let Some((channel, hint)) = self
+		let existing_hints = invoice.route_hints();
+		let mut candidates: Vec<(ChannelDetails, RouteHint)> = self
 			.channel_manager
 			.list_usable_channels()
 			.into_iter()
 			.filter(|c| self.config.route_hint_peers.contains(&c.counterparty.node_id))
 			.filter_map(|c| route_hint_for_channel(&c).map(|hint| (c, hint)))
-			.max_by_key(|(c, _)| c.inbound_capacity_msat)
-		else {
+			.filter(|(_, hint)| {
+				!existing_hints.iter().any(|h| {
+					h.0.iter().any(|hop| hop.short_channel_id == hint.0[0].short_channel_id)
+				})
+			})
+			.collect();
+		candidates.sort_by_key(|(c, _)| std::cmp::Reverse(c.inbound_capacity_msat));
+		candidates.truncate(ROUTE_HINT_PEER_HINTS);
+		if candidates.is_empty() {
 			log_info!(self.logger, "No usable channel to a route hint peer, leaving invoice as is");
-			return Ok(invoice);
-		};
-
-		let existing_hints = invoice.route_hints();
-		if existing_hints
-			.iter()
-			.any(|h| h.0.iter().any(|hop| hop.short_channel_id == hint.0[0].short_channel_id))
-		{
 			return Ok(invoice);
 		}
 
@@ -641,7 +648,9 @@ impl Bolt11Payment {
 		for existing_hint in existing_hints {
 			builder = builder.private_route(existing_hint);
 		}
-		builder = builder.private_route(hint);
+		for (_, hint) in &candidates {
+			builder = builder.private_route(hint.clone());
+		}
 
 		let raw_invoice = builder.build_raw().map_err(|e| {
 			log_error!(self.logger, "Failed to rebuild invoice with route hint: {}", e);
@@ -657,13 +666,15 @@ impl Bolt11Payment {
 			Error::InvoiceCreationFailed
 		})?;
 
-		log_info!(
-			self.logger,
-			"Added route hint via channel {} with {} ({} msat inbound)",
-			channel.channel_id,
-			channel.counterparty.node_id,
-			channel.inbound_capacity_msat
-		);
+		for (channel, _) in &candidates {
+			log_info!(
+				self.logger,
+				"Added route hint via channel {} with {} ({} msat inbound)",
+				channel.channel_id,
+				channel.counterparty.node_id,
+				channel.inbound_capacity_msat
+			);
+		}
 		Ok(invoice)
 	}
 
