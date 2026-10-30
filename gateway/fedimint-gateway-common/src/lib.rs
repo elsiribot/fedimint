@@ -9,7 +9,7 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Network, OutPoint};
 use clap::Subcommand;
 use envs::{
-    FM_LDK_ALIAS_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV, FM_LND_MACAROON_ENV,
+    FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV, FM_LND_MACAROON_ENV,
     FM_LND_PAYMENT_TIMEOUT_SECS_ENV, FM_LND_RPC_ADDR_ENV, FM_LND_TIME_PREF_ENV,
     FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
 };
@@ -789,6 +789,17 @@ pub enum LightningMode {
         )]
         #[serde(default)]
         route_hint_peers: Vec<PublicKey>,
+
+        /// Addresses to announce to the network, e.g. `203.0.113.1:9735`.
+        /// Without them LDK announces its listening address, `0.0.0.0`,
+        /// which no peer can connect to.
+        #[arg(
+            long = "ldk-announce-addresses",
+            env = FM_LDK_ANNOUNCE_ADDRESSES_ENV,
+            value_delimiter = ','
+        )]
+        #[serde(default)]
+        announce_addresses: Vec<String>,
     },
 }
 

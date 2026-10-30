@@ -175,6 +175,7 @@ impl GatewayLdkClient {
         lightning_port: u16,
         alias: String,
         route_hint_peers: Vec<PublicKey>,
+        announce_addresses: Vec<String>,
         mnemonic: Mnemonic,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, LdkClientInitError> {
@@ -188,6 +189,13 @@ impl GatewayLdkClient {
         let truncated = &alias_bytes[..alias_bytes.len().min(32)];
         bytes[..truncated.len()].copy_from_slice(truncated);
         let node_alias = Some(NodeAlias(bytes));
+        let announcement_addresses = announce_addresses
+            .iter()
+            .map(|address| {
+                SocketAddress::from_str(address)
+                    .map_err(|_| LdkClientInitError::InvalidAnnounceAddress(address.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut node_builder = ldk_node::Builder::from_config(ldk_node::config::Config {
             network,
@@ -195,6 +203,8 @@ impl GatewayLdkClient {
                 addr: [0, 0, 0, 0],
                 port: lightning_port,
             }]),
+            announcement_addresses: (!announcement_addresses.is_empty())
+                .then_some(announcement_addresses),
             node_alias,
             route_hint_peers,
             ..Default::default()
@@ -466,6 +476,10 @@ pub enum LdkClientInitError {
     /// storage path.
     #[error("Invalid data dir path")]
     InvalidDataDir,
+
+    /// An address to announce is not a valid `<host>:<port>`.
+    #[error("Invalid announce address: {0}")]
+    InvalidAnnounceAddress(String),
 
     /// LDK could not build the node, for example because its storage could
     /// not be read or was created for another network.

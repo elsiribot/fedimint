@@ -22,6 +22,11 @@ pub const FM_LDK_ALIAS_ENV: &str = "FM_LDK_ALIAS";
 /// inbound capacity.
 pub const FM_LDK_ROUTE_HINT_PEERS_ENV: &str = "FM_LDK_ROUTE_HINT_PEERS";
 
+/// Comma-separated addresses (`<ip>:<port>` or `<host>:<port>`) the LDK Node
+/// announces to the network, so peers can reach it. Without them it announces
+/// its listening address, `0.0.0.0`.
+pub const FM_LDK_ANNOUNCE_ADDRESSES_ENV: &str = "FM_LDK_ANNOUNCE_ADDRESSES";
+
 /// Environment variable for overriding the iroh secret key
 pub const FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV: &str = "FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE";
 

@@ -90,6 +90,7 @@ fn a_non_utf8_data_dir_is_rejected_before_the_node_is_built() {
         0,
         String::new(),
         Vec::new(),
+        Vec::new(),
         Mnemonic::from_entropy(&[0; 16]).expect("16 bytes of entropy form a mnemonic"),
         runtime,
     );
