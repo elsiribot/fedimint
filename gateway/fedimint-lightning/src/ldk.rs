@@ -24,10 +24,10 @@ use ldk_node::lightning::chain::channelmonitor::BalanceSource;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::routing::gossip::{NodeAlias, NodeId};
 use ldk_node::logger::{LogLevel, LogRecord, LogWriter};
-use ldk_node::{BalanceDetails, LightningBalance, PendingSweepBalance};
 use ldk_node::payment::{
     PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus, SendingParameters,
 };
+use ldk_node::{BalanceDetails, LightningBalance, PendingSweepBalance};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::offers::offer::{Offer, OfferId};
 use lightning::types::payment::{PaymentHash, PaymentPreimage};
@@ -38,6 +38,7 @@ use tokio::sync::{RwLock, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, trace, warn};
 
+pub use self::probe::ProbeConfig;
 use super::{ChannelInfo, ILnRpcClient, LightningRpcError, ListChannelsResponse, RouteHtlcStream};
 use crate::{
     CloseChannelsWithPeerRequest, CloseChannelsWithPeerResponse, CreateInvoiceRequest,
@@ -157,7 +158,6 @@ impl std::fmt::Debug for GatewayLdkClient {
     }
 }
 
-
 /// Funds in channels and in channel closes that the on-chain balance does not
 /// already count, so the two balances add up to what the node holds.
 ///
@@ -190,7 +190,10 @@ fn lightning_balance_sats(balances: &BalanceDetails) -> u64 {
             _ => 0,
         })
         .sum();
-    balances.total_lightning_balance_sats.saturating_sub(in_wallet_already) + awaiting_sweep
+    balances
+        .total_lightning_balance_sats
+        .saturating_sub(in_wallet_already)
+        + awaiting_sweep
 }
 impl GatewayLdkClient {
     /// Creates a new `GatewayLdkClient` instance and starts the underlying
@@ -213,6 +216,7 @@ impl GatewayLdkClient {
         alias: String,
         route_hint_peers: Vec<PublicKey>,
         announce_addresses: Vec<String>,
+        probe_config: ProbeConfig,
         mnemonic: Mnemonic,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, LdkClientInitError> {
@@ -310,6 +314,8 @@ impl GatewayLdkClient {
                 .await;
             }
         });
+
+        probe::spawn_prober(&task_group, node.clone(), probe_config);
 
         info!("Successfully started LDK Gateway");
         Ok(GatewayLdkClient {
@@ -1508,5 +1514,6 @@ impl Ord for UserChannelId {
     }
 }
 
+mod probe;
 #[cfg(test)]
 mod tests;

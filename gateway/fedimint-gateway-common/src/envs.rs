@@ -27,6 +27,11 @@ pub const FM_LDK_ROUTE_HINT_PEERS_ENV: &str = "FM_LDK_ROUTE_HINT_PEERS";
 /// its listening address, `0.0.0.0`.
 pub const FM_LDK_ANNOUNCE_ADDRESSES_ENV: &str = "FM_LDK_ANNOUNCE_ADDRESSES";
 
+/// Comma-separated node public keys the LDK Node probes in the background, so
+/// its scorer knows which paths towards them have liquidity before a payment
+/// needs one.
+pub const FM_LDK_PROBE_TARGETS_ENV: &str = "FM_LDK_PROBE_TARGETS";
+
 /// Environment variable for overriding the iroh secret key
 pub const FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV: &str = "FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE";
 

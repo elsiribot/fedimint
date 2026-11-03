@@ -10,7 +10,8 @@ use tokio::sync::{RwLock, oneshot};
 
 use super::{
     GatewayLdkClient, InboundRegistrationRefusal, LdkClientInitError, PendingPaymentWakeup,
-    check_inbound_registration, get_esplora_url, htlc_completion_error, lightning_balance_sats,
+    ProbeConfig, check_inbound_registration, get_esplora_url, htlc_completion_error,
+    lightning_balance_sats,
 };
 use crate::LightningRpcError;
 
@@ -91,6 +92,7 @@ fn a_non_utf8_data_dir_is_rejected_before_the_node_is_built() {
         String::new(),
         Vec::new(),
         Vec::new(),
+        ProbeConfig::default(),
         Mnemonic::from_entropy(&[0; 16]).expect("16 bytes of entropy form a mnemonic"),
         runtime,
     );
@@ -215,5 +217,8 @@ fn lightning_balance_leaves_out_coop_closes_and_adds_unswept_outputs() {
     };
     // The force close's 300k is not in the wallet yet and stays; the coop
     // close is already on-chain and goes; the unswept 40k is added.
-    assert_eq!(lightning_balance_sats(&balances), 4_726_078 + 300_000 + 40_000);
+    assert_eq!(
+        lightning_balance_sats(&balances),
+        4_726_078 + 300_000 + 40_000
+    );
 }

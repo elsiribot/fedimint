@@ -9,9 +9,9 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Network, OutPoint};
 use clap::Subcommand;
 use envs::{
-    FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV, FM_LND_MACAROON_ENV,
-    FM_LND_PAYMENT_TIMEOUT_SECS_ENV, FM_LND_RPC_ADDR_ENV, FM_LND_TIME_PREF_ENV,
-    FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
+    FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_PROBE_TARGETS_ENV,
+    FM_LDK_ROUTE_HINT_PEERS_ENV, FM_LND_MACAROON_ENV, FM_LND_PAYMENT_TIMEOUT_SECS_ENV,
+    FM_LND_RPC_ADDR_ENV, FM_LND_TIME_PREF_ENV, FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
 };
 use fedimint_core::config::{FederationId, JsonClientConfig};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -800,6 +800,18 @@ pub enum LightningMode {
         )]
         #[serde(default)]
         announce_addresses: Vec<String>,
+
+        /// Nodes to probe in the background. LDK penalizes a failed channel
+        /// only after a payment used it, so without probes a payment can
+        /// spend its whole retry window on drained channels towards its
+        /// destination. Probe a private payee's LSP, not the payee.
+        #[arg(
+            long = "ldk-probe-targets",
+            env = FM_LDK_PROBE_TARGETS_ENV,
+            value_delimiter = ','
+        )]
+        #[serde(default)]
+        probe_targets: Vec<PublicKey>,
     },
 }
 

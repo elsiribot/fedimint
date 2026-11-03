@@ -1038,8 +1038,26 @@ where
 
 			LdkEvent::PaymentPathSuccessful { .. } => {},
 			LdkEvent::PaymentPathFailed { .. } => {},
-			LdkEvent::ProbeSuccessful { .. } => {},
-			LdkEvent::ProbeFailed { .. } => {},
+			// The background processor feeds probe outcomes to the scorer before they reach
+			// us, so there is nothing to do here except leave a trace for the operator.
+			LdkEvent::ProbeSuccessful { path, .. } => {
+				log_info!(
+					self.logger,
+					"Probe of {}msat to {} succeeded over {} hops",
+					path.final_value_msat(),
+					path.hops.last().map_or("<no hops>".to_string(), |hop| hop.pubkey.to_string()),
+					path.hops.len(),
+				);
+			},
+			LdkEvent::ProbeFailed { path, short_channel_id, .. } => {
+				log_info!(
+					self.logger,
+					"Probe of {}msat to {} failed at channel {}",
+					path.final_value_msat(),
+					path.hops.last().map_or("<no hops>".to_string(), |hop| hop.pubkey.to_string()),
+					short_channel_id.map_or("<unknown>".to_string(), |scid| scid.to_string()),
+				);
+			},
 			LdkEvent::HTLCHandlingFailed { failed_next_destination, .. } => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					liquidity_source.handle_htlc_handling_failed(failed_next_destination);

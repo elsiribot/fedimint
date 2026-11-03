@@ -2262,6 +2262,7 @@ impl Gateway {
                 alias,
                 route_hint_peers,
                 announce_addresses,
+                probe_targets,
             } => {
                 let mnemonic = Self::load_mnemonic(&self.gateway_db)
                     .await
@@ -2278,6 +2279,14 @@ impl Gateway {
                         alias.clone(),
                         route_hint_peers.clone(),
                         announce_addresses.clone(),
+                        ldk::ProbeConfig {
+                            targets: probe_targets.clone(),
+                            // Probes look for the routes a send would get
+                            // with the default fee, which federations
+                            // without their own fee setting use.
+                            max_fee_base_msat: self.default_routing_fees.base.msats,
+                            max_fee_ppm: self.default_routing_fees.parts_per_million,
+                        },
                         mnemonic.clone(),
                         runtime.clone(),
                     )

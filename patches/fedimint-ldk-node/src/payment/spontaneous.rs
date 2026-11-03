@@ -201,4 +201,37 @@ impl SpontaneousPayment {
 
 		Ok(())
 	}
+
+	/// Sends payment probes over all paths of a route that would be used to pay the given
+	/// amount to the given `node_id`, looking only for routes that cost at most
+	/// `max_total_routing_fee_msat`.
+	///
+	/// Unlike [`Self::send_probes`], which uses LDK's default fee limit, this lets the caller
+	/// probe the paths a payment with that fee budget would take, so the scorer learns about
+	/// exactly those. Returns the number of probes sent, which is zero if every path was skipped,
+	/// e.g. because it has a single hop or would put our first hop under the liquidity limit.
+	/// The caller gets no error back when nothing was sent, so it decides how loudly to report it.
+	pub fn send_probes_with_max_fee(
+		&self, amount_msat: u64, node_id: PublicKey, max_total_routing_fee_msat: u64,
+	) -> Result<usize, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		if rt_lock.is_none() {
+			return Err(Error::NotRunning);
+		}
+
+		let payment_params =
+			PaymentParameters::from_node_id(node_id, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA);
+		let mut route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, amount_msat);
+		route_params.max_total_routing_fee_msat = Some(max_total_routing_fee_msat);
+
+		let liquidity_limit_multiplier = Some(self.config.probing_liquidity_limit_multiplier);
+
+		let probes = self
+			.channel_manager
+			.send_preflight_probes(route_params, liquidity_limit_multiplier)
+			.map_err(|_| Error::ProbeSendingFailed)?;
+
+		Ok(probes.len())
+	}
 }
