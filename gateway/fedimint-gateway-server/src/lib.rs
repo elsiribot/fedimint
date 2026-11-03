@@ -2263,6 +2263,7 @@ impl Gateway {
                 route_hint_peers,
                 announce_addresses,
                 probe_targets,
+                probe_recent_destinations,
             } => {
                 let mnemonic = Self::load_mnemonic(&self.gateway_db)
                     .await
@@ -2281,6 +2282,7 @@ impl Gateway {
                         announce_addresses.clone(),
                         ldk::ProbeConfig {
                             targets: probe_targets.clone(),
+                            recent_destinations: probe_recent_destinations,
                             // Probes look for the routes a send would get
                             // with the default fee, which federations
                             // without their own fee setting use.

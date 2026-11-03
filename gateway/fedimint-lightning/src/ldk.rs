@@ -58,13 +58,15 @@ use crate::{
 struct LdkTracingLogger {
     /// Whether we're running under devimint/tests. When set, some benign LDK
     /// error logs that are expected in regtest are downgraded to avoid spamming
-    /// the test output. See [`Self::downgraded_level`].
+    /// the test output. See [`Self::effective_level`].
     in_test_env: bool,
 }
 
 impl LdkTracingLogger {
     /// Returns the level to emit `record` at, downgrading benign-but-noisy LDK
-    /// errors when running under devimint/tests.
+    /// errors when running under devimint/tests, and raising LDK's reasons
+    /// for skipping a probe path to `Info` so the operator sees why a probe
+    /// was not sent.
     ///
     /// In regtest there is no fee-rate history, so `ldk-node` logs "Failed to
     /// retrieve fee rate estimates ... Falling back to default" at `Error` on
@@ -72,13 +74,18 @@ impl LdkTracingLogger {
     /// feerate), so in test environments we emit it at `Debug` instead. In
     /// production the original `Error` level is preserved, since a persistent
     /// failure there can indicate a real problem.
-    fn downgraded_level(&self, record: &LogRecord<'_>) -> LogLevel {
+    fn effective_level(&self, record: &LogRecord<'_>) -> LogLevel {
         if self.in_test_env
             && record.level == LogLevel::Error
             && record.module_path == "ldk_node::chain"
             && format!("{}", record.args).contains("Failed to retrieve fee rate estimates")
         {
             LogLevel::Debug
+        } else if record.level == LogLevel::Debug
+            && record.module_path == "lightning::ln::channelmanager"
+            && format!("{}", record.args).contains("payment probe")
+        {
+            LogLevel::Info
         } else {
             record.level
         }
@@ -88,7 +95,7 @@ impl LdkTracingLogger {
 impl LogWriter for LdkTracingLogger {
     fn log(&self, record: LogRecord<'_>) {
         // `tracing` requires a static level per call-site, so match each LDK level.
-        match self.downgraded_level(&record) {
+        match self.effective_level(&record) {
             LogLevel::Gossip | LogLevel::Trace => trace!(
                 target: LOG_LIGHTNING_LDK,
                 ldk_module = record.module_path, line = record.line, "{}", record.args,
@@ -146,6 +153,10 @@ pub struct GatewayLdkClient {
     /// actual result is still read from `node.payment()` after the wakeup; this
     /// map only signals that a terminal event has arrived.
     pending_payments: Arc<RwLock<HashMap<PaymentId, oneshot::Sender<()>>>>,
+
+    /// Where `pay()` reports the invoices it pays, if the prober follows the
+    /// destinations of recent sends.
+    paid_invoices: Option<probe::PaidInvoiceSender>,
 }
 
 /// Sends a channel's funding outpoint once the channel is pending, or the
@@ -315,7 +326,7 @@ impl GatewayLdkClient {
             }
         });
 
-        probe::spawn_prober(&task_group, node.clone(), probe_config);
+        let paid_invoices = probe::spawn_prober(&task_group, node.clone(), probe_config, data_dir);
 
         info!("Successfully started LDK Gateway");
         Ok(GatewayLdkClient {
@@ -326,6 +337,7 @@ impl GatewayLdkClient {
             outbound_offer_lock_pool: lockable::LockPool::new(),
             pending_channels,
             pending_payments,
+            paid_invoices,
         })
     }
 
@@ -727,6 +739,16 @@ impl ILnRpcClient for GatewayLdkClient {
                 }
             };
             assert_eq!(sent_payment_id, payment_id);
+
+            if let Some(paid_invoices) = &self.paid_invoices
+                && let Err(err) = paid_invoices.try_send(probe::PaidInvoice::new(&invoice))
+            {
+                debug!(
+                    target: LOG_LIGHTNING,
+                    err = %err,
+                    "Not probing this payment's destination: the prober's queue is full"
+                );
+            }
         }
 
         // The payment may already be in a terminal state (a known/resumed

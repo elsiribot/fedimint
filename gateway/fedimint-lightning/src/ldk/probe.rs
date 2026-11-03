@@ -9,15 +9,25 @@
 //! no one can claim, so it moves no funds, and its outcome trains the scorer
 //! the same way a failed payment would, but before a user is waiting.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs;
+use std::io::{self, Write as _};
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bitcoin::secp256k1::PublicKey;
 use fedimint_core::Amount;
 use fedimint_core::task::{TaskGroup, block_in_place};
 use fedimint_core::util::FmtCompact;
 use fedimint_logging::LOG_LIGHTNING;
-use tracing::{debug, info};
+use ldk_node::lightning::routing::gossip::NodeId;
+use lightning_invoice::Bolt11Invoice;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 /// How long after start-up the first probe goes out. Until gossip has synced,
 /// LDK finds no route to most targets.
@@ -35,11 +45,27 @@ const PROBE_AMOUNTS: [Amount; 3] = [
     Amount::from_sats(500_000),
 ];
 
+/// How far back payments count towards a destination's rank, and how long a
+/// destination stays a probe target after its last payment.
+const RECENT_DESTINATION_WINDOW: Duration = Duration::from_hours(30 * 24);
+
+/// File in the LDK data directory that keeps the recent destinations across
+/// restarts. Without it every deploy would start the 30-day window over.
+const RECENT_DESTINATIONS_FILE: &str = "probe_destinations.json";
+
+/// Paid invoices waiting for the prober. The prober reads them once per round,
+/// and a round takes minutes, so this only needs to absorb a burst of sends.
+const PAID_INVOICE_QUEUE_LEN: usize = 1024;
+
 /// What the background prober probes, and within which fee budget.
 #[derive(Debug, Clone, Default)]
 pub struct ProbeConfig {
-    /// Nodes to probe. With none, the prober does not run.
+    /// Nodes to probe in every round.
     pub targets: Vec<PublicKey>,
+    /// Also probe up to this many destinations of recent sends, those paid
+    /// most often in the last [`RECENT_DESTINATION_WINDOW`]. `None` probes only
+    /// [`Self::targets`]; with neither, the prober does not run.
+    pub recent_destinations: Option<NonZeroUsize>,
     /// Base of the routing fee budget a probe route may cost. Probes should
     /// look for the routes a payment with the gateway's fee budget would take,
     /// since that is what the scorer needs to know about.
@@ -58,125 +84,377 @@ impl ProbeConfig {
     }
 }
 
-/// Every target with every amount, in turn and forever. Consecutive probes go
-/// to different targets, so no single path towards one carries them back to
-/// back. Empty if there are no targets.
-fn probe_schedule(targets: &[PublicKey]) -> impl Iterator<Item = (PublicKey, Amount)> + '_ {
+/// Where a paid invoice goes, as far as a probe can follow it.
+#[derive(Debug, Clone)]
+pub(super) struct PaidInvoice {
+    payee: PublicKey,
+    /// First node of each route hint: the LSP in front of a private payee.
+    hint_entries: Vec<PublicKey>,
+}
+
+impl PaidInvoice {
+    pub(super) fn new(invoice: &Bolt11Invoice) -> Self {
+        Self {
+            payee: invoice.get_payee_pub_key(),
+            hint_entries: invoice
+                .route_hints()
+                .iter()
+                .filter_map(|hint| hint.0.first().map(|hop| hop.src_node_id))
+                .collect(),
+        }
+    }
+
+    /// The nodes to probe for this invoice: the payee if the network graph
+    /// knows it, since a probe can only follow public channels; otherwise the
+    /// hint entries it knows. Wallets add made-up hints, e.g. with absurd
+    /// fees, so a hint entry missing from the graph is not probed either.
+    fn probe_targets(&self, is_public: impl Fn(&PublicKey) -> bool) -> Vec<PublicKey> {
+        if is_public(&self.payee) {
+            return vec![self.payee];
+        }
+        self.hint_entries
+            .iter()
+            .filter(|entry| is_public(entry))
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
+
+/// When each destination was paid within [`RECENT_DESTINATION_WINDOW`].
+#[derive(Debug, Default)]
+struct RecentDestinations {
+    paid_at: HashMap<PublicKey, VecDeque<SystemTime>>,
+}
+
+/// [`RecentDestinations`] on disk: node id (hex) to payment times in unix
+/// seconds, oldest first.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoredDestinations {
+    paid_at_secs: BTreeMap<String, Vec<u64>>,
+}
+
+impl RecentDestinations {
+    fn record(&mut self, destination: PublicKey, at: SystemTime) {
+        self.paid_at.entry(destination).or_default().push_back(at);
+    }
+
+    /// Forgets payments older than the window, then returns up to `max`
+    /// destinations, most payments first and the most recently paid first
+    /// among equals.
+    fn top(&mut self, max: NonZeroUsize, now: SystemTime) -> Vec<PublicKey> {
+        let cutoff = now
+            .checked_sub(RECENT_DESTINATION_WINDOW)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        self.paid_at.retain(|_, times| {
+            while times.front().is_some_and(|at| *at < cutoff) {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+
+        let mut ranked = self
+            .paid_at
+            .iter()
+            .map(|(destination, times)| {
+                let last = times.back().copied().unwrap_or(SystemTime::UNIX_EPOCH);
+                (times.len(), last, *destination)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|a, b| b.cmp(a));
+        ranked
+            .into_iter()
+            .take(max.get())
+            .map(|(_, _, destination)| destination)
+            .collect()
+    }
+
+    /// Payments recorded for `destination` in the window, as of the last
+    /// [`Self::top`].
+    fn payments(&self, destination: &PublicKey) -> usize {
+        self.paid_at.get(destination).map_or(0, VecDeque::len)
+    }
+
+    fn to_stored(&self) -> StoredDestinations {
+        StoredDestinations {
+            paid_at_secs: self
+                .paid_at
+                .iter()
+                .map(|(destination, times)| {
+                    let secs = times
+                        .iter()
+                        .map(|at| {
+                            at.duration_since(SystemTime::UNIX_EPOCH)
+                                .map_or(0, |since| since.as_secs())
+                        })
+                        .collect();
+                    (destination.to_string(), secs)
+                })
+                .collect(),
+        }
+    }
+
+    /// Entries that do not parse are dropped: the file only decides which
+    /// nodes get probed, so a damaged one costs some probe coverage until
+    /// the destinations are paid again, nothing more.
+    fn from_stored(stored: StoredDestinations) -> Self {
+        let paid_at = stored
+            .paid_at_secs
+            .into_iter()
+            .filter_map(|(destination, secs)| {
+                let destination = PublicKey::from_str(&destination).ok()?;
+                let mut times = secs
+                    .into_iter()
+                    .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                    .collect::<Vec<_>>();
+                times.sort();
+                Some((destination, times.into()))
+            })
+            .collect();
+        Self { paid_at }
+    }
+
+    /// An absent file is a first start. A file that cannot be read or parsed
+    /// is logged and replaced on the next save, see [`Self::from_stored`].
+    fn load(path: &Path) -> Self {
+        let stored = match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| err.to_string()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(StoredDestinations::default()),
+            Err(err) => Err(err.to_string()),
+        };
+        match stored {
+            Ok(stored) => Self::from_stored(stored),
+            Err(err) => {
+                warn!(
+                    target: LOG_LIGHTNING,
+                    path = %path.display(), err = %err,
+                    "Could not load the recent probe destinations, starting without them"
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// Writes a temporary file and renames it over `path`, so a crash leaves
+    /// either the old list or the new one.
+    fn save(&self, path: &Path) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&self.to_stored()).map_err(io::Error::other)?;
+        let tmp = path.with_extension("json.tmp");
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+/// One round's targets: the configured ones, then the recent destinations
+/// not already among them, without our direct peers, since LDK never probes a
+/// path of a single hop.
+fn round_targets(
+    configured: &[PublicKey],
+    recent: &[PublicKey],
+    peers: &BTreeSet<PublicKey>,
+) -> Vec<PublicKey> {
+    let mut seen = BTreeSet::new();
+    configured
+        .iter()
+        .chain(recent)
+        .filter(|target| !peers.contains(target) && seen.insert(**target))
+        .copied()
+        .collect()
+}
+
+/// Every target with every amount, in turn. Consecutive probes go to
+/// different targets, so no single path towards one carries them back to
+/// back.
+fn round_schedule(targets: &[PublicKey]) -> impl Iterator<Item = (PublicKey, Amount)> + '_ {
     PROBE_AMOUNTS
         .iter()
         .flat_map(move |amount| targets.iter().map(move |target| (*target, *amount)))
-        .cycle()
 }
 
-/// Starts the prober on `task_group` unless `config` has no targets.
-pub(super) fn spawn_prober(task_group: &TaskGroup, node: Arc<ldk_node::Node>, config: ProbeConfig) {
-    if config.targets.is_empty() {
-        return;
+/// Where [`super::GatewayLdkClient::pay`] reports the invoices it pays to.
+pub(super) type PaidInvoiceSender = mpsc::Sender<PaidInvoice>;
+
+/// Starts the prober on `task_group` unless `config` gives it nothing to
+/// probe. Returns the sender for paid invoices if the prober follows recent
+/// destinations, which it keeps in `data_dir`.
+pub(super) fn spawn_prober(
+    task_group: &TaskGroup,
+    node: Arc<ldk_node::Node>,
+    config: ProbeConfig,
+    data_dir: &Path,
+) -> Option<PaidInvoiceSender> {
+    if config.targets.is_empty() && config.recent_destinations.is_none() {
+        return None;
     }
 
-    info!(target: LOG_LIGHTNING, targets = config.targets.len(), "Starting LDK prober");
-    task_group.spawn_cancellable("ldk prober", async move {
-        fedimint_core::runtime::sleep(PROBE_START_DELAY).await;
+    let (paid_sender, recent) = match config.recent_destinations {
+        Some(max) => {
+            let (sender, receiver) = mpsc::channel(PAID_INVOICE_QUEUE_LEN);
+            let path = data_dir.join(RECENT_DESTINATIONS_FILE);
+            let destinations = block_in_place(|| RecentDestinations::load(&path));
+            (
+                Some(sender),
+                Some(RecentTracking {
+                    max,
+                    receiver,
+                    path,
+                    destinations,
+                }),
+            )
+        }
+        None => (None, None),
+    };
 
-        for (target, amount) in probe_schedule(&config.targets) {
-            let max_fee_msat = config.max_fee_msat(amount);
-            // Route finding walks the whole network graph, which is CPU work
-            // that must not stall the async workers.
-            let result = block_in_place(|| {
-                node.spontaneous_payment().send_probes_with_max_fee(
-                    amount.msats,
-                    target,
-                    max_fee_msat,
-                )
-            });
+    info!(
+        target: LOG_LIGHTNING,
+        targets = config.targets.len(),
+        recent_destinations = ?config.recent_destinations,
+        "Starting LDK prober"
+    );
+    task_group.spawn_cancellable("ldk prober", run_prober(node, config, recent));
 
-            match result {
-                Ok(0) => debug!(
-                    target: LOG_LIGHTNING,
-                    %target, %amount,
-                    "Sent no probe: every path was too short or would drain our first hop"
-                ),
-                Ok(probes) => {
-                    debug!(target: LOG_LIGHTNING, %target, %amount, probes, "Sent probes")
-                }
-                // Includes finding no route within the fee budget, which is
-                // worth knowing for a target users pay.
-                Err(err) => info!(
-                    target: LOG_LIGHTNING,
-                    %target, %amount, max_fee_msat, err = %err.fmt_compact(),
-                    "Could not probe target"
-                ),
+    paid_sender
+}
+
+/// The prober's view of recent sends, when it follows them.
+struct RecentTracking {
+    max: NonZeroUsize,
+    receiver: mpsc::Receiver<PaidInvoice>,
+    path: PathBuf,
+    destinations: RecentDestinations,
+}
+
+impl RecentTracking {
+    /// Takes in the invoices paid since the last round and returns this
+    /// round's recent targets. The payment time recorded is when the prober
+    /// read the invoice, at most one round late, which the 30-day window
+    /// does not notice.
+    fn update(&mut self, node: &ldk_node::Node) -> Vec<PublicKey> {
+        let graph = node.network_graph();
+        let is_public = |key: &PublicKey| graph.node(&NodeId::from_pubkey(key)).is_some();
+        let now = fedimint_core::time::now();
+        let mut paid = 0;
+        while let Ok(invoice) = self.receiver.try_recv() {
+            for destination in invoice.probe_targets(is_public) {
+                self.destinations.record(destination, now);
+                paid += 1;
             }
+        }
+        let top = self.destinations.top(self.max, now);
+        if paid > 0
+            && let Err(err) = block_in_place(|| self.destinations.save(&self.path))
+        {
+            warn!(
+                target: LOG_LIGHTNING,
+                path = %self.path.display(), err = %err.fmt_compact(),
+                "Could not save the recent probe destinations"
+            );
+        }
+        top
+    }
+}
 
+async fn run_prober(
+    node: Arc<ldk_node::Node>,
+    config: ProbeConfig,
+    mut recent: Option<RecentTracking>,
+) {
+    fedimint_core::runtime::sleep(PROBE_START_DELAY).await;
+
+    loop {
+        let recent_targets = recent
+            .as_mut()
+            .map(|recent| recent.update(&node))
+            .unwrap_or_default();
+
+        let peers = node
+            .list_channels()
+            .into_iter()
+            .map(|channel| channel.counterparty_node_id)
+            .collect::<BTreeSet<_>>();
+        let targets = round_targets(&config.targets, &recent_targets, &peers);
+        // One line per round so that whoever reads the log knows which nodes
+        // are being probed and why, including those added from recent sends.
+        info!(
+            target: LOG_LIGHTNING,
+            configured = %join_keys(&config.targets),
+            recent = %recent_targets
+                .iter()
+                .map(|target| {
+                    let payments = recent.as_ref().map_or(0, |r| r.destinations.payments(target));
+                    format!("{target}:{payments}")
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            skipped_peers = %join_keys(
+                &config.targets.iter().chain(&recent_targets)
+                    .filter(|target| peers.contains(target))
+                    .copied()
+                    .collect::<Vec<_>>()
+            ),
+            "Starting probe round"
+        );
+
+        if targets.is_empty() {
+            // Nothing paid recently and nothing configured beyond our peers.
+            fedimint_core::runtime::sleep(PROBE_INTERVAL).await;
+            continue;
+        }
+
+        for (target, amount) in round_schedule(&targets) {
+            probe(&node, &config, target, amount);
             fedimint_core::runtime::sleep(PROBE_INTERVAL).await;
         }
+    }
+}
+
+fn join_keys(keys: &[PublicKey]) -> String {
+    keys.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Logs one line per attempt at `Info`, which a log reader can pair with
+/// ldk-node's per-path outcome lines that follow (`Probe of ... to <target>`):
+/// `probes` says how many there will be.
+fn probe(node: &ldk_node::Node, config: &ProbeConfig, target: PublicKey, amount: Amount) {
+    let max_fee_msat = config.max_fee_msat(amount);
+    // Route finding walks the whole network graph, which is CPU work that must
+    // not stall the async workers.
+    let result = block_in_place(|| {
+        node.spontaneous_payment()
+            .send_probes_with_max_fee(amount.msats, target, max_fee_msat)
     });
+
+    match result {
+        // LDK logs why it skipped each path right before this.
+        Ok(0) => info!(
+            target: LOG_LIGHTNING,
+            %target, amount_msat = amount.msats,
+            "Sent no probe: every path was too short or would drain our first hop"
+        ),
+        Ok(probes) => info!(
+            target: LOG_LIGHTNING,
+            %target, amount_msat = amount.msats, probes,
+            "Sent probes"
+        ),
+        // Includes finding no route within the fee budget, which is worth
+        // knowing for a target users pay.
+        Err(err) => info!(
+            target: LOG_LIGHTNING,
+            %target, amount_msat = amount.msats, max_fee_msat, err = %err.fmt_compact(),
+            "Could not probe target"
+        ),
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-    use std::str::FromStr;
-
-    use bitcoin::secp256k1::PublicKey;
-    use fedimint_core::Amount;
-
-    use super::{PROBE_AMOUNTS, ProbeConfig, probe_schedule};
-
-    fn key(hex: &str) -> PublicKey {
-        PublicKey::from_str(hex).expect("test keys are valid compressed points")
-    }
-
-    #[test]
-    fn schedule_covers_every_target_and_amount_before_repeating() {
-        let targets = [
-            key("029fc6217803748cc8fb6b041acbe81e6e295a914487dcea7e5d7e141b64883826"),
-            key("039174f846626c6053ba80f5443d0db33da384f1dde135bf7080ba1eec465019c3"),
-        ];
-        let pairs = targets.len() * PROBE_AMOUNTS.len();
-
-        let first_round = probe_schedule(&targets).take(pairs).collect::<Vec<_>>();
-        let distinct = first_round.iter().collect::<BTreeSet<_>>();
-        assert_eq!(
-            distinct.len(),
-            pairs,
-            "one round probes each pair exactly once"
-        );
-
-        let second_round = probe_schedule(&targets)
-            .skip(pairs)
-            .take(pairs)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            first_round, second_round,
-            "the schedule repeats round by round"
-        );
-
-        assert!(
-            first_round.windows(2).all(|w| w[0].0 != w[1].0),
-            "consecutive probes go to different targets"
-        );
-    }
-
-    #[test]
-    fn schedule_without_targets_is_empty() {
-        assert_eq!(probe_schedule(&[]).next(), None);
-    }
-
-    #[test]
-    fn fee_budget_matches_the_routing_fee_formula() {
-        let config = ProbeConfig {
-            targets: Vec::new(),
-            max_fee_base_msat: 3_000,
-            max_fee_ppm: 5_000,
-        };
-        assert_eq!(config.max_fee_msat(Amount::from_sats(20_000)), 103_000);
-
-        let huge = ProbeConfig {
-            targets: Vec::new(),
-            max_fee_base_msat: u64::MAX,
-            max_fee_ppm: u64::MAX,
-        };
-        assert_eq!(huge.max_fee_msat(Amount::from_msats(u64::MAX)), u64::MAX);
-    }
-}
+mod tests;

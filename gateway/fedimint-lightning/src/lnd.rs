@@ -1752,7 +1752,8 @@ impl ILnRpcClient for GatewayLndClient {
         let channels_with_peer: Vec<_> = channels_with_peer
             .into_iter()
             .filter(|channel| {
-                funding_outpoint.is_none_or(|outpoint| channel.channel_point == outpoint.to_string())
+                funding_outpoint
+                    .is_none_or(|outpoint| channel.channel_point == outpoint.to_string())
             })
             .collect();
 

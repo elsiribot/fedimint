@@ -32,6 +32,10 @@ pub const FM_LDK_ANNOUNCE_ADDRESSES_ENV: &str = "FM_LDK_ANNOUNCE_ADDRESSES";
 /// needs one.
 pub const FM_LDK_PROBE_TARGETS_ENV: &str = "FM_LDK_PROBE_TARGETS";
 
+/// How many of the destinations the LDK Node paid most often in the last 30
+/// days it probes in addition to `FM_LDK_PROBE_TARGETS`. Unset follows none.
+pub const FM_LDK_PROBE_RECENT_DESTINATIONS_ENV: &str = "FM_LDK_PROBE_RECENT_DESTINATIONS";
+
 /// Environment variable for overriding the iroh secret key
 pub const FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV: &str = "FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE";
 

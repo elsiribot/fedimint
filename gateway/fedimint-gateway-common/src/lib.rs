@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
@@ -9,9 +10,10 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Network, OutPoint};
 use clap::Subcommand;
 use envs::{
-    FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_PROBE_TARGETS_ENV,
-    FM_LDK_ROUTE_HINT_PEERS_ENV, FM_LND_MACAROON_ENV, FM_LND_PAYMENT_TIMEOUT_SECS_ENV,
-    FM_LND_RPC_ADDR_ENV, FM_LND_TIME_PREF_ENV, FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
+    FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_PROBE_RECENT_DESTINATIONS_ENV,
+    FM_LDK_PROBE_TARGETS_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV, FM_LND_MACAROON_ENV,
+    FM_LND_PAYMENT_TIMEOUT_SECS_ENV, FM_LND_RPC_ADDR_ENV, FM_LND_TIME_PREF_ENV,
+    FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
 };
 use fedimint_core::config::{FederationId, JsonClientConfig};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -812,6 +814,16 @@ pub enum LightningMode {
         )]
         #[serde(default)]
         probe_targets: Vec<PublicKey>,
+
+        /// Also probe this many of the destinations paid most often in the
+        /// last 30 days: a public payee itself, a private one's LSP from the
+        /// invoice's route hints. Unset probes only `--ldk-probe-targets`.
+        #[arg(
+            long = "ldk-probe-recent-destinations",
+            env = FM_LDK_PROBE_RECENT_DESTINATIONS_ENV
+        )]
+        #[serde(default)]
+        probe_recent_destinations: Option<NonZeroUsize>,
     },
 }
 
