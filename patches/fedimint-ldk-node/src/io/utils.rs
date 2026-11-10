@@ -149,11 +149,11 @@ where
 /// Read a previously persisted [`ProbabilisticScorer`] from the store.
 pub(crate) fn read_scorer<G: Deref<Target = NetworkGraph<L>>, L: Deref + Clone>(
 	kv_store: Arc<DynStore>, network_graph: G, logger: L,
+	params: ProbabilisticScoringDecayParameters,
 ) -> Result<ProbabilisticScorer<G, L>, std::io::Error>
 where
 	L::Target: LdkLogger,
 {
-	let params = ProbabilisticScoringDecayParameters::default();
 	let mut reader = Cursor::new(kv_store.read(
 		SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
 		SCORER_PERSISTENCE_SECONDARY_NAMESPACE,

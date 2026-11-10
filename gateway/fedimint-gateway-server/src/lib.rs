@@ -2264,6 +2264,7 @@ impl Gateway {
                 announce_addresses,
                 probe_targets,
                 probe_recent_destinations,
+                scorer,
             } => {
                 let mnemonic = Self::load_mnemonic(&self.gateway_db)
                     .await
@@ -2289,6 +2290,7 @@ impl Gateway {
                             max_fee_base_msat: self.default_routing_fees.base.msats,
                             max_fee_ppm: self.default_routing_fees.parts_per_million,
                         },
+                        &scorer,
                         mnemonic.clone(),
                         runtime.clone(),
                     )

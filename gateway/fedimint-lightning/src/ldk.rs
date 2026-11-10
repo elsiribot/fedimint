@@ -14,12 +14,12 @@ use fedimint_core::task::{TaskGroup, TaskHandle, block_in_place};
 use fedimint_core::util::{FmtCompact, SafeUrl};
 use fedimint_core::{Amount, BitcoinAmountOrAll, crit};
 use fedimint_gateway_common::{
-    ChainSource, ConnectPeerRequest, GetInvoiceRequest, GetInvoiceResponse,
+    ChainSource, ConnectPeerRequest, GetInvoiceRequest, GetInvoiceResponse, LdkScorerOptions,
     ListTransactionsResponse, NodeAddress, SetChannelFeesRequest,
 };
 use fedimint_ln_common::contracts::Preimage;
 use fedimint_logging::{LOG_LIGHTNING, LOG_LIGHTNING_LDK};
-use ldk_node::config::ChannelConfig;
+use ldk_node::config::{ChannelConfig, ScoringParameters};
 use ldk_node::lightning::chain::channelmonitor::BalanceSource;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::lightning::routing::gossip::{NodeAlias, NodeId};
@@ -206,6 +206,39 @@ fn lightning_balance_sats(balances: &BalanceDetails) -> u64 {
         .saturating_sub(in_wallet_already)
         + awaiting_sweep
 }
+/// LDK's scorer parameters with the gateway's overrides; anything not
+/// overridden keeps LDK's default.
+fn scoring_parameters(options: &LdkScorerOptions) -> ScoringParameters {
+    let defaults = ScoringParameters::default();
+    ScoringParameters {
+        liquidity_offset_half_life: options
+            .liquidity_offset_half_life_secs
+            .map_or(defaults.liquidity_offset_half_life, Duration::from_secs),
+        historical_no_updates_half_life: options.historical_no_updates_half_life_secs.map_or(
+            defaults.historical_no_updates_half_life,
+            Duration::from_secs,
+        ),
+        base_penalty_msat: options
+            .base_penalty_msat
+            .unwrap_or(defaults.base_penalty_msat),
+        base_penalty_amount_multiplier_msat: options
+            .base_penalty_amount_multiplier_msat
+            .unwrap_or(defaults.base_penalty_amount_multiplier_msat),
+        liquidity_penalty_multiplier_msat: options
+            .liquidity_penalty_multiplier_msat
+            .unwrap_or(defaults.liquidity_penalty_multiplier_msat),
+        liquidity_penalty_amount_multiplier_msat: options
+            .liquidity_penalty_amount_multiplier_msat
+            .unwrap_or(defaults.liquidity_penalty_amount_multiplier_msat),
+        historical_liquidity_penalty_multiplier_msat: options
+            .historical_liquidity_penalty_multiplier_msat
+            .unwrap_or(defaults.historical_liquidity_penalty_multiplier_msat),
+        historical_liquidity_penalty_amount_multiplier_msat: options
+            .historical_liquidity_penalty_amount_multiplier_msat
+            .unwrap_or(defaults.historical_liquidity_penalty_amount_multiplier_msat),
+    }
+}
+
 impl GatewayLdkClient {
     /// Creates a new `GatewayLdkClient` instance and starts the underlying
     /// lightning node. All resources, including the lightning node, will be
@@ -228,6 +261,7 @@ impl GatewayLdkClient {
         route_hint_peers: Vec<PublicKey>,
         announce_addresses: Vec<String>,
         probe_config: ProbeConfig,
+        scorer: &LdkScorerOptions,
         mnemonic: Mnemonic,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, LdkClientInitError> {
@@ -249,6 +283,27 @@ impl GatewayLdkClient {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let scoring_parameters = scoring_parameters(scorer);
+        // Whatever is set, the values in force are worth one line: they
+        // decide which routes LDK prefers and how long it avoids a channel.
+        info!(
+            target: LOG_LIGHTNING,
+            liquidity_offset_half_life_secs = scoring_parameters.liquidity_offset_half_life.as_secs(),
+            historical_no_updates_half_life_secs =
+                scoring_parameters.historical_no_updates_half_life.as_secs(),
+            base_penalty_msat = scoring_parameters.base_penalty_msat,
+            base_penalty_amount_multiplier_msat =
+                scoring_parameters.base_penalty_amount_multiplier_msat,
+            liquidity_penalty_multiplier_msat = scoring_parameters.liquidity_penalty_multiplier_msat,
+            liquidity_penalty_amount_multiplier_msat =
+                scoring_parameters.liquidity_penalty_amount_multiplier_msat,
+            historical_liquidity_penalty_multiplier_msat =
+                scoring_parameters.historical_liquidity_penalty_multiplier_msat,
+            historical_liquidity_penalty_amount_multiplier_msat =
+                scoring_parameters.historical_liquidity_penalty_amount_multiplier_msat,
+            "LDK scorer parameters"
+        );
+
         let mut node_builder = ldk_node::Builder::from_config(ldk_node::config::Config {
             network,
             listening_addresses: Some(vec![SocketAddress::TcpIpV4 {
@@ -259,6 +314,7 @@ impl GatewayLdkClient {
                 .then_some(announcement_addresses),
             node_alias,
             route_hint_peers,
+            scoring_parameters,
             ..Default::default()
         });
 

@@ -79,7 +79,7 @@ fn a_non_utf8_data_dir_is_rejected_before_the_node_is_built() {
 
     use bitcoin::Network;
     use fedimint_bip39::Mnemonic;
-    use fedimint_gateway_common::ChainSource;
+    use fedimint_gateway_common::{ChainSource, LdkScorerOptions};
 
     let runtime = Arc::new(tokio::runtime::Runtime::new().expect("A tokio runtime can be built"));
     let result = GatewayLdkClient::new(
@@ -93,6 +93,7 @@ fn a_non_utf8_data_dir_is_rejected_before_the_node_is_built() {
         Vec::new(),
         Vec::new(),
         ProbeConfig::default(),
+        &LdkScorerOptions::default(),
         Mnemonic::from_entropy(&[0; 16]).expect("16 bytes of entropy form a mnemonic"),
         runtime,
     );

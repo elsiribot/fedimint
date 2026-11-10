@@ -43,9 +43,7 @@ use lightning::ln::msgs::{RoutingMessageHandler, SocketAddress};
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler};
 use lightning::routing::gossip::NodeAlias;
 use lightning::routing::router::DefaultRouter;
-use lightning::routing::scoring::{
-	ProbabilisticScorer, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
-};
+use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::sign::EntropySource;
 
 use lightning::util::persist::{
@@ -1140,15 +1138,17 @@ fn build_with_store_internal(
 			},
 		};
 
+	let decay_params = config.scoring_parameters.decay_parameters();
 	let scorer = match io::utils::read_scorer(
 		Arc::clone(&kv_store),
 		Arc::clone(&network_graph),
 		Arc::clone(&logger),
+		decay_params,
 	) {
 		Ok(scorer) => Arc::new(Mutex::new(scorer)),
 		Err(e) => {
 			if e.kind() == std::io::ErrorKind::NotFound {
-				let params = ProbabilisticScoringDecayParameters::default();
+				let params = decay_params;
 				Arc::new(Mutex::new(ProbabilisticScorer::new(
 					params,
 					Arc::clone(&network_graph),
@@ -1160,7 +1160,7 @@ fn build_with_store_internal(
 		},
 	};
 
-	let scoring_fee_params = ProbabilisticScoringFeeParameters::default();
+	let scoring_fee_params = config.scoring_parameters.fee_parameters();
 	let router = Arc::new(DefaultRouter::new(
 		Arc::clone(&network_graph),
 		Arc::clone(&logger),

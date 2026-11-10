@@ -12,6 +12,9 @@ use crate::payment::SendingParameters;
 
 use lightning::ln::msgs::SocketAddress;
 use lightning::routing::gossip::NodeAlias;
+use lightning::routing::scoring::{
+	ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
+};
 use lightning::util::config::ChannelConfig as LdkChannelConfig;
 use lightning::util::config::MaxDustHTLCExposure as LdkMaxDustHTLCExposure;
 use lightning::util::config::UserConfig;
@@ -178,6 +181,80 @@ pub struct Config {
 	/// cannot reach us. Listing well-connected peers here makes every invoice carry a hint
 	/// through the best online channel to one of them, whether announced or not.
 	pub route_hint_peers: Vec<PublicKey>,
+	/// How the scorer weighs and forgets what it learned about channel liquidity.
+	///
+	/// Defaults to LDK's own defaults, which ldk-node used to hardcode.
+	pub scoring_parameters: ScoringParameters,
+}
+
+/// The tunable parts of LDK's [`ProbabilisticScoringDecayParameters`] and
+/// [`ProbabilisticScoringFeeParameters`]. Everything not listed keeps LDK's default.
+///
+/// The decay half-lives decide how long a probe's or payment's outcome keeps steering the
+/// router; the penalty multipliers decide how much an uncertain channel costs next to its fees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScoringParameters {
+	/// See [`ProbabilisticScoringDecayParameters::liquidity_offset_half_life`].
+	pub liquidity_offset_half_life: Duration,
+	/// See [`ProbabilisticScoringDecayParameters::historical_no_updates_half_life`].
+	pub historical_no_updates_half_life: Duration,
+	/// See [`ProbabilisticScoringFeeParameters::base_penalty_msat`].
+	pub base_penalty_msat: u64,
+	/// See [`ProbabilisticScoringFeeParameters::base_penalty_amount_multiplier_msat`].
+	pub base_penalty_amount_multiplier_msat: u64,
+	/// See [`ProbabilisticScoringFeeParameters::liquidity_penalty_multiplier_msat`].
+	pub liquidity_penalty_multiplier_msat: u64,
+	/// See [`ProbabilisticScoringFeeParameters::liquidity_penalty_amount_multiplier_msat`].
+	pub liquidity_penalty_amount_multiplier_msat: u64,
+	/// See [`ProbabilisticScoringFeeParameters::historical_liquidity_penalty_multiplier_msat`].
+	pub historical_liquidity_penalty_multiplier_msat: u64,
+	/// See
+	/// [`ProbabilisticScoringFeeParameters::historical_liquidity_penalty_amount_multiplier_msat`].
+	pub historical_liquidity_penalty_amount_multiplier_msat: u64,
+}
+
+impl Default for ScoringParameters {
+	fn default() -> Self {
+		let decay = ProbabilisticScoringDecayParameters::default();
+		let fee = ProbabilisticScoringFeeParameters::default();
+		Self {
+			liquidity_offset_half_life: decay.liquidity_offset_half_life,
+			historical_no_updates_half_life: decay.historical_no_updates_half_life,
+			base_penalty_msat: fee.base_penalty_msat,
+			base_penalty_amount_multiplier_msat: fee.base_penalty_amount_multiplier_msat,
+			liquidity_penalty_multiplier_msat: fee.liquidity_penalty_multiplier_msat,
+			liquidity_penalty_amount_multiplier_msat: fee.liquidity_penalty_amount_multiplier_msat,
+			historical_liquidity_penalty_multiplier_msat: fee
+				.historical_liquidity_penalty_multiplier_msat,
+			historical_liquidity_penalty_amount_multiplier_msat: fee
+				.historical_liquidity_penalty_amount_multiplier_msat,
+		}
+	}
+}
+
+impl ScoringParameters {
+	/// LDK's decay parameters with these half-lives.
+	pub(crate) fn decay_parameters(&self) -> ProbabilisticScoringDecayParameters {
+		ProbabilisticScoringDecayParameters {
+			liquidity_offset_half_life: self.liquidity_offset_half_life,
+			historical_no_updates_half_life: self.historical_no_updates_half_life,
+		}
+	}
+
+	/// LDK's fee parameters with these penalties, LDK's defaults otherwise.
+	pub(crate) fn fee_parameters(&self) -> ProbabilisticScoringFeeParameters {
+		ProbabilisticScoringFeeParameters {
+			base_penalty_msat: self.base_penalty_msat,
+			base_penalty_amount_multiplier_msat: self.base_penalty_amount_multiplier_msat,
+			liquidity_penalty_multiplier_msat: self.liquidity_penalty_multiplier_msat,
+			liquidity_penalty_amount_multiplier_msat: self.liquidity_penalty_amount_multiplier_msat,
+			historical_liquidity_penalty_multiplier_msat: self
+				.historical_liquidity_penalty_multiplier_msat,
+			historical_liquidity_penalty_amount_multiplier_msat: self
+				.historical_liquidity_penalty_amount_multiplier_msat,
+			..ProbabilisticScoringFeeParameters::default()
+		}
+	}
 }
 
 impl Default for Config {
@@ -193,6 +270,7 @@ impl Default for Config {
 			sending_parameters: None,
 			node_alias: None,
 			route_hint_peers: Vec::new(),
+			scoring_parameters: ScoringParameters::default(),
 		}
 	}
 }
@@ -324,8 +402,7 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	// a single received payment at a tenth of the channel (a 720k receive over a 6.27M channel
 	// failed). Allow the whole channel, as ldk-node already does for unannounced channels. This
 	// is negotiated at channel open, so it only applies to channels opened after this change.
-	user_config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel =
-		100;
+	user_config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;

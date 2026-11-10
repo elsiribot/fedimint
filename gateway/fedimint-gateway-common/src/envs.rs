@@ -36,6 +36,39 @@ pub const FM_LDK_PROBE_TARGETS_ENV: &str = "FM_LDK_PROBE_TARGETS";
 /// days it probes in addition to `FM_LDK_PROBE_TARGETS`. Unset follows none.
 pub const FM_LDK_PROBE_RECENT_DESTINATIONS_ENV: &str = "FM_LDK_PROBE_RECENT_DESTINATIONS";
 
+// The LDK Node's scorer: how fast it forgets what probes and payments taught
+// it, and how much an uncertain channel costs next to its fees. Each unset
+// variable keeps LDK's default; see LDK's `ProbabilisticScoringDecayParameters`
+// and `ProbabilisticScoringFeeParameters` for what each one does.
+
+/// Half-life of the liquidity bounds learned from one probe or payment, in
+/// seconds (LDK default: 1800).
+pub const FM_LDK_SCORER_LIQUIDITY_OFFSET_HALF_LIFE_SECS_ENV: &str =
+    "FM_LDK_SCORER_LIQUIDITY_OFFSET_HALF_LIFE_SECS";
+/// Half-life of a channel's liquidity history once nothing updates it, in
+/// seconds (LDK default: 14 days).
+pub const FM_LDK_SCORER_HISTORICAL_NO_UPDATES_HALF_LIFE_SECS_ENV: &str =
+    "FM_LDK_SCORER_HISTORICAL_NO_UPDATES_HALF_LIFE_SECS";
+/// Fixed penalty per hop, msat (LDK default: 1024).
+pub const FM_LDK_SCORER_BASE_PENALTY_MSAT_ENV: &str = "FM_LDK_SCORER_BASE_PENALTY_MSAT";
+/// Per-hop penalty per 2^30 msat sent (LDK default: 131072).
+pub const FM_LDK_SCORER_BASE_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV: &str =
+    "FM_LDK_SCORER_BASE_PENALTY_AMOUNT_MULTIPLIER_MSAT";
+/// Penalty per -log10 of the success probability from the latest liquidity
+/// bounds, msat (LDK default: 0, i.e. off).
+pub const FM_LDK_SCORER_LIQUIDITY_PENALTY_MULTIPLIER_MSAT_ENV: &str =
+    "FM_LDK_SCORER_LIQUIDITY_PENALTY_MULTIPLIER_MSAT";
+/// Same, per 2^20 msat sent (LDK default: 0, i.e. off).
+pub const FM_LDK_SCORER_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV: &str =
+    "FM_LDK_SCORER_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT";
+/// Penalty per -log10 of the success probability from the liquidity history,
+/// msat (LDK default: 10000).
+pub const FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_MULTIPLIER_MSAT_ENV: &str =
+    "FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_MULTIPLIER_MSAT";
+/// Same, per 2^20 msat sent (LDK default: 1250).
+pub const FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV: &str =
+    "FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT";
+
 /// Environment variable for overriding the iroh secret key
 pub const FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV: &str = "FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE";
 

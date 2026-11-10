@@ -8,10 +8,17 @@ use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::sha256;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Network, OutPoint};
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use envs::{
     FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_PROBE_RECENT_DESTINATIONS_ENV,
-    FM_LDK_PROBE_TARGETS_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV, FM_LND_MACAROON_ENV,
+    FM_LDK_PROBE_TARGETS_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV,
+    FM_LDK_SCORER_BASE_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV, FM_LDK_SCORER_BASE_PENALTY_MSAT_ENV,
+    FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV,
+    FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_MULTIPLIER_MSAT_ENV,
+    FM_LDK_SCORER_HISTORICAL_NO_UPDATES_HALF_LIFE_SECS_ENV,
+    FM_LDK_SCORER_LIQUIDITY_OFFSET_HALF_LIFE_SECS_ENV,
+    FM_LDK_SCORER_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV,
+    FM_LDK_SCORER_LIQUIDITY_PENALTY_MULTIPLIER_MSAT_ENV, FM_LND_MACAROON_ENV,
     FM_LND_PAYMENT_TIMEOUT_SECS_ENV, FM_LND_RPC_ADDR_ENV, FM_LND_TIME_PREF_ENV,
     FM_LND_TLS_CERT_ENV, FM_PORT_LDK,
 };
@@ -824,7 +831,83 @@ pub enum LightningMode {
         )]
         #[serde(default)]
         probe_recent_destinations: Option<NonZeroUsize>,
+
+        #[command(flatten)]
+        #[serde(default)]
+        scorer: LdkScorerOptions,
     },
+}
+
+/// Overrides for the LDK Node's scorer. Each one unset keeps LDK's default,
+/// so setting none changes nothing.
+#[derive(Debug, Clone, Default, Args, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LdkScorerOptions {
+    /// Half-life of the liquidity bounds one probe or payment taught, seconds.
+    #[arg(
+        long = "ldk-scorer-liquidity-offset-half-life-secs",
+        env = FM_LDK_SCORER_LIQUIDITY_OFFSET_HALF_LIFE_SECS_ENV
+    )]
+    #[serde(default)]
+    pub liquidity_offset_half_life_secs: Option<u64>,
+
+    /// Half-life of a channel's liquidity history while nothing updates it,
+    /// seconds.
+    #[arg(
+        long = "ldk-scorer-historical-no-updates-half-life-secs",
+        env = FM_LDK_SCORER_HISTORICAL_NO_UPDATES_HALF_LIFE_SECS_ENV
+    )]
+    #[serde(default)]
+    pub historical_no_updates_half_life_secs: Option<u64>,
+
+    /// Fixed penalty per hop, msat.
+    #[arg(
+        long = "ldk-scorer-base-penalty-msat",
+        env = FM_LDK_SCORER_BASE_PENALTY_MSAT_ENV
+    )]
+    #[serde(default)]
+    pub base_penalty_msat: Option<u64>,
+
+    /// Per-hop penalty per 2^30 msat sent.
+    #[arg(
+        long = "ldk-scorer-base-penalty-amount-multiplier-msat",
+        env = FM_LDK_SCORER_BASE_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV
+    )]
+    #[serde(default)]
+    pub base_penalty_amount_multiplier_msat: Option<u64>,
+
+    /// Penalty per -log10 of the success probability from the latest
+    /// liquidity bounds, msat.
+    #[arg(
+        long = "ldk-scorer-liquidity-penalty-multiplier-msat",
+        env = FM_LDK_SCORER_LIQUIDITY_PENALTY_MULTIPLIER_MSAT_ENV
+    )]
+    #[serde(default)]
+    pub liquidity_penalty_multiplier_msat: Option<u64>,
+
+    /// Same, per 2^20 msat sent.
+    #[arg(
+        long = "ldk-scorer-liquidity-penalty-amount-multiplier-msat",
+        env = FM_LDK_SCORER_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV
+    )]
+    #[serde(default)]
+    pub liquidity_penalty_amount_multiplier_msat: Option<u64>,
+
+    /// Penalty per -log10 of the success probability from the liquidity
+    /// history, msat.
+    #[arg(
+        long = "ldk-scorer-historical-liquidity-penalty-multiplier-msat",
+        env = FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_MULTIPLIER_MSAT_ENV
+    )]
+    #[serde(default)]
+    pub historical_liquidity_penalty_multiplier_msat: Option<u64>,
+
+    /// Same, per 2^20 msat sent.
+    #[arg(
+        long = "ldk-scorer-historical-liquidity-penalty-amount-multiplier-msat",
+        env = FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV
+    )]
+    #[serde(default)]
+    pub historical_liquidity_penalty_amount_multiplier_msat: Option<u64>,
 }
 
 #[derive(Clone)]
