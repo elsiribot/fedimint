@@ -22,7 +22,7 @@ use crate::logger::Logger;
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
-use crate::payment::{ProbeOutcome, ProbeOutcomeSender};
+use crate::payment::{PaymentOutcome, PaymentOutcomeSender, ProbeOutcome, ProbeOutcomeSender};
 
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
@@ -456,6 +456,7 @@ where
 	logger: L,
 	config: Arc<Config>,
 	probe_outcomes: ProbeOutcomeSender,
+	payment_outcomes: PaymentOutcomeSender,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -470,7 +471,7 @@ where
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, logger: L, config: Arc<Config>,
-		probe_outcomes: ProbeOutcomeSender,
+		probe_outcomes: ProbeOutcomeSender, payment_outcomes: PaymentOutcomeSender,
 	) -> Self {
 		Self {
 			event_queue,
@@ -487,6 +488,7 @@ where
 			runtime,
 			config,
 			probe_outcomes,
+			payment_outcomes,
 		}
 	}
 
@@ -993,6 +995,12 @@ where
 						hex_utils::to_string(&payment_preimage.0)
 					);
 				});
+				// Nobody listening is fine: only fixed-route senders wait for these.
+				let _ = self.payment_outcomes.send(PaymentOutcome::Sent {
+					payment_id,
+					payment_preimage,
+					fee_paid_msat,
+				});
 				let event = Event::PaymentSuccessful {
 					payment_id: Some(payment_id),
 					payment_hash,
@@ -1029,6 +1037,7 @@ where
 					},
 				};
 
+				let _ = self.payment_outcomes.send(PaymentOutcome::Failed { payment_id, reason });
 				let event =
 					Event::PaymentFailed { payment_id: Some(payment_id), payment_hash, reason };
 				match self.event_queue.add_event(event) {
@@ -1041,7 +1050,19 @@ where
 			},
 
 			LdkEvent::PaymentPathSuccessful { .. } => {},
-			LdkEvent::PaymentPathFailed { .. } => {},
+			LdkEvent::PaymentPathFailed {
+				payment_id: Some(payment_id),
+				short_channel_id,
+				payment_failed_permanently,
+				..
+			} => {
+				let _ = self.payment_outcomes.send(PaymentOutcome::PathFailed {
+					payment_id,
+					failed_channel: short_channel_id,
+					permanently: payment_failed_permanently,
+				});
+			},
+			LdkEvent::PaymentPathFailed { payment_id: None, .. } => {},
 			// The background processor feeds probe outcomes to the scorer before they reach
 			// us, so there is nothing to do here except leave a trace for the operator.
 			LdkEvent::ProbeSuccessful { payment_id, path, .. } => {

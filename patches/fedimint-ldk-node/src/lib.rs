@@ -136,11 +136,11 @@ use gossip::GossipSource;
 use graph::NetworkGraph;
 use io::utils::write_node_metrics;
 use liquidity::{LSPS1Liquidity, LiquiditySource};
-use payment::ProbeOutcomeSender;
 use payment::{
 	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
 	UnifiedQrPayment,
 };
+use payment::{FixedRoutePayment, PaymentOutcomeSender, ProbeOutcomeSender};
 use peer_store::{PeerInfo, PeerStore};
 use types::{
 	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
@@ -204,6 +204,7 @@ pub struct Node {
 	is_listening: Arc<AtomicBool>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	probe_outcomes: ProbeOutcomeSender,
+	payment_outcomes: PaymentOutcomeSender,
 }
 
 impl Node {
@@ -545,6 +546,7 @@ impl Node {
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
 			self.probe_outcomes.clone(),
+			self.payment_outcomes.clone(),
 		));
 
 		// Setup background processing
@@ -920,6 +922,18 @@ impl Node {
 			Arc::clone(&self.logger),
 			self.probe_outcomes.clone(),
 		))
+	}
+
+	/// Returns a payment handler for payments over a route whose first hop the caller chose,
+	/// and for circular rebalances between two of our channels.
+	pub fn fixed_route_payment(&self) -> FixedRoutePayment {
+		FixedRoutePayment::new(
+			Arc::clone(&self.runtime),
+			Arc::clone(&self.channel_manager),
+			Arc::clone(&self._router),
+			Arc::clone(&self.logger),
+			self.payment_outcomes.clone(),
+		)
 	}
 
 	/// Returns a payment handler allowing to send and receive on-chain payments.

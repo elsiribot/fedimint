@@ -26,7 +26,7 @@ use crate::liquidity::{
 };
 use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
-use crate::payment::PROBE_OUTCOME_CAPACITY;
+use crate::payment::{PAYMENT_OUTCOME_CAPACITY, PROBE_OUTCOME_CAPACITY};
 use crate::peer_store::PeerStore;
 use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
@@ -1524,6 +1524,7 @@ fn build_with_store_internal(
 		is_listening,
 		node_metrics,
 		probe_outcomes: tokio::sync::broadcast::channel(PROBE_OUTCOME_CAPACITY).0,
+		payment_outcomes: tokio::sync::broadcast::channel(PAYMENT_OUTCOME_CAPACITY).0,
 	})
 }
 

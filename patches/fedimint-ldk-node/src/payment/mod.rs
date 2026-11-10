@@ -9,6 +9,7 @@
 
 mod bolt11;
 mod bolt12;
+mod fixed_route;
 mod onchain;
 mod spontaneous;
 pub(crate) mod store;
@@ -16,6 +17,8 @@ mod unified_qr;
 
 pub use bolt11::Bolt11Payment;
 pub use bolt12::Bolt12Payment;
+pub use fixed_route::{FixedRouteError, FixedRoutePayment, PaymentOutcome};
+pub(crate) use fixed_route::{PaymentOutcomeSender, PAYMENT_OUTCOME_CAPACITY};
 pub use onchain::OnchainPayment;
 pub use spontaneous::{ProbeOutcome, SpontaneousPayment};
 pub(crate) use spontaneous::{ProbeOutcomeSender, PROBE_OUTCOME_CAPACITY};
