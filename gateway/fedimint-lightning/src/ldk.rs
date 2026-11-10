@@ -15,7 +15,8 @@ use fedimint_core::util::{FmtCompact, SafeUrl};
 use fedimint_core::{Amount, BitcoinAmountOrAll, crit};
 use fedimint_gateway_common::{
     ChainSource, ConnectPeerRequest, GetInvoiceRequest, GetInvoiceResponse, LdkScorerOptions,
-    ListTransactionsResponse, NodeAddress, SetChannelFeesRequest,
+    ListTransactionsResponse, NodeAddress, RebalanceChannelRequest, RebalanceChannelResponse,
+    SetChannelFeesRequest,
 };
 use fedimint_ln_common::contracts::Preimage;
 use fedimint_logging::{LOG_LIGHTNING, LOG_LIGHTNING_LDK};
@@ -1222,6 +1223,33 @@ impl ILnRpcClient for GatewayLdkClient {
         Ok(ListChannelsResponse { channels })
     }
 
+    async fn rebalance_channel(
+        &self,
+        payload: RebalanceChannelRequest,
+    ) -> Result<RebalanceChannelResponse, LightningRpcError> {
+        fixed_route::rebalance(&self.node, payload).await
+    }
+
+    async fn pay_via_first_hop(
+        &self,
+        invoice: Bolt11Invoice,
+        first_hop: OutPoint,
+        max_fee: Amount,
+    ) -> Result<PayInvoiceResponse, LightningRpcError> {
+        let payment_id = PaymentId(*invoice.payment_hash().as_byte_array());
+        // The same lock as `pay`, so the two cannot send one invoice at once.
+        let _payment_lock_guard = self
+            .outbound_lightning_payment_lock_pool
+            .async_lock(payment_id)
+            .await;
+        if self.outbound_payment(payment_id).is_some() {
+            return Err(LightningRpcError::FailedPayment {
+                failure_reason: "the node already has a payment of this invoice".to_string(),
+            });
+        }
+        fixed_route::pay_via_first_hop(&self.node, &invoice, first_hop, max_fee).await
+    }
+
     async fn set_channel_fees(
         &self,
         payload: SetChannelFeesRequest,
@@ -1592,6 +1620,7 @@ impl Ord for UserChannelId {
     }
 }
 
+mod fixed_route;
 mod probe;
 #[cfg(test)]
 mod tests;

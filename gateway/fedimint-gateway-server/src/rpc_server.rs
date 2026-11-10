@@ -26,11 +26,12 @@ use fedimint_gateway_common::{
     PAY_INVOICE_FOR_OPERATOR_ENDPOINT, PAY_OFFER_FOR_OPERATOR_ENDPOINT, PAYMENT_LOG_ENDPOINT,
     PAYMENT_SUMMARY_ENDPOINT, PEGIN_FROM_ONCHAIN_ENDPOINT, PayInvoiceForOperatorPayload,
     PayOfferPayload, PaymentLogPayload, PaymentSummaryPayload, PeginFromOnchainPayload,
-    RECEIVE_ECASH_ENDPOINT, ReceiveEcashPayload, SEND_ONCHAIN_ENDPOINT, SET_CHANNEL_FEES_ENDPOINT,
-    SET_FEES_ENDPOINT, SET_PAYMENT_POLICY_ENDPOINT, SPEND_ECASH_ENDPOINT, STOP_ENDPOINT,
-    SendOnchainRequest, SetChannelFeesRequest, SetFeesPayload, SetMnemonicPayload,
-    SetPaymentPolicyPayload, SpendEcashPayload, V1_API_ENDPOINT, WITHDRAW_ENDPOINT,
-    WITHDRAW_TO_ONCHAIN_ENDPOINT, WithdrawPayload, WithdrawToOnchainPayload,
+    REBALANCE_CHANNEL_ENDPOINT, RECEIVE_ECASH_ENDPOINT, RebalanceChannelRequest,
+    ReceiveEcashPayload, SEND_ONCHAIN_ENDPOINT, SET_CHANNEL_FEES_ENDPOINT, SET_FEES_ENDPOINT,
+    SET_PAYMENT_POLICY_ENDPOINT, SPEND_ECASH_ENDPOINT, STOP_ENDPOINT, SendOnchainRequest,
+    SetChannelFeesRequest, SetFeesPayload, SetMnemonicPayload, SetPaymentPolicyPayload,
+    SpendEcashPayload, V1_API_ENDPOINT, WITHDRAW_ENDPOINT, WITHDRAW_TO_ONCHAIN_ENDPOINT,
+    WithdrawPayload, WithdrawToOnchainPayload,
 };
 use fedimint_gateway_ui::IAdminGateway;
 use fedimint_ln_common::gateway_endpoint_constants::{
@@ -437,6 +438,13 @@ fn routes(gateway: Arc<Gateway>, task_group: TaskGroup, handlers: &mut Handlers)
         is_authenticated,
         authenticated_routes,
     );
+    let authenticated_routes = register_post_handler(
+        handlers,
+        REBALANCE_CHANNEL_ENDPOINT,
+        rebalance_channel,
+        is_authenticated,
+        authenticated_routes,
+    );
     let authenticated_routes = register_get_handler(
         handlers,
         LIST_CHANNELS_ENDPOINT,
@@ -748,6 +756,15 @@ async fn open_channel_with_push(
 ) -> Result<Json<serde_json::Value>, GatewayError> {
     let funding_txid = gateway.handle_open_channel_msg(payload).await?;
     Ok(Json(json!(funding_txid)))
+}
+
+#[instrument(target = LOG_GATEWAY, skip_all, err, fields(?payload))]
+async fn rebalance_channel(
+    Extension(gateway): Extension<Arc<Gateway>>,
+    Json(payload): Json<RebalanceChannelRequest>,
+) -> Result<Json<serde_json::Value>, GatewayError> {
+    let response = gateway.handle_rebalance_channel_msg(payload).await?;
+    Ok(Json(json!(response)))
 }
 
 #[instrument(target = LOG_GATEWAY, skip_all, err, fields(?payload))]

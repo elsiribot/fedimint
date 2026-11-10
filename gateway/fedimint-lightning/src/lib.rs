@@ -7,8 +7,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bitcoin::Network;
 use bitcoin::hashes::sha256;
+use bitcoin::{Network, OutPoint};
 use fedimint_core::Amount;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::envs::{FM_IN_DEVIMINT_ENV, is_env_var_set};
@@ -19,7 +19,8 @@ use fedimint_core::util::{FmtCompact as _, FmtCompactResult as _, backoff_util, 
 use fedimint_gateway_common::{
     ChannelInfo, CloseChannelsWithPeerRequest, CloseChannelsWithPeerResponse, ConnectPeerRequest,
     GetInvoiceRequest, GetInvoiceResponse, LightningInfo, ListTransactionsResponse,
-    OpenChannelRequest, SendOnchainRequest, SetChannelFeesRequest,
+    OpenChannelRequest, RebalanceChannelRequest, RebalanceChannelResponse, SendOnchainRequest,
+    SetChannelFeesRequest,
 };
 use fedimint_ln_common::PrunedInvoice;
 pub use fedimint_ln_common::contracts::Preimage;
@@ -67,6 +68,8 @@ pub enum LightningRpcError {
     FailedToCloseChannelsWithPeer { failure_reason: String },
     #[error("Failed to set channel fees: {failure_reason}")]
     FailedToSetChannelFees { failure_reason: String },
+    #[error("Failed to rebalance channel: {failure_reason}")]
+    FailedToRebalanceChannel { failure_reason: String },
     #[error("Failed to get Invoice: {failure_reason}")]
     FailedToGetInvoice { failure_reason: String },
     #[error("Failed to list transactions: {failure_reason}")]
@@ -268,6 +271,32 @@ pub trait ILnRpcClient: Debug + Send + Sync {
         &self,
         payload: SetChannelFeesRequest,
     ) -> Result<(), LightningRpcError>;
+
+    /// Moves outbound liquidity from one of our channels to another with a
+    /// circular payment. A backend that cannot says so.
+    async fn rebalance_channel(
+        &self,
+        payload: RebalanceChannelRequest,
+    ) -> Result<RebalanceChannelResponse, LightningRpcError> {
+        let _ = payload;
+        Err(LightningRpcError::FailedToRebalanceChannel {
+            failure_reason: "this Lightning backend cannot rebalance channels".to_string(),
+        })
+    }
+
+    /// Pays `invoice` out of the channel funded by `first_hop` only, spending
+    /// at most `max_fee` on routing. A backend that cannot says so.
+    async fn pay_via_first_hop(
+        &self,
+        invoice: Bolt11Invoice,
+        first_hop: OutPoint,
+        max_fee: Amount,
+    ) -> Result<PayInvoiceResponse, LightningRpcError> {
+        let _ = (invoice, first_hop, max_fee);
+        Err(LightningRpcError::FailedPayment {
+            failure_reason: "this Lightning backend cannot pay out of a chosen channel".to_string(),
+        })
+    }
 
     /// Returns a summary of the lightning node's balance, including the onchain
     /// wallet, outbound liquidity, and inbound liquidity.
@@ -742,6 +771,32 @@ impl ILnRpcClient for LnRpcTracked {
             self,
             "set_channel_fees",
             self.inner.set_channel_fees(payload).await
+        )
+    }
+
+    async fn rebalance_channel(
+        &self,
+        payload: RebalanceChannelRequest,
+    ) -> Result<RebalanceChannelResponse, LightningRpcError> {
+        tracked_call!(
+            self,
+            "rebalance_channel",
+            self.inner.rebalance_channel(payload).await
+        )
+    }
+
+    async fn pay_via_first_hop(
+        &self,
+        invoice: Bolt11Invoice,
+        first_hop: OutPoint,
+        max_fee: Amount,
+    ) -> Result<PayInvoiceResponse, LightningRpcError> {
+        tracked_call!(
+            self,
+            "pay_via_first_hop",
+            self.inner
+                .pay_via_first_hop(invoice, first_hop, max_fee)
+                .await
         )
     }
 

@@ -2193,7 +2193,10 @@ where
                 .parse::<lightning_invoice::Bolt11Invoice>()
             {
                 Ok(invoice) => {
-                    let bolt11_payload = PayInvoiceForOperatorPayload { invoice };
+                    let bolt11_payload = PayInvoiceForOperatorPayload {
+                        invoice,
+                        first_hop: None,
+                    };
                     match state
                         .api
                         .handle_pay_invoice_for_operator_msg(bolt11_payload)

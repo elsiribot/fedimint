@@ -23,7 +23,8 @@ use fedimint_gateway_common::{
     ChannelInfo, CloseChannelsWithPeerResponse, CreateOfferResponse, FederationConfig,
     FederationInfo, GatewayBalances, GatewayFedConfig, GatewayInfo, GetInvoiceResponse,
     ListTransactionsResponse, MnemonicResponse, PayOfferResponse, PaymentLogResponse,
-    PaymentSummaryResponse, ReceiveEcashResponse, SpendEcashResponse, WithdrawResponse,
+    PaymentSummaryResponse, RebalanceChannelResponse, ReceiveEcashResponse, SpendEcashResponse,
+    WithdrawResponse,
 };
 use fedimint_ln_common::client::GatewayApi;
 use fedimint_logging::TracingSetup;
@@ -62,6 +63,7 @@ pub enum CliOutput {
     },
     Channels(Vec<ChannelInfo>),
     CloseChannels(CloseChannelsWithPeerResponse),
+    Rebalance(RebalanceChannelResponse),
     InvoiceDetails(Option<GetInvoiceResponse>),
     Transactions(ListTransactionsResponse),
     Offer(CreateOfferResponse),

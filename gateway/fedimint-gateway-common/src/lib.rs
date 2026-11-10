@@ -68,6 +68,7 @@ pub const PAY_OFFER_FOR_OPERATOR_ENDPOINT: &str = "/pay_offer_for_operator";
 pub const PAYMENT_LOG_ENDPOINT: &str = "/payment_log";
 pub const PAYMENT_SUMMARY_ENDPOINT: &str = "/payment_summary";
 pub const PEGIN_FROM_ONCHAIN_ENDPOINT: &str = "/pegin_from_onchain";
+pub const REBALANCE_CHANNEL_ENDPOINT: &str = "/rebalance_channel";
 pub const RECEIVE_ECASH_ENDPOINT: &str = "/receive_ecash";
 pub const SET_CHANNEL_FEES_ENDPOINT: &str = "/set_channel_fees";
 pub const SET_FEES_ENDPOINT: &str = "/set_fees";
@@ -288,6 +289,69 @@ pub struct CreateInvoiceForOperatorPayload {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PayInvoiceForOperatorPayload {
     pub invoice: Bolt11Invoice,
+    /// Pay out of the channel with this funding outpoint only, over a single
+    /// path. Unset, the node's router picks any channel, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_hop: Option<OutPoint>,
+}
+
+/// Moves outbound liquidity from one of the gateway's channels to another
+/// with a circular payment: out through `source`, back in through
+/// `destination`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RebalanceChannelRequest {
+    /// Funding outpoint of the channel to move outbound liquidity out of.
+    pub source: OutPoint,
+    /// Funding outpoint of the channel to move outbound liquidity into.
+    pub destination: OutPoint,
+    /// How much arrives back in `destination`.
+    pub amount_sats: u64,
+    /// Most the whole loop may cost, in parts per million of `amount_sats`.
+    /// With `max_fee_sats` too, the lower of the two applies; with neither,
+    /// the gateway's default cap does.
+    #[serde(default)]
+    pub max_fee_ppm: Option<u64>,
+    /// Most the whole loop may cost, in sats.
+    #[serde(default)]
+    pub max_fee_sats: Option<u64>,
+}
+
+/// One hop of a rebalance route: the node the hop reaches and the channel it
+/// takes there.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct RouteHopSummary {
+    pub node_id: PublicKey,
+    pub short_channel_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RebalanceStatus {
+    /// The loop was paid: `amount_sats` moved, `fee_msat` spent.
+    Succeeded,
+    /// Every route tried failed; nothing moved and nothing is in flight.
+    Failed,
+    /// No route within the fee cap, or a channel cannot carry the amount.
+    NoRoute,
+    /// The last route did not settle in time and may still complete; check
+    /// the channel balances before trying again.
+    Timeout,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RebalanceChannelResponse {
+    pub status: RebalanceStatus,
+    pub amount_sats: u64,
+    /// What the loop cost, once it succeeded.
+    pub fee_msat: Option<u64>,
+    /// Routes sent.
+    pub attempts: u32,
+    /// The last route sent (or found), source peer first, ending with us.
+    pub route: Vec<RouteHopSummary>,
+    /// Channels earlier routes failed at.
+    pub failed_channels: Vec<u64>,
+    /// Why it did not succeed.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

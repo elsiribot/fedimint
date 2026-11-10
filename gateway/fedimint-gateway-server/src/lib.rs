@@ -84,11 +84,12 @@ use fedimint_gateway_common::{
     LightningMode, ListTransactionsPayload, ListTransactionsResponse, MnemonicResponse,
     OpenChannelRequest, PayInvoiceForOperatorPayload, PayOfferPayload, PayOfferResponse,
     PaymentLogPayload, PaymentLogResponse, PaymentPolicy, PaymentStats, PaymentSummaryPayload,
-    PaymentSummaryResponse, PeginFromOnchainPayload, ReceiveEcashPayload, ReceiveEcashResponse,
-    RegisteredProtocol, SendOnchainRequest, SetChannelFeesRequest, SetFeesPayload,
-    SetMnemonicPayload, SetPaymentPolicyPayload, SpendEcashPayload, SpendEcashResponse,
-    V1_API_ENDPOINT, WithdrawPayload, WithdrawPreviewPayload, WithdrawPreviewResponse,
-    WithdrawResponse, WithdrawToOnchainPayload,
+    PaymentSummaryResponse, PeginFromOnchainPayload, RebalanceChannelRequest,
+    RebalanceChannelResponse, ReceiveEcashPayload, ReceiveEcashResponse, RegisteredProtocol,
+    SendOnchainRequest, SetChannelFeesRequest, SetFeesPayload, SetMnemonicPayload,
+    SetPaymentPolicyPayload, SpendEcashPayload, SpendEcashResponse, V1_API_ENDPOINT,
+    WithdrawPayload, WithdrawPreviewPayload, WithdrawPreviewResponse, WithdrawResponse,
+    WithdrawToOnchainPayload,
 };
 use fedimint_gateway_server_db::{GatewayDbtxNcExt as _, get_gatewayd_database_migrations};
 pub use fedimint_gateway_ui::IAdminGateway;
@@ -321,6 +322,22 @@ impl Gateway {
             chain_source,
         )
         .await
+    }
+    /// Moves outbound liquidity between two of the gateway's channels with a
+    /// circular payment.
+    pub async fn handle_rebalance_channel_msg(
+        &self,
+        payload: RebalanceChannelRequest,
+    ) -> AdminResult<RebalanceChannelResponse> {
+        info!(
+            target: LOG_GATEWAY,
+            source = %payload.source,
+            destination = %payload.destination,
+            amount_sats = payload.amount_sats,
+            "Rebalancing channels..."
+        );
+        let context = self.get_lightning_context().await?;
+        Ok(context.lnrpc.rebalance_channel(payload).await?)
     }
 }
 
@@ -2979,10 +2996,20 @@ impl IAdminGateway for Gateway {
                 .context("Invoice is missing amount")?
                 .saturating_div(FEE_DENOMINATOR);
 
-        let res = lightning_context
-            .lnrpc
-            .pay(payload.invoice, MAX_DELAY, Amount::from_msats(max_fee))
-            .await?;
+        let res = match payload.first_hop {
+            Some(first_hop) => {
+                lightning_context
+                    .lnrpc
+                    .pay_via_first_hop(payload.invoice, first_hop, Amount::from_msats(max_fee))
+                    .await?
+            }
+            None => {
+                lightning_context
+                    .lnrpc
+                    .pay(payload.invoice, MAX_DELAY, Amount::from_msats(max_fee))
+                    .await?
+            }
+        };
         Ok(res.preimage)
     }
 

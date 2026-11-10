@@ -6,12 +6,13 @@ use fedimint_core::Amount;
 use fedimint_gateway_client::{
     close_channels_with_peer, connect_peer, create_invoice_for_self, create_offer, get_invoice,
     list_channels, list_transactions, open_channel, open_channel_with_push, pay_invoice, pay_offer,
-    set_channel_fees,
+    rebalance_channel, set_channel_fees,
 };
 use fedimint_gateway_common::{
     CloseChannelsWithPeerRequest, ConnectPeerRequest, CreateInvoiceForOperatorPayload,
     CreateOfferPayload, GetInvoiceRequest, ListTransactionsPayload, NodeAddress,
-    OpenChannelRequest, PayInvoiceForOperatorPayload, PayOfferPayload, SetChannelFeesRequest,
+    OpenChannelRequest, PayInvoiceForOperatorPayload, PayOfferPayload, RebalanceChannelRequest,
+    SetChannelFeesRequest,
 };
 use fedimint_ln_common::client::GatewayApi;
 use lightning_invoice::Bolt11Invoice;
@@ -33,7 +34,34 @@ pub enum LightningCommands {
         description: Option<String>,
     },
     /// Pay a lightning invoice as the gateway (i.e. no e-cash exchange).
-    PayInvoice { invoice: Bolt11Invoice },
+    PayInvoice {
+        invoice: Bolt11Invoice,
+        /// Pay out of the channel with this funding outpoint only, in
+        /// `<txid>:<vout>` form
+        #[clap(long)]
+        first_hop: Option<bitcoin::OutPoint>,
+    },
+    /// Move outbound liquidity from one of the gateway's channels to another
+    /// with a circular payment (out through `source`, back in through
+    /// `destination`).
+    RebalanceChannel {
+        /// Funding outpoint of the channel to move outbound out of, in
+        /// `<txid>:<vout>` form
+        #[clap(long)]
+        source: bitcoin::OutPoint,
+        /// Funding outpoint of the channel to move outbound into
+        #[clap(long)]
+        destination: bitcoin::OutPoint,
+        /// How much arrives back in the destination channel
+        #[clap(long)]
+        amount_sats: u64,
+        /// Most the loop may cost, in parts per million of the amount
+        #[clap(long)]
+        max_fee_ppm: Option<u64>,
+        /// Most the loop may cost, in sats
+        #[clap(long)]
+        max_fee_sats: Option<u64>,
+    },
     /// Connect to another lightning node without opening a channel.
     ConnectPeer {
         /// The peer to connect to, in `pubkey@host[:port]` format.
@@ -183,10 +211,35 @@ impl LightningCommands {
                     invoice: response.to_string(),
                 })
             }
-            Self::PayInvoice { invoice } => {
-                let preimage =
-                    pay_invoice(client, base_url, PayInvoiceForOperatorPayload { invoice }).await?;
+            Self::PayInvoice { invoice, first_hop } => {
+                let preimage = pay_invoice(
+                    client,
+                    base_url,
+                    PayInvoiceForOperatorPayload { invoice, first_hop },
+                )
+                .await?;
                 Ok(CliOutput::Preimage { preimage })
+            }
+            Self::RebalanceChannel {
+                source,
+                destination,
+                amount_sats,
+                max_fee_ppm,
+                max_fee_sats,
+            } => {
+                let response = rebalance_channel(
+                    client,
+                    base_url,
+                    RebalanceChannelRequest {
+                        source,
+                        destination,
+                        amount_sats,
+                        max_fee_ppm,
+                        max_fee_sats,
+                    },
+                )
+                .await?;
+                Ok(CliOutput::Rebalance(response))
             }
             Self::ConnectPeer { node_address } => {
                 connect_peer(client, base_url, ConnectPeerRequest { node_address }).await?;

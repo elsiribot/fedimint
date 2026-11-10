@@ -25,12 +25,14 @@ use fedimint_gateway_common::{
     PAY_INVOICE_FOR_OPERATOR_ENDPOINT, PAY_OFFER_FOR_OPERATOR_ENDPOINT, PAYMENT_LOG_ENDPOINT,
     PAYMENT_SUMMARY_ENDPOINT, PEGIN_FROM_ONCHAIN_ENDPOINT, PayInvoiceForOperatorPayload,
     PayOfferPayload, PayOfferResponse, PaymentLogPayload, PaymentLogResponse,
-    PaymentSummaryPayload, PaymentSummaryResponse, PeginFromOnchainPayload, RECEIVE_ECASH_ENDPOINT,
-    ReceiveEcashPayload, ReceiveEcashResponse, SEND_ONCHAIN_ENDPOINT, SET_CHANNEL_FEES_ENDPOINT,
-    SET_FEES_ENDPOINT, SET_PAYMENT_POLICY_ENDPOINT, SPEND_ECASH_ENDPOINT, STOP_ENDPOINT,
-    SendOnchainRequest, SetChannelFeesRequest, SetFeesPayload, SetMnemonicPayload,
-    SetPaymentPolicyPayload, SpendEcashPayload, SpendEcashResponse, WITHDRAW_ENDPOINT,
-    WITHDRAW_TO_ONCHAIN_ENDPOINT, WithdrawPayload, WithdrawResponse, WithdrawToOnchainPayload,
+    PaymentSummaryPayload, PaymentSummaryResponse, PeginFromOnchainPayload,
+    REBALANCE_CHANNEL_ENDPOINT, RECEIVE_ECASH_ENDPOINT, RebalanceChannelRequest,
+    RebalanceChannelResponse, ReceiveEcashPayload, ReceiveEcashResponse, SEND_ONCHAIN_ENDPOINT,
+    SET_CHANNEL_FEES_ENDPOINT, SET_FEES_ENDPOINT, SET_PAYMENT_POLICY_ENDPOINT,
+    SPEND_ECASH_ENDPOINT, STOP_ENDPOINT, SendOnchainRequest, SetChannelFeesRequest, SetFeesPayload,
+    SetMnemonicPayload, SetPaymentPolicyPayload, SpendEcashPayload, SpendEcashResponse,
+    WITHDRAW_ENDPOINT, WITHDRAW_TO_ONCHAIN_ENDPOINT, WithdrawPayload, WithdrawResponse,
+    WithdrawToOnchainPayload,
 };
 use fedimint_ln_common::Method;
 use fedimint_ln_common::client::GatewayApi;
@@ -296,6 +298,21 @@ pub async fn list_channels(
 ) -> ServerResult<Vec<ChannelInfo>> {
     client
         .request::<(), Vec<ChannelInfo>>(base_url, Method::GET, LIST_CHANNELS_ENDPOINT, None)
+        .await
+}
+
+pub async fn rebalance_channel(
+    client: &GatewayApi,
+    base_url: &SafeUrl,
+    payload: RebalanceChannelRequest,
+) -> ServerResult<RebalanceChannelResponse> {
+    client
+        .request(
+            base_url,
+            Method::POST,
+            REBALANCE_CHANNEL_ENDPOINT,
+            Some(payload),
+        )
         .await
 }
 
