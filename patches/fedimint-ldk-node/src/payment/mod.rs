@@ -17,7 +17,8 @@ mod unified_qr;
 pub use bolt11::Bolt11Payment;
 pub use bolt12::Bolt12Payment;
 pub use onchain::OnchainPayment;
-pub use spontaneous::SpontaneousPayment;
+pub use spontaneous::{ProbeOutcome, SpontaneousPayment};
+pub(crate) use spontaneous::{ProbeOutcomeSender, PROBE_OUTCOME_CAPACITY};
 pub use store::{
 	ConfirmationStatus, LSPFeeLimits, PaymentDetails, PaymentDirection, PaymentKind, PaymentStatus,
 };

@@ -2264,6 +2264,7 @@ impl Gateway {
                 announce_addresses,
                 probe_targets,
                 probe_recent_destinations,
+                probe_max_routes,
                 scorer,
             } => {
                 let mnemonic = Self::load_mnemonic(&self.gateway_db)
@@ -2289,6 +2290,7 @@ impl Gateway {
                             // without their own fee setting use.
                             max_fee_base_msat: self.default_routing_fees.base.msats,
                             max_fee_ppm: self.default_routing_fees.parts_per_million,
+                            max_routes: probe_max_routes,
                         },
                         &scorer,
                         mnemonic.clone(),

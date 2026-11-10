@@ -36,6 +36,11 @@ pub const FM_LDK_PROBE_TARGETS_ENV: &str = "FM_LDK_PROBE_TARGETS";
 /// days it probes in addition to `FM_LDK_PROBE_TARGETS`. Unset follows none.
 pub const FM_LDK_PROBE_RECENT_DESTINATIONS_ENV: &str = "FM_LDK_PROBE_RECENT_DESTINATIONS";
 
+/// How many routes one probe attempt of the LDK Node tries before it gives up
+/// on a target and amount: after a failed route it re-routes around what
+/// failed, like a payment's retry would. Unset tries 3.
+pub const FM_LDK_PROBE_MAX_ROUTES_ENV: &str = "FM_LDK_PROBE_MAX_ROUTES";
+
 // The LDK Node's scorer: how fast it forgets what probes and payments taught
 // it, and how much an uncertain channel costs next to its fees. Each unset
 // variable keeps LDK's default; see LDK's `ProbabilisticScoringDecayParameters`

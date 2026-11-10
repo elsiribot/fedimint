@@ -10,8 +10,8 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Network, OutPoint};
 use clap::{Args, Subcommand};
 use envs::{
-    FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_PROBE_RECENT_DESTINATIONS_ENV,
-    FM_LDK_PROBE_TARGETS_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV,
+    FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_PROBE_MAX_ROUTES_ENV,
+    FM_LDK_PROBE_RECENT_DESTINATIONS_ENV, FM_LDK_PROBE_TARGETS_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV,
     FM_LDK_SCORER_BASE_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV, FM_LDK_SCORER_BASE_PENALTY_MSAT_ENV,
     FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV,
     FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_MULTIPLIER_MSAT_ENV,
@@ -831,6 +831,13 @@ pub enum LightningMode {
         )]
         #[serde(default)]
         probe_recent_destinations: Option<NonZeroUsize>,
+
+        /// Routes one probe attempt tries: after a failed one it re-routes
+        /// around what failed, as a payment's retry would, and stops at the
+        /// first that reaches the target. Unset tries 3.
+        #[arg(long = "ldk-probe-max-routes", env = FM_LDK_PROBE_MAX_ROUTES_ENV)]
+        #[serde(default)]
+        probe_max_routes: Option<NonZeroUsize>,
 
         #[command(flatten)]
         #[serde(default)]

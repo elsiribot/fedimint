@@ -8,8 +8,14 @@
 //! tries a different hub. A probe is an HTLC with a random payment hash that
 //! no one can claim, so it moves no funds, and its outcome trains the scorer
 //! the same way a failed payment would, but before a user is waiting.
+//!
+//! An attempt retries like a payment does: when a route fails, LDK has
+//! already marked the channel it failed at, so routing again finds a way
+//! around it. The attempt stops at the first route that reaches the target,
+//! so each one leaves the scorer knowing a path that works right now, not
+//! only one that does not.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
@@ -23,10 +29,12 @@ use fedimint_core::Amount;
 use fedimint_core::task::{TaskGroup, block_in_place};
 use fedimint_core::util::FmtCompact;
 use fedimint_logging::LOG_LIGHTNING;
+use ldk_node::lightning::ln::channelmanager::PaymentId;
 use ldk_node::lightning::routing::gossip::NodeId;
+use ldk_node::payment::ProbeOutcome;
 use lightning_invoice::Bolt11Invoice;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 /// How long after start-up the first probe goes out. Until gossip has synced,
@@ -57,6 +65,14 @@ const RECENT_DESTINATIONS_FILE: &str = "probe_destinations.json";
 /// and a round takes minutes, so this only needs to absorb a burst of sends.
 const PAID_INVOICE_QUEUE_LEN: usize = 1024;
 
+/// Routes an attempt tries when [`ProbeConfig::max_routes`] is unset.
+const DEFAULT_MAX_ROUTES: usize = 3;
+
+/// How long the paths of one route get to settle. A probe settles in seconds;
+/// one held longer ties up liquidity on its path, so the attempt ends there
+/// rather than sending more.
+const ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// What the background prober probes, and within which fee budget.
 #[derive(Debug, Clone, Default)]
 pub struct ProbeConfig {
@@ -72,9 +88,17 @@ pub struct ProbeConfig {
     pub max_fee_base_msat: u64,
     /// Proportional part of the routing fee budget, in parts per million.
     pub max_fee_ppm: u64,
+    /// Routes one attempt tries before giving up on a target and amount;
+    /// `None` tries [`DEFAULT_MAX_ROUTES`].
+    pub max_routes: Option<NonZeroUsize>,
 }
 
 impl ProbeConfig {
+    fn max_routes(&self) -> usize {
+        self.max_routes
+            .map_or(DEFAULT_MAX_ROUTES, NonZeroUsize::get)
+    }
+
     fn max_fee_msat(&self, amount: Amount) -> u64 {
         amount
             .msats
@@ -409,7 +433,7 @@ async fn run_prober(
         }
 
         for (target, amount) in round_schedule(&targets) {
-            probe(&node, &config, target, amount);
+            probe(&node, &config, target, amount).await;
             fedimint_core::runtime::sleep(PROBE_INTERVAL).await;
         }
     }
@@ -422,37 +446,199 @@ fn join_keys(keys: &[PublicKey]) -> String {
         .join(",")
 }
 
-/// Logs one line per attempt at `Info`, which a log reader can pair with
-/// ldk-node's per-path outcome lines that follow (`Probe of ... to <target>`):
-/// `probes` says how many there will be.
-fn probe(node: &ldk_node::Node, config: &ProbeConfig, target: PublicKey, amount: Amount) {
-    let max_fee_msat = config.max_fee_msat(amount);
-    // Route finding walks the whole network graph, which is CPU work that must
-    // not stall the async workers.
-    let result = block_in_place(|| {
-        node.spontaneous_payment()
-            .send_probes_with_max_fee(amount.msats, target, max_fee_msat)
-    });
+/// How one route of an attempt ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteOutcome {
+    /// Every path of the route reached the target.
+    Reached,
+    /// At least one path failed; the channels they failed at, where LDK
+    /// knows them.
+    Failed(Vec<u64>),
+    /// LDK sent nothing: every path was a single hop or would put our first
+    /// hop under the liquidity limit.
+    Skipped,
+    /// No route within the fee budget, or another error sending.
+    NoRoute,
+    /// Not every path settled within [`ROUTE_TIMEOUT`].
+    TimedOut,
+}
 
-    match result {
-        // LDK logs why it skipped each path right before this.
-        Ok(0) => info!(
-            target: LOG_LIGHTNING,
-            %target, amount_msat = amount.msats,
-            "Sent no probe: every path was too short or would drain our first hop"
-        ),
-        Ok(probes) => info!(
-            target: LOG_LIGHTNING,
-            %target, amount_msat = amount.msats, probes,
-            "Sent probes"
-        ),
-        // Includes finding no route within the fee budget, which is worth
-        // knowing for a target users pay.
-        Err(err) => info!(
-            target: LOG_LIGHTNING,
-            %target, amount_msat = amount.msats, max_fee_msat, err = %err.fmt_compact(),
-            "Could not probe target"
-        ),
+impl RouteOutcome {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Reached => "reached",
+            Self::Failed(_) => "failed",
+            Self::Skipped => "skipped",
+            Self::NoRoute => "no_route",
+            Self::TimedOut => "timeout",
+        }
+    }
+
+    fn sent(&self) -> bool {
+        matches!(self, Self::Reached | Self::Failed(_) | Self::TimedOut)
+    }
+}
+
+/// The routes one attempt has tried so far, and whether to try another.
+#[derive(Debug, Default)]
+struct Attempt {
+    routes: Vec<RouteOutcome>,
+}
+
+impl Attempt {
+    fn record(&mut self, outcome: RouteOutcome) {
+        self.routes.push(outcome);
+    }
+
+    /// Only a failed route earns another try: after a success there is
+    /// nothing left to learn, after a timeout an HTLC may still hold
+    /// liquidity, and when LDK found no route or skipped it, routing again
+    /// finds the same.
+    fn wants_another_route(&self, max_routes: usize) -> bool {
+        matches!(self.routes.last(), Some(RouteOutcome::Failed(_)))
+            && self.routes_sent() < max_routes
+    }
+
+    fn routes_sent(&self) -> usize {
+        self.routes.iter().filter(|route| route.sent()).count()
+    }
+
+    fn first(&self) -> &'static str {
+        self.routes.first().map_or("none", RouteOutcome::name)
+    }
+
+    /// The last route's outcome; a retry that found no route or was skipped
+    /// leaves the attempt failed, since an earlier route did.
+    fn final_outcome(&self) -> &'static str {
+        match self.routes.last() {
+            Some(RouteOutcome::Skipped | RouteOutcome::NoRoute) if self.routes_sent() > 0 => {
+                "failed"
+            }
+            Some(last) => last.name(),
+            None => "none",
+        }
+    }
+
+    fn failed_channels(&self) -> Vec<u64> {
+        let mut seen = BTreeSet::new();
+        self.routes
+            .iter()
+            .filter_map(|route| match route {
+                RouteOutcome::Failed(channels) => Some(channels),
+                _ => None,
+            })
+            .flatten()
+            .filter(|channel| seen.insert(**channel))
+            .copied()
+            .collect()
+    }
+}
+
+/// Probes `target` with `amount`, re-routing after a failure up to
+/// [`ProbeConfig::max_routes`] routes. Logs `Sent probes` for every route (a
+/// log reader pairs it with ldk-node's per-path `Probe of ... to <target>`
+/// lines that follow; `probes` says how many), `Sent no probe` and
+/// `Could not probe target` for the first route as before, and one
+/// `Probe attempt done` line per attempt.
+async fn probe(node: &ldk_node::Node, config: &ProbeConfig, target: PublicKey, amount: Amount) {
+    let max_fee_msat = config.max_fee_msat(amount);
+    let payments = node.spontaneous_payment();
+    // Subscribed before sending, so no outcome can come too early.
+    let mut outcomes = payments.subscribe_probe_outcomes();
+    let mut attempt = Attempt::default();
+
+    loop {
+        let first = attempt.routes.is_empty();
+        // Route finding walks the whole network graph, which is CPU work
+        // that must not stall the async workers.
+        let sent = block_in_place(|| {
+            payments.send_probe_paths_with_max_fee(amount.msats, target, max_fee_msat)
+        });
+        let outcome = match sent {
+            Ok(ids) if ids.is_empty() => {
+                // LDK logs why it skipped each path right before this.
+                if first {
+                    info!(
+                        target: LOG_LIGHTNING,
+                        %target, amount_msat = amount.msats,
+                        "Sent no probe: every path was too short or would drain our first hop"
+                    );
+                }
+                RouteOutcome::Skipped
+            }
+            Ok(ids) => {
+                info!(
+                    target: LOG_LIGHTNING,
+                    %target, amount_msat = amount.msats, probes = ids.len(),
+                    "Sent probes"
+                );
+                wait_for_paths(&mut outcomes, ids).await
+            }
+            // Includes finding no route within the fee budget, which is
+            // worth knowing for a target users pay.
+            Err(err) => {
+                if first {
+                    info!(
+                        target: LOG_LIGHTNING,
+                        %target, amount_msat = amount.msats, max_fee_msat, err = %err.fmt_compact(),
+                        "Could not probe target"
+                    );
+                }
+                RouteOutcome::NoRoute
+            }
+        };
+        attempt.record(outcome);
+        if !attempt.wants_another_route(config.max_routes()) {
+            break;
+        }
+    }
+
+    info!(
+        target: LOG_LIGHTNING,
+        %target,
+        amount_msat = amount.msats,
+        routes = attempt.routes_sent(),
+        first = attempt.first(),
+        outcome = attempt.final_outcome(),
+        failed_channels = %attempt
+            .failed_channels()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        "Probe attempt done"
+    );
+}
+
+/// Waits until every path in `ids` has reached its target or failed.
+async fn wait_for_paths(
+    outcomes: &mut broadcast::Receiver<ProbeOutcome>,
+    ids: Vec<PaymentId>,
+) -> RouteOutcome {
+    let mut pending = ids.into_iter().collect::<HashSet<_>>();
+    let mut failed = Vec::new();
+    let settled = fedimint_core::runtime::timeout(ROUTE_TIMEOUT, async {
+        while !pending.is_empty() {
+            match outcomes.recv().await {
+                Ok(outcome) => {
+                    if pending.remove(&outcome.payment_id) && !outcome.reached {
+                        failed.push(outcome.failed_channel);
+                    }
+                }
+                // Missed outcomes leave their paths pending until the
+                // timeout, which only ends this attempt early.
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return false,
+            }
+        }
+        true
+    })
+    .await;
+
+    match settled {
+        Ok(true) if failed.is_empty() => RouteOutcome::Reached,
+        Ok(true) => RouteOutcome::Failed(failed.into_iter().flatten().collect()),
+        Ok(false) | Err(_) => RouteOutcome::TimedOut,
     }
 }
 

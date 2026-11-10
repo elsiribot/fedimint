@@ -136,6 +136,7 @@ use gossip::GossipSource;
 use graph::NetworkGraph;
 use io::utils::write_node_metrics;
 use liquidity::{LSPS1Liquidity, LiquiditySource};
+use payment::ProbeOutcomeSender;
 use payment::{
 	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
 	UnifiedQrPayment,
@@ -202,6 +203,7 @@ pub struct Node {
 	payment_store: Arc<PaymentStore>,
 	is_listening: Arc<AtomicBool>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
+	probe_outcomes: ProbeOutcomeSender,
 }
 
 impl Node {
@@ -542,6 +544,7 @@ impl Node {
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
+			self.probe_outcomes.clone(),
 		));
 
 		// Setup background processing
@@ -901,6 +904,7 @@ impl Node {
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.logger),
+			self.probe_outcomes.clone(),
 		)
 	}
 
@@ -914,6 +918,7 @@ impl Node {
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.logger),
+			self.probe_outcomes.clone(),
 		))
 	}
 

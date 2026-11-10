@@ -22,6 +22,7 @@ use crate::logger::Logger;
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
+use crate::payment::{ProbeOutcome, ProbeOutcomeSender};
 
 use crate::io::{
 	EVENT_QUEUE_PERSISTENCE_KEY, EVENT_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE,
@@ -454,6 +455,7 @@ where
 	runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 	logger: L,
 	config: Arc<Config>,
+	probe_outcomes: ProbeOutcomeSender,
 }
 
 impl<L: Deref + Clone + Sync + Send + 'static> EventHandler<L>
@@ -468,6 +470,7 @@ where
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, logger: L, config: Arc<Config>,
+		probe_outcomes: ProbeOutcomeSender,
 	) -> Self {
 		Self {
 			event_queue,
@@ -483,6 +486,7 @@ where
 			logger,
 			runtime,
 			config,
+			probe_outcomes,
 		}
 	}
 
@@ -1040,7 +1044,7 @@ where
 			LdkEvent::PaymentPathFailed { .. } => {},
 			// The background processor feeds probe outcomes to the scorer before they reach
 			// us, so there is nothing to do here except leave a trace for the operator.
-			LdkEvent::ProbeSuccessful { path, .. } => {
+			LdkEvent::ProbeSuccessful { payment_id, path, .. } => {
 				log_info!(
 					self.logger,
 					"Probe of {}msat to {} succeeded over {} hops",
@@ -1048,8 +1052,14 @@ where
 					path.hops.last().map_or("<no hops>".to_string(), |hop| hop.pubkey.to_string()),
 					path.hops.len(),
 				);
+				// Nobody listening is fine: only the prober waits for these.
+				let _ = self.probe_outcomes.send(ProbeOutcome {
+					payment_id,
+					reached: true,
+					failed_channel: None,
+				});
 			},
-			LdkEvent::ProbeFailed { path, short_channel_id, .. } => {
+			LdkEvent::ProbeFailed { payment_id, path, short_channel_id, .. } => {
 				log_info!(
 					self.logger,
 					"Probe of {}msat to {} failed at channel {}",
@@ -1057,6 +1067,11 @@ where
 					path.hops.last().map_or("<no hops>".to_string(), |hop| hop.pubkey.to_string()),
 					short_channel_id.map_or("<unknown>".to_string(), |scid| scid.to_string()),
 				);
+				let _ = self.probe_outcomes.send(ProbeOutcome {
+					payment_id,
+					reached: false,
+					failed_channel: short_channel_id,
+				});
 			},
 			LdkEvent::HTLCHandlingFailed { failed_next_destination, .. } => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {

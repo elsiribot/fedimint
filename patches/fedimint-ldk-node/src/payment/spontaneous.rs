@@ -27,6 +27,26 @@ use std::sync::{Arc, RwLock};
 // The default `final_cltv_expiry_delta` we apply when not set.
 const LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA: u32 = 144;
 
+/// How many probe outcomes a subscriber that falls behind may miss before it is told so.
+pub(crate) const PROBE_OUTCOME_CAPACITY: usize = 1024;
+
+/// How one probe path ended, as LDK reported it with `ProbeSuccessful` or `ProbeFailed`.
+///
+/// LDK has already updated the scorer with it when it is published, so a route found after
+/// receiving a failure takes that failure into account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeOutcome {
+	/// The id [`SpontaneousPayment::send_probe_paths_with_max_fee`] returned for the path.
+	pub payment_id: PaymentId,
+	/// Whether the probe reached its target.
+	pub reached: bool,
+	/// The channel the probe failed at, if it failed and LDK knows where.
+	pub failed_channel: Option<u64>,
+}
+
+/// Where the event handler publishes probe outcomes.
+pub(crate) type ProbeOutcomeSender = tokio::sync::broadcast::Sender<ProbeOutcome>;
+
 /// A payment handler allowing to send spontaneous ("keysend") payments.
 ///
 /// Should be retrieved by calling [`Node::spontaneous_payment`].
@@ -39,6 +59,7 @@ pub struct SpontaneousPayment {
 	payment_store: Arc<PaymentStore>,
 	config: Arc<Config>,
 	logger: Arc<Logger>,
+	probe_outcomes: ProbeOutcomeSender,
 }
 
 impl SpontaneousPayment {
@@ -46,8 +67,17 @@ impl SpontaneousPayment {
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 		channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
 		payment_store: Arc<PaymentStore>, config: Arc<Config>, logger: Arc<Logger>,
+		probe_outcomes: ProbeOutcomeSender,
 	) -> Self {
-		Self { runtime, channel_manager, keys_manager, payment_store, config, logger }
+		Self {
+			runtime,
+			channel_manager,
+			keys_manager,
+			payment_store,
+			config,
+			logger,
+			probe_outcomes,
+		}
 	}
 
 	/// Send a spontaneous aka. "keysend", payment.
@@ -214,6 +244,16 @@ impl SpontaneousPayment {
 	pub fn send_probes_with_max_fee(
 		&self, amount_msat: u64, node_id: PublicKey, max_total_routing_fee_msat: u64,
 	) -> Result<usize, Error> {
+		self.send_probe_paths_with_max_fee(amount_msat, node_id, max_total_routing_fee_msat)
+			.map(|ids| ids.len())
+	}
+
+	/// Like [`Self::send_probes_with_max_fee`], but returns the id of each probe path sent, so
+	/// the caller can match them with the outcomes from [`Self::subscribe_probe_outcomes`].
+	/// Subscribe before sending, or an outcome may arrive before the subscription.
+	pub fn send_probe_paths_with_max_fee(
+		&self, amount_msat: u64, node_id: PublicKey, max_total_routing_fee_msat: u64,
+	) -> Result<Vec<PaymentId>, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
 			return Err(Error::NotRunning);
@@ -232,6 +272,11 @@ impl SpontaneousPayment {
 			.send_preflight_probes(route_params, liquidity_limit_multiplier)
 			.map_err(|_| Error::ProbeSendingFailed)?;
 
-		Ok(probes.len())
+		Ok(probes.into_iter().map(|(_, payment_id)| payment_id).collect())
+	}
+
+	/// Outcomes of all probes sent from now on, one per path.
+	pub fn subscribe_probe_outcomes(&self) -> tokio::sync::broadcast::Receiver<ProbeOutcome> {
+		self.probe_outcomes.subscribe()
 	}
 }
