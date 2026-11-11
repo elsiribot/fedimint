@@ -272,7 +272,15 @@ impl FixedRoutePayment {
 				"the destination's peer has not told us its forwarding policy yet".to_string(),
 			)
 		})?;
-		let short_channel_id = dest.get_inbound_payment_scid().ok_or_else(|| {
+		// As for invoice route hints: an announced channel goes by its real SCID, which the peer
+		// forwards on whether or not it honours SCID aliases. Lightspark failed every rebalance
+		// whose last hop named our alias (2026-11-10/11); only unannounced channels use it.
+		let short_channel_id = if dest.is_announced {
+			dest.short_channel_id.or(dest.inbound_scid_alias)
+		} else {
+			dest.get_inbound_payment_scid()
+		}
+		.ok_or_else(|| {
 			FixedRouteError::ChannelCannotCarry(
 				"the destination has no short channel id yet".to_string(),
 			)
