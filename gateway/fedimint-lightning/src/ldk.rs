@@ -148,6 +148,10 @@ pub struct GatewayLdkClient {
     /// opened and is now pending, or the reason it closed before that.
     pending_channels: Arc<RwLock<BTreeMap<UserChannelId, PendingChannelSender>>>,
 
+    /// Forwarding fees (base msat, ppm) new channels start with, as the node
+    /// was configured; fills in whatever an `open_channel` request leaves out.
+    default_forwarding_fees: (u32, u32),
+
     /// Waiters for outgoing LDK payments that are woken by terminal payment
     /// events (`PaymentSuccessful` / `PaymentFailed`). This lets `pay()` block
     /// until the payment resolves instead of polling `node.payment()`. The
@@ -263,6 +267,7 @@ impl GatewayLdkClient {
         announce_addresses: Vec<String>,
         probe_config: ProbeConfig,
         scorer: &LdkScorerOptions,
+        default_channel_fees: Option<(u64, u64)>,
         mnemonic: Mnemonic,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self, LdkClientInitError> {
@@ -305,6 +310,29 @@ impl GatewayLdkClient {
             "LDK scorer parameters"
         );
 
+        let default_forwarding_fees = default_channel_fees
+            .map(|(base_msat, ppm)| {
+                Ok::<_, LdkClientInitError>((
+                    u32::try_from(base_msat)
+                        .map_err(|_| LdkClientInitError::InvalidDefaultChannelFees(base_msat))?,
+                    u32::try_from(ppm)
+                        .map_err(|_| LdkClientInitError::InvalidDefaultChannelFees(ppm))?,
+                ))
+            })
+            .transpose()?;
+        let (default_fee_base_msat, default_fee_ppm) =
+            default_forwarding_fees.unwrap_or_else(|| {
+                let ldk = ChannelConfig::default();
+                (ldk.forwarding_fee_base_msat, ldk.forwarding_fee_proportional_millionths)
+            });
+        info!(
+            target: LOG_LIGHTNING,
+            base_fee_msat = default_fee_base_msat,
+            parts_per_million = default_fee_ppm,
+            configured = default_forwarding_fees.is_some(),
+            "Default forwarding fees of new channels"
+        );
+
         let mut node_builder = ldk_node::Builder::from_config(ldk_node::config::Config {
             network,
             listening_addresses: Some(vec![SocketAddress::TcpIpV4 {
@@ -316,6 +344,7 @@ impl GatewayLdkClient {
             node_alias,
             route_hint_peers,
             scoring_parameters,
+            default_forwarding_fees,
             ..Default::default()
         });
 
@@ -395,6 +424,7 @@ impl GatewayLdkClient {
             pending_channels,
             pending_payments,
             paid_invoices,
+            default_forwarding_fees: (default_fee_base_msat, default_fee_ppm),
         })
     }
 
@@ -601,6 +631,36 @@ pub enum LdkClientInitError {
     /// LDK built the node but could not start it.
     #[error("The LDK node could not be started")]
     Start(#[source] ldk_node::NodeError),
+
+    /// A default channel fee does not fit LDK's 32-bit fee fields.
+    #[error("Default channel fee {0} does not fit in u32 (LDK limit)")]
+    InvalidDefaultChannelFees(u64),
+}
+
+/// The channel config an `open_channel` request asks for: `None` leaves the
+/// node's defaults, which carry the default forwarding fees; a request that
+/// sets only one of the two fees takes the other from those defaults rather
+/// than from LDK's 1000 msat / 0 ppm.
+fn open_channel_config(
+    base_fee_msat: Option<u64>,
+    parts_per_million: Option<u64>,
+    (default_base_msat, default_ppm): (u32, u32),
+) -> Result<Option<ChannelConfig>, LightningRpcError> {
+    if base_fee_msat.is_none() && parts_per_million.is_none() {
+        return Ok(None);
+    }
+    let fits = |value: u64, name: &str| {
+        u32::try_from(value).map_err(|_| LightningRpcError::FailedToOpenChannel {
+            failure_reason: format!("{name} {value} does not fit in u32 (LDK limit)"),
+        })
+    };
+    Ok(Some(ChannelConfig {
+        forwarding_fee_base_msat: base_fee_msat
+            .map_or(Ok(default_base_msat), |base| fits(base, "base_fee_msat"))?,
+        forwarding_fee_proportional_millionths: parts_per_million
+            .map_or(Ok(default_ppm), |ppm| fits(ppm, "parts_per_million"))?,
+        ..ChannelConfig::default()
+    }))
 }
 
 /// Why an invoice must not be registered for a payment hash on the node.
@@ -1043,30 +1103,8 @@ impl ILnRpcClient for GatewayLdkClient {
             );
         }
 
-        let channel_config = match (base_fee_msat, parts_per_million) {
-            (None, None) => None,
-            (base, ppm) => {
-                let mut config = ChannelConfig::default();
-                if let Some(base) = base {
-                    config.forwarding_fee_base_msat = u32::try_from(base).map_err(|_| {
-                        LightningRpcError::FailedToOpenChannel {
-                            failure_reason: format!(
-                                "base_fee_msat {base} does not fit in u32 (LDK limit)"
-                            ),
-                        }
-                    })?;
-                }
-                if let Some(ppm) = ppm {
-                    config.forwarding_fee_proportional_millionths =
-                        u32::try_from(ppm).map_err(|_| LightningRpcError::FailedToOpenChannel {
-                            failure_reason: format!(
-                                "parts_per_million {ppm} does not fit in u32 (LDK limit)"
-                            ),
-                        })?;
-                }
-                Some(config)
-            }
-        };
+        let channel_config =
+            open_channel_config(base_fee_msat, parts_per_million, self.default_forwarding_fees)?;
 
         let (tx, rx) = oneshot::channel::<Result<OutPoint, String>>();
 

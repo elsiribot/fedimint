@@ -10,7 +10,8 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Address, Network, OutPoint};
 use clap::{Args, Subcommand};
 use envs::{
-    FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_PROBE_MAX_ROUTES_ENV,
+    FM_LDK_ALIAS_ENV, FM_LDK_ANNOUNCE_ADDRESSES_ENV, FM_LDK_DEFAULT_CHANNEL_FEES_ENV,
+    FM_LDK_PROBE_MAX_ROUTES_ENV,
     FM_LDK_PROBE_RECENT_DESTINATIONS_ENV, FM_LDK_PROBE_TARGETS_ENV, FM_LDK_ROUTE_HINT_PEERS_ENV,
     FM_LDK_SCORER_BASE_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV, FM_LDK_SCORER_BASE_PENALTY_MSAT_ENV,
     FM_LDK_SCORER_HISTORICAL_LIQUIDITY_PENALTY_AMOUNT_MULTIPLIER_MSAT_ENV,
@@ -902,6 +903,14 @@ pub enum LightningMode {
         #[arg(long = "ldk-probe-max-routes", env = FM_LDK_PROBE_MAX_ROUTES_ENV)]
         #[serde(default)]
         probe_max_routes: Option<NonZeroUsize>,
+
+        /// Forwarding fees, `<base msat>,<ppm>`, every new channel starts
+        /// with: channels peers open to us, and ours opened without fees.
+        /// Unset keeps LDK's 1000 msat and 0 ppm, which makes an announced
+        /// channel a near-free hop for anyone routing towards its peer.
+        #[arg(long = "ldk-default-channel-fees", env = FM_LDK_DEFAULT_CHANNEL_FEES_ENV)]
+        #[serde(default)]
+        default_channel_fees: Option<PaymentFee>,
 
         #[command(flatten)]
         #[serde(default)]

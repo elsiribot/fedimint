@@ -1151,7 +1151,11 @@ impl Node {
 
 		let mut user_config = default_user_config(&self.config);
 		user_config.channel_handshake_config.announce_for_forwarding = announce_for_forwarding;
-		user_config.channel_config = (channel_config.unwrap_or_default()).clone().into();
+		// Without an explicit config the channel keeps the defaults, including the configured
+		// default forwarding fees, rather than LDK's bare `ChannelConfig::default()`.
+		if let Some(channel_config) = channel_config {
+			user_config.channel_config = channel_config.into();
+		}
 		// We set the max inflight to 100% for private channels.
 		// FIXME: LDK will default to this behavior soon, too, at which point we should drop this
 		// manual override.

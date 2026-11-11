@@ -11,7 +11,7 @@ use tokio::sync::{RwLock, oneshot};
 use super::{
     GatewayLdkClient, InboundRegistrationRefusal, LdkClientInitError, PendingPaymentWakeup,
     ProbeConfig, check_inbound_registration, get_esplora_url, htlc_completion_error,
-    lightning_balance_sats,
+    lightning_balance_sats, open_channel_config,
 };
 use crate::LightningRpcError;
 
@@ -94,6 +94,7 @@ fn a_non_utf8_data_dir_is_rejected_before_the_node_is_built() {
         Vec::new(),
         ProbeConfig::default(),
         &LdkScorerOptions::default(),
+        None,
         Mnemonic::from_entropy(&[0; 16]).expect("16 bytes of entropy form a mnemonic"),
         runtime,
     );
@@ -222,4 +223,41 @@ fn lightning_balance_leaves_out_coop_closes_and_adds_unswept_outputs() {
         lightning_balance_sats(&balances),
         4_726_078 + 300_000 + 40_000
     );
+}
+
+/// An open that names no fees leaves the node's defaults (which carry the
+/// configured default fees); one that names only one fee takes the other from
+/// the configured default, never from LDK's 1000 msat / 0 ppm.
+#[test]
+fn open_channel_fees_fall_back_to_the_configured_default() {
+    let default = (0, 10_000);
+    assert!(
+        open_channel_config(None, None, default)
+            .expect("no fees is valid")
+            .is_none()
+    );
+
+    let base_only = open_channel_config(Some(500), None, default)
+        .expect("valid")
+        .expect("a config");
+    assert_eq!(
+        (
+            base_only.forwarding_fee_base_msat,
+            base_only.forwarding_fee_proportional_millionths
+        ),
+        (500, 10_000)
+    );
+
+    let ppm_only = open_channel_config(None, Some(2_000), default)
+        .expect("valid")
+        .expect("a config");
+    assert_eq!(
+        (
+            ppm_only.forwarding_fee_base_msat,
+            ppm_only.forwarding_fee_proportional_millionths
+        ),
+        (0, 2_000)
+    );
+
+    assert!(open_channel_config(Some(u64::from(u32::MAX) + 1), None, default).is_err());
 }

@@ -109,6 +109,7 @@ pub const WALLET_KEYS_SEED_LEN: usize = 64;
 /// | `log_level`                            | Debug              |
 /// | `anchor_channels_config`               | Some(..)           |
 /// | `sending_parameters`                   | None               |
+/// | `default_forwarding_fees`              | None               |
 ///
 /// See [`AnchorChannelsConfig`] and [`SendingParameters`] for more information regarding their
 /// respective default values.
@@ -185,6 +186,12 @@ pub struct Config {
 	///
 	/// Defaults to LDK's own defaults, which ldk-node used to hardcode.
 	pub scoring_parameters: ScoringParameters,
+	/// The forwarding fees every new channel starts with, as (base msat, proportional
+	/// millionths): channels peers open to us, and ours opened without a [`ChannelConfig`].
+	///
+	/// `None` keeps LDK's default of 1000 msat and 0 ppm, which on an announced channel makes
+	/// this node a near-free hop for anyone routing towards that peer.
+	pub default_forwarding_fees: Option<(u32, u32)>,
 }
 
 /// The tunable parts of LDK's [`ProbabilisticScoringDecayParameters`] and
@@ -271,6 +278,7 @@ impl Default for Config {
 			node_alias: None,
 			route_hint_peers: Vec::new(),
 			scoring_parameters: ScoringParameters::default(),
+			default_forwarding_fees: None,
 		}
 	}
 }
@@ -403,6 +411,11 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	// failed). Allow the whole channel, as ldk-node already does for unannounced channels. This
 	// is negotiated at channel open, so it only applies to channels opened after this change.
 	user_config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+
+	if let Some((base_msat, proportional_millionths)) = config.default_forwarding_fees {
+		user_config.channel_config.forwarding_fee_base_msat = base_msat;
+		user_config.channel_config.forwarding_fee_proportional_millionths = proportional_millionths;
+	}
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;
@@ -662,5 +675,20 @@ mod tests {
 			addresses.push(socket_address);
 		}
 		assert!(may_announce_channel(&node_config).is_ok());
+	}
+
+	#[test]
+	fn default_forwarding_fees_apply_to_new_channels() {
+		let ldk_default = super::default_user_config(&Config::default()).channel_config;
+		assert_eq!(
+			(ldk_default.forwarding_fee_base_msat, ldk_default.forwarding_fee_proportional_millionths),
+			(1000, 0),
+			"unset keeps LDK's default"
+		);
+
+		let config = Config { default_forwarding_fees: Some((0, 10_000)), ..Config::default() };
+		let channel_config = super::default_user_config(&config).channel_config;
+		assert_eq!(channel_config.forwarding_fee_base_msat, 0);
+		assert_eq!(channel_config.forwarding_fee_proportional_millionths, 10_000);
 	}
 }

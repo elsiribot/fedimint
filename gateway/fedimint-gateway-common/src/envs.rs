@@ -41,6 +41,11 @@ pub const FM_LDK_PROBE_RECENT_DESTINATIONS_ENV: &str = "FM_LDK_PROBE_RECENT_DEST
 /// failed, like a payment's retry would. Unset tries 3.
 pub const FM_LDK_PROBE_MAX_ROUTES_ENV: &str = "FM_LDK_PROBE_MAX_ROUTES";
 
+/// Environment variable for the forwarding fees, `<base msat>,<ppm>`, every new
+/// channel starts with: those peers open to the gateway and its own opened
+/// without explicit fees. Unset keeps LDK's 1000 msat and 0 ppm.
+pub const FM_LDK_DEFAULT_CHANNEL_FEES_ENV: &str = "FM_LDK_DEFAULT_CHANNEL_FEES";
+
 // The LDK Node's scorer: how fast it forgets what probes and payments taught
 // it, and how much an uncertain channel costs next to its fees. Each unset
 // variable keeps LDK's default; see LDK's `ProbabilisticScoringDecayParameters`
