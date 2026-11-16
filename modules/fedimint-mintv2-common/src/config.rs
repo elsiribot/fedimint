@@ -136,14 +136,13 @@ impl FeeConsensus {
         base: Amount,
         parts_per_million: u64,
     ) -> Result<FeeConsensus, &'static str> {
-        // Preserve the legacy static-config invariant. The dynamic-fee design in
-        // #8758 moves broader policy to separate FeeConsensus/FeeRate types.
-        if !((base == Amount::ZERO && parts_per_million == 0)
-            || (base == Amount::from_msats(100) && parts_per_million <= 1_000))
-        {
-            return Err(
-                "Mint fees must be zero or use the 100 msat base fee and at most one thousand parts per million",
-            );
+        // The base fee used to be pinned to exactly 0 or 100 msat here. Federations
+        // are free to set their own base fee (e.g. to adjust for note-processing
+        // costs), so only the relative fee is bounded; any non-negative base fee
+        // from a federation's own config is accepted rather than rejected at decode
+        // time.
+        if parts_per_million > 1_000 {
+            return Err("Mint relative fee must be at most one thousand parts per million");
         }
 
         Ok(Self {
