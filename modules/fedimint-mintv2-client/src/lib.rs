@@ -459,31 +459,30 @@ impl ClientModule for MintClientModule {
         }
     }
 
-    // The fee follows the note's own denomination, as the federation computes
-    // it, rather than the declared amount: `reissue` declares an output above
-    // its denomination to overpay the federation, and that must not raise the
-    // fee.
     fn input_fee(
         &self,
-        _amounts: &Amounts,
+        amounts: &Amounts,
         input: &<Self::Common as ModuleCommon>::Input,
     ) -> Option<Amounts> {
-        let fee = self
-            .cfg
-            .fee_consensus
-            .fee(input.maybe_v0_ref()?.note.amount());
-
-        Some(Amounts::new_custom(self.cfg.amount_unit, fee))
+        mint_input_fee(
+            &self.cfg.fee_consensus,
+            self.cfg.amount_unit,
+            amounts,
+            input,
+        )
     }
 
     fn output_fee(
         &self,
-        _amounts: &Amounts,
+        amounts: &Amounts,
         output: &<Self::Common as ModuleCommon>::Output,
     ) -> Option<Amounts> {
-        let fee = self.cfg.fee_consensus.fee(output.maybe_v0_ref()?.amount());
-
-        Some(Amounts::new_custom(self.cfg.amount_unit, fee))
+        mint_output_fee(
+            &self.cfg.fee_consensus,
+            self.cfg.amount_unit,
+            amounts,
+            output,
+        )
     }
 
     #[cfg(feature = "cli")]
@@ -1084,7 +1083,9 @@ impl MintClientModule {
     /// has to be less than a note of the smallest denomination plus its fee,
     /// and is left to the federation; the client adds no note of its own to
     /// either side. Otherwise the reissue is refused with
-    /// [`ReissueError::Unbalanced`] before anything is written.
+    /// [`ReissueError::Unbalanced`] before anything is written, as is any
+    /// denomination outside the client denominations, with
+    /// [`ReissueError::InvalidDenomination`].
     ///
     /// # Cancel safety
     ///
@@ -1223,7 +1224,7 @@ impl MintClientModule {
         for outpoint in change_outpoint_range {
             self.await_output_sm_success(operation_id, outpoint)
                 .await
-                .map_err(|_| ReissueError::Rejected)?;
+                .map_err(ReissueError::from)?;
         }
 
         Ok(())
@@ -1620,8 +1621,12 @@ pub enum ReissueError {
 
     /// The client holds fewer notes of this denomination than the inputs
     /// name.
-    #[error("No spendable note of denomination {0} is left to spend")]
+    #[error("Fewer spendable notes of denomination {0} are held than the inputs name")]
     MissingNote(Denomination),
+
+    /// An input or output is not one of the client denominations.
+    #[error("Denomination {0} is not a client denomination")]
+    InvalidDenomination(Denomination),
 
     /// The inputs do not pay for the outputs and fees, or pay so much more
     /// that a note of the smallest denomination would still fit.
@@ -1636,21 +1641,64 @@ pub enum ReissueError {
     #[error("The reissue transaction could not be submitted")]
     Failed(#[source] TransactionSubmitError),
 
-    /// The federation did not issue the outputs.
-    #[error("The reissue was not issued by the federation")]
+    /// The federation rejected the transaction. Its inputs are claimed back.
+    #[error("The reissue transaction was rejected")]
     Rejected,
+
+    /// The federation accepted the transaction, so its inputs are spent, but
+    /// the notes of the outputs could not be finalized.
+    #[error("The reissue was accepted but its outputs could not be finalized")]
+    OutputsFailed,
 
     /// No reissue operation with this ID exists.
     #[error("No reissue operation with this ID exists")]
     NotFound,
 }
 
+impl From<AwaitOutputError> for ReissueError {
+    fn from(error: AwaitOutputError) -> Self {
+        match error {
+            AwaitOutputError::Rejected => ReissueError::Rejected,
+            AwaitOutputError::Failed => ReissueError::OutputsFailed,
+        }
+    }
+}
+
+/// The fee on a mint input.
+///
+/// It follows the note's own denomination, as the federation computes it,
+/// and never the declared `amounts`: `reissue` declares an output above its
+/// denomination to overpay the federation, and that must not change a fee.
+fn mint_input_fee(
+    fee_consensus: &FeeConsensus,
+    unit: AmountUnit,
+    _amounts: &Amounts,
+    input: &MintInput,
+) -> Option<Amounts> {
+    let fee = fee_consensus.fee(input.maybe_v0_ref()?.note.amount());
+
+    Some(Amounts::new_custom(unit, fee))
+}
+
+/// The fee on a mint output, from its denomination, as [`mint_input_fee`].
+fn mint_output_fee(
+    fee_consensus: &FeeConsensus,
+    unit: AmountUnit,
+    _amounts: &Amounts,
+    output: &MintOutput,
+) -> Option<Amounts> {
+    let fee = fee_consensus.fee(output.maybe_v0_ref()?.amount());
+
+    Some(Amounts::new_custom(unit, fee))
+}
+
 /// What reissuing `inputs` into `outputs` leaves to the federation beyond the
 /// fees, if that is allowed.
 ///
-/// It is allowed when the inputs pay for the outputs and the fees on both,
-/// and the remainder is less than a note of the smallest denomination plus
-/// its fee, so no further output could take it.
+/// It is allowed when every denomination is a client denomination, the
+/// inputs pay for the outputs and the fees on both, and the remainder is less
+/// than a note of the smallest denomination plus its fee, so no further
+/// output could take it.
 fn reissue_overpayment(
     fee_consensus: &FeeConsensus,
     inputs: &[Denomination],
@@ -1658,6 +1706,16 @@ fn reissue_overpayment(
 ) -> Result<Amount, ReissueError> {
     if inputs.is_empty() || outputs.is_empty() {
         return Err(ReissueError::Empty);
+    }
+
+    // Checked first, so that no amount is computed from a denomination whose
+    // `1 << d` could overflow.
+    if let Some(invalid) = inputs
+        .iter()
+        .chain(outputs)
+        .find(|d| !client_denominations().any(|valid| valid == **d))
+    {
+        return Err(ReissueError::InvalidDenomination(*invalid));
     }
 
     let face_value =

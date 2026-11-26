@@ -996,3 +996,51 @@ async fn reissue_of_a_note_not_held_is_refused() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reissue_into_a_denomination_outside_the_client_range_is_refused() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = funded_client(&fed).await?;
+    let mint = client.get_first_module::<MintClientModule>()?;
+
+    let counts = mint.get_count_by_denomination().await;
+    let balance = client.get_balance_for_btc().await?;
+    let operations = client
+        .operation_log()
+        .paginate_operations_rev(100, None)
+        .await
+        .len();
+
+    // A consensus denomination the federation would sign, but below the
+    // client denominations.
+    assert_matches!(
+        mint.reissue(
+            vec![Denomination(12)],
+            vec![Denomination(11), Denomination(8)],
+            Value::Null
+        )
+        .await,
+        Err(ReissueError::InvalidDenomination(Denomination(8)))
+    );
+
+    // Not a denomination at all: `1 << 64` would overflow.
+    assert_matches!(
+        mint.reissue(vec![Denomination(12)], vec![Denomination(64)], Value::Null)
+            .await,
+        Err(ReissueError::InvalidDenomination(Denomination(64)))
+    );
+
+    assert_eq!(mint.get_count_by_denomination().await, counts);
+    assert_eq!(client.get_balance_for_btc().await?, balance);
+    assert_eq!(
+        client
+            .operation_log()
+            .paginate_operations_rev(100, None)
+            .await
+            .len(),
+        operations
+    );
+
+    Ok(())
+}
