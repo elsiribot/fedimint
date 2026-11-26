@@ -51,7 +51,9 @@ use fedimint_client_module::{DynGlobalClientContext, sm_enum_variant_translation
 use fedimint_core::base32::{self, FEDIMINT_PREFIX};
 use fedimint_core::config::FederationId;
 use fedimint_core::core::{IntoDynInstance, ModuleInstanceId, ModuleKind, OperationId};
-use fedimint_core::db::{DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped};
+use fedimint_core::db::{
+    AutocommitError, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
+};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{
     AmountUnit, Amounts, ApiVersion, CommonModuleInit, ModuleCommon, ModuleInit, MultiApiVersion,
@@ -60,7 +62,7 @@ use fedimint_core::secp256k1::rand::{Rng, thread_rng};
 use fedimint_core::secp256k1::{Keypair, PublicKey};
 use fedimint_core::util::backoff_util::custom_backoff;
 use fedimint_core::util::{BoxStream, NextOrPending};
-use fedimint_core::{Amount, OutPoint, PeerId, apply, async_trait_maybe_send};
+use fedimint_core::{Amount, IdxRange, OutPoint, PeerId, apply, async_trait_maybe_send};
 use fedimint_derive_secret::DerivableSecret;
 use fedimint_mintv2_common::config::{FeeConsensus, MintClientConfig, client_denominations};
 use fedimint_mintv2_common::{
@@ -457,28 +459,31 @@ impl ClientModule for MintClientModule {
         }
     }
 
+    // The fee follows the note's own denomination, as the federation computes
+    // it, rather than the declared amount: `reissue` declares an output above
+    // its denomination to overpay the federation, and that must not raise the
+    // fee.
     fn input_fee(
         &self,
-        amounts: &Amounts,
-        _input: &<Self::Common as ModuleCommon>::Input,
+        _amounts: &Amounts,
+        input: &<Self::Common as ModuleCommon>::Input,
     ) -> Option<Amounts> {
-        let unit = self.cfg.amount_unit;
-        let amount = amounts.get(&unit).copied().unwrap_or_default();
-        let fee = self.cfg.fee_consensus.fee(amount);
+        let fee = self
+            .cfg
+            .fee_consensus
+            .fee(input.maybe_v0_ref()?.note.amount());
 
-        Some(Amounts::new_custom(unit, fee))
+        Some(Amounts::new_custom(self.cfg.amount_unit, fee))
     }
 
     fn output_fee(
         &self,
-        amounts: &Amounts,
-        _output: &<Self::Common as ModuleCommon>::Output,
+        _amounts: &Amounts,
+        output: &<Self::Common as ModuleCommon>::Output,
     ) -> Option<Amounts> {
-        let unit = self.cfg.amount_unit;
-        let amount = amounts.get(&unit).copied().unwrap_or_default();
-        let fee = self.cfg.fee_consensus.fee(amount);
+        let fee = self.cfg.fee_consensus.fee(output.maybe_v0_ref()?.amount());
 
-        Some(Amounts::new_custom(unit, fee))
+        Some(Amounts::new_custom(self.cfg.amount_unit, fee))
     }
 
     #[cfg(feature = "cli")]
@@ -787,6 +792,22 @@ impl MintClientModule {
         operation_id: OperationId,
         requested_denominations: Vec<Denomination>,
     ) -> ClientOutputBundle<MintOutput, MintClientStateMachines> {
+        self.create_overpaid_output_bundle(operation_id, requested_denominations, Amount::ZERO)
+            .await
+    }
+
+    /// [`Self::create_output_bundle`], with `overpayment` added to the
+    /// declared amount of the last output.
+    ///
+    /// The federation only sees the denominations, so the overpayment is
+    /// left to it as a fee, while the client sees a balanced transaction and
+    /// adds no change. Cancel safe, as [`Self::create_output_bundle`].
+    async fn create_overpaid_output_bundle(
+        &self,
+        operation_id: OperationId,
+        requested_denominations: Vec<Denomination>,
+        overpayment: Amount,
+    ) -> ClientOutputBundle<MintOutput, MintClientStateMachines> {
         let issuance_requests = futures::stream::iter(requested_denominations)
             .zip(self.tweak_receiver.clone())
             .map(|(d, tweak)| NoteIssuanceRequest::new(d, tweak, &self.root_secret))
@@ -794,11 +815,20 @@ impl MintClientModule {
             .await;
 
         let amount_unit = self.cfg.amount_unit;
+        let last = issuance_requests.len().saturating_sub(1);
         let outputs = issuance_requests
             .iter()
-            .map(|request| ClientOutput {
+            .enumerate()
+            .map(|(index, request)| ClientOutput {
                 output: request.output(),
-                amounts: Amounts::new_custom(amount_unit, request.denomination.amount()),
+                amounts: Amounts::new_custom(
+                    amount_unit,
+                    if index == last {
+                        request.denomination.amount() + overpayment
+                    } else {
+                        request.denomination.amount()
+                    },
+                ),
             })
             .collect();
 
@@ -856,6 +886,11 @@ impl MintClientModule {
         pin_mut!(stream);
 
         stream.next_or_pending().await
+    }
+
+    /// The fees the federation charges per note.
+    pub fn fee_consensus(&self) -> &FeeConsensus {
+        &self.cfg.fee_consensus
     }
 
     /// Count the `ECash` notes in the client's database by denomination.
@@ -1039,6 +1074,159 @@ impl MintClientModule {
         dbtx.on_commit(move || sender.send_replace(()));
 
         Ok(Some((operation_id, ecash)))
+    }
+
+    /// Reissue one held note per entry of `inputs` into one new note per entry
+    /// of `outputs`, in a single transaction, and return the operation ID.
+    ///
+    /// Any held note of the named denomination is spent. The inputs have to
+    /// pay for the outputs and the fees on both. What they pay beyond that
+    /// has to be less than a note of the smallest denomination plus its fee,
+    /// and is left to the federation; the client adds no note of its own to
+    /// either side. Otherwise the reissue is refused with
+    /// [`ReissueError::Unbalanced`] before anything is written.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel safe. The notes are removed and the transaction is submitted in
+    /// one [`autocommit`](fedimint_core::db::Database::autocommit)
+    /// transaction, so dropping the future either commits both or neither.
+    pub async fn reissue(
+        &self,
+        mut inputs: Vec<Denomination>,
+        mut outputs: Vec<Denomination>,
+        custom_meta: Value,
+    ) -> Result<OperationId, ReissueError> {
+        let overpayment = reissue_overpayment(&self.cfg.fee_consensus, &inputs, &outputs)?;
+
+        // We sort the notes by denomination to minimize the leaked information.
+        inputs.sort();
+        outputs.sort();
+
+        let mut held_needed = BTreeMap::<Denomination, usize>::new();
+
+        for denomination in inputs {
+            *held_needed.entry(denomination).or_default() += 1;
+        }
+
+        let operation_id = OperationId::new_random();
+        let amount = outputs.iter().map(|d| d.amount()).sum::<Amount>();
+        let n_outputs = outputs.len() as u64;
+
+        let output_bundle = self.client_ctx.make_client_outputs(
+            self.create_overpaid_output_bundle(operation_id, outputs, overpayment)
+                .await,
+        );
+
+        self.client_ctx
+            .module_db()
+            .autocommit(
+                |dbtx, _| {
+                    let held_needed = held_needed.clone();
+                    let output_bundle = output_bundle.clone();
+                    let custom_meta = custom_meta.clone();
+
+                    Box::pin(async move {
+                        let mut notes = Vec::new();
+
+                        for (denomination, count) in held_needed {
+                            let held = dbtx
+                                .find_by_prefix(&SpendableNoteAmountPrefix(denomination))
+                                .await
+                                .map(|entry| entry.0.0)
+                                .take(count)
+                                .collect::<Vec<SpendableNote>>()
+                                .await;
+
+                            if held.len() < count {
+                                return Err(ReissueError::MissingNote(denomination));
+                            }
+
+                            notes.extend(held);
+                        }
+
+                        for note in &notes {
+                            self.remove_spendable_note(dbtx, note).await;
+                        }
+
+                        let input_bundle =
+                            self.client_ctx
+                                .make_client_inputs(Self::create_input_bundle(
+                                    operation_id,
+                                    notes,
+                                    false,
+                                    self.cfg.amount_unit,
+                                ));
+
+                        self.client_ctx
+                            .finalize_and_submit_transaction_dbtx(
+                                dbtx,
+                                operation_id,
+                                MintCommonInit::KIND.as_str(),
+                                // The transaction is balanced, so the change
+                                // range is empty: the outputs are all ours.
+                                move |change_range: OutPointRange| MintOperationMeta::Reissue {
+                                    change_outpoint_range: OutPointRange::new(
+                                        change_range.txid(),
+                                        IdxRange::from(0..n_outputs),
+                                    ),
+                                    amount,
+                                    custom_meta: custom_meta.clone(),
+                                },
+                                TransactionBuilder::new()
+                                    .with_inputs(input_bundle)
+                                    .with_outputs(output_bundle),
+                            )
+                            .await
+                            .map_err(ReissueError::Failed)?;
+
+                        let sender = self.balance_update_sender.clone();
+                        dbtx.on_commit(move || sender.send_replace(()));
+
+                        Ok(())
+                    })
+                },
+                Some(100),
+            )
+            .await
+            .map_err(|error| match error {
+                AutocommitError::ClosureError { error, .. } => error,
+                AutocommitError::CommitFailed { last_error, .. } => {
+                    ReissueError::Failed(TransactionSubmitError::Database(last_error))
+                }
+            })?;
+
+        Ok(operation_id)
+    }
+
+    /// Wait until every output of the reissue `operation_id` is issued.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel safe: this only reads and waits. The state machines keep running
+    /// in the executor.
+    pub async fn await_reissue(&self, operation_id: OperationId) -> Result<(), ReissueError> {
+        let operation = self
+            .client_ctx
+            .get_operation(operation_id)
+            .await
+            .map_err(|_| ReissueError::NotFound)?;
+
+        let MintOperationMeta::Reissue {
+            change_outpoint_range,
+            ..
+        } = operation.meta::<MintOperationMeta>()
+        else {
+            return Err(ReissueError::NotFound);
+        };
+
+        for outpoint in change_outpoint_range {
+            self.await_output_sm_success(operation_id, outpoint)
+                .await
+                .map_err(|_| ReissueError::Rejected)?;
+        }
+
+        Ok(())
     }
 
     /// Receive the `ECash` by reissuing the notes and return the operation ID.
@@ -1422,6 +1610,83 @@ pub enum ReceiveECashError {
     Failed(#[source] TransactionSubmitError),
 }
 
+/// A failure to reissue chosen notes into chosen denominations.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ReissueError {
+    /// The reissue names no input or no output.
+    #[error("A reissue needs at least one input and one output")]
+    Empty,
+
+    /// The client holds fewer notes of this denomination than the inputs
+    /// name.
+    #[error("No spendable note of denomination {0} is left to spend")]
+    MissingNote(Denomination),
+
+    /// The inputs do not pay for the outputs and fees, or pay so much more
+    /// that a note of the smallest denomination would still fit.
+    #[error("Inputs of {inputs} do not balance outputs of {outputs} and fees of {fees}")]
+    Unbalanced {
+        inputs: Amount,
+        outputs: Amount,
+        fees: Amount,
+    },
+
+    /// The reissue transaction could not be submitted.
+    #[error("The reissue transaction could not be submitted")]
+    Failed(#[source] TransactionSubmitError),
+
+    /// The federation did not issue the outputs.
+    #[error("The reissue was not issued by the federation")]
+    Rejected,
+
+    /// No reissue operation with this ID exists.
+    #[error("No reissue operation with this ID exists")]
+    NotFound,
+}
+
+/// What reissuing `inputs` into `outputs` leaves to the federation beyond the
+/// fees, if that is allowed.
+///
+/// It is allowed when the inputs pay for the outputs and the fees on both,
+/// and the remainder is less than a note of the smallest denomination plus
+/// its fee, so no further output could take it.
+fn reissue_overpayment(
+    fee_consensus: &FeeConsensus,
+    inputs: &[Denomination],
+    outputs: &[Denomination],
+) -> Result<Amount, ReissueError> {
+    if inputs.is_empty() || outputs.is_empty() {
+        return Err(ReissueError::Empty);
+    }
+
+    let face_value =
+        |denominations: &[Denomination]| denominations.iter().map(|d| d.amount()).sum::<Amount>();
+
+    let inputs_amount = face_value(inputs);
+    let outputs_amount = face_value(outputs);
+    let fees = inputs
+        .iter()
+        .chain(outputs)
+        .map(|d| fee_consensus.fee(d.amount()))
+        .sum::<Amount>();
+
+    let smallest = client_denominations()
+        .next()
+        .expect("There is a client denomination")
+        .amount();
+    let ceiling = smallest + fee_consensus.fee(smallest);
+
+    inputs_amount
+        .checked_sub(outputs_amount + fees)
+        .filter(|overpayment| *overpayment < ceiling)
+        .ok_or(ReissueError::Unbalanced {
+            inputs: inputs_amount,
+            outputs: outputs_amount,
+            fees,
+        })
+}
+
 /// Why an output's state machine did not issue its notes.
 #[derive(Debug, Error)]
 enum AwaitOutputError {
@@ -1537,3 +1802,6 @@ fn represent_amount(mut remaining_amount: Amount) -> Vec<Denomination> {
 
     denominations
 }
+
+#[cfg(test)]
+mod tests;

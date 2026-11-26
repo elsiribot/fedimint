@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::pin::pin;
 
 use anyhow::ensure;
@@ -20,7 +21,7 @@ use fedimint_eventlog::{Event, EventLogEntry, EventLogId};
 use fedimint_mintv2_client::{
     ECash, FinalReceiveOperationState, MintClientInit, MintClientModule, MintOperationMeta,
     ReceiveECashError, ReceivePaymentEvent, ReceivePaymentStatus, ReceivePaymentUpdateEvent,
-    SendECashError, SendPaymentEvent, SpendableNote,
+    ReissueError, SendECashError, SendPaymentEvent, SpendableNote,
 };
 use fedimint_mintv2_common::{Denomination, KIND};
 use fedimint_mintv2_server::MintInit;
@@ -706,3 +707,292 @@ async fn send_without_funds_reports_insufficient_balance() -> anyhow::Result<()>
 }
 
 mod db;
+
+/// Sum of the face values of `denominations`.
+fn face_value(denominations: &[Denomination]) -> Amount {
+    denominations.iter().map(|d| d.amount()).sum()
+}
+
+/// Sum of the mint fees on `denominations`, one fee per note.
+fn fees(mint: &MintClientModule, denominations: &[Denomination]) -> Amount {
+    denominations
+        .iter()
+        .map(|d| mint.fee_consensus().fee(d.amount()))
+        .sum()
+}
+
+/// What is left of the `inputs` once the `outputs` and every fee are paid.
+fn remainder(mint: &MintClientModule, inputs: &[Denomination], outputs: &[Denomination]) -> Amount {
+    face_value(inputs) - fees(mint, inputs) - face_value(outputs) - fees(mint, outputs)
+}
+
+/// Greedily spend `amount` on notes of at most `max`, each paying its own fee,
+/// largest first.
+fn split_with_fees(mint: &MintClientModule, mut amount: Amount, max: u8) -> Vec<Denomination> {
+    let mut denominations = Vec::new();
+
+    for denomination in (9..=max).rev().map(Denomination) {
+        let cost = denomination.amount() + mint.fee_consensus().fee(denomination.amount());
+
+        while amount >= cost {
+            amount -= cost;
+            denominations.push(denomination);
+        }
+    }
+
+    denominations
+}
+
+/// A client holding the 11,000 sats the dummy module issued it, settled.
+async fn funded_client(fed: &FederationTest) -> anyhow::Result<ClientHandleArc> {
+    let client = fed.new_client().await;
+
+    issue_ecash(&client, Amount::from_sats(11_000)).await?;
+
+    client.wait_for_all_active_state_machines().await;
+
+    Ok(client)
+}
+
+/// Reissue `inputs` into `outputs`, wait for it, and check that exactly the
+/// named notes went and came and that the balance fell by Σin − Σout. Returns
+/// the note counts afterwards.
+async fn reissue_and_check(
+    client: &ClientHandleArc,
+    inputs: Vec<Denomination>,
+    outputs: Vec<Denomination>,
+) -> anyhow::Result<BTreeMap<Denomination, u64>> {
+    let mint = client.get_first_module::<MintClientModule>()?;
+
+    let counts_before = mint.get_count_by_denomination().await;
+    let balance_before = client.get_balance_for_btc().await?;
+
+    let operation_id = mint
+        .reissue(inputs.clone(), outputs.clone(), Value::Null)
+        .await?;
+
+    mint.await_reissue(operation_id).await?;
+
+    client.wait_for_all_active_state_machines().await;
+
+    let MintOperationMeta::Reissue {
+        change_outpoint_range,
+        amount,
+        ..
+    } = client
+        .operation_log()
+        .get_operation(operation_id)
+        .await
+        .expect("operation exists")
+        .meta::<MintOperationMeta>()
+    else {
+        panic!("expected a reissue operation");
+    };
+
+    assert_eq!(change_outpoint_range.into_iter().count(), outputs.len());
+    assert_eq!(amount, face_value(&outputs));
+
+    let counts_after = mint.get_count_by_denomination().await;
+    let balance_after = client.get_balance_for_btc().await?;
+
+    assert_eq!(
+        balance_before - balance_after,
+        face_value(&inputs) - face_value(&outputs)
+    );
+
+    let tiers = counts_before
+        .keys()
+        .chain(counts_after.keys())
+        .chain(&inputs)
+        .chain(&outputs)
+        .copied()
+        .collect::<std::collections::BTreeSet<Denomination>>();
+
+    for tier in tiers {
+        let spent = inputs.iter().filter(|d| **d == tier).count() as u64;
+        let issued = outputs.iter().filter(|d| **d == tier).count() as u64;
+        let before = counts_before.get(&tier).copied().unwrap_or(0);
+        let after = counts_after.get(&tier).copied().unwrap_or(0);
+
+        assert_eq!(after, before - spent + issued, "tier {tier}");
+    }
+
+    Ok(counts_after)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reissue_merges_chosen_notes() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = funded_client(&fed).await?;
+    let mint = client.get_first_module::<MintClientModule>()?;
+
+    let counts = mint.get_count_by_denomination().await;
+    assert!(counts[&Denomination(12)] >= 2);
+    assert!(counts[&Denomination(11)] >= 1);
+
+    // Two notes of 12 alone are worth exactly one of 13, which leaves nothing
+    // for the fees, so a note of 11 pays them.
+    let inputs = vec![Denomination(12), Denomination(11), Denomination(12)];
+    let rest = split_with_fees(&mint, remainder(&mint, &inputs, &[Denomination(13)]), 41);
+    let outputs = std::iter::once(Denomination(13)).chain(rest).collect();
+
+    let counts_before = counts;
+    let counts_after = reissue_and_check(&client, inputs, outputs).await?;
+
+    assert_eq!(
+        counts_after[&Denomination(13)],
+        counts_before[&Denomination(13)] + 1
+    );
+    assert_eq!(
+        counts_after.get(&Denomination(12)).copied().unwrap_or(0),
+        counts_before[&Denomination(12)] - 2
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reissue_splits_a_chosen_note() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = funded_client(&fed).await?;
+    let mint = client.get_first_module::<MintClientModule>()?;
+
+    assert!(mint.get_count_by_denomination().await[&Denomination(15)] >= 1);
+
+    let inputs = vec![Denomination(15)];
+    let outputs = split_with_fees(&mint, remainder(&mint, &inputs, &[]), 14);
+
+    assert!(outputs.len() > 1);
+    assert!(
+        outputs
+            .iter()
+            .all(|d| (Denomination(9)..=Denomination(14)).contains(d))
+    );
+
+    reissue_and_check(&client, inputs, outputs).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reissue_with_a_remainder_touches_no_other_note() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = funded_client(&fed).await?;
+    let mint = client.get_first_module::<MintClientModule>()?;
+
+    let ceiling = Denomination(9).amount() + mint.fee_consensus().fee(Denomination(9).amount());
+
+    // Pile up notes of 9, so that the primary module, were it asked to
+    // balance anything, would pick from that tier first.
+    let inputs = vec![Denomination(15)];
+    let nines = vec![Denomination(9); 9];
+    let rest = split_with_fees(&mint, remainder(&mint, &inputs, &nines), 14);
+    let outputs = nines.into_iter().chain(rest).collect();
+
+    let counts = reissue_and_check(&client, inputs, outputs).await?;
+
+    assert!(counts[&Denomination(9)] > 6);
+
+    let inputs = vec![Denomination(14)];
+    let outputs = vec![
+        Denomination(10),
+        Denomination(11),
+        Denomination(12),
+        Denomination(13),
+    ];
+    let r = remainder(&mint, &inputs, &outputs);
+
+    assert!(Amount::ZERO < r && r < ceiling, "remainder {r}");
+
+    let counts_after = reissue_and_check(&client, inputs, outputs).await?;
+
+    assert_eq!(counts_after[&Denomination(9)], counts[&Denomination(9)]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unbalanced_reissue_is_refused_before_submission() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = funded_client(&fed).await?;
+    let mint = client.get_first_module::<MintClientModule>()?;
+
+    let counts = mint.get_count_by_denomination().await;
+    let balance = client.get_balance_for_btc().await?;
+    let operations = client
+        .operation_log()
+        .paginate_operations_rev(100, None)
+        .await
+        .len();
+
+    // The fees push the outputs above the inputs.
+    assert_matches!(
+        mint.reissue(vec![Denomination(12)], vec![Denomination(12)], Value::Null)
+            .await,
+        Err(ReissueError::Unbalanced { .. })
+    );
+
+    // A note of 9 and its fee would still fit into what is left over.
+    assert_matches!(
+        mint.reissue(vec![Denomination(14)], vec![Denomination(13)], Value::Null)
+            .await,
+        Err(ReissueError::Unbalanced { .. })
+    );
+
+    assert_eq!(mint.get_count_by_denomination().await, counts);
+    assert_eq!(client.get_balance_for_btc().await?, balance);
+    assert_eq!(
+        client
+            .operation_log()
+            .paginate_operations_rev(100, None)
+            .await
+            .len(),
+        operations
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reissue_of_a_note_not_held_is_refused() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = funded_client(&fed).await?;
+    let mint = client.get_first_module::<MintClientModule>()?;
+
+    let counts = mint.get_count_by_denomination().await;
+    let balance = client.get_balance_for_btc().await?;
+    let operations = client
+        .operation_log()
+        .paginate_operations_rev(100, None)
+        .await
+        .len();
+
+    assert!(!counts.contains_key(&Denomination(30)));
+
+    // Balanced, so the only thing wrong is the missing note.
+    let inputs = vec![Denomination(30)];
+    let outputs = split_with_fees(&mint, remainder(&mint, &inputs, &[]), 29);
+
+    assert_matches!(
+        mint.reissue(inputs, outputs, Value::Null).await,
+        Err(ReissueError::MissingNote(Denomination(30)))
+    );
+
+    assert_eq!(mint.get_count_by_denomination().await, counts);
+    assert_eq!(client.get_balance_for_btc().await?, balance);
+    assert_eq!(
+        client
+            .operation_log()
+            .paginate_operations_rev(100, None)
+            .await
+            .len(),
+        operations
+    );
+
+    Ok(())
+}
