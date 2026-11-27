@@ -17,6 +17,7 @@ use rusqlite::{named_params, Connection};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 mod migrations;
 
@@ -33,6 +34,33 @@ pub const DEFAULT_KV_TABLE_NAME: &str = "ldk_data";
 
 // The current SQLite `user_version`, which we can use if we'd ever need to do a schema migration.
 const SCHEMA_USER_VERSION: u16 = 2;
+
+// Waits between the attempts of a failing write or removal, ~4 s in all.
+// A write can fail for a moment, e.g. while the process is out of file
+// descriptors ("unable to open database file": SQLite opens its journal per
+// transaction). LDK treats a failed write of a `ChannelMonitor` or the
+// `ChannelManager` as fatal, so wait such a moment out before giving up.
+const WRITE_RETRY_DELAYS_MS: [u64; 6] = [50, 100, 250, 500, 1000, 2000];
+
+// Runs `op` until it succeeds or `delays_ms` is used up, returning the last
+// error. Callers keep the connection locked across the attempts, so writes
+// stay in order.
+fn retry_with_delays<T>(delays_ms: &[u64], mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+	let mut delays = delays_ms.iter();
+	loop {
+		match op() {
+			Ok(res) => return Ok(res),
+			Err(e) => match delays.next() {
+				Some(delay_ms) => {
+					// The store has no logger.
+					eprintln!("SqliteStore: {}; retrying in {} ms", e, delay_ms);
+					std::thread::sleep(Duration::from_millis(*delay_ms));
+				},
+				None => return Err(e),
+			},
+		}
+	}
+}
 
 /// A [`KVStore`] implementation that writes to and reads from an [SQLite] database.
 ///
@@ -185,27 +213,29 @@ impl KVStore for SqliteStore {
 			self.kv_table_name
 		);
 
-		let mut stmt = locked_conn.prepare_cached(&sql).map_err(|e| {
-			let msg = format!("Failed to prepare statement: {}", e);
-			io::Error::new(io::ErrorKind::Other, msg)
-		})?;
+		retry_with_delays(&WRITE_RETRY_DELAYS_MS, || {
+			let mut stmt = locked_conn.prepare_cached(&sql).map_err(|e| {
+				let msg = format!("Failed to prepare statement: {}", e);
+				io::Error::new(io::ErrorKind::Other, msg)
+			})?;
 
-		stmt.execute(named_params! {
-			":primary_namespace": primary_namespace,
-			":secondary_namespace": secondary_namespace,
-			":key": key,
-			":value": buf,
-		})
-		.map(|_| ())
-		.map_err(|e| {
-			let msg = format!(
-				"Failed to write to key {}/{}/{}: {}",
-				PrintableString(primary_namespace),
-				PrintableString(secondary_namespace),
-				PrintableString(key),
-				e
-			);
-			io::Error::new(io::ErrorKind::Other, msg)
+			stmt.execute(named_params! {
+				":primary_namespace": primary_namespace,
+				":secondary_namespace": secondary_namespace,
+				":key": key,
+				":value": buf,
+			})
+			.map(|_| ())
+			.map_err(|e| {
+				let msg = format!(
+					"Failed to write to key {}/{}/{}: {}",
+					PrintableString(primary_namespace),
+					PrintableString(secondary_namespace),
+					PrintableString(key),
+					e
+				);
+				io::Error::new(io::ErrorKind::Other, msg)
+			})
 		})
 	}
 
@@ -218,27 +248,29 @@ impl KVStore for SqliteStore {
 
 		let sql = format!("DELETE FROM {} WHERE primary_namespace=:primary_namespace AND secondary_namespace=:secondary_namespace AND key=:key;", self.kv_table_name);
 
-		let mut stmt = locked_conn.prepare_cached(&sql).map_err(|e| {
-			let msg = format!("Failed to prepare statement: {}", e);
-			io::Error::new(io::ErrorKind::Other, msg)
-		})?;
+		retry_with_delays(&WRITE_RETRY_DELAYS_MS, || {
+			let mut stmt = locked_conn.prepare_cached(&sql).map_err(|e| {
+				let msg = format!("Failed to prepare statement: {}", e);
+				io::Error::new(io::ErrorKind::Other, msg)
+			})?;
 
-		stmt.execute(named_params! {
-			":primary_namespace": primary_namespace,
-			":secondary_namespace": secondary_namespace,
-			":key": key,
+			stmt.execute(named_params! {
+				":primary_namespace": primary_namespace,
+				":secondary_namespace": secondary_namespace,
+				":key": key,
+			})
+			.map(|_| ())
+			.map_err(|e| {
+				let msg = format!(
+					"Failed to delete key {}/{}/{}: {}",
+					PrintableString(primary_namespace),
+					PrintableString(secondary_namespace),
+					PrintableString(key),
+					e
+				);
+				io::Error::new(io::ErrorKind::Other, msg)
+			})
 		})
-		.map_err(|e| {
-			let msg = format!(
-				"Failed to delete key {}/{}/{}: {}",
-				PrintableString(primary_namespace),
-				PrintableString(secondary_namespace),
-				PrintableString(key),
-				e
-			);
-			io::Error::new(io::ErrorKind::Other, msg)
-		})?;
-		Ok(())
 	}
 
 	fn list(&self, primary_namespace: &str, secondary_namespace: &str) -> io::Result<Vec<String>> {
@@ -295,6 +327,27 @@ mod tests {
 				_ => {},
 			}
 		}
+	}
+
+	#[test]
+	fn retries_until_success_or_out_of_delays() {
+		let mut calls = 0;
+		let res = retry_with_delays(&[0, 0, 0], || {
+			calls += 1;
+			if calls < 3 {
+				Err(io::Error::new(io::ErrorKind::Other, "transient"))
+			} else {
+				Ok(calls)
+			}
+		});
+		assert_eq!(res.unwrap(), 3);
+
+		let mut calls = 0;
+		let res: io::Result<()> = retry_with_delays(&[0, 0], || {
+			calls += 1;
+			Err(io::Error::new(io::ErrorKind::Other, format!("failure {}", calls)))
+		});
+		assert_eq!(res.unwrap_err().to_string(), "failure 3");
 	}
 
 	#[test]

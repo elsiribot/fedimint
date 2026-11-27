@@ -173,6 +173,36 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "uniffi")]
 uniffi::include_scaffolding!("ldk_node");
 
+/// Spawns a task the node cannot work without. If the task panics, the
+/// process is aborted so its supervisor restarts it.
+///
+/// tokio catches a panic in a spawned task and only that task dies. For these
+/// tasks that leaves a node that looks alive but no longer handles events,
+/// persists the `ChannelManager` or follows the chain; the `ChannelManager`
+/// on disk falls behind the `ChannelMonitor`s, peers force-close as HTLCs
+/// expire unhandled, and the next start force-closes every remaining
+/// channel. A restart within seconds avoids all of that.
+fn spawn_critical<F>(
+	runtime: &tokio::runtime::Runtime, logger: Arc<Logger>, name: &'static str, future: F,
+) where
+	F: std::future::Future<Output = ()> + Send + 'static,
+{
+	let handle = runtime.spawn(future);
+	runtime.spawn(async move {
+		if let Err(e) = handle.await {
+			if e.is_panic() {
+				log_error!(
+					logger,
+					"Task '{}' panicked ({}); aborting the process so that it is restarted.",
+					name,
+					e
+				);
+				std::process::abort();
+			}
+		}
+	});
+}
+
 /// The main interface object of LDK Node, wrapping the necessary LDK and BDK functionalities.
 ///
 /// Needs to be initialized and instantiated through [`Builder::build`].
@@ -261,7 +291,7 @@ impl Node {
 		let sync_cman = Arc::clone(&self.channel_manager);
 		let sync_cmon = Arc::clone(&self.chain_monitor);
 		let sync_sweeper = Arc::clone(&self.output_sweeper);
-		runtime.spawn(async move {
+		spawn_critical(&runtime, Arc::clone(&self.logger), "chain sync", async move {
 			chain_source
 				.continuously_sync_wallets(stop_sync_receiver, sync_cman, sync_cmon, sync_sweeper)
 				.await;
@@ -340,7 +370,7 @@ impl Node {
 				bind_addrs.extend(resolved_address);
 			}
 
-			runtime.spawn(async move {
+			spawn_critical(&runtime, Arc::clone(&self.logger), "inbound listener", async move {
 				{
 				let listener =
 					tokio::net::TcpListener::bind(&*bind_addrs).await
@@ -364,7 +394,16 @@ impl Node {
 							break;
 						}
 						res = listener.accept() => {
-							let tcp_stream = res.unwrap().0;
+							// Typically EMFILE or ENFILE. Dropping this
+							// connection and waiting beats ending the listener.
+							let tcp_stream = match res {
+								Ok((tcp_stream, _)) => tcp_stream,
+								Err(e) => {
+									log_error!(listening_logger, "Failed to accept inbound connection: {}", e);
+									tokio::time::sleep(Duration::from_secs(1)).await;
+									continue;
+								},
+							};
 							tokio::spawn(async move {
 								lightning_net_tokio::setup_inbound(
 									Arc::clone(&peer_mgr),
@@ -504,7 +543,7 @@ impl Node {
 		let mut stop_tx_bcast = self.stop_sender.subscribe();
 		let chain_source = Arc::clone(&self.chain_source);
 		let tx_bcast_logger = Arc::clone(&self.logger);
-		runtime.spawn(async move {
+		spawn_critical(&runtime, Arc::clone(&self.logger), "transaction broadcaster", async move {
 			// Every second we try to clear our broadcasting queue.
 			let mut interval = tokio::time::interval(Duration::from_secs(1));
 			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -583,7 +622,7 @@ impl Node {
 
 		let background_stop_logger = Arc::clone(&self.logger);
 		let event_handling_stopped_sender = self.event_handling_stopped_sender.clone();
-		runtime.spawn(async move {
+		spawn_critical(&runtime, Arc::clone(&self.logger), "background processor", async move {
 			process_events_async(
 				background_persister,
 				|e| background_event_handler.handle_event(e),
@@ -600,8 +639,17 @@ impl Node {
 			)
 			.await
 			.unwrap_or_else(|e| {
-				log_error!(background_error_logger, "Failed to process events: {}", e);
-				panic!("Failed to process events");
+				// Without the background processor nothing handles events or
+				// persists the ChannelManager any more, while the
+				// ChannelMonitors keep advancing. Exit at once instead of
+				// running on in that state: a panic here would only end
+				// this task.
+				log_error!(
+					background_error_logger,
+					"Failed to process events: {}. Aborting the process so that it is restarted.",
+					e
+				);
+				std::process::abort();
 			});
 			log_debug!(background_stop_logger, "Events processing stopped.",);
 
